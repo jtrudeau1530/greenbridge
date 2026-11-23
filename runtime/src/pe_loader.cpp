@@ -13,6 +13,7 @@
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -28,9 +29,36 @@ std::string lower(std::string s) {
 
 namespace {
 
+std::filesystem::path::string_type module_key(const std::filesystem::path& path) {
+    // Keep identity in the platform's native path representation. Only the existing ASCII case folding is
+    // applied here; representable names also retain their old narrow-byte alias below.
+    auto key = path.filename().native();
+    for (auto& c : key)
+        if (c >= 'A' && c <= 'Z') c = static_cast<std::filesystem::path::value_type>(c + ('a' - 'A'));
+    return key;
+}
+
+std::string narrow_module_key(const std::filesystem::path& path) {
+    const auto filename = path.filename();
+    try {
+        const auto narrow = filename.string();
+        // A lossy/default-character alias must not collapse two distinct Unicode basenames.
+        if (std::filesystem::path(narrow).native() == filename.native()) return lower(narrow);
+    } catch (const std::system_error&) {
+        // Some Windows standard libraries throw when a basename is outside the current narrow code page.
+        // It still has a native identity; it simply has no alias in the existing narrow lookup API.
+    }
+    return {};
+}
+
+std::string path_utf8(const std::filesystem::path& path) {
+    const auto bytes = path.u8string();
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + p.string());
+    if (!f) throw std::runtime_error("cannot open " + path_utf8(p));
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
@@ -930,11 +958,13 @@ Loader::~Loader() {
 
 Module& Loader::load(const std::filesystem::path& image) {
     std::lock_guard lock(mutex_);
-    std::string key = lower(image.filename().string());
+    const auto key = module_key(image);
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
+    const auto narrow_key = narrow_module_key(image);
+    if (Module* existing = find_narrow_module(narrow_key)) return *existing;
     Module* mapped = nullptr;
     try {
-        mapped = &map_image(image);
+        mapped = &map_image(image, narrow_key);
         bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
         protect_sections(*mapped);
         register_unwind(*mapped);
@@ -954,10 +984,19 @@ Module& Loader::load(const std::filesystem::path& image) {
     return m;
 }
 
+Module* Loader::find_narrow_module(const std::string& dll_lower) const {
+    if (dll_lower.empty()) return nullptr;
+    // library_loader and PE import names keep their existing narrow-byte contract. Do not reinterpret them
+    // as UTF-8 or widen already-folded bytes (which could be part of a multibyte code-page character).
+    for (const auto& entry : by_name_)
+        if (entry.second->narrow_key == dll_lower) return entry.second;
+    return nullptr;
+}
+
 void* Loader::find_loaded_module(const std::string& dll_lower) const {
     std::lock_guard lock(mutex_);
-    auto it = by_name_.find(dll_lower);
-    return it == by_name_.end() ? nullptr : static_cast<void*>(it->second->base);
+    Module* m = find_narrow_module(dll_lower);
+    return m ? static_cast<void*>(m->base) : nullptr;
 }
 
 void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled) {
@@ -965,10 +1004,10 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
 
     std::lock_guard lock(mutex_);
-    const auto existing = by_name_.find(dll_lower);
+    Module* existing = find_narrow_module(dll_lower);
     const std::filesystem::path candidate = game_dir_ / dll_lower;
     std::error_code ec;
-    const bool is_bundled = existing != by_name_.end() || std::filesystem::is_regular_file(candidate, ec);
+    const bool is_bundled = existing || std::filesystem::is_regular_file(candidate, ec);
     if (!is_bundled) return nullptr;
 
     handled = true;
@@ -982,10 +1021,10 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
         return nullptr;
     }
 
-    if (existing != by_name_.end()) {
+    if (existing) {
         try {
             initialise();
-            return static_cast<void*>(existing->second->base);
+            return static_cast<void*>(existing->base);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[rt] loader: run-time initialise of %s failed: %s\n", dll_lower.c_str(), e.what());
             SetLastError(ERROR_DLL_INIT_FAILED);
@@ -993,15 +1032,17 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
         }
     }
 
+    Module* mapped = nullptr;
     try {
         Module& m = load(candidate);
+        mapped = &m;
         initialise();
         std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
         return static_cast<void*>(m.base);
     } catch (const std::exception& e) {
         // load() drops a module that failed to map or bind (dependencies included); this also drops one whose
         // initialise() failed, so later GetModuleHandle/LoadLibrary calls don't see it. ~Loader frees it via order_.
-        by_name_.erase(dll_lower);
+        by_name_.erase(module_key(mapped ? mapped->path : candidate));
         std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
         return nullptr;
@@ -1129,12 +1170,12 @@ void Loader::set_initialised(Module& m, bool value) {
     m.initialised = value;
 }
 
-Module& Loader::map_image(const std::filesystem::path& path) {
+Module& Loader::map_image(const std::filesystem::path& path, const std::string& narrow_key) {
     auto file = read_file(path);
-    const std::string name = path.filename().string();
+    const std::string name = path_utf8(path.filename());
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(file.data());
     if (file.size() < sizeof(IMAGE_DOS_HEADER) || dos->e_magic != IMAGE_DOS_SIGNATURE)
-        throw std::runtime_error(path.string() + ": not an MZ image");
+        throw std::runtime_error(path_utf8(path) + ": not an MZ image");
     if (dos->e_lfanew < 0 || static_cast<uint64_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > file.size())
         throw std::runtime_error(name + ": the NT headers are outside the file");
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(file.data() + dos->e_lfanew);
@@ -1158,11 +1199,12 @@ Module& Loader::map_image(const std::filesystem::path& path) {
 
     auto* m = new Module;
     m->name = name;
+    m->narrow_key = narrow_key;
     m->path = path;
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
-    by_name_[lower(m->name)] = m;
+    by_name_[module_key(path)] = m;
     order_.push_back(m);
 
     // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.

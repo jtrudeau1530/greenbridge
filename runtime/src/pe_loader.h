@@ -27,7 +27,8 @@ struct ImportRecord {
 };
 
 struct Module {
-    std::string name;
+    std::string name;        // UTF-8 basename for diagnostics and traces, not a lookup key
+    std::string narrow_key;  // legacy lower-case narrow basename; empty when it cannot round-trip
     std::filesystem::path path;
     uint8_t* base = nullptr;
     uint64_t preferred_base = 0;
@@ -122,7 +123,8 @@ public:
 private:
     void initialise(Module& m);
     static void set_initialised(Module& m, bool value);
-    Module& map_image(const std::filesystem::path& path);
+    Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_
+    Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
     void initialize_tls(Module& m);
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
@@ -133,7 +135,7 @@ private:
 
     mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
-    std::map<std::string, Module*> by_name_;  // lower-case file name
+    std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
 

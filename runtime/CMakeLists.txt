@@ -502,6 +502,33 @@ if(BUILD_TESTING)
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
 
+    add_executable(module_names_test test/module_names_test.cpp src/pe_loader.cpp shims/registry.cpp)
+    target_include_directories(module_names_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(module_names_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(module_names_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(module_names_test PRIVATE /OPT:NOREF)
+    add_dependencies(module_names_test gta6rt_tls_host tiny_dll)
+    add_test(NAME module_names COMMAND module_names_test "$<TARGET_FILE:tiny_dll>")
+
+    add_executable(tiny_module_names test/fixtures/tiny_module_names.cpp)
+    target_compile_definitions(tiny_module_names PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_module_names PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    set_target_properties(tiny_module_names PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
+
+    # Native Windows and --dry-run/--init/--run share original renamed fixtures, including an ACP-named import.
+    if(NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME run_module_names COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_module_names.py"
+          "--loader=$<TARGET_FILE:gta6rt>" "--guest=$<TARGET_FILE:tiny_module_names>"
+          "--importer=$<TARGET_FILE:tiny_exe>" "--dependency=$<TARGET_FILE:tiny_dll>"
+          "--work-dir=${CMAKE_CURRENT_BINARY_DIR}"
+          "--report=${CMAKE_CURRENT_BINARY_DIR}/module-names-results.json")
+        set_tests_properties(run_module_names PROPERTIES TIMEOUT 90)
+      endif()
+    endif()
+
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The xmem and d3d12_xs tables
     # are linked too so the optional LEONIDA_GAME_DIR run classifies the shipped modules' imports exactly like
     # gta6rt does (no d3d12.lib is needed: d3d12_xs resolves its host entry points at run time).
