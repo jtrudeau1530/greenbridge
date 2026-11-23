@@ -1264,15 +1264,16 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 part_joint_names = None
 
             mat_spec = None
-            if "material" in prim and 0 <= prim["material"] < len(materials):
-                gm = materials[prim["material"]]
+            if "material" not in prim or 0 <= prim["material"] < len(materials):
+                gm = materials[prim["material"]] if "material" in prim else {"name": f"{pname}_mat"}
                 pbr = gm.get("pbrMetallicRoughness", {})
-                bcf = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+                # glTF defaults also apply to primitives with no material; other input formats keep their clay defaults.
+                bcf = pbr.get("baseColorFactor", [1.0, 1.0, 1.0, 1.0])
                 mat_spec = MaterialSpec(
                     name=str(gm.get("name", f"{node_name}_mat")),
                     base_color_factor=(float(bcf[0]), float(bcf[1]), float(bcf[2]), float(bcf[3])),
-                    metallic_factor=float(pbr.get("metallicFactor", 0.0)),
-                    roughness_factor=float(pbr.get("roughnessFactor", 0.85)),
+                    metallic_factor=float(pbr.get("metallicFactor", 1.0)),
+                    roughness_factor=float(pbr.get("roughnessFactor", 1.0)),
                     alpha_mode=str(gm.get("alphaMode", "OPAQUE")),
                     alpha_cutoff=float(gm["alphaCutoff"]) if "alphaCutoff" in gm else None,
                     double_sided=bool(gm.get("doubleSided", False)),
