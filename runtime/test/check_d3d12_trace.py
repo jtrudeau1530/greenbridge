@@ -1,20 +1,50 @@
 """Check the trace on the CPU command-list fixture, or on d3d12_com_test with --queue."""
 
 import argparse
+import os
 import re
+import signal
 import subprocess
 
 
 RUNNER = []  # the command that runs a Windows executable here: empty on Windows, ["wine"] for a cross build
+# A first start of Wine in a fresh prefix can take tens of seconds, hence the longer limit through a runner.
+TIMEOUT_S = 30
+RUNNER_TIMEOUT_S = 120
+
+
+def stop(process):
+    """Kill the fixture and, on POSIX, everything it started: Wine's children outlive the launcher it runs."""
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def run_fixture(exe, *args):
-    # A first start of Wine in a fresh prefix can take tens of seconds, hence the longer limit through a runner.
-    process = subprocess.run([*RUNNER, exe, *args], capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=120 if RUNNER else 30)
+    command = [*RUNNER, exe, *args]
+    timeout = RUNNER_TIMEOUT_S if RUNNER else TIMEOUT_S
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   encoding="utf-8", errors="replace", start_new_session=os.name == "posix")
+    except OSError as error:  # no Wine on PATH, or a fixture that was not built
+        raise SystemExit(f"cannot start {command[0]}: {error.strerror or error}")
+    with process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stop(process)
+            raise SystemExit(f"{exe} did not finish within {timeout} s")
+        except BaseException:
+            stop(process)
+            raise
     if process.returncode:
-        raise SystemExit(f"{exe} exited with {process.returncode}\n{process.stdout}{process.stderr}")
-    return [line for line in process.stderr.splitlines() if line.startswith("[d3d12-trace]")]
+        raise SystemExit(f"{exe} exited with {process.returncode}\n{stdout}{stderr}")
+    return [line for line in stderr.splitlines() if line.startswith("[d3d12-trace]")]
 
 
 def main():
