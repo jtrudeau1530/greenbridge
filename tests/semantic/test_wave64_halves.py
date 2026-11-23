@@ -962,6 +962,32 @@ class AddTidBuffer(unittest.TestCase):
                    "buffer_load_dword v6, off, s[0:3], 0"])
         self.assertEqual(meta_of("vs_tid_copy", lines)[0][0], "C")
 
+    def test_word3_built_by_other_scalar_ops_counts(self):
+        # rdna2spirv folds these into the literal word3; the analysis must see the same bit
+        head = ["s_mov_b32 s0, 0x1000", "s_mov_b32 s1, 0x80040000", "s_mov_b32 s2, 0x1000"]
+        load = "buffer_load_dword v6, off, s[0:3], 0"
+        for name, build, tier in (
+                ("mov64_set", ["s_mov_b64 s[2:3], 0x31816fac00001000"], "C"),
+                ("mov64_clear", ["s_mov_b64 s[2:3], 0x31016fac00001000"], "A"),
+                ("mov64_pair_copy", ["s_mov_b64 s[20:21], 0x31816fac00001000", "s_mov_b64 s[2:3], s[20:21]"], "C"),
+                ("pack_set", ["s_pack_ll_b32_b16 s3, 0x6fac, 0x3181"], "C"),
+                ("pack_clear", ["s_pack_ll_b32_b16 s3, 0x6fac, 0x3101"], "A"),
+                ("bfm_set", ["s_bfm_b32 s3, 9, 23"], "C"),
+                ("bfm_clear", ["s_bfm_b32 s3, 3, 12"], "A"),
+                ("movk_clear", ["s_movk_i32 s3, 0x1234"], "A")):
+            lines = vs(head + (["s_mov_b32 s3, 0"] if name.startswith("mov64") else []) + build
+                       + ["v_mov_b32_e32 v9, 0", load, "s_waitcnt vmcnt(0)"])
+            self.assertEqual(meta_of("vs_w3_" + name, lines)[0][0], tier, name)
+
+    def test_offen_tbuffer_and_store_format_follow_the_bit(self):
+        for access in ("buffer_load_dword v6, v9, s[0:3], 0 offen",
+                       "tbuffer_load_format_x v6, off, s[0:3], 0 format:[BUF_FMT_32_FLOAT]",
+                       "buffer_store_format_x v6, off, s[0:3], 0"):
+            (tier, reasons, _), _ = meta_of("vs_tid_variant", self.program(self.TID, access))
+            self.assertEqual((tier, "lane-id" in reasons), ("C", True), access)
+            (tier, reasons, _), _ = meta_of("vs_notid_variant", self.program(self.NO_TID, access))
+            self.assertEqual((tier, reasons), ("A", []), access)
+
     def test_stores_and_atomics_by_lane_are_tier_c(self):
         for access in ("buffer_store_dword v6, off, s[0:3], 0", "buffer_atomic_add v6, off, s[0:3], 0"):
             (tier, reasons, _), _ = meta_of("vs_tid_write", self.program(self.TID, access))
