@@ -31,7 +31,8 @@ Usage:
     python -I tools/cf_diff.py --seed S --program K --show [--minimize]     # print (and shrink) one program
 
 Exit code 0 when every program matches, 1 on a mismatch (case, seed, lane, the expected and actual words and the
-listing; with --minimize also a reduced listing), 2 on harness errors. Skips are counted with reasons.
+listing; with --minimize also a reduced listing), 2 on harness errors or when every program was skipped (nothing was
+compared). Skips are counted with reasons.
 """
 import argparse
 import gc
@@ -655,7 +656,12 @@ def main(argv=None):
         print(f"  ... {len(failures) - 10} more")
     if counts["harness-error"]:
         return 2
-    return 1 if counts["mismatch"] else 0
+    if counts["mismatch"]:
+        return 1
+    if not counts["pass"]:
+        print("no program ran: every one was skipped")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

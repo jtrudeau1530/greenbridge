@@ -93,7 +93,7 @@ class ArgumentValidation(unittest.TestCase):
 
     def test_a_valid_limit_still_runs_that_many_programs(self):
         out = io.StringIO()
-        with mock.patch.object(sd, "run_one", lambda *_a: ("pass", "")), contextlib.redirect_stdout(out):
+        with mock.patch.object(sd, "run_one", lambda *_a: ("match", "")), contextlib.redirect_stdout(out):
             self.assertEqual(sd.main(["--programs", "5", "--limit", "1"]), 0)
         self.assertIn("1 programs", out.getvalue())
 
