@@ -416,7 +416,9 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
         raise SpirvAsmError(f"line {lineno}: unsupported operand kind {kind!r}")
 
-    for lineno, raw_line in enumerate(text.splitlines(), 1):
+    # Unicode separators such as U+2028 are ordinary characters inside a literal string.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    for lineno, raw_line in enumerate(lines, 1):
         toks = _tokenize_line(raw_line, lineno)
         if not toks:
             continue

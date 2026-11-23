@@ -40,6 +40,17 @@ def _validate(spv: bytes, target_env: str = "vulkan1.2") -> None:
 
 
 class SpirvAsmUnitTests(unittest.TestCase):
+    def test_unicode_separators_remain_in_literal_strings(self):
+        literal = "first\u0085second\u2028third\u2029last"
+        expected = literal.encode("utf-8") + b"\x00"
+        expected += b"\x00" * (-len(expected) % 4)
+        for newline in ("\n", "\r\n", "\r"):
+            with self.subTest(newline=newline):
+                asm = f'%str = OpString "{literal}"{newline}OpNop{newline}'
+                spv = spirv_asm.assemble(asm)
+                words = _literal_words(spv, 7, 1)  # OpString result ID precedes its literal.
+                self.assertEqual(struct.pack(f"<{len(words)}I", *words), expected)
+
     def test_reject_repeated_type_result_ids(self):
         declarations = (
             ("OpTypeInt 32 0", "OpTypeFloat 32"),
