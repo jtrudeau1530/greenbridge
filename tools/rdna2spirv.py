@@ -14638,7 +14638,8 @@ def assemble(gen):
     reserved = {loc for pair in gen.f16_half_locs.values() for loc in pair} if gen.stage == "ps" else set()
     if any(not k.startswith("%in_f16h") and v in reserved for k, v in gen.inputs.items()):
         raise Unsupported("--f16-interp-fallback: a decoded-half location is also read as an attribute")
-    gen.bary_location = next(n for n in range(len(used) + 1) if n not in used) if bary and BARY_FALLBACK else None
+    occupied = used | reserved
+    gen.bary_location = next(n for n in range(len(occupied) + 1) if n not in occupied) if bary and BARY_FALLBACK else None
     bary_builtin = bary and gen.bary_location is None
     if gen.frag_inputs or bary:
         iface += ["%frag_coord"] + (["%front_facing"] if "front" in gen.frag_inputs.values() else []) +             (["%bary"] if bary else [])
