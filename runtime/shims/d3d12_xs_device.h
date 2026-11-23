@@ -1,6 +1,8 @@
 // Xbox-ABI proxy around a PC ID3D12Device.
 //
 // Measured Xbox device deviations used here (vtable indices, x64):
+//   slot 61   CreateSamplerX(desc, dest) -> PC CreateSampler (slot 22); the description's PC
+//             D3D12_SAMPLER_DESC prefix is passed. The PC slot 61 is CreateMetaCommand. Measured on the retail title's boot.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
