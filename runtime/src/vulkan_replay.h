@@ -3001,8 +3001,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
                 return ReplayResult::invalid_indirect_arguments;
-            const VkDeviceSize bytes = VkDeviceSize(ind->max_count - 1) * ind->stride + record_size;
-            if (!detail::indirect_range(p.binding, ind->argument_offset, bytes))
+            // The span is max_count * stride, the bytes the signature can walk, as D3D12 measures it: a record that
+            // fits at the end of the buffer while its stride runs past it is refused (`240` with stride `20` in a
+            // `256`-byte buffer). A zero max_count still has to name an offset inside the buffer.
+            if (ind->argument_offset > p.binding.size ||
+                ind->max_count > (p.binding.size - ind->argument_offset) / ind->stride ||
+                !detail::indirect_range(p.binding, ind->argument_offset,
+                                        VkDeviceSize(ind->max_count) * ind->stride))
                 return ReplayResult::invalid_indirect_arguments;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
