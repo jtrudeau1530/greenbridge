@@ -453,6 +453,35 @@ class OutputTest(unittest.TestCase):
                     self.assertEqual(f.read(), blob)
         self.assertFalse(os.path.exists(other))
 
+    def test_out_csv_or_xml_over_a_stream_of_the_source_folder_is_refused(self):
+        stream = os.path.join(self.root, "00000000.bin")
+        blob = wide_blob()
+        with open(stream, "wb") as f:
+            f.write(blob)
+        other = os.path.join(self.root, "reports", "tree.json")
+        cases = (((self.root, os.path.join(self.root, "00000000.BIN" if os.name == "nt" else "00000000.bin")),
+                  "would overwrite the stream"),
+                 ((self.root, other, "--csv", stream), "would overwrite the stream"),
+                 ((self.root, other, "--xml", os.path.join(self.root, ".")), "must not be the source folder"))
+        for argv, message in cases:
+            with self.subTest(argv=argv):
+                result = self._run_cli(*argv)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                with open(stream, "rb") as f:
+                    self.assertEqual(f.read(), blob)
+                self.assertEqual(sorted(os.listdir(self.root)), ["00000000.bin"])
+
+    def test_reports_beside_the_streams_are_still_allowed(self):
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        out = os.path.join(self.root, "tree.json")
+        result = self._run_cli(self.root, out, "--csv", os.path.join(self.root, "nodes.csv"),
+                               "--xml", os.path.join(self.root, "xml"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.isfile(out))
+
     def test_out_and_csv_on_the_same_file_are_refused(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())

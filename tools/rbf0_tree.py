@@ -702,6 +702,19 @@ def main(argv=None):
         for flag, path in (("out", args.out), ("--csv", args.csv)):
             if path and same_output_path(path, args.source):
                 ap.error(f"{flag} would overwrite the source {args.source}")
+    elif os.path.isdir(args.source):
+        # A carve folder: out or --csv naming one of its streams used to replace that stream, and --xml on the
+        # folder itself put the XML files among the streams, where the next run read them as resources.
+        try:
+            streams = [full for full in (os.path.join(args.source, n) for n in os.listdir(args.source))
+                       if os.path.isfile(full) and not full.lower().endswith((".json", ".csv"))]
+        except OSError:
+            streams = []   # decode_source reports the unreadable folder
+        for flag, path in (("out", args.out), ("--csv", args.csv)):
+            if path and os.path.exists(path) and any(same_output_path(path, s) for s in streams):
+                ap.error(f"{flag} would overwrite the stream {path} in the source folder")
+        if args.xml and same_output_path(args.xml, args.source):
+            ap.error("--xml must not be the source folder: its XML files would be read as streams")
 
     def progress(n, total):
         if not args.quiet and (n % 100 == 0 or n == total):
