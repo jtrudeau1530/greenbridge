@@ -6814,6 +6814,15 @@ class Gen:
             self.dst(a[0], self.tou(r))
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
+            # A half of a register is read with a shift and a mask, not with OpBitField{S,U}Extract at offset 16,
+            # as for every other 16-bit half reader (docs/design.md, "16-bit high-half reads", #1506). The field
+            # extract here is what @Dark0rz measured miscompiled on an AMD Windows driver 25.10.36 (gfx1036): the
+            # offset came back taken mod 16, so both result halves read the low half of the source, in 5 of the
+            # 2,000 wave32 programs of `tools/valu_fuzz.py --family f16 --seed 1`. The same programs run clean on
+            # a second gfx1036 with driver 31.0.24002.92 (2000/2000 match), which is why this is a driver-proof
+            # lowering and not a value change: on 200,010 inputs (0, 1, 0xFFFF, 0x10000, 0x80000000, 0xFFFFFFFF,
+            # 0x7FFFFFFF, 0x8000 and random) BitField{S,U}Extract(x, 16, 16) equals x >> 16 with the matching
+            # right shift, and BitFieldUExtract(x, 16, 4) equals (x >> 16) & 15.
             def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
                 if m is None:
@@ -6836,12 +6845,23 @@ class Gen:
                     or any(b not in (0, 1) for b in sel + selhi) or any(neg_lo) or any(neg_hi)):
                 raise Unsupported(op + " modifiers")
             sh_src, val_src = self.src_u(a[1]), self.src_u(a[2])
+            signed = op.endswith("i16")
             halves = []
             for h, sl in ((0, sel), (1, selhi)):
                 amt, val, am, r16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(16 * sl[0])} {self.cu(4)}")
-                ext = "OpBitFieldSExtract" if op.endswith("i16") else "OpBitFieldUExtract"
-                self.emit(f"{val} = {ext} %uint {val_src} {self.cu(16 * sl[1])} {self.cu(16)}")
+                if sl[0]:
+                    half = self.tmp()
+                    self.emit(f"{half} = OpShiftRightLogical %uint {sh_src} {self.cu(16)}")
+                    self.emit(f"{amt} = OpBitwiseAnd %uint {half} {self.cu(15)}")
+                else:
+                    self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(0)} {self.cu(4)}")
+                if sl[1]:
+                    # The high half: x >> 16 already extends it the right way for the shift that follows.
+                    right = "OpShiftRightArithmetic" if signed else "OpShiftRightLogical"
+                    self.emit(f"{val} = {right} %uint {val_src} {self.cu(16)}")
+                else:
+                    ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
+                    self.emit(f"{val} = {ext} %uint {val_src} {self.cu(0)} {self.cu(16)}")
                 k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical",
                      "v_pk_ashrrev_i16": "OpShiftRightArithmetic"}[op]
                 self.emit(f"{am} = {k} %uint {val} {amt}")
