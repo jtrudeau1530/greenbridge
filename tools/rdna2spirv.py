@@ -1868,23 +1868,17 @@ class Gen:
         self.emit(f"OpStore %scc {res}")
 
     def swizzle(self, a, mods, ins):
-        """ds_swizzle_b32 vD, vS offset:swizzle(...): a subgroup shuffle (one invocation per lane)."""
+        """ds_swizzle_b32 vD, vS [offset:swizzle(...) | offset:N]: a subgroup shuffle (one invocation per lane)."""
         line = " ".join(m for m in mods) + " " + " ".join(x.get("t", "") for x in a if x["k"] in ("special", "raw"))
         import re as _re
         text = line + " " + str(ins.get("raw", ""))
         bm = _re.search(r'swizzle\(BITMASK_PERM,\s*"([01pi]{5})"\)', text)
         m = _re.search(r"swizzle\((\w+)((?:,\s*\d+)*)\)", text)
-        if not m and not bm:
-            raise Unsupported("ds_swizzle pattern")
-        kind = "BITMASK_PERM" if bm else m.group(1)
-        args = [int(x) for x in m.group(2).split(",")[1:]] if m and m.group(2) else []
-        self.uses_subgroup = True
-        lane = self.tmp()
-        self.sub_lane(lane)
-        if kind == "BITMASK_PERM":
+        and_m = or_m = xor_m = 0
+        if bm:
+            kind, args = "BITMASK_PERM", []
             # One character per lane-index bit, bit 4 first: p = keep, i = invert, 0 / 1 = force.
             # Source lane = ((lane & and_mask) | or_mask) ^ xor_mask, within each group of 32 lanes.
-            and_m = or_m = xor_m = 0
             for k, ch in enumerate(bm.group(1)):
                 bit = 1 << (4 - k)
                 if ch in "pi":
@@ -1893,6 +1887,36 @@ class Gen:
                     xor_m |= bit
                 if ch == "1":
                     or_m |= bit
+        elif m:
+            kind = m.group(1)
+            args = [int(x) for x in m.group(2).split(",")[1:]] if m.group(2) else []
+        else:
+            # Raw 16-bit DS_SWIZZLE_B32 offset (RDNA2 ISA): llvm-mc prints numeric offset:N when QDMode bits 13:8
+            # are non-zero (e.g. 0x81e4 -> offset:33252) and omits offset: when it is 0. Measured across all 65,536
+            # offsets on gfx1036: 0x0000..0x7FFF is bitmask mode, 0x8000..0xBFFF is QDMode (bits 13:8 ignored), and
+            # 0xC000..0xFFFF (bits 15:14 = 11) is a separate hardware mode (not a quad permute) and stays Unsupported.
+            if ("swizzle(" in text or len(mods) > 1 or len(a) != 2 or
+                    any(x["k"] in ("special", "raw") for x in a) or
+                    any(not mod.startswith("offset:") for mod in mods)):
+                raise Unsupported("ds_swizzle pattern")
+            off = 0
+            if mods:
+                try:
+                    off = int(mods[0][7:], 0)
+                except ValueError:
+                    raise Unsupported("ds_swizzle pattern") from None
+                if not 0 <= off <= 0xBFFF:
+                    raise Unsupported("ds_swizzle offset")
+            if off & 0x8000:
+                kind = "QUAD_PERM"
+                args = [(off >> (2 * i)) & 3 for i in range(4)]
+            else:
+                kind, args = "BITMASK_PERM", []
+                and_m, or_m, xor_m = off & 0x1F, (off >> 5) & 0x1F, (off >> 10) & 0x1F
+        self.uses_subgroup = True
+        lane = self.tmp()
+        self.sub_lane(lane)
+        if kind == "BITMASK_PERM":
             t1, t2, src = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{t1} = OpBitwiseAnd %uint {lane} {self.cu(and_m | 0xFFFFFFE0)}")
             self.emit(f"{t2} = OpBitwiseOr %uint {t1} {self.cu(or_m)}")
