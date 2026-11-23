@@ -140,7 +140,14 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     const Drive drive = console_drive(path, prefix_length);
     if (drive == Drive::None) return Parsed::Host;
     parts.clear();
-    if (drive == Drive::Scratch) parts.push_back(kScratchDir);
+    if (drive == Drive::Scratch) {
+        parts.push_back(kScratchDir);
+        const std::filesystem::path overlay = roots().overlay;
+        const DWORD last_error = ::GetLastError();
+        std::error_code ec;
+        if (!overlay.empty()) std::filesystem::create_directories(overlay / kScratchDir, ec);
+        ::SetLastError(last_error);
+    }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
     auto flush = [&]() -> bool {
@@ -174,6 +181,10 @@ std::filesystem::path join(const std::filesystem::path& root, const std::vector<
     std::filesystem::path p = root;
     for (const auto& part : parts) p /= part;
     return p;
+}
+
+bool drive_root(const std::vector<std::wstring>& parts) {
+    return parts.empty() || (parts.size() == 1 && same_name(parts[0].c_str(), kScratchDir));
 }
 
 struct Target {
@@ -869,7 +880,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" itself stays
+    if (drive_root(parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
@@ -906,7 +917,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (src.empty() || dst.empty()) return fail_bool(ERROR_ACCESS_DENIED);
+    if (drive_root(src) || drive_root(dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     const View to_view = view(r, dst);
