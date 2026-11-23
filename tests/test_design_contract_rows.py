@@ -65,7 +65,7 @@ class DesignTable(unittest.TestCase):
             row = next(line for line in f.read().splitlines()
                        if line.startswith("| Image atomics, size and LOD queries |"))
         for fact in ("GPU-checked (TEST-184)", "Measured natively on RDNA2", "raw LOD includes",
-                     "Unverified:", "on other dimensions is", "A host quirk", "OpImageQuerySizeLod"):
+                     "Unverified:", "on other dimensions is", "A host quirk", "OpImageQuerySizeLod", "OpImageQueryLevels"):
             with self.subTest(fact=fact):
                 self.assertIn(fact, row)
         self.assertNotIn("depth (1) and the level count", row)  # the superseded wording
