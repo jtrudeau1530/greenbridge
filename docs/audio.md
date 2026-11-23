@@ -351,6 +351,10 @@ out. A file is matched by its stream id and its bank: the folder below the Opus 
 folders removed, so one Opus folder can hold several archives' exports. `--source` limits the names to one source
 label of the names CSV.
 
+Dialogue wave names are matched without case. Repeated rows are accepted when they produce identical tags,
+including after subtitle markup is removed. Conflicting labels, speakers or subtitles stop the pass with a CSV
+line diagnostic before any Ogg file is modified; this also applies to `--dry-run`.
+
 ```sh
 python -I tools/opus_tags.py <work>/assets/audio/ogg --names <temp>/awc_names.csv --dialogue <temp>/dialogue.csv
 ```
