@@ -435,7 +435,13 @@ def select_clips(dictionary, wanted):
         return clips
     out = []
     for w in wanted:
-        hits = [c for c in clips if clip_label(c) == w or (w.lower().startswith("0x") and c["hash"] == int(w, 16))]
+        wanted_hash = None
+        if w.lower().startswith("0x"):
+            try:
+                wanted_hash = int(w, 16)
+            except ValueError:
+                wanted_hash = None
+        hits = [c for c in clips if clip_label(c) == w or (wanted_hash is not None and c["hash"] == wanted_hash)]
         require(hits, f"clip {w!r} is not in the dictionary")
         out.extend(hits)
     return out
@@ -454,8 +460,14 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
         rate = entry["rate"] if entry["rate"] and math.isfinite(entry["rate"]) and entry["rate"] > 0 else 1.0
         step = anim["duration"] / (frames - 1) if frames > 1 and anim["duration"] > 0 else 1.0 / 30
         start = entry["start"] if math.isfinite(entry["start"]) else 0.0
-        end = entry["end"] if math.isfinite(entry["end"]) and entry["end"] > start else anim["duration"]
-        keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4] or [0]
+        end = entry["end"] if math.isfinite(entry["end"]) and entry["end"] >= start else anim["duration"]
+        keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
+        fallback = not keep
+        if fallback:
+            target_time = 0.5 * (start + end) if end >= start else start
+            keep = [min(range(frames), key=lambda k: abs(k * step - target_time))] if frames else []
+        if not keep:
+            continue
         tally["animations"] += 1
         for t, (bone, ttype, fmt) in enumerate(anim["tracks"]):
             path = TRACK_PATHS.get(ttype)
@@ -479,7 +491,10 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
             if (target, path) in channels:
                 tally["tracks_overridden"] += 1
             # a frame kept by the 1e-4 tolerance before `start` would get a slightly negative time
-            channels[(target, path)] = [(max(0.0, (k * step - start) / rate), tuple(tracks[t][k])) for k in keep]
+            if fallback:
+                channels[(target, path)] = [(0.0, tuple(tracks[t][k])) for k in keep]
+            else:
+                channels[(target, path)] = [(max(0.0, (k * step - start) / rate), tuple(tracks[t][k])) for k in keep]
     return channels
 
 

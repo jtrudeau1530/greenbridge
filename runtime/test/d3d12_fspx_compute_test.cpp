@@ -10,6 +10,7 @@
 // The shader (test/glsl/cs_user_data.comp) stands in for a translated one. No game data. Set LEONIDA_VK_VALIDATION=1
 // to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
@@ -163,15 +164,18 @@ int main() {
     constexpr std::uint32_t marker_a = 5000, marker_b = 7000;
     const auto code_a = kind6(marker_a), code_b = kind6(marker_b);
     const auto container_a = container(payload(code_a));
-    const auto library = std::filesystem::temp_directory_path() / "leonida_fspx_compute_test";
-    std::filesystem::remove_all(library);
+    const testfiles::ScratchDir scratch("leonida_fspx_compute_test");
+    const auto& library = scratch.path();
     std::filesystem::create_directories(library / "fspx");
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "fspx" / "cs_user_data.spv");
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "fspx" / "cs_user_data_b.spv");
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
+                                library / "fspx" / "cs_user_data.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
+                                library / "fspx" / "cs_user_data_b.spv"));
     // The review case on #1911: program C in two containers whose kind-0 entries differ, translated to two
     // different modules (the second has another generator word in its header, still a valid module).
     const auto code_c = kind6(9100);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / "fspx" / "cs_c_state1.spv");
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
+                                library / "fspx" / "cs_c_state1.spv"));
     {
         std::ifstream in(LEONIDA_TEST_CS_SPV, std::ios::binary);
         std::vector<char> words((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -395,7 +399,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (std::uint32_t i = 0; i < elements; ++i) {

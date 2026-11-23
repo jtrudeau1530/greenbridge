@@ -455,7 +455,8 @@ class PipelineCheckExeTest(unittest.TestCase):
         self.touch("vk_pipeline_check.exe")
         work = os.path.join(self.tmp.name, "work")
         os.makedirs(os.path.join(work, "shaders", "spirv"))
-        open(os.path.join(work, "shaders", "spirv", "index.json"), "w").close()
+        with open(os.path.join(work, "shaders", "spirv", "index.json"), "w") as f:
+            f.write('{"shader_0": {}}')   # a finished translation is never empty
         out = os.path.join(self.tmp.name, "out")
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch.object(make_game, "log"), \

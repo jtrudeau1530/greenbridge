@@ -454,11 +454,16 @@ the last byte. The corpus has 0 bad, 0 truncated and 0 trailing resources.
 `tools/rbf0_encode.py` writes a tree document back to bytes with the grammar of section 3. It emits each descriptor
 name at its first use, then the element header words `0, 0, attribute count`, the attributes, and the content in tree
 order. Text and strings keep their recorded bytes and terminating NUL. `--check` decodes every resource of a carve,
-joining continuations as `rbf0_tree.py` does, encodes it, and compares the result with the original bytes.
+joining continuations as `rbf0_tree.py` does, encodes it, and compares the result with the original bytes. It exits 0
+only when every resource is byte-identical: a resource that encodes to different bytes or is refused makes it exit 1,
+as `rbf0_tree.py` does for a resource that is not `ok`.
 
 The encoder fails closed: it refuses a tree that cannot hold the original bytes instead of writing other bytes. A
 refusal is one of these: an incomplete parse, invalid UTF-8 that the decoder replaced, a NaN float (infinities are
-exact), an attribute after content, a descriptor out of order, or a string or text whose byte length changed.
+exact), an attribute after content, a descriptor out of order, a string or text whose byte length changed, or a
+value the record cannot hold: an integer out of range for the layout, a float that overflows it, an unknown type, or
+an element with more attribute records than its attribute count. An element short of its attribute count with a
+value in its content is refused as an attribute after content, because that value would decode as an attribute.
 
 Measured on the same 1,263 `data.rpf` resources:
 
@@ -471,7 +476,7 @@ Measured on the same 1,263 `data.rpf` resources:
 | Narrow layout, exact | 3 of 3 |
 
 The 23 refused resources are exactly those that hold the 26 invalid UTF-8 text payloads in 9.5. No other reason
-occurs. So the tree loses no byte anywhere else: element words, attribute counts, descriptor order, value widths,
+occurs, and with them `--check` exits 1 on this corpus. So the tree loses no byte anywhere else: element words, attribute counts, descriptor order, value widths,
 float bits and NUL terminators all survive. The encoder also writes an edited tree, for example a JSON report
 changed by hand. It then checks each string and text against the recorded byte length when one is present, so a
 change that alters a length needs that field dropped or updated.

@@ -571,6 +571,52 @@ int main() {
               "CreateFile2 refuses a path above GAME:");
         if (h_esc != INVALID_HANDLE_VALUE) ::CloseHandle(h_esc);
 
+        // MAXIMUM_ALLOWED asks for every right the file grants, write included, without naming one. Such an open of
+        // a package file is a write-open: it gets the overlay copy, so a write through the handle cannot reach the
+        // package. CreateFileW, CreateFileA and CreateFile2 share the rule. The write is shorter than the file, so
+        // the bytes after it show the overlay copy started as the package file's contents (OPEN_EXISTING keeps them).
+        {
+            write_path(package / "data" / "max_w.txt", "pkg-max");
+            write_path(package / "data" / "max_a.txt", "pkg-max");
+            write_path(package / "data" / "max_2.txt", "pkg-max");
+            const auto write_through = [](HANDLE h) {
+                if (h == INVALID_HANDLE_VALUE) return false;
+                DWORD written = 0;
+                const BOOL ok = ::WriteFile(h, "OV", 2, &written, nullptr);
+                ::CloseHandle(h);
+                return ok != FALSE && written == 2;
+            };
+            check(write_through(create_w(L"GAME:\\data\\max_w.txt", MAXIMUM_ALLOWED, 0, nullptr, OPEN_EXISTING, 0,
+                                         nullptr)),
+                  "CreateFileW(MAXIMUM_ALLOWED, OPEN_EXISTING) opens a package file for writing");
+            check(read_path(package / "data" / "max_w.txt") == "pkg-max",
+                  "a write through a MAXIMUM_ALLOWED handle does not reach the package (CreateFileW)");
+            check(read_path(overlay / "data" / "max_w.txt") == "OVg-max",
+                  "the write through a MAXIMUM_ALLOWED handle is in the overlay copy (CreateFileW)");
+
+            check(write_through(create_a("GAME:\\data\\max_a.txt", MAXIMUM_ALLOWED | GENERIC_READ, 0, nullptr,
+                                         OPEN_EXISTING, 0, nullptr)),
+                  "CreateFileA(MAXIMUM_ALLOWED | GENERIC_READ, OPEN_EXISTING) opens a package file for writing");
+            check(read_path(package / "data" / "max_a.txt") == "pkg-max" &&
+                      read_path(overlay / "data" / "max_a.txt") == "OVg-max",
+                  "the write goes to the overlay and not the package (CreateFileA)");
+
+            check(write_through(create2(L"GAME:\\data\\max_2.txt", MAXIMUM_ALLOWED, 0, OPEN_EXISTING, &ext)),
+                  "CreateFile2(MAXIMUM_ALLOWED, OPEN_EXISTING) opens a package file for writing");
+            check(read_path(package / "data" / "max_2.txt") == "pkg-max" &&
+                      read_path(overlay / "data" / "max_2.txt") == "OVg-max",
+                  "the write goes to the overlay and not the package (CreateFile2)");
+
+            // A plain read still opens the package file in place: no overlay copy appears for it.
+            write_path(package / "data" / "max_read.txt", "pkg-max");
+            const HANDLE h_plain = create_w(L"GAME:\\data\\max_read.txt", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                            OPEN_EXISTING, 0, nullptr);
+            check(h_plain != INVALID_HANDLE_VALUE && read_handle(h_plain) == "pkg-max" &&
+                      !std::filesystem::exists(overlay / "data" / "max_read.txt"),
+                  "a GENERIC_READ open is still a read: no overlay copy is made");
+            if (h_plain != INVALID_HANDLE_VALUE) ::CloseHandle(h_plain);
+        }
+
         // FindFirstFileExW merges package + overlay and honours FindExInfoBasic & FindExSearchLimitToDirectories.
         WIN32_FIND_DATAW fd{};
         std::vector<std::wstring> basic_names;

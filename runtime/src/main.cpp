@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "base_reservation.h"
+#include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
@@ -46,16 +47,16 @@ const char* binding_name(rt::Binding b) {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--trace FILE]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--trace FILE]\n"
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--trace-d3d12] [--trace FILE]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
 }
 
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    std::filesystem::path image, game_dir, overlay_dir;
+    std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     std::wstring trace_file;
@@ -72,6 +73,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--trace" && i + 1 < argc) trace_file = argv[++i];
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
+        else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
         else if (image.empty()) image = a;
         else return usage();
     }
@@ -95,6 +97,27 @@ int wmain(int argc, wchar_t** argv) {
     // GAME: paths read under --game-dir; whatever a title writes lands in the overlay, never in the package.
     if (overlay_dir.empty()) overlay_dir = game_dir / "overlay";
     rt::fs::configure(game_dir, overlay_dir);
+    // Mods (docs/modding.md): <folder of gta6rt.exe>\mods unless --mods names another. Loaded and reported here;
+    // the archetype swaps take effect once the game's archetype lookup is hooked for this executable version.
+    if (mods_dir.empty()) {
+        std::wstring self(32768, L'\0');
+        const DWORD n = GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
+        if (n && n < self.size()) mods_dir = std::filesystem::path(self.substr(0, n)).parent_path() / L"mods";
+    }
+    {
+        const leonida::mods::LoadResult mods = leonida::mods::load_mods(mods_dir);
+        for (const std::string& e : mods.errors) std::fprintf(stderr, "[rt] mods: skipped %s\n", e.c_str());
+        for (const auto& m : mods.mods) {
+            std::fprintf(stderr, "[rt] mods: %s%s\n", m.name.c_str(), m.enabled ? "" : " (disabled)");
+            for (const auto& sw : m.archetype_swaps)
+                std::fprintf(stderr, "[rt] mods:   archetype %s (0x%08X) -> %s (0x%08X)\n", sw.from_name.c_str(),
+                             sw.from, sw.to_name.c_str(), sw.to);
+        }
+        leonida::mods::set_active(leonida::mods::ArchetypeSwaps(mods.mods));
+        if (leonida::mods::active().size())
+            std::fprintf(stderr, "[rt] mods: %zu archetype swap(s) loaded; not applied yet: the archetype lookup hook "
+                                 "for this executable is not known (docs/modding.md)\n", leonida::mods::active().size());
+    }
     rt::d3d12_trace::set_enabled(trace_d3d12);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"

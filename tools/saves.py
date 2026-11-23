@@ -109,7 +109,7 @@ def parse_jsav(d):
     try:
         body_text = d[body_off:].rstrip(b'\0').decode('utf-8')
         _, json_end = json.JSONDecoder().raw_decode(body_text)
-    except (UnicodeError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ValueError(f'JSAV body is not valid UTF-8 JSON: {exc}') from None
     # raw_decode returns a character offset, while the entry table uses byte offsets.
     # The last nonzero byte is not the JSON boundary: corrupt data can follow the document's padding.
@@ -301,7 +301,7 @@ def pack_from_dir(src):
 
     try:
         idx = json.loads(read(index_path))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise ValueError(f'{index_path}: invalid JSON ({exc})') from None
     if not isinstance(idx, dict):
         invalid('index', 'an object')

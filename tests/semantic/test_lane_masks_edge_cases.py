@@ -58,7 +58,10 @@ class LaneMasksEndToEndTests(unittest.TestCase):
             "global_store_dword v3, v2, s[0:1]",
             "s_endpgm",
         ])
-        self.assertEqual(got, [0xdeadbeff, 0xdeadbeff, 0xdeadbeff, 0xdeadbeef])
+        # Only the inactive lane tests this EXEC regression. Active lanes read s6 as
+        # ordinary data, which needs mask materialization (#293); do not enshrine
+        # the translator's per-lane 0xff representation instead of hardware's 0x07.
+        self.assertEqual(got[3], 0xdeadbeef)
 
     def test_writelane_invalidates_vgpr_mask_before_readfirstlane(self):
         """Overwriting lane 0 of a mask-holding VGPR via v_writelane_b32 must end ("v", r) tracking."""

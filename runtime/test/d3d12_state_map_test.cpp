@@ -660,6 +660,21 @@ int main() {
         CHECK(!resizable_bar(VkPhysicalDeviceMemoryProperties{}));
     }
 
+    // D3D-299: a texture (required 0, preferred DEVICE_LOCAL) in host memory has spilled; the arena (required
+    // HOST_VISIBLE | HOST_COHERENT, preferred DEVICE_LOCAL) in host memory has not, and neither has anything that
+    // got DEVICE_LOCAL or never asked for it.
+    {
+        constexpr VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        CHECK(spilled_to_host(0, local, host));
+        CHECK(spilled_to_host(0, local, 0));
+        CHECK(!spilled_to_host(0, local, local));
+        CHECK(!spilled_to_host(0, local, local | host));
+        CHECK(!spilled_to_host(host, local, host));
+        CHECK(!spilled_to_host(host, 0, host));
+        CHECK(!spilled_to_host(0, 0, host));
+    }
+
     // Memory type choice. Heaps as an RTX 3090 without Resizable BAR reports them: VRAM, system memory, and the
     // 214 MiB BAR heap that holds the only DEVICE_LOCAL | HOST_VISIBLE type.
     {

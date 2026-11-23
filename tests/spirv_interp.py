@@ -4,7 +4,9 @@ without a GPU.
 It only covers the straight-line, one-lane subset the translator produces for branch-free shaders: scalar/vector
 arithmetic, bit ops, bitcasts, the GLSL.std.450 functions used so far, and Function/Output variables. Anything else
 raises NotImplementedError (a test then fails loudly instead of passing on a guess). Floats are rounded to binary32
-after every operation. Texture, buffer and control-flow instructions are out of scope.
+after every operation. An integer is always held as its unsigned 32-bit pattern, whatever the signedness of its
+type; the instructions that read it as signed (OpS*, SMin, SMax) convert with s32() themselves, as SPIR-V defines
+them on the bits and not on the type. Texture, buffer and control-flow instructions are out of scope.
 """
 import math
 import re
@@ -52,15 +54,61 @@ def s32(u):
 
 
 def half_to_float(h):
-    return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
+    # Bit-level f16 -> f32; every non-NaN result is exact. struct's '<e' is not used because its NaN result
+    # depends on the Python version: before 3.14 it drops the payload and returns the canonical quiet NaN, from
+    # 3.14 it keeps sign and payload (CPython gh-130317). Pinned rule, the one CI's 3.12 sees: a NaN half expands
+    # to the canonical quiet NaN with its sign, payload dropped.
+    h &= 0xFFFF
+    sign = (h >> 15) << 31
+    exp = (h >> 10) & 0x1F
+    frac = h & 0x3FF
+    if exp == 0x1F:
+        bits = sign | (0x7FC00000 if frac else 0x7F800000)     # NaN: canonical quiet, payload dropped; infinity
+    elif exp == 0 and frac:
+        b = frac.bit_length()
+        bits = sign | ((b + 102) << 23) | ((frac << (24 - b)) & 0x7FFFFF)   # subnormal half -> normal f32
+    elif exp == 0:
+        bits = sign                                            # +-0
+    else:
+        bits = sign | ((exp + 112) << 23) | (frac << 13)       # normal half -> f32, exact
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
 
 
 def float_to_half(x):
-    """Round to nearest even; overflow gives infinity (the struct module raises instead)."""
-    try:
-        return struct.unpack("<H", struct.pack("<e", x))[0]
-    except OverflowError:
-        return 0xFC00 if x < 0 else 0x7C00
+    # Bit-level double -> f16, round to nearest even; overflow gives infinity (struct's '<e' raised OverflowError
+    # here, which the old except mapped to the same words). '<e' is not used for the same version dependence as
+    # half_to_float (gh-130317); pinned rule: any NaN becomes the canonical quiet NaN with the operand's sign,
+    # payload dropped. Rounding runs on the operand's own 64-bit pattern, so normal, subnormal and tie results
+    # cannot change with the Python version, and the double is rounded once, as struct's '<e' rounded it.
+    bits = struct.unpack("<Q", struct.pack("<d", x))[0]
+    sign = (bits >> 63) << 15
+    exp = (bits >> 52) & 0x7FF
+    mant = bits & ((1 << 52) - 1)
+    if exp == 0x7FF:
+        return sign | (0x7E00 if mant else 0x7C00)             # NaN: canonical quiet, sign kept; infinity
+    if exp == 0:
+        return sign                                            # +-0 and double subnormals sit far below the half grid
+    e = exp - 1023
+    full = (1 << 52) | mant
+    if e < -14:
+        drop = 28 - e                                          # subnormal grid: multiples of 2**-24
+        n = full >> drop
+        rem = full & ((1 << drop) - 1)
+        if rem > (1 << (drop - 1)) or (rem == (1 << (drop - 1)) and n & 1):
+            n += 1
+        if n > 0x3FF:                                          # rounds up to the smallest normal
+            return sign | 0x0400
+        return sign | n
+    n = full >> 42                                             # keep the top 11 significand bits, RNE the rest
+    rem = full & ((1 << 42) - 1)
+    if rem > (1 << 41) or (rem == (1 << 41) and n & 1):
+        n += 1
+    if n > 0x7FF:                                              # significand carry bumps the exponent
+        e += 1
+        n = 0x400
+    if e > 15:                                                 # overflow, incl. the 65520 RNE tie
+        return sign | 0x7C00
+    return sign | ((e + 15) << 10) | (n & 0x3FF)
 
 
 class Result:
@@ -106,7 +154,7 @@ def run(spvasm):
             if t == "Float":
                 consts[res] = float(args[1]) if types[args[0]][1] == "64" else f32(float(args[1]))
             else:
-                consts[res] = int(args[1]) & M32 if t == "Int" and types[args[0]][2] == "0" else s32(int(args[1]))
+                consts[res] = int(args[1]) & M32
         elif op == "OpConstantTrue":
             consts[res] = True
         elif op == "OpConstantFalse":
@@ -142,11 +190,13 @@ def run(spvasm):
         "OpShiftLeftLogical": lambda a, b: (a << (b & 31)) & M32 if b < 32 else 0,
         "OpShiftRightLogical": lambda a, b: a >> b if b < 32 else 0,
         "OpFAdd": lambda a, b: f32(a + b), "OpFSub": lambda a, b: f32(a - b), "OpFMul": lambda a, b: f32(a * b),
-        "OpFDiv": lambda a, b: f32(a / b) if b else math.copysign(math.inf, a) if a else math.nan,
+        # x / +-0: infinity with the sign of x times the sign of the zero; 0 / 0 and NaN / 0 are NaN.
+        "OpFDiv": lambda a, b: f32(a / b) if b else
+        math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b)) if a and not math.isnan(a) else math.nan,
         "OpFOrdGreaterThan": lambda a, b: a > b, "OpFOrdLessThan": lambda a, b: a < b,
         "OpFOrdEqual": lambda a, b: a == b,
         "OpLogicalOr": lambda a, b: a or b, "OpLogicalAnd": lambda a, b: a and b,
-        "OpSLessThanEqual": lambda a, b: a <= b, "OpSGreaterThanEqual": lambda a, b: a >= b,
+        "OpSLessThanEqual": lambda a, b: s32(a) <= s32(b), "OpSGreaterThanEqual": lambda a, b: s32(a) >= s32(b),
         "OpULessThan": lambda a, b: a < b, "OpUGreaterThan": lambda a, b: a > b,
         "OpULessThanEqual": lambda a, b: a <= b, "OpUGreaterThanEqual": lambda a, b: a >= b,
         "OpFUnordNotEqual": lambda a, b: a != b,          # true when either is NaN, as Python's != is
@@ -199,7 +249,7 @@ def run(spvasm):
         if fn == "FClamp":
             return round_out(min(max(a[0], a[1]), a[2]))
         if fn in ("SMax", "SMin"):
-            return (max if fn == "SMax" else min)(*a)
+            return (max if fn == "SMax" else min)(*a, key=s32)
         if fn in ("UMax", "UMin"):
             return (max if fn == "UMax" else min)(*a)
         raise NotImplementedError("GLSL." + fn)
@@ -231,8 +281,7 @@ def run(spvasm):
             elif t == "Float":
                 val[res] = u2f(v) if isinstance(v, int) else v
             else:
-                bits = f2u(v) if isinstance(v, float) else v & M32
-                val[res] = s32(bits) if types[args[0]][2] == "1" else bits
+                val[res] = f2u(v) if isinstance(v, float) else v & M32
         elif op == "OpSelect":
             val[res] = get(args[2]) if get(args[1]) else get(args[3])
         elif op in ARITH:
@@ -263,7 +312,7 @@ def run(spvasm):
         elif op == "OpBitFieldSExtract":
             v, off, cnt = s32(get(args[1])), get(args[2]), get(args[3])
             x = (v >> off) & ((1 << cnt) - 1)
-            val[res] = x - (1 << cnt) if x >> (cnt - 1) else x
+            val[res] = (x - (1 << cnt) if cnt and x >> (cnt - 1) else x) & M32
         elif op == "OpBitFieldUExtract":
             val[res] = (get(args[1]) >> get(args[2])) & ((1 << get(args[3])) - 1)
         elif op == "OpBitCount":
@@ -275,7 +324,8 @@ def run(spvasm):
         elif op == "OpConvertFToU":
             x = get(args[1]); val[res] = 0 if math.isnan(x) or x <= 0 else M32 if x >= 2**32 else int(x)
         elif op == "OpConvertFToS":
-            x = get(args[1]); val[res] = 0 if math.isnan(x) else max(-2**31, min(2**31 - 1, int(x)))
+            x = get(args[1])
+            val[res] = 0 if math.isnan(x) else (-2**31 if x <= -2**31 else 2**31 - 1 if x >= 2**31 else int(x)) & M32
         elif op == "OpIAddCarry":
             t = get(args[1]) + get(args[2]); val[res] = (t & M32, t >> 32)
         elif op == "OpISubBorrow":

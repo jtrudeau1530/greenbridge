@@ -292,6 +292,9 @@ def main(argv=None):
             print(f"MODE denorm32 sanity error: {sanity}")
             return 2
         print(f"MODE sanity (v_mul_f32 FLT_MIN * 0.5): denorm32=0 -> 0x{sanity[0]:08x}, denorm32=3 -> 0x{sanity[1]:08x}")
+        if sanity != [POS_ZERO, SUBNORM_HALF]:
+            print(f"MODE denorm32 sanity failed: expected [0x{POS_ZERO:08x}, 0x{SUBNORM_HALF:08x}], got {[hex(x) for x in sanity]}")
+            return 2
         for wave in (32, 64):
             for name, mode in MODES:
                 got = run_hw(oracle, CASES, wave, mode)

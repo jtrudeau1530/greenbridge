@@ -2,6 +2,7 @@
 
     python -I tests/test_world_archetypes.py
 """
+import contextlib
 import importlib.util
 import io
 import json
@@ -212,6 +213,29 @@ class TransformTest(unittest.TestCase):
         lo, hi = WA.world_box(e, (-1.0, -1.0, 0.0), (1.0, 1.0, 1.0), conjugate=True, use_scale=False)
         self.assertEqual((lo, hi), ([-1.0, -1.0, 0.0], [1.0, 1.0, 1.0]))
 
+    def test_zero_scales_collapse_only_their_axes(self):
+        box = ((-1.0, -2.0, -3.0), (2.0, 4.0, 4.0))
+        for zero in (0.0, -0.0):
+            cases = [
+                (zero, 3.0, ([10.0, 20.0, 21.0], [10.0, 20.0, 42.0])),
+                (2.0, zero, ([8.0, 16.0, 30.0], [14.0, 28.0, 30.0])),
+                (zero, zero, ([10.0, 20.0, 30.0], [10.0, 20.0, 30.0])),
+            ]
+            for sxy, sz, expected in cases:
+                with self.subTest(scale_xy=sxy, scale_z=sz):
+                    e = {"position": [10.0, 20.0, 30.0], "scale_xy": sxy, "scale_z": sz}
+                    self.assertEqual(WA.world_box(e, *box, conjugate=True, use_scale=True), expected)
+                    self.assertEqual(WA.world_box(e, *box, conjugate=True, use_scale=False),
+                                     ([9.0, 18.0, 27.0], [12.0, 24.0, 34.0]))
+
+    def test_missing_and_none_scales_still_default_to_one(self):
+        for scales in ({}, {"scale_xy": None}, {"scale_z": None}, {"scale_xy": None, "scale_z": None}):
+            with self.subTest(scales=scales):
+                e = {"position": [10.0, 20.0, 30.0], **scales}
+                self.assertEqual(WA.world_box(e, (-1.0, -2.0, -3.0), (2.0, 4.0, 4.0),
+                                              conjugate=True, use_scale=True),
+                                 ([9.0, 18.0, 27.0], [12.0, 24.0, 34.0]))
+
 
 class ExtentsTest(unittest.TestCase):
     def test_conjugate_matches_and_scale_is_ignored(self):
@@ -232,6 +256,28 @@ class ExtentsTest(unittest.TestCase):
         ents = []
         row = WI.parse_resource(m, collect=ents)
         self.assertEqual(WA.check_extents([(row, ents)], defs)["maps_fully_defined"], 0)
+
+    def test_zero_scale_maps_are_included_in_scale_comparisons(self):
+        defs = {d["name"]: d for d in WA.parse_archetypes(maptypes([(CRATE, 1, *CRATE_BOX)]))}
+        for zero in (0.0, -0.0):
+            for sxy, sz in ((zero, 1.0), (1.0, zero), (zero, zero)):
+                with self.subTest(scale_xy=sxy, scale_z=sz):
+                    m = mapfile([entity(CRATE, (0.0, 0.0, 0.0), sxy=sxy, sz=sz)], *CRATE_BOX)
+                    ents = []
+                    row = WI.parse_resource(m, collect=ents)
+                    res = WA.check_extents([(row, ents)], defs)
+                    self.assertEqual(res["maps_fully_defined"], 1)
+                    self.assertEqual(res["scale"], {"maps": 1, "scaled_matches": 0, "unscaled_matches": 1,
+                                                   "scaled_exceeds_extents": 0, "unscaled_exceeds_extents": 0})
+
+    def test_missing_and_none_scales_are_not_counted_as_scaled(self):
+        defs = {CRATE: {"bb_min": CRATE_BOX[0], "bb_max": CRATE_BOX[1]}}
+        row = {"entities_min": CRATE_BOX[0], "entities_max": CRATE_BOX[1]}
+        for scales in ({}, {"scale_xy": None}, {"scale_z": None}, {"scale_xy": None, "scale_z": None}):
+            with self.subTest(scales=scales):
+                res = WA.check_extents([(row, [{"archetype": CRATE, **scales}])], defs)
+                self.assertEqual(res["maps_fully_defined"], 1)
+                self.assertEqual(res["scale"]["maps"], 0)
 
 
 class CliTest(unittest.TestCase):
@@ -270,6 +316,29 @@ class CliTest(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(rpf([defs, m]))
         self.check(self.run_cli(path))
+
+    def cli_error(self, argv):
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            WA.main(argv)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertNotIn("Traceback", err.getvalue())
+        return err.getvalue()
+
+    def test_out_equal_to_the_input_is_refused_and_leaves_it_alone(self):
+        path = os.path.join(self.tmp.name, "carved.bin")
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 3000)
+        self.assertIn("overwrite the input", self.cli_error([path, "--out", path]))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"\x00" * 3000)
+
+    def test_out_under_a_regular_file_or_naming_a_folder_is_one_error(self):
+        path = os.path.join(self.tmp.name, "carved.bin")
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 64)
+        self.assertIn("--out", self.cli_error([path, "--out", os.path.join(path, "sub", "r.json")]))
+        self.assertIn("folder", self.cli_error([path, "--out", self.tmp.name]))
 
     def test_missing_path_is_an_error(self):
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):

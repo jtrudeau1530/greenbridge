@@ -162,11 +162,18 @@ def motion_times(s, at):
     return out
 
 
+# Where a multi-axis node keeps its sample count (the number of +0x90 sample lists of a one-node `.motion`)
+NODE_SAMPLE_COUNT_AT = {4: 0x90, 5: 0x90, 6: 0x50, 8: 0xA0}
+
+
 def parameter_node(s, at, parameters):
     """The node that places a `.motion`'s children in parameter space: the pointer at +0x138 when +0x58 is 1;
     when +0x58 is 2, +0x120 points at a block whose +0x18 is the node. A node starts {u64 0, u32 type, u32 0}.
-    Type 3 is one sampled axis: {array of u32 name hashes, array of (u32 sample index, f32 value) sorted by
-    value, f32 min, f32 max}. Other types are not decoded. -> (type, axis or None) or None"""
+    Types 3, 4, 5, 6 and 8 have 1, 2, 3, 4 and 5 axes: +0x10 is an array of 8-byte {u32 name hash, u16, u16}.
+    Type 3 is one sampled axis: then an array of (u32 sample index, f32 value) sorted by value, f32 min, f32 max.
+    Types 4, 5, 6 and 8 keep their sample count at NODE_SAMPLE_COUNT_AT; the rest of them is not decoded.
+    Type 1 has no axes and its sample count (1) at +0x20.
+    -> (type, axis or None) or None; axis = {names, slots, sample_count, and for type 3 samples, min, max}"""
     if parameters == 1:
         node = s.ptr(at + 0x138)
     elif parameters == 2:
@@ -177,14 +184,35 @@ def parameter_node(s, at, parameters):
     if node is None or s.u64(node) != 0 or s.u32(node + 12) != 0:
         return None
     kind, axis = s.u32(node + 8), None
-    if kind == 3:
+    if kind == 1:
+        axis = {"names": [], "slots": [], "sample_count": s.u32(node + 0x20)}
+    elif kind == 3 or kind in NODE_SAMPLE_COUNT_AT:
         names, nn = s.array(node + 0x10)
-        samples, ns = s.array(node + 0x20)
-        if names is not None and samples is not None:
-            axis = {"names": [s.u32(names + 4 * i) for i in range(nn)],
-                    "samples": [(s.u32(samples + 8 * i), s.f32(samples + 8 * i + 4)) for i in range(ns)],
-                    "min": s.f32(node + 0x30), "max": s.f32(node + 0x34)}
+        if names is not None:
+            axis = {"names": [s.u32(names + 8 * i) for i in range(nn)],
+                    "slots": [(s.u16(names + 8 * i + 4), s.u16(names + 8 * i + 6)) for i in range(nn)]}
+            if kind == 3:
+                samples, ns = s.array(node + 0x20)
+                if samples is None:
+                    return kind, None
+                axis.update(samples=[(s.u32(samples + 8 * i), s.f32(samples + 8 * i + 4)) for i in range(ns)],
+                            min=s.f32(node + 0x30), max=s.f32(node + 0x34), sample_count=ns)
+            else:
+                axis["sample_count"] = s.u32(node + NODE_SAMPLE_COUNT_AT[kind])
     return kind, axis
+
+
+def motion_samples(s, at):
+    """`.motion` +0x90: one {ptr, u16 count} list per sample of the parameter node, each item a 12-byte
+    {u32 child index, f32, f32}. A one-node `.motion` has as many lists as its node has samples, so type-3 sample
+    index k plays child list[k][0]. -> [[(child, f32, f32)]] ([] when +0x90 is null)"""
+    p, n = s.array(at + 0x90)
+    out = []
+    for i in range(n if p is not None else 0):
+        items, count = s.array(p + 16 * i)
+        out.append([(s.u32(items + 12 * j), s.f32(items + 12 * j + 4), s.f32(items + 12 * j + 8))
+                    for j in range(count)] if items is not None else [])
+    return out
 
 
 def parse_clip(s, at):
@@ -207,11 +235,18 @@ def parse_clip(s, at):
                     motion["parameters"] = s.u32(at + 0x58)
             except (DecodeError, struct.error):
                 pass
-            try:
+            try:  # read apart: a malformed node must not mark a readable time table unreadable
                 motion["times"] = motion_times(s, at)
+            except (DecodeError, struct.error):
+                motion["times"] = None
+            try:
                 motion["node"] = parameter_node(s, at, motion["parameters"])
             except (DecodeError, struct.error):
-                motion["times"], motion["node"] = None, None
+                motion["node"] = None
+            try:
+                motion["samples"] = motion_samples(s, at)
+            except (DecodeError, struct.error):
+                motion["samples"] = None
             return motion
         # `.motionmatcher`: a 16-byte id at +0x28, name at +0x38
         return {"kind": "motionmatcher", "name": s.string(at + 0x38), "animations": []}
@@ -706,6 +741,12 @@ def count_motion_blend(c, stats):
     stats[f"motion_node_type:{kind}"] += 1
     if axis is None:
         return
+    count_motion_samples(c, kind, axis, stats)
+    if kind != 3:
+        stats[f"motion_node_axes:{kind}:{len(axis['names'])}"] += 1
+        for h in axis["names"]:
+            stats[f"motion_node_axis_name:{kind}:" + AXIS_NAMES.get(h, "unresolved")] += 1
+        return
     values = [v for _i, v in axis["samples"]]
     stats["motion_axes"] += 1
     stats["motion_axis_samples"] += len(values)
@@ -717,6 +758,29 @@ def count_motion_blend(c, stats):
     stats[f"motion_axis_sample_count:{len(values)}"] += 1
     for h in axis["names"]:
         stats["motion_axis_name:" + AXIS_NAMES.get(h, f"0x{h:08x}")] += 1
+
+
+def count_motion_samples(c, kind, axis, stats):
+    """Counts for the +0x90 sample lists of a one-node `.motion` (+0x58 == 1) against its node (no values)."""
+    lists = c.get("samples")
+    if c["parameters"] != 1 or lists is None:
+        return
+    children = len(c["children"])
+    mapped = [items[0][0] for items in lists if items]
+    pre = f"motion_samples:{kind}:"
+    stats[pre + "motions"] += 1
+    stats[pre + "lists_equal_node_samples"] += len(lists) == axis["sample_count"]
+    stats[pre + "lists_more_than_children"] += len(lists) > children
+    stats[pre + "every_list_one_item"] += all(len(items) == 1 for items in lists)
+    stats[pre + "children_in_range"] += all(ch < children for items in lists for ch, _a, _b in items)
+    stats[pre + "every_child_sampled"] += {ch for items in lists for ch, _a, _b in items} == set(range(children))
+    stats[pre + "sample_k_is_child_k"] += (len(lists) == children and all(len(items) == 1 for items in lists) and
+                                           mapped == list(range(children)))
+    for items in lists:
+        for _ch, a, b in items:
+            stats[pre + "items"] += 1
+            stats[pre + "items_first_float_1"] += a == 1.0
+            stats[pre + "items_second_float_1"] += b == 1.0
 
 
 def new_stats():

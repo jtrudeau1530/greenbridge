@@ -144,17 +144,38 @@ class DrawBindingTests(unittest.TestCase):
         struct.pack_into("<Q", self.system, 280, 0x60000000 + 640)
         self.assertEqual(mp.draw_binding(self.system, graphics, 0)["meshlet_group"], 640)
 
-    def test_primary_lod_traversal(self):
+    def add_drawable(self, lod_index):
         self.system.extend(bytes(304))
-        for at, target in ((784, 880), (880, 896), (896, 912), (920, 976), (976, 0)):
+        lod_field = 784 + 8 * lod_index
+        for at, target in ((lod_field, 880), (880, 896), (896, 912), (920, 976), (976, 0)):
             struct.pack_into("<Q", self.system, at, 0x50000000 + target)
         for at in (888, 928):
             struct.pack_into("<HH", self.system, at, 1, 1)
         struct.pack_into("<H", self.system, 966, 1)
+
+    def test_primary_lod_traversal(self):
+        self.add_drawable(0)
         self.assertEqual(list(mp.drawable_geometries(self.system, 704)), [0])
         self.system[966] = 2
         with self.assertRaises(mp.PageError):
             list(mp.drawable_geometries(self.system, 704))
+
+    def test_cli_selects_a_nonprimary_lod_from_the_drawable(self):
+        self.add_drawable(1)
+        with tempfile.TemporaryDirectory() as folder:
+            system = os.path.join(folder, "system")
+            graphics = os.path.join(folder, "graphics")
+            for path, data in ((system, self.system), (graphics, self.graphics)):
+                with open(path, "wb") as out:
+                    out.write(data)
+            cmd = [sys.executable, "-I", TOOL, graphics, "--draw-system", system, "--drawable-offset", "704"]
+            primary = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(primary.returncode, 1)
+            self.assertIn("unresolved", json.loads(primary.stdout)["bindings"][0])
+            secondary = subprocess.run([*cmd, "--lod", "1"], capture_output=True, text=True)
+            self.assertEqual(secondary.returncode, 0, secondary.stderr)
+            self.assertEqual(json.loads(secondary.stdout)["bindings"],
+                             [{"geometry": 0, "vertex_block": 384, "meshlet_group": 256, "vertices": 8}])
 
     def test_inconsistent_bindings(self):
         for offset, fmt, value in ((64, "Q", 0x50010000), (248, "H", 2),
@@ -482,7 +503,9 @@ class MeshletCentreTests(unittest.TestCase):
         # w2 bit 28 doubles the step: 1/8 m, out to +-256 m
         self.assertEqual(mp.meshlet_centre(0x10000FFF, 0x00000FFF), (256.0, -255.875, 256.0))
         self.assertEqual(mp.meshlet_centre(0x1080F7EF, 0x7FF), (-2.0, 2.0, 0.0))
-        self.assertEqual((mp.centre_step(0x007FF7FF), mp.centre_step(0x107FF7FF)), (0.0625, 0.125))
+        # w2 bits 28-31 are an exponent: step 2^e / 16 m
+        self.assertEqual([mp.centre_step(e << 28 | 0x007FF7FF) for e in range(5)], [0.0625, 0.125, 0.25, 0.5, 1.0])
+        self.assertEqual(mp.meshlet_centre(0x2080F7EF, 0x7FF), (-4.0, 4.0, 0.0))
 
     def grid_page(self, steps):
         """A 4x4 grid in one meshlet whose stored centre is the vertex-box centre moved by `steps` (x, y, z)."""
@@ -507,17 +530,18 @@ class MeshletCentreTests(unittest.TestCase):
         self.assertNotIn("centres_4240_meshlets", mp.summarise_page(data, "p")["checks"])
 
     def test_coarse_centre_agreement(self):
-        # the grid page with its stored centre written at 1/8 m steps and bit 28 set
-        data = bytearray(self.grid_page((0, 0, 0)))
-        blk, grp = mp.parse_page(bytes(data))
-        pos = mp.positions_4240(bytes(data), blk)
-        box = [(min(p[i] for p in pos) + max(p[i] for p in pos)) / 2 for i in range(3)]
-        f = [round(c * 8) + 2047 for c in box]
-        rec = grp["offset"] + 12
-        w3 = struct.unpack_from("<I", data, rec + 12)[0] & ~0xFFF
-        struct.pack_into("<2I", data, rec + 8, 1 << 28 | f[0] | f[1] << 12, w3 | f[2])
-        c = mp.summarise_page(bytes(data), "p", centres=True)["checks"]
-        self.assertEqual((c["centres_4240_coarse_steps"], c["centres_4240_axes_exact"]), (1, 3))
+        # the grid page with its stored centre written at 2^e / 16 m steps and the exponent e in w2 bits 28-31
+        for e in (1, 2, 3):
+            data = bytearray(self.grid_page((0, 0, 0)))
+            blk, grp = mp.parse_page(bytes(data))
+            pos = mp.positions_4240(bytes(data), blk)
+            box = [(min(p[i] for p in pos) + max(p[i] for p in pos)) / 2 for i in range(3)]
+            f = [round(c * 16 / 2 ** e) + 2047 for c in box]
+            rec = grp["offset"] + 12
+            w3 = struct.unpack_from("<I", data, rec + 12)[0] & ~0xFFF
+            struct.pack_into("<2I", data, rec + 8, e << 28 | f[0] | f[1] << 12, w3 | f[2])
+            c = mp.summarise_page(bytes(data), "p", centres=True)["checks"]
+            self.assertEqual((c["centres_4240_coarse_steps"], c["centres_4240_axes_exact"]), (1, 3), e)
 
     def test_meshlet_radius(self):
         self.assertEqual(mp.meshlet_radius(0x3C00 << 16 | 0x1FFF), 1.0)

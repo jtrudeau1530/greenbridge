@@ -170,6 +170,32 @@ class TestRules(unittest.TestCase):
         self.assertEqual(stats["family_min_size"], 2)
         self.assertEqual(stats["control_dialogue"] + stats["control_family"], 0)
 
+    def test_rejected_dialogue_hit_does_not_shadow_accepted_family_member(self):
+        d = A.Dictionary(["zz_fooau_abcd_01"])
+        bases = ["zz_fooau_abcd"]
+        # Including SALT + zz_fooau_abcd_01 makes the salted control reject the dialogue rule;
+        # zz_fooau_abcd_01 must still be named via its 3-member family alongside _02 and _03.
+        index = self.index({
+            "b0": [
+                "zz_fooau_abcd_01",
+                "zz_fooau_abcd_02",
+                "zz_fooau_abcd_03",
+                A.SALT + "zz_fooau_abcd_01",
+            ]
+        })
+        real, stats = A.name_source(d, bases, index)
+        self.assertFalse(stats["dialogue_rule"])
+        self.assertEqual(stats["family_min_size"], 2)
+        self.assertEqual(stats["named"], 3)
+        self.assertEqual(
+            sorted(real.values()),
+            [
+                ("zz_fooau_abcd_01", "family", 3),
+                ("zz_fooau_abcd_02", "family", 3),
+                ("zz_fooau_abcd_03", "family", 3),
+            ],
+        )
+
 
 class TestConversations(unittest.TestCase):
     def test_waves_per_label(self):
@@ -297,6 +323,17 @@ class TestCli(unittest.TestCase):
     def test_needs_a_dictionary(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             A.main([ROOT])
+
+    def test_malformed_banks_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            words = write(os.path.join(tmp, "words.json"), json.dumps(["x"]))
+            for doc in ([1], [["Path"]]):
+                banks = write(os.path.join(tmp, "banks.json"), json.dumps(doc))
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(A.main(["--words", words, banks]), 2)
+                self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                self.assertIn("awc_names: error:", err.getvalue())
 
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):

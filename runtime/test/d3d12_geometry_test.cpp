@@ -40,7 +40,9 @@ struct Vertex {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU (hosted CI): ctest skips
+    EXPECT(device_status == vktest::DeviceStatus::ready);
     if (!d.enabled.geometryShader) {
         std::printf("SKIP: no geometryShader on this GPU\n");
         return 77;  // ctest's SKIP_RETURN_CODE

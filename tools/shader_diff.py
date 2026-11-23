@@ -240,8 +240,6 @@ def run_one(name, lines, writers):
                 gc.collect()
         except rdna2spirv.Unsupported as e:
             return ("skip", f"translator unsupported: {e}")
-        except (IndexError, KeyError, ValueError) as e:
-            return ("skip", f"translator error {type(e).__name__}: {e}")
         try:
             out = run_fragment(spvasm)
         except UnsupportedConstruct as e:

@@ -35,6 +35,7 @@ EXPECT = {
     "ps_w64_a_permlane": ("A", [], []),
     "ps_w64_a_swizzle": ("A", [], []),
     "ps_w64_a_bpermute": ("A", [], []),
+    "ps_w64_a_discard": ("A", [], []),
     "ps_w64_b_waterfall": ("B", [], ["waterfall"]),
     "ps_w64_b_readfirstlane": ("B", [], ["readfirstlane-uniform"]),
     "ps_w64_b_readlane_uniform": ("B", [], ["readlane-uniform"]),
@@ -162,6 +163,9 @@ def test_expected_words_of_the_gpu_fixtures():
     assert w64_graphics._a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)
     assert w64_graphics._b_waterfall(5 + 64 * 6) == (17 * ((5 & 3) + 4 * (6 & 3)) + 5, (5 & 3) + 4 * (6 & 3), 0, 0)
     assert w64_graphics._b_readfirstlane(10) == (133, 277, 0, 0)
+    assert w64_graphics._a_discard(29 + 64 * 3) == (0xBF800000,) * 4                 # x < 30: discarded
+    assert w64_graphics._a_discard(30 + 64 * 49) == (7 * 49 + 30, 1, 2049, 3)
+    assert w64_graphics._a_discard(31 + 64 * 1) == (0xBF800000,) * 4                 # x % 4 == 3, y odd
     assert w64_graphics._vs_a_skip(1 + 64 * 3) == (7 * 3 + 1, 1, 2000 + 3, 2)        # no whole-quad word in r1
     assert w64_graphics._vs_a_skip(6 + 64 * 2) == (1006, 0, 2000 + 2 + 9, 3)
     assert w64_graphics._vs_b_readlane_uniform(70) == (6 + 123, 200, 6 + 123, 277)

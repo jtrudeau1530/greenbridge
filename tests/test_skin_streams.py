@@ -232,6 +232,39 @@ class TestResourceKindDictionary(unittest.TestCase):
         self.assertEqual(ss.resource_kind(self.dictionary()), "dictionary")
 
 
+class TestResourceKindDictionaryChild(unittest.TestCase):
+    """The dictionary signature follows the pinned rpf9-explorer's DrawableDictionaryCheckBytes.
+
+    When the child-pointer array named by +48 is inside the supplied prefix, its first entry must also
+    be a system pointer. Every byte here is built by the test; no package bytes are used.
+    """
+
+    @staticmethod
+    def dictionary(child_at=0x80, first_child=0x50000000 + 0x300):
+        b = bytearray(192)
+        struct.pack_into("<Q", b, 0, 0)
+        struct.pack_into("<Q", b, 8, 0x50000000 + 0x180)
+        struct.pack_into("<Q", b, 32, 0x50000000 + 0x200)
+        struct.pack_into("<Q", b, 48, 0x50000000 + child_at)
+        for at in (40, 42, 56, 58):
+            struct.pack_into("<H", b, at, 2)
+        if child_at <= len(b) - 8:
+            struct.pack_into("<Q", b, child_at, first_child)
+        return bytes(b)
+
+    def test_null_first_child_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(first_child=0)))
+
+    def test_non_system_first_child_is_not_a_dictionary(self):
+        self.assertIsNone(ss.resource_kind(self.dictionary(first_child=0x12345678)))
+
+    def test_system_first_child_is_a_dictionary(self):
+        self.assertEqual(ss.resource_kind(self.dictionary()), "dictionary")
+
+    def test_child_array_beyond_prefix_is_still_a_dictionary(self):
+        self.assertEqual(ss.resource_kind(self.dictionary(child_at=0x100)), "dictionary")
+
+
 class TestValidate(unittest.TestCase):
     def test_weighted_8bit_clean(self):
         _s, gfx, mesh = weighted_mesh("weighted-8inf-8bit", vertices=16, bones=6)

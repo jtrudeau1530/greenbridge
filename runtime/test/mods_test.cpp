@@ -1,0 +1,86 @@
+// mods.h: mod.json manifests and archetype swaps (docs/modding.md). No game files.
+#include "../src/mods.h"
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+namespace {
+
+int g_checks = 0, g_failures = 0;
+
+void check(bool ok, const char* what) {
+    ++g_checks;
+    if (!ok) {
+        ++g_failures;
+        std::printf("FAIL %s\n", what);
+    }
+}
+
+void write(const std::filesystem::path& p, const std::string& text) {
+    std::filesystem::create_directories(p.parent_path());
+    std::ofstream(p, std::ios::binary) << text;
+}
+
+}  // namespace
+
+int main() {
+    using namespace leonida::mods;
+
+    // The model ids docs/character_skeleton.md measured in the packs tables are the joaat of their names.
+    static_assert(joaat("player_story000_00") == 0xE472B687u, "Lucia's player model id");
+    static_assert(joaat("cs_mandy") == 0xD7C0CDFFu, "cs_mandy's model id");
+    static_assert(joaat("mandy") == 0x03A885E6u, "Mandy's PERSCHARS name hash");
+    static_assert(joaat("CS_Mandy") == joaat("cs_mandy"), "joaat lower-cases");
+
+    uint32_t id = 0;
+    check(parse_model_id("0xD7C0CDFF", id) && id == 0xD7C0CDFFu, "a 0x hash is taken as it is");
+    check(parse_model_id("cs_monalisa", id) && id == 0x9CB9BCC6u, "a name is hashed");
+    check(!parse_model_id("0x123456789", id), "a hash wider than 32 bits is refused");
+    check(!parse_model_id("0xZZ", id), "a malformed hash is refused");
+    check(!parse_model_id("", id), "an empty name is refused");
+
+    Mod mod;
+    std::string error;
+    check(parse_mod(R"({"name":"Mandy","archetype_swaps":[{"from":"player_story000_00","to":"cs_mandy"}]})", "m",
+                    mod, error) && mod.enabled && mod.archetype_swaps.size() == 1 &&
+              mod.archetype_swaps[0].from == 0xE472B687u && mod.archetype_swaps[0].to == 0xD7C0CDFFu,
+          "a swap parses into the two model ids");
+    check(!parse_mod(R"({"archetype_swaps":[{"from":"a","to":"b","when":"mission:intro"}]})", "m", mod, error) &&
+              error.find("\"when\"") != std::string::npos,
+          "a condition the runtime cannot honour yet is refused, not ignored");
+    check(!parse_mod(R"({"archetype_swaps":[{"from":"cs_mandy","to":"0xD7C0CDFF"}]})", "m", mod, error),
+          "a swap of a model with itself is refused");
+    check(!parse_mod(R"({"enabled":"yes"})", "m", mod, error), "\"enabled\" must be a boolean");
+    check(!parse_mod("[1,2]", "m", mod, error), "a manifest that is not an object is refused");
+    check(parse_mod("{}", "folder_name", mod, error) && mod.name == "folder_name", "the name defaults to the folder");
+
+    const auto dir = std::filesystem::temp_directory_path() / "leonida_mods_test";
+    std::filesystem::remove_all(dir);
+    write(dir / "a_mandy" / "mod.json",
+          R"({"name":"Mandy","archetype_swaps":[{"from":"player_story000_00","to":"cs_mandy","when":"always"}]})");
+    write(dir / "b_off" / "mod.json",
+          R"({"name":"Off","enabled":false,"archetype_swaps":[{"from":"cs_mandy","to":"cs_monalisa"}]})");
+    write(dir / "c_broken" / "mod.json", "{not json");
+    write(dir / "d_notes" / "readme.txt", "not a mod");
+    write(dir / "e_later" / "mod.json", R"({"archetype_swaps":[{"from":"player_story000_00","to":"cs_monalisa"}]})");
+
+    const LoadResult loaded = load_mods(dir);
+    check(loaded.mods.size() == 3, "three manifests load (the broken one and the folder without one do not)");
+    check(loaded.errors.size() == 1 && loaded.errors[0].rfind("c_broken:", 0) == 0, "the broken one is reported");
+
+    const ArchetypeSwaps swaps(loaded.mods);
+    check(swaps.remap(0xE472B687u) == joaat("cs_monalisa"), "a later folder wins for the same model");
+    check(swaps.remap(0xD7C0CDFFu) == 0xD7C0CDFFu, "a disabled mod swaps nothing");
+    check(swaps.remap(0x12345678u) == 0x12345678u, "a model no mod names is left alone");
+
+    const ArchetypeSwaps mandy_only({loaded.mods[0]});
+    check(mandy_only.remap(0xE472B687u) == 0xD7C0CDFFu, "the Mandy mod swaps Lucia's player model for cs_mandy");
+
+    check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
+    std::filesystem::remove_all(dir);
+
+    std::printf("mods_test: %d checks, %d failures\n", g_checks, g_failures);
+    return g_failures == 0 ? 0 : 1;
+}

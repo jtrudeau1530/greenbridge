@@ -147,14 +147,23 @@ class CvtPknormTests(unittest.TestCase):
             with self.subTest(op=op, x=hex(x), y=hex(y)):
                 self.assertEqual(run_op(op, x, y), norm16(x, OPS[op]) | norm16(y, OPS[op]) << 16)
 
-    def test_source_modifiers_and_rejected_clamp(self):
+    def test_source_and_output_modifiers(self):
         half = bits(0.5)
         self.assertEqual(run_op("v_cvt_pknorm_i16_f32", half, half, "-"), (-16384 & 0xFFFF) | 16384 << 16)
         got = run_lines([f"v_mov_b32 v1, {bits(-0.5):#x}", f"v_mov_b32 v2, {half:#x}",
                          "v_cvt_pknorm_u16_f32 v0, |v1|, -v2"])
         self.assertEqual(got, 32768)                                  # |-0.5| -> 32768, -0.5 -> 0
+        for op, snorm in OPS.items():
+            for x, y in ((bits(-2.0), bits(2.0)), (bits(0.5), bits(-0.5)), (0x7FC00000, bits(1.0))):
+                with self.subTest(op=op, x=hex(x), y=hex(y)):
+                    got_clamp = run_lines([
+                        f"v_mov_b32 v1, {x:#x}",
+                        f"v_mov_b32 v2, {y:#x}",
+                        f"{op} v0, v1, v2 clamp",
+                    ])
+                    self.assertEqual(got_clamp, norm16(x, snorm) | (norm16(y, snorm) << 16))
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["v_cvt_pknorm_i16_f32 v0, v1, v2 clamp"])
+            run_lines(["v_cvt_pknorm_i16_f32 v0, v1, v2 mul:2"])
 
 
 if __name__ == "__main__":

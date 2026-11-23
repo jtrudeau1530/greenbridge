@@ -294,6 +294,63 @@ class BlockRunTests(unittest.TestCase):
             measure_stream(block(with_group=False))
 
 
+def block_with_streams(extra, grid=GRID):
+    """block() with more (slot, tag, per-vertex bytes) streams appended after its own, before the group."""
+    n = grid * grid
+    buf = bytearray(block(grid=grid, with_group=False))
+    for slot, tag, data in extra:
+        struct.pack_into("<I", buf, 4 * slot, tag | ((len(buf) // 2) << 8))
+        buf += data * n
+    buf += b"\0" * (-len(buf) % 16)
+    return bytes(buf + padded_group(grid))
+
+
+def skin_block(weights, joints, pairs=1):
+    """block() with weight slots 6(/7) (tag 0x26) and joint slots 8(/9) (tag 0x25); weights and joints are
+    8-byte lists (two slots' worth), the first four bytes used when pairs == 1."""
+    extra = [(6, 0x26, bytes(weights[:4])), (8, 0x25, bytes(joints[:4]))]
+    if pairs == 2:
+        extra = [(6, 0x26, bytes(weights[:4])), (7, 0x26, bytes(weights[4:])),
+                 (8, 0x25, bytes(joints[:4])), (9, 0x25, bytes(joints[4:]))]
+    return block_with_streams(extra)
+
+
+class SkinTests(unittest.TestCase):
+    N = GRID * GRID
+
+    def test_two_pairs_of_sorted_weights_summing_to_255(self):
+        _, out = measure(skin_block([100, 80, 40, 20, 10, 5, 0, 0], [3, 7, 1, 2, 9, 4, 0, 0], pairs=2))
+        sk = out["skin"]
+        self.assertEqual(sk["blocks"], 1)
+        self.assertEqual(sk["pairs_2"], 1)
+        for k in ("weight_sum_255", "weight_sum_247_255", "weights_descending", "nonzero_indices_distinct",
+                  "zero_weight_zero_index"):
+            self.assertEqual(sk[k], self.N, k)
+        self.assertEqual(sk["index_max_0-15"], 1)
+        self.assertEqual(sk["colour_vertices"], self.N)
+        self.assertEqual(sk["colour_sum_255"], 0)
+
+    def test_failures_are_counted(self):
+        # sum 250, not descending, joint 40 repeated, a zero weight with a non-zero index
+        _, out = measure(skin_block([50, 100, 100, 0], [40, 40, 2, 5]))
+        sk = out["skin"]
+        self.assertEqual(sk["pairs_1"], 1)
+        self.assertEqual(sk["weight_sum_255"], 0)
+        self.assertEqual(sk["weight_sum_247_255"], self.N)
+        self.assertEqual(sk["weights_descending"], 0)
+        self.assertEqual(sk["nonzero_indices_distinct"], 0)
+        self.assertEqual(sk["zero_weight_zero_index"], 0)
+        self.assertEqual(sk["index_max_32-47"], 1)
+
+    def test_no_joint_slot_no_counts(self):
+        _, out = measure(block())
+        self.assertEqual(out["skin"], {})
+
+    def test_joint_slot_without_weights_is_unpaired(self):
+        _, out = measure(block_with_streams([(8, 0x25, bytes((1, 2, 3, 4)))]))
+        self.assertEqual(out["skin"], {"unpaired": 1})
+
+
 class ArchiveTests(unittest.TestCase):
     def test_end_to_end_on_a_fake_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -405,6 +462,61 @@ class ArchiveTests(unittest.TestCase):
             self.assertIn("cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
             self.assertIn('"blocks"', r.stdout)
+
+
+def block27(word, grid=GRID):
+    """block() with a tag-0x27 stream in slot 11 (the same word on every vertex), before the group."""
+    buf = bytearray(block(grid=grid, with_group=False))
+    struct.pack_into("<I", buf, 4 * 11, 0x27 | ((len(buf) // 2) << 8))
+    buf += word * (grid * grid)
+    buf += bytes(-len(buf) % 16)
+    return bytes(buf + padded_group(grid))
+
+
+def word27(x, y, z, w):
+    """Inverse of tangent_0x27 for components in [-1, 1] and w in 0..3."""
+    return struct.pack("<I", sum(round((c + 1) / 2 * 1023) << s for c, s in ((x, 0), (y, 10), (z, 20))) | w << 30)
+
+
+class Tag27Tests(unittest.TestCase):
+    N = GRID * GRID
+
+    def test_decode_is_2_10_10_10_unorm_times_2_minus_1(self):
+        t, sign = vt.tangent_0x27(struct.unpack("<I", word27(1, 0, 0, 3))[0])
+        self.assertGreater(t[0], 0.999)
+        self.assertEqual(sign, 1.0)
+        t, sign = vt.tangent_0x27(struct.unpack("<I", word27(0, 0, -1, 0))[0])
+        self.assertLess(t[2], -0.999)
+        self.assertEqual(sign, -1.0)
+        self.assertAlmostEqual(vt.tangent_0x27(2 << 30)[1], 1 / 3)
+
+    def test_tangent_along_u_with_w_as_bitangent_sign(self):
+        # flat grid: face normal +z, dP/du = +x, dP/dv = +y; cross(+z, +x) = +y, so it points along +v and
+        # w = 0 (sign -1) is the "w > 0 exactly when -v" side; w = 3 is the other
+        for w, agree in ((0, True), (3, False)):
+            _, out = measure(block27(word27(1, 0, 0, w)))
+            t = out["tag27"]
+            self.assertEqual(t["11:vertices"], self.N)
+            self.assertEqual(t["11:unit"], self.N)
+            self.assertEqual(t[f"11:w{w}"], self.N)
+            self.assertEqual(t["11:perp_face"], t["11:perp_face_n"])
+            self.assertEqual(t["11:uv3_along_u"], t["11:uv3_n"])
+            self.assertEqual(t["11:uv3_w_plus_minus_v"], t["11:uv3_along_u"] if agree else 0)
+
+    def test_vector_along_the_normal_fails_the_checks(self):
+        _, out = measure(block27(word27(0, 0, 1, 3)))
+        t = out["tag27"]
+        self.assertEqual(t["11:unit"], self.N)
+        self.assertEqual(t["11:perp_face"], 0)
+        self.assertNotIn("11:uv3_along_u", t)
+
+    def test_non_unit_vectors_are_counted(self):
+        _, out = measure(block27(word27(0.5, 0, 0, 3)))
+        self.assertEqual(out["tag27"]["11:unit"], 0)
+
+    def test_no_0x27_slot_no_counts(self):
+        _, out = measure(block())
+        self.assertEqual(out["tag27"], {})
 
 
 class Rpf9ValidationTests(unittest.TestCase):

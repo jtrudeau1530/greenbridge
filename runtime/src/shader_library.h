@@ -642,6 +642,9 @@ struct ShaderEntry {
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
     // --f16-interp-fallback: param/attr index -> {low_half_location, high_half_location} (SHADER-378).
     std::map<std::uint32_t, std::array<std::uint32_t, 2>> f16_halves;
+    // The S#s the shader builds from immediates (the index's literal_samplers): no heap slot names them, so a
+    // pipeline that uses the shader registers them in the bindless set itself (docs/design.md, Literal samplers).
+    std::vector<std::array<std::uint32_t, 4>> literal_samplers;
 };
 
 class ShaderLibrary {
@@ -811,6 +814,14 @@ private:
                     const unsigned long param = std::strtoul(key.c_str(), &end, 10);
                     if (!end || *end != '\0') continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
+                }
+            }
+            if (const Json* l = meta.find("literal_samplers"); l && l->kind == Json::Kind::array) {
+                for (const Json& item : l->array) {
+                    if (item.kind != Json::Kind::array || item.array.size() != 4) continue;
+                    std::array<std::uint32_t, 4> words{};
+                    for (std::size_t i = 0; i < 4; ++i) words[i] = u32(&item.array[i]);
+                    e.literal_samplers.push_back(words);
                 }
             }
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);

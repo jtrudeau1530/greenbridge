@@ -446,11 +446,13 @@ class BranchTests(CfRefTestCase):
             "s_lshl_b32 exec_hi, 1, 2",
             "s_cselect_b32 exec_hi, 7, 9",
             "s_mov_b32 s0, exec_hi",
+            "s_add_u32 s1, exec_hi, 5",
             "v_mov_b32 v0, 1",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ], wave=32)
         self.assertEqual(res_exec["sgpr"][0], 0)
+        self.assertEqual(res_exec["sgpr"][1], 5)
         self.assertEqual(sorted(res_exec["exports"]), list(range(32)))
 
 

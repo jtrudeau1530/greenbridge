@@ -36,13 +36,14 @@ def build(work, name, emulate, llvm_mc):
     return os.path.join(out, "spirv", name + ".spv")
 
 
-def segments(spv):
-    """(segments, continuation segments) of an emulated module: the cases of the scheduler's OpSwitch."""
-    text = open(spv[:-4] + ".spvasm", encoding="utf-8").read()
-    m = re.search(r"OpSwitch %pcv %sw_default ([^\n]+)", text)
-    if not m:
+def segments(spv: str) -> tuple[int, int] | None:
+    """Count scheduler cases and continuations, including inner switches in a partitioned dispatch."""
+    with open(spv[:-4] + ".spvasm", encoding="utf-8") as source:
+        text = source.read()
+    tables = re.findall(r"^[ \t]*OpSwitch %pcv %(?:sw_default|swm\d+) ([^\n]+)", text, re.MULTILINE)
+    if not tables:
         return None
-    cases = [int(x) for x in re.findall(r"(\d+) %blk\d+", m.group(1))]
+    cases = sorted(int(case) for table in tables for case in re.findall(r"(\d+) %blk\d+", table))
     blocks = next((i for i, c in enumerate(cases) if c != i), len(cases))   # blocks 0..n-1, then "done" = n, then segments
     return len(cases), len(cases) - blocks
 

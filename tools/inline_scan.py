@@ -20,6 +20,8 @@ back to the previous store-back of the same list, and sorts the site into:
 A PE is disassembled with MSVC `dumpbin /disasm:nobytes` (it comes with the build tools the runtime needs) and
 streamed, so an image of any size works in one pass; a saved dumpbin listing (with or without the byte column)
 works too, on any OS. Nothing is executed. The output is RVAs, counts and constants, no code bytes.
+An input with no instructions in it (an empty or other text file, a PE dumpbin prints no code for) exits 2
+instead of reporting zero sites, so "UNCHECKED 0" always means something was scanned.
 The matcher knows the instruction shapes MSVC emits for these writes (see tests/test_inline_scan.py); a shape it
 does not know shows up as `unrelated`, so read a few of those by hand on a new image.
 """
@@ -137,11 +139,15 @@ def classify(window, base, stored):
             "bases": bases, "load_traced": load is not None and not broken}
 
 
-def scan(lines):
-    """Yield one dict per cursor store-back site; fallback slots are filled in once the branch target is seen."""
+def scan(lines, stats=None):
+    """Yield one dict per cursor store-back site; fallback slots are filled in once the branch target is seen.
+    `stats["instructions"]` (if a dict is passed) counts the instructions read."""
+    stats = {} if stats is None else stats
+    stats["instructions"] = 0
     window = collections.deque(maxlen=LOOKBACK)
     pending, watching, tail = [], [], []
     for idx, (addr, mnem, ops) in enumerate(instructions(lines)):
+        stats["instructions"] = idx + 1
         for item in tail[:]:  # list fields written right after the store-back (e.g. clearing +140h) count too
             site, left = item
             tail.remove(item)
@@ -179,13 +185,14 @@ def limit_text(limit):
     return "none" if limit is None else "reg" if limit == REG_LIMIT else f"+0x{limit:x}"
 
 
-def summarize(sites):
+def summarize(sites, instructions=None):
     checked = [s for s in sites if s["checked"]]
     unchecked = [s for s in sites if not s["checked"] and s["list"]]
     unrelated = [s for s in sites if not s["list"]]
     plain = lambda v: "none" if v is None else str(v)
-    out = [f"list sites {len(checked) + len(unchecked)}: checked {len(checked)}, UNCHECKED {len(unchecked)} "
-           f"(plus {len(unrelated)} cursor-like stores with no list field nearby, likely other structures)"]
+    out = [] if instructions is None else [f"instructions scanned: {instructions}"]
+    out += [f"list sites {len(checked) + len(unchecked)}: checked {len(checked)}, UNCHECKED {len(unchecked)} "
+            f"(plus {len(unrelated)} cursor-like stores with no list field nearby, likely other structures)"]
     for title, key, group, fmt in (("limit offsets (checked)", "limit", checked, limit_text),
                                    ("fallback vtable slots (checked)", "fallback_slot", checked, plain),
                                    ("packet sizes, checked", "size", checked, plain),
@@ -206,9 +213,14 @@ def main() -> int:
     if not args.source.is_file():
         print(f"{args.source} not found", file=sys.stderr)
         return 2
-    sites = list(scan(read_lines(args.source)))
+    stats = {}
+    sites = list(scan(read_lines(args.source), stats))
+    if not stats["instructions"]:
+        print(f"{args.source}: no instructions found (not a dumpbin listing, or an image without code)",
+              file=sys.stderr)
+        return 2
     base = args.base if args.base is not None else min((s["store_back"] for s in sites), default=0) & ~0xFFFFFFF
-    print(summarize(sites))
+    print(summarize(sites, stats["instructions"]))
     if args.sites:
         rva = lambda a: "?" if a is None else f"+0x{a - base:x}"
         for s in sites:

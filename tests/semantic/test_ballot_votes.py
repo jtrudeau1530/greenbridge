@@ -40,6 +40,7 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 # COMPUTE_PGM_RSRC2 0x8090: 8 user SGPRs (s[0:3] the V#, s4..s7 push constants), TGID_X.
 VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
 LANE_BASE = 0x100      # per-lane results start here, one dword per lane
+RESTORED_BASE = 0x200  # and each lane's mark written after EXEC is restored
 NONE = 0xFFFFFFFF
 
 
@@ -133,6 +134,11 @@ def listing(wave):
             + "v_readfirstlane_b32 s22, v0\n"
             + f"s_bcnt1_i32_{b} s23, {exec_}\n"
             + restore + "\n"
+            # Every lane writes its own slot after the restore: a partial restore leaves the other slots unwritten.
+            + "v_mov_b32_e32 v6, 1\n"
+            + "v_lshlrev_b32_e32 v7, 2, v0\n"
+            + f"v_add_nc_u32_e32 v7, 0x{RESTORED_BASE:x}, v7\n"
+            + "buffer_store_dword v6, v7, s[0:3], 0 offen\n"
             + store_sgpr("s22", 4) + store_sgpr("s23", 5)
             + "s_endpgm\n")
 
@@ -170,6 +176,8 @@ class BallotVoteTests(unittest.TestCase):
         if mask:  # with no lane left in EXEC, v_readfirstlane has no lane to read
             self.assertEqual(mem[16], want["first_active"], "v_readfirstlane under the mask as EXEC")
         self.assertEqual(mem[20], want["exec_count"], "s_bcnt1 exec under the mask as EXEC")
+        self.assertEqual([mem.get(RESTORED_BASE + 4 * lane) for lane in range(wave)], [1] * wave,
+                         "every lane runs again after EXEC is restored")
 
     def test_wave64(self):
         for mask in MASKS64:

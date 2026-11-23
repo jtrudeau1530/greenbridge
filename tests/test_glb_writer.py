@@ -927,6 +927,95 @@ f 1//1 2//2 3//3
         self.assertEqual(len(prims), 1)
         self.assertEqual(len(prims[0]["indices"]), 3)
 
+    def test_parse_obj_single_line_face_remains_unchanged(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "f 1 2 3",
+        ])
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2])
+
+    def test_parse_obj_joins_face_split_across_two_lines(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "f 1 2 \\  ",
+            "3",
+        ])
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2])
+
+    def test_parse_obj_joins_face_split_across_three_lines(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "f 1 \\",
+            "2 \\",
+            "3",
+        ])
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2])
+
+    def test_parse_obj_joins_face_split_immediately_after_keyword(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "f \\",
+            "1 2 3",
+        ])
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2])
+
+    def test_parse_obj_continuation_skips_blank_and_comment_lines(self):
+        obj_text = "\r\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "f 1 2 \\",
+            "   # split after two corners",
+            "",
+            "3",
+        ]) + "\r\n"
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2])
+
+    def test_parse_obj_backslash_inside_line_stays_an_invalid_token(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "f 1 2\\ 3",
+        ])
+        self.assertEqual(glb_writer.parse_obj(obj_text, is_path=False, up_axis="y"), [])
+
+    def test_parse_obj_inline_comment_backslash_does_not_continue(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "v 1 1 0",
+            "f 1 2 3 # keep this comment \\",
+            "f 1 2 4",
+        ])
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2, 0, 1, 3])
+
+    def test_parse_obj_continuation_before_inline_comment(self):
+        obj_text = "\n".join([
+            "v 0 0 0",
+            "v 1 0 0",
+            "v 0 1 0",
+            "f 1 2 \\ # split before the comment",
+            "3",
+        ])
+        prim, = glb_writer.parse_obj(obj_text, is_path=False, up_axis="y")
+        self.assertEqual(prim["indices"], [0, 1, 2])
+
     def test_compute_bounds_calculation(self):
         prims = [
             {"positions": [(-5.0, 1.0, 2.0), (10.0, -3.0, 8.0)]},

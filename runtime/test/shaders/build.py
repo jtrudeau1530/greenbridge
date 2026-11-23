@@ -16,8 +16,9 @@ are also what a shader reads through s_getpc_b64 (the code base) at that offset.
 The stage comes from the name's prefix. Mesh shaders (ms_) also need a DXBC container with their PSV0, which this
 doesn't make; geometry shaders (gs_) get gs_tri's signatures (gs_container).
 The comment at the top of each .asm says which test program to run on the result and what it should print.
-With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
-VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
+With LEONIDA_FMA=khr (or glsl, or exact), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
+VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77), --fma glsl, or --fma exact
+(a single rounding built from plain f32 ops, for a driver that splits GLSL Fma and has no VK_KHR_shader_fma).
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
@@ -164,7 +165,7 @@ def translate_tests(work, names):
         cmd.append("--wave64-emulate")
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
-    if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR
+    if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma (default), OpFmaKHR, or emulated
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")

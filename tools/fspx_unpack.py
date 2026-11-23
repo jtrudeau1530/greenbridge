@@ -171,13 +171,23 @@ def main(argv=None) -> int:
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
     a = ap.parse_args(argv)
-    os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
+    fspx_dir = os.path.join(a.out, "fspx")
+    try:
+        os.makedirs(fspx_dir, exist_ok=True)
+    except OSError as error:
+        print(f"cannot create output directory {fspx_dir}: {error}", file=sys.stderr)
+        return 2
     disasm = None
     if a.disasm:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import shader_disasm  # noqa: E402  (resolves LLVM_MC at import)
         disasm = shader_disasm
-        os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
+        disasm_dir = os.path.join(a.out, "disasm")
+        try:
+            os.makedirs(disasm_dir, exist_ok=True)
+        except OSError as error:
+            print(f"cannot create output directory {disasm_dir}: {error}", file=sys.stderr)
+            return 2
     index, bad = [], 0
     used_names = set()
     for path in a.files:
@@ -219,6 +229,19 @@ def main(argv=None) -> int:
                 entry["threads"] = meta["threads"]
             if "wave32" in meta:
                 entry["wave32"] = meta["wave32"]
+            listing = None
+            if disasm and meta["code"]["end"]:
+                start, end = meta["code"]["start"], meta["code"]["end"]
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                if not asm.strip():
+                    reason = (err.strip().splitlines() or ["no output"])[0]
+                    print(f"{name}: {reason}", file=sys.stderr)
+                    bad += 1
+                    continue
+                entry["invalid_words"] = invalid
+                listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
+                if err.strip():
+                    listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
             if container:
                 with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
                     f.write(container)
@@ -228,15 +251,9 @@ def main(argv=None) -> int:
                 f.write(blob[0])
             with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(meta, f, indent=1)
-            if disasm and meta["code"]["end"]:
-                start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
-                entry["invalid_words"] = invalid
+            if listing is not None:
                 with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
-                    f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
-                    f.write(asm)
-                    if err.strip():
-                        f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+                    f.write(listing)
             index.append(entry)
     with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)

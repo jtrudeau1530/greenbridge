@@ -1,4 +1,5 @@
-"""Each table in docs/design.md, docs/README.md and docs/testing.md names a topic once.
+"""Each table in docs/design.md, docs/README.md and docs/testing.md names a topic once, and every row has the
+same number of cells as its header.
 
     python -I tests/test_docs_design_rows.py
 
@@ -8,12 +9,57 @@ other lacks, and a reader who stops at the first one misses the rest. On 2026-11
 times; the docs index and the testing guide's "Known problems" had the same pattern. This test fails on a repeated
 first cell within one table of those pages, where the first cell is the topic (other pages repeat it on purpose, e.g.
 one row per benchmark size). No game files or build tools.
+
+The second check is the table's shape: a rule that writes a literal pipe (`|v|` in a list of source modifiers)
+has to escape it as `\\|`, or GitHub reads it as a separator, renders the row into columns the header does not
+have and drops the tail of the rule — text lost in a page nobody re-reads. On 2026-11-22 eighteen rows of the
+contract table had that shape (four to thirteen cells against a three-cell header).
 """
 import os
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PAGES = ("design.md", "README.md", "testing.md")
+
+
+def unescaped_pipes(line):
+    """How many table separators a row really has: a cell that needs a literal pipe writes it ``\\|``."""
+    count, i = 0, 0
+    while i < len(line):
+        if line[i] == "\\":                          # the next character is literal, pipe or not
+            i += 2
+            continue
+        if line[i] == "|":
+            count += 1
+        i += 1
+    return count
+
+
+def mis_shaped_rows(lines):
+    """[(line, cells, header cells)] for rows whose cell count differs from their table's header.
+
+    A rule that lists modifiers (`|v|`, `-|v|`) has to escape those pipes as `\\|`. Left raw, GitHub reads each one
+    as a separator and renders the row into columns the header does not have, dropping the tail of the rule, so the
+    table silently loses text instead of failing.
+    """
+    found = []
+    header, in_fence = None, False
+    for n, line in enumerate(lines, 1):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        if in_fence or not line.startswith("|"):
+            header = None
+            continue
+        cells = unescaped_pipes(line)
+        if set(line.strip()) <= set("|-: "):           # the |---| rule carries the header's shape
+            header = cells
+            continue
+        if header is None:
+            header = cells
+            continue
+        if cells != header:
+            found.append((n, cells, header))
+    return found
 
 
 def repeated_topics(lines):
@@ -49,6 +95,19 @@ class DesignTableRows(unittest.TestCase):
                  "| Topic | Rule |", "|---|---|", "| LDS | other table |", "```", "| EXEC | in a code block |",
                  "| EXEC | in a code block |", "```"]
         self.assertEqual(repeated_topics(lines), [("EXEC", [3, 5])])
+
+    def test_checker_finds_a_stray_pipe_but_not_an_escaped_one(self):
+        lines = ["| Topic | Rule |", "|---|---|", "| EXEC | writes |v| |", "| LDS | fine |", "",
+                 "| Topic | Rule |", "|---|---|", "| EXEC | writes \\|v\\| |", "```", "| x | a | b |", "```"]
+        self.assertEqual(mis_shaped_rows(lines), [(3, 5, 3)])
+
+    def test_each_page_has_rows_its_header_can_hold(self):
+        for page in PAGES:
+            with self.subTest(page=page):
+                with open(os.path.join(ROOT, "docs", page), encoding="utf-8") as f:
+                    lines = f.read().split("\n")
+                wrong = mis_shaped_rows(lines)
+                self.assertEqual(wrong, [], f"rows to fix in docs/{page} (line, cells, header cells): {wrong}")
 
     def test_each_page_names_each_topic_once_per_table(self):
         for page in PAGES:

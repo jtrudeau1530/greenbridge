@@ -605,7 +605,7 @@ def inspect_model_resource(sys_bytes, gfx_bytes, gfx_page_sizes):
     }
 
 
-def _inflate_exact(buf, offset, end, max_inflate):
+def _inflate_exact(buf, offset, end, max_inflate, *, min_inflate=64):
     """Inflate one zlib stream at `offset` inside `buf[offset:end]`."""
     d = zlib.decompressobj()
     p = offset
@@ -629,7 +629,7 @@ def _inflate_exact(buf, offset, end, max_inflate):
                     break
     except zlib.error:
         return None, 0, False
-    if not d.eof or total < 64:
+    if not d.eof or total < min_inflate:
         return None, 0, False
     used = p - offset - len(d.unused_data)
     if used <= 0:
@@ -930,6 +930,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 raise ValueError("start offset is outside the archive")
             end = min(file_size, pos + limit) if limit is not None else file_size
             last = pos
+            system_pages_remaining = 0
             while pos < end:
                 found = ZHDR.search(m, pos, end)
                 if not found:
@@ -961,16 +962,21 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                         "head_tag": "bink2",
                     })
                     last = pos = s + blen
+                    system_pages_remaining = 0
                     continue
 
-                data, used, too_big = _inflate_exact(m, s, end, max_inflate)
+                continued_system = (system_pages_remaining > 0 and s == ((last + 15) & ~15)
+                                    and not any(m[last:s]))
+                # A declared final system page can be smaller than the minimum for a scanned stream.
+                data, used, too_big = _inflate_exact(
+                    m, s, end, max_inflate, min_inflate=1 if continued_system and system_pages_remaining == 1 else 64)
                 if data is None:
                     if too_big:
                         skipped += 1
                     pos = s + 1
                     continue
                 gap = m[last:s]
-                streams.append({
+                meta = {
                     "stream_index": len(streams),
                     "offset": s,
                     "stored": used,
@@ -984,7 +990,18 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     "is_0drp": len(data) >= 0x14 and data[0x10:0x14] == b"0DRP",
                     "u64_at_8": struct.unpack_from("<Q", data, 8)[0] if len(data) >= 16 else 0,
                     "head_tag": classify_graphics_head(data),
-                })
+                }
+                streams.append(meta)
+                if continued_system:
+                    system_pages_remaining = system_pages_remaining - 1 if len(data) % 65536 == 0 else 0
+                else:
+                    system_pages_remaining = 0
+                    if (meta["align4k_plus16"] and meta["pre16_zero"] and len(data) % 65536 == 0
+                            and classify_system_root(data) in ("drawable", "drawable_dict", "fragment")):
+                        try:
+                            system_pages_remaining = parse_page_map(data)["system_pages"] - 1
+                        except JoinError:
+                            pass  # The full join checks page maps that extend into another system page.
                 last = pos = s + used
 
             cache = {}
@@ -994,7 +1011,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     if len(cache) >= 64:
                         cache.clear()
                     meta = streams[s_idx]
-                    payload, _, _ = _inflate_exact(m, meta["offset"], meta["offset"] + meta["stored"], max_inflate)
+                    payload, _, _ = _inflate_exact(m, meta["offset"], meta["offset"] + meta["stored"], max_inflate,
+                                                   min_inflate=meta["size"])
                     cache[s_idx] = payload
                 return cache[s_idx]
 

@@ -98,8 +98,9 @@ int main() {
     reinterpret_cast<Close>(vtable[17])(obj, queue);
     reinterpret_cast<Release>(vtable[2])(obj);
 
-    // A class not served (an id no runtime class has) is refused, with the out pointer cleared.
-    const GUID unserved = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+    // A class not served (an id no runtime class has) is refused, with the out pointer cleared: XGameSaveImpl
+    // (xgameruntime include/xgamesave.idl), which is not served yet.
+    const GUID unserved = {0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}};
     void* out = reinterpret_cast<void*>(1);
     hr = query(&unserved, unserved, &out);
     if (hr != static_cast<HRESULT>(0x80070032) || out != nullptr)

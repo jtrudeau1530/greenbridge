@@ -4,6 +4,8 @@
 
 Everything is synthetic: an RPF9-like header, zlib streams and hand-built block headers. No game data is used.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "analyze_4240_full.py")
@@ -96,7 +99,7 @@ class Analyze4240Test(unittest.TestCase):
     def test_missing_input_is_one_error_line(self):
         missing = os.path.join(self.root, "missing.rpf")
         p = self.run_tool(missing)
-        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("does not exist", p.stderr)
         self.assertIn("missing.rpf", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
@@ -113,6 +116,30 @@ class Analyze4240Test(unittest.TestCase):
         self.assertIn("carve", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         self.assertIn("Processing " + good, p.stdout, "the next archive is still read")
+
+    def test_unreadable_archive_is_reported_and_later_archives_are_measured(self):
+        blocked = os.path.join(self.root, "locked.rpf")
+        make_archive(blocked, BLOCK_6330)
+        good = self.truncated_archive()
+        out = os.path.join(self.root, "stats.json")
+        stderr = io.StringIO()
+
+        def open_archive(path, *args, **kwargs):
+            if path == blocked:
+                raise PermissionError(13, "input is locked", path)
+            return open(path, *args, **kwargs)
+
+        with (mock.patch.object(A, "open", create=True, side_effect=open_archive),
+              mock.patch.object(sys, "argv", [TOOL, blocked, good, "--json", out]),
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(stderr)):
+            self.assertEqual(A.main(), 1)
+        self.assertEqual(stderr.getvalue().splitlines(),
+                         [f"ERROR: cannot read {blocked}: input is locked"])
+        with open(out, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(len(doc), 1)
+        self.assertEqual(doc[0]["errors"], 1)
 
     def test_limit_below_one_is_refused(self):
         path = self.truncated_archive()

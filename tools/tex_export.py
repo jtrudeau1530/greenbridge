@@ -117,11 +117,12 @@ def export_one(t, carve, out, blob_cache, png=False):
     bpe, blk = FMT[fmt]
     w, h = t["w"], t["h"]
     we, he = (w + blk - 1) // blk, (h + blk - 1) // blk
-    key = (t["archive"], t["gpu"])
+    chain_offs = tuple(off for off, _ in (t.get("gpu_chain") or ((t["gpu"], t["gpu_size"]),)))
+    key = (t["archive"], chain_offs)
     if key not in blob_cache:
         blob_cache.clear()
         parts = []
-        for off, _ in t.get("gpu_chain") or [[t["gpu"], t["gpu_size"]]]:
+        for off in chain_offs:
             with open(os.path.join(carve, t["archive"], f"{off:012x}.bin"), "rb") as f:
                 parts.append(f.read())
         blob_cache[key] = b"".join(parts)

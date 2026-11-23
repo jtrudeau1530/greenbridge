@@ -283,6 +283,7 @@ VALU_REMOVED = {
     "v_mad_f32": _MAD_GONE.format("v_fma_f32"),
     "v_mac_f32": _MAD_GONE.format("v_fmac_f32"),
     "v_madak_f32": _MAD_GONE.format("v_fmaak_f32"),
+    "v_madmk_f32": _MAD_GONE.format("v_fmamk_f32"),
     "v_mad_legacy_f32": _MAD_GONE.format("v_fma_dx9_zero_f32"),
 }
 # Same instruction, new mnemonic: the assembler takes the GFX10 spelling for GFX11 and encodes the GFX11 name.
