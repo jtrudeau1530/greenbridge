@@ -219,10 +219,10 @@ class SqrtF16ModifiersAndOperandsTests(unittest.TestCase):
         with self.assertRaises(si.UnsupportedConstruct):
             run_op("v_sqrt_f16_e64 v0, -|v1| op_sel:[0,0]", v1)
 
-        # Output modifiers: mul:2, div:2, clamp.
+        # Output modifiers: mul:2 and div:2 ignored on RDNA2 with denorms kept; clamp applies.
         v1_pos = (H_9P0 << 16) | H_4P0
-        self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 mul:2", v1_pos), merge_half(OLD, H_4P0, 0))
-        self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 div:2", v1_pos), merge_half(OLD, H_1P0, 0))
+        self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 mul:2", v1_pos), merge_half(OLD, H_2P0, 0))
+        self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 div:2", v1_pos), merge_half(OLD, H_2P0, 0))
         self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 clamp", v1_pos), merge_half(OLD, H_1P0, 0))
         self.assertEqual(run_op("v_sqrt_f16_e64 v0, v1 op_sel:[1,1] clamp", v1_pos), merge_half(OLD, H_1P0, 1))
 
