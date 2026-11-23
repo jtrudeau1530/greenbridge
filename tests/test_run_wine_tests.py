@@ -448,20 +448,25 @@ class DriveMapTest(unittest.TestCase):
         # The "Wine" here is the Python interpreter, so the program reads the drive through its dosdevices link, which
         # is where Wine resolves D:/win/root/... too.
         probe = self.root / "probe.py"
-        target = self.link / "win" / "root" / "runtime" / "build" / "generated" / "cs.spv"
-        probe.write_text(f"import sys\nsys.exit(0 if open({str(target)!r}).read() == 'spirv' else 1)\n", encoding="utf-8")
         listing = self.root / "ctest.json"
-        listing.write_text(json.dumps({"tests": [ctest_entry("compiled_in_path", [WINDOWS_ROOT + "/probe.py"])]}),
-                           encoding="utf-8")
-        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
-                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
-        out = io.StringIO()
-        with mock.patch.dict(os.environ, {"WINEPREFIX": str(self.prefix)}), mock.patch.object(sys, "argv", argv), \
-                contextlib.redirect_stdout(out):
-            code = rwt.main()
-        self.assertEqual(code, 0, out.getvalue())
-        self.assertIn("[PASS] compiled_in_path", out.getvalue())
-        self.assertFalse(os.path.lexists(self.link))
+        for windows_root, checkout in ((WINDOWS_ROOT, self.link / "win" / "root"), ("D:/", self.link)):
+            with self.subTest(windows_root=windows_root):
+                target = checkout / "runtime" / "build" / "generated" / "cs.spv"
+                probe.write_text(f"import sys\nsys.exit(0 if open({str(target)!r}).read() == 'spirv' else 1)\n",
+                                 encoding="utf-8", newline="\n")
+                command = [windows_root.rstrip("/") + "/probe.py"]
+                listing.write_text(json.dumps({"tests": [ctest_entry("compiled_in_path", command)]}),
+                                   encoding="utf-8", newline="\n")
+                argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", windows_root,
+                        "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/"),
+                        "--require", "compiled_in_path"]
+                out = io.StringIO()
+                with mock.patch.dict(os.environ, {"WINEPREFIX": str(self.prefix)}), \
+                        mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
+                    code = rwt.main()
+                self.assertEqual(code, 0, out.getvalue())
+                self.assertIn("[PASS] compiled_in_path", out.getvalue())
+                self.assertFalse(os.path.lexists(self.link))
 
 
 class MainTest(unittest.TestCase):

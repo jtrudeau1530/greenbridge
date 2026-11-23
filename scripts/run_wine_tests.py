@@ -42,7 +42,9 @@ def _make_parent(path: str) -> None:
 
 
 def norm(path: str) -> str:
-    return ntpath.normpath(path).replace("\\", "/").rstrip("/")
+    path = ntpath.normpath(path).replace("\\", "/")
+    # Removing this slash would turn an absolute drive root into a drive-relative path.
+    return path if re.fullmatch(r"[A-Za-z]:/", path) else path.rstrip("/")
 
 
 def map_path(arg: str, windows_root: str, root: str) -> str | None:
@@ -51,8 +53,9 @@ def map_path(arg: str, windows_root: str, root: str) -> str | None:
     w = norm(windows_root)
     if a.lower() == w.lower():
         return root
-    if a.lower().startswith(w.lower() + "/"):
-        return os.path.join(root, *a[len(w) + 1:].split("/"))
+    prefix = w.rstrip("/") + "/"
+    if a.lower().startswith(prefix.lower()):
+        return os.path.join(root, *a[len(prefix):].split("/"))
     return None
 
 
@@ -61,8 +64,9 @@ class DriveMap:
 
     A test that opens D:/a/Leonida/Leonida/runtime/build/generated/x.spv (a path compiled into it) then reads
     <root>/runtime/build/generated/x.spv. The drive is a dosdevices link to a scratch folder holding a/Leonida/Leonida
-    as a link to the root; both are removed afterwards. A drive the prefix already has (c:, z:, or one set up by
-    hand) is left alone, and so is a root without a drive letter.
+    as a link to the root. If the Windows checkout is the drive root itself, the drive links directly to the
+    Linux checkout. Temporary links and scratch folders are removed afterwards. A drive the prefix already has
+    (c:, z:, or one set up by hand) is left alone, and so is a root without an absolute drive path.
     """
 
     def __init__(self, windows_root: str, root: str, prefix: str):
@@ -71,7 +75,7 @@ class DriveMap:
         self.note = ""
 
     def __enter__(self):
-        m = re.fullmatch(r"([A-Za-z]):/(.+)", self.windows_root)
+        m = re.fullmatch(r"([A-Za-z]):/(.*)", self.windows_root)
         if not m:
             self.note = f"{self.windows_root} has no drive letter: no drive mapped"
             return self
@@ -85,20 +89,23 @@ class DriveMap:
         if os.path.lexists(link):
             self.note = already_set
             return self
-        self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
+        target = self.root
         try:
-            parent = os.path.join(self.scratch, *rest[:-1])
-            os.makedirs(parent, exist_ok=True)
-            os.symlink(self.root, os.path.join(parent, rest[-1]))
+            if rest:
+                self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
+                parent = os.path.join(self.scratch, *rest[:-1])
+                os.makedirs(parent, exist_ok=True)
+                os.symlink(self.root, os.path.join(parent, rest[-1]))
+                target = self.scratch
             try:
-                os.symlink(self.scratch, link)
+                os.symlink(target, link)
             except FileExistsError:
                 self.note = already_set
                 return self
             self.link = link
         finally:
             # __exit__ only runs after a successful __enter__.
-            if self.link is None:
+            if self.link is None and self.scratch is not None:
                 shutil.rmtree(self.scratch, ignore_errors=True)
                 self.scratch = None
         self.note = f"drive {drive}: maps {self.windows_root} to {self.root} for this run"
