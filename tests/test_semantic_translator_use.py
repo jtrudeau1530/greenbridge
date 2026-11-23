@@ -36,9 +36,6 @@ ALLOWLIST = {
     "test_fixtures.py": "checks fixtures/disasm/*.s against regen_fixtures.py; the listing is the subject",
     "test_alu_frexp.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
     "test_alu_ldexp.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
-    "test_alu_lshl_add.py": "hand-written copy of the emitted SPIR-V run by spirv_mini_interp.py",
-    "test_alu_pack_in_place.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
-    "test_alu_sad_hi_u32.py": "pure oracle and hand-written SPIR-V run by spirv_mini_interp.py",
 }
 
 # Debt from before this guard: files that model the answer instead of running the translator.  They are
