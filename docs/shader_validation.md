@@ -1135,6 +1135,20 @@ Results (`--max-ops 16`, half wave32, half wave64, nothing skipped): it found `s
 wave32 and `s_ff0_i32_b64` of a negative constant (#1409), both fixed on `main` since; on `main` 7b7d73f8, 600 of
 600 match (seeds 401 to 403).
 
+For one case from a default wave32 run, `tools/wave_trace.py` writes a self-contained HTML report. Use the seed,
+zero-based case index, and `--max-ops` from `wave_diff.py --wave 32`. The report compares all 32 lanes after
+initialization and after each subsequent instruction. Select a register or jump to the first observed mismatch.
+
+```powershell
+python -I tools/wave_trace.py --seed 1 --case 0 --max-ops 12 --out wave.html
+```
+
+Each checkpoint re-translates a shorter program with the same observation epilogue, so liveness and lowering can
+change between checkpoints. The first mismatch identifies an observed prefix. The final checkpoint runs the full
+original case. The tool uses synthetic programs and the CPU interpreters above. It writes a report for mismatches
+and unavailable checkpoints as well. Exit 1 means a mismatch was observed, 2 means the comparison was incomplete
+or the command failed, and 0 means all checkpoints matched.
+
 ### 32-bit float VALU on the GPU (`tools/f32_fuzz.py`, FUZZ-3)
 
 `--oracle hw` (or `translator,hw`) runs the same seeded VOP1/VOP2/VOP3 f32 programs natively on the AMD GPU and judges
