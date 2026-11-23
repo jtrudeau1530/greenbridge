@@ -12184,17 +12184,19 @@ class Gen:
         det = fop("OpFAdd", uu, fop("OpFAdd", vv_, ww))
         tt = fop("OpFAdd", fop("OpFAdd", fop("OpFMul", uu, az0), fop("OpFMul", vv_, bz0)), fop("OpFMul", ww, cz0))
         tk = fop("OpFMul", sgz, tt)                    # k*T
-        # Inside: det is not 0 or NaN, and every edge function has det's sign, or is 0 and its edge passes the tie
-        # rule fitted to the 49 measured RDNA2 rows with a zero edge function (all with z dominant): the edge from P
-        # to Q, (tx, ty) = Q - P in the sheared frame, passes when ty == 0 ? tx < 0 : sign(det) ty > 0. Hit: inside
-        # and sign(det) T >= 0 (t = 0 hits); there is no test against the ray extent. Every compare is ordered, so a
-        # NaN fails it.
+        # Inside: det is not 0 or NaN, and every edge function has det's sign, or is 0 and its edge passes RDNA2's tie
+        # rule (docs/design.md, Ray tracing row; measured with x, y and z dominant, both windings, both signs of
+        # d[kz]): the edge from P to Q, with (tx, ty) = Q - P in the sheared frame with the d[kz] < 0 swap undone,
+        # passes when ty == 0 ? sign(det) tx > 0 : sign(d[kz]) sign(det) ty > 0. Hit: inside and sign(det) T >= 0
+        # (t = 0 hits); there is no test against the ray extent. Every compare is ordered, so a NaN fails it.
         dpos, dneg = gt0(det), lt0(det)
         sd = sel(dpos, ONE, NEG1)
+        sdz = fop("OpFMul", sgz, sd)                   # sign(d[kz]) sign(det)
 
         def inside(x, p, q):
             tx, ty = fop("OpFSub", q[0], p[0]), fop("OpFSub", q[1], p[1])
-            tie = sel(eq0(ty), lt0(tx), gt0(fop("OpFMul", sd, ty)), "%bool")
+            tx, ty = sel(neg, ty, tx), sel(neg, tx, ty)        # undo the kx/ky swap of d[kz] < 0
+            tie = sel(eq0(ty), gt0(fop("OpFMul", sd, tx)), gt0(fop("OpFMul", sdz, ty)), "%bool")
             return sel(eq0(x), tie, gt0(fop("OpFMul", sd, x)), "%bool")
         a2, b2, c2 = (ax, ay), (bx, by), (cx, cy)
         front = bop("OpFOrdGreaterThanEqual", fop("OpFMul", sd, tk), "%f0")
