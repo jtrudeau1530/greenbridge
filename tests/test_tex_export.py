@@ -606,6 +606,16 @@ def test_main_reports_an_index_row_without_keys(tmp_path, monkeypatch, capsys):
     assert "Traceback" not in err
 
 
+def test_main_reads_an_index_saved_with_a_utf8_bom(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("\ufeff[]", encoding="utf-8")   # Notepad and PowerShell's ">" write a BOM
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() is None       # read as an empty texture list; nothing to export
+    assert (out / "export_log.json").read_text(encoding="utf-8") == "[]"
+    assert capsys.readouterr().err == ""
+
+
 def test_main_rejects_an_out_that_is_a_file(tmp_path, monkeypatch, capsys):
     index = tmp_path / "textures_index.json"
     index.write_text("[]", encoding="utf-8")

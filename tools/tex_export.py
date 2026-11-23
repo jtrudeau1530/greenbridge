@@ -193,7 +193,7 @@ def main():
     ap.add_argument("--png", action="store_true", help="also write a PNG beside each DDS dds_png.py can decode")
     a = ap.parse_args()
     try:
-        with open(a.index, encoding="utf-8") as f:
+        with open(a.index, encoding="utf-8-sig") as f:  # Notepad and PowerShell ">" save a BOM; json would refuse it
             texs = json.load(f)
     except (OSError, ValueError) as e:
         print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)
