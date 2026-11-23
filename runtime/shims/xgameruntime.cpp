@@ -1044,7 +1044,10 @@ std::vector<std::string> package_locales() {
 HRESULT STDMETHODCALLTYPE pkg_user_locale(void*, size_t size, char* locale) {
     if (!locale || !size) return E_INVALIDARG;
     const std::vector<std::string> declared = package_locales();
-    if (declared.empty()) return S_OK;
+    if (declared.empty()) {
+        locale[0] = '\0';
+        return S_OK;
+    }
     wchar_t wide[LOCALE_NAME_MAX_LENGTH] = {};
     char user[LOCALE_NAME_MAX_LENGTH * 4] = "";
     if (GetUserDefaultLocaleName(wide, LOCALE_NAME_MAX_LENGTH) > 0)

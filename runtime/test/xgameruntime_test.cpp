@@ -731,8 +731,8 @@ void check_run_time_load() {
             reinterpret_cast<IsPackagedExport>(rt::shims::find("xgameruntime.dll", "XPackageIsPackagedProcess"));
         check(packaged_export && reinterpret_cast<IsPackaged>(slot(pk, 4))(pk) == packaged_export(),
               "slot 4 is XPackageIsPackagedProcess");
-        // Slot 11, XPackageGetUserLocale: one of the package's declared locales, never the host's; nothing written
-        // (but S_OK) when the package declares none.
+        // Slot 11, XPackageGetUserLocale: one of the package's declared locales, never the host's; an empty
+        // string (with S_OK) when the package declares none.
         using Locale = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
         char tmp[MAX_PATH] = {};
         GetTempPathA(sizeof(tmp), tmp);
@@ -741,8 +741,8 @@ void check_run_time_load() {
         SetEnvironmentVariableA("LEONIDA_GAME_DIR", game.c_str());
         char locale[128];
         std::memset(locale, 'z', sizeof(locale));
-        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK && locale[0] == 'z',
-              "slot 11 without declared locales: S_OK and nothing written");
+        check(reinterpret_cast<Locale>(slot(pk, 11))(pk, 1, locale) == S_OK && locale[0] == '\0',
+              "slot 11 without declared locales: S_OK and an empty string in a one-byte buffer");
         if (FILE* f = std::fopen((game + "\\MicrosoftGame.Config").c_str(), "wb")) {
             std::fputs("<Game><Resources><Resource Language=\"zz-ZZ\"/><Resource Language='xx-YY'/></Resources></Game>",
                        f);
