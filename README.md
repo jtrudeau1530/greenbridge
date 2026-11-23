@@ -8,9 +8,6 @@
   <b>Leonida</b>
   <br>
 </h1>
-  <h3 align="center">
-    <i>Só mais 72h gigi!</i> 🚀
-  </h3>
 
 <h4 align="center">Grand Theft Auto VI (Xbox Series) running natively on Windows, built on your PC from your own copy.
 </h4>
