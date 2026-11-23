@@ -508,6 +508,11 @@ def main() -> int:
     if not os.path.exists(a.carve_dir):
         print(f"ERROR: {a.carve_dir}: does not exist", file=sys.stderr)
         return 2
+    if not os.path.isfile(os.path.join(a.carve_dir, "index.json")):
+        # A file, or a folder without the carve's index, otherwise fails below as a raw
+        # FileNotFoundError naming "<source>\index.json", which the user never typed.
+        print(f"ERROR: {a.carve_dir}: not an rpf9_carve.py folder (no index.json)", file=sys.stderr)
+        return 2
 
     try:
         if a.json:
