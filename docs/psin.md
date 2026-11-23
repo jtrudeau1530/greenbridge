@@ -583,7 +583,10 @@ python -I tools/script_qtable.py <carve_dir_or_rpf_or_bin> [--root-hash HEX] [--
 Accepts an `rpf9_carve.py` carve directory (`script`), a `script.rpf` archive or a joined `.bin` payload.
 Default stdout and `--json` output emit aggregate counts, histograms and structural invariant checks only; `--root-hash`
 and `--type-hash` report local tree/type counts in hex. `tests/test_script_qtable.py` covers synthetic multi-tree parsing,
-64 KiB stream reassembly across a carve folder, pointer validation and output collision guards.
+64 KiB stream reassembly across a carve folder, pointer validation and output collision guards. A target that does not
+exist, or that cannot be read, stops the tool with one `ERROR:` line and exit 2 before anything is parsed; a readable
+file that is not an object-tree payload is exit 1, the scan's verdict, and a `--json` file that cannot be written is
+exit 2 as well.
 
 ## Limits
 
