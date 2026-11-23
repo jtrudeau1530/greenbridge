@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tools"), str(ROOT / "tests")]
 import make_game
 import ttpf_assets
+import ttpf_mips
 import world_build
 from test_calibrated_texture import synthetic_profile
 from test_ttpf_mips import build_bc1_bcpack_pool
@@ -252,6 +253,127 @@ class TextureAssets(unittest.TestCase):
         row = self.row_after_export()
         self.assertIsNone(row["File"])
         self.assertEqual(row["BCPackLimitation"], "texture range is not completely mapped")
+
+
+BC_FORMAT = next(iter(ttpf_mips.BC_FORMATS))
+NOT_BC = "R8G8B8A8_UNORM"
+
+
+def synthetic_row(**changes):
+    out = {"DxgiFormat": BC_FORMAT, "File": None, "BaseMipLevel": 0, "Mips": 1, "SourceMips": 1}
+    out.update(changes)
+    return out
+
+
+class PublishWriter(unittest.TestCase):
+    """`publish` stages in the destination folder and must never leave the staging file behind."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def names(self):
+        return sorted(p.name for p in self.dir.iterdir())
+
+    def test_writes_the_bytes_and_leaves_no_staging_file(self):
+        ttpf_assets.publish(self.dir / "manifest.json", b'{"Textures": []}')
+        self.assertEqual((self.dir / "manifest.json").read_bytes(), b'{"Textures": []}')
+        self.assertEqual(self.names(), ["manifest.json"])
+
+    def test_replaces_the_previous_contents(self):
+        target = self.dir / "manifest.json"
+        target.write_bytes(b"old contents that are longer")
+        ttpf_assets.publish(target, b"new")
+        self.assertEqual(target.read_bytes(), b"new")
+        self.assertEqual(self.names(), ["manifest.json"])
+
+    def test_failed_replace_keeps_the_previous_bytes_and_no_temp(self):
+        target = self.dir / "manifest.json"
+        target.write_bytes(b"previous")
+        with mock.patch.object(ttpf_assets.os, "replace", side_effect=OSError(5, "access denied")), \
+                self.assertRaises(OSError):
+            ttpf_assets.publish(target, b"replacement")
+        self.assertEqual(target.read_bytes(), b"previous")
+        self.assertEqual(self.names(), ["manifest.json"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes only")
+    def test_preserves_the_destination_mode(self):
+        target = self.dir / "manifest.json"
+        target.write_bytes(b"previous")
+        os.chmod(target, 0o640)
+        ttpf_assets.publish(target, b"replacement")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.names(), ["manifest.json"])
+
+
+class CandidateRules(unittest.TestCase):
+    def test_other_formats_are_never_candidates(self):
+        self.assertFalse(ttpf_assets.candidate(synthetic_row(DxgiFormat=NOT_BC, File=None), None))
+
+    def test_a_strict_decoder_claim_is_a_candidate_without_a_profile(self):
+        self.assertTrue(ttpf_assets.candidate(synthetic_row(BCPackDecoder="bc1-strict"), None))
+
+    def test_a_calibrated_decoder_claim_needs_a_profile(self):
+        self.assertFalse(ttpf_assets.candidate(synthetic_row(BCPackDecoder="bc1-calibrated"), None))
+        self.assertTrue(ttpf_assets.candidate(synthetic_row(BCPackDecoder="bc1-calibrated"), {"version": 1}))
+
+    def test_a_missing_file_is_a_candidate(self):
+        self.assertTrue(ttpf_assets.candidate(synthetic_row(File=None), None))
+
+    def test_a_lower_mip_start_or_a_partial_chain_is_a_candidate(self):
+        self.assertTrue(ttpf_assets.candidate(synthetic_row(File="000001.dds", BaseMipLevel=2), None))
+        self.assertTrue(ttpf_assets.candidate(synthetic_row(File="000001.dds", Mips=2, SourceMips=5), None))
+
+    def test_a_complete_chain_with_a_file_is_not_a_candidate(self):
+        self.assertFalse(ttpf_assets.candidate(synthetic_row(File="000001.dds", Mips=5, SourceMips=5), None))
+
+
+class ProfileRules(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = Path(tmp.name)
+
+    def write(self, text):
+        (self.work / "bcpack-calibration.json").write_text(text, encoding="utf-8")
+
+    def test_missing_calibration_is_the_strict_profile(self):
+        self.assertEqual(ttpf_assets.load_profile(self.work), ("v1-strict", None))
+
+    def test_another_calibration_version_is_an_error(self):
+        self.write(json.dumps({"version": 2}))
+        with self.assertRaises(ValueError):
+            ttpf_assets.load_profile(self.work)
+
+    def test_a_non_object_calibration_is_an_error(self):
+        self.write("[]")
+        with self.assertRaises(ValueError):
+            ttpf_assets.load_profile(self.work)
+
+    def test_malformed_json_is_an_error(self):
+        self.write("{")
+        with self.assertRaises(ValueError):
+            ttpf_assets.load_profile(self.work)
+
+
+class CompletePoolEarlyReturn(unittest.TestCase):
+    def test_a_matching_pass_stamp_returns_before_opening_the_pool(self):
+        manifest = {"BCPackPass": "v1-deadbeef", "Textures": [synthetic_row()]}
+        with mock.patch.object(ttpf_assets, "publish") as publish, \
+                mock.patch.object(ttpf_assets.ttpf, "Pool") as pool:
+            self.assertEqual(ttpf_assets.complete_pool("missing.rpf", "/tmp/out", manifest, ("v1-deadbeef", None)),
+                             (0, 0))
+        publish.assert_not_called()
+        pool.assert_not_called()
+
+    def test_no_candidates_returns_before_opening_the_pool(self):
+        manifest = {"BCPackPass": "v1-new",
+                    "Textures": [synthetic_row(File="000001.dds", Mips=5, SourceMips=5)]}
+        with mock.patch.object(ttpf_assets.ttpf, "Pool") as pool:
+            self.assertEqual(ttpf_assets.complete_pool("missing.rpf", "/tmp/out", manifest, ("v1-other", None)),
+                             (0, 0))
+        pool.assert_not_called()
 
 
 if __name__ == "__main__":
