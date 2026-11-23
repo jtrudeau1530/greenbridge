@@ -6389,21 +6389,30 @@ class Gen:
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
         self.cur_either = self.lane_either.get(id(ins), ())
-        if ins["op"].endswith("_dpp"):
-            return self.dpp_insn(ins)
-        if not ins["op"].endswith("_sdwa"):
-            return self._insn(ins)
-        op, mods = base_op(ins["op"]), ins["mods"]
-        kv = dict(m.split(":", 1) for m in mods if m.split(":", 1)[0] in ("src0_sel", "src1_sel", "dst_sel", "dst_unused"))
-        args = [dict(x) for x in ins["args"]]
-        first = 0 if op.startswith("v_cmpx") else 1
-        for i, key in enumerate(("src0_sel", "src1_sel")):
-            j = first + i
-            if j < len(args) and (kv.get(key, "DWORD") != "DWORD" or args[j].get("sext")):
-                args[j]["sdwa_sel"] = kv.get(key, "DWORD")
-        if not op.startswith("v_cmp") and args:    # DWORD too: a 16-bit result then zeroes the high half (write_lo16)
-            args[0]["sdwa_dst"] = (kv.get("dst_sel", "DWORD"), kv.get("dst_unused", "UNUSED_PAD"))
-        return self._insn({**ins, "args": args})
+        try:
+            if ins["op"].endswith("_dpp"):
+                return self.dpp_insn(ins)
+            if not ins["op"].endswith("_sdwa"):
+                return self._insn(ins)
+            op, mods = base_op(ins["op"]), ins["mods"]
+            kv = dict(m.split(":", 1) for m in mods if m.split(":", 1)[0] in ("src0_sel", "src1_sel", "dst_sel", "dst_unused"))
+            args = [dict(x) for x in ins["args"]]
+            first = 0 if op.startswith("v_cmpx") else 1
+            for i, key in enumerate(("src0_sel", "src1_sel")):
+                j = first + i
+                if j < len(args) and (kv.get(key, "DWORD") != "DWORD" or args[j].get("sext")):
+                    args[j]["sdwa_sel"] = kv.get(key, "DWORD")
+            if not op.startswith("v_cmp") and args:    # DWORD too: a 16-bit result then zeroes the high half (write_lo16)
+                args[0]["sdwa_dst"] = (kv.get("dst_sel", "DWORD"), kv.get("dst_unused", "UNUSED_PAD"))
+            return self._insn({**ins, "args": args})
+        except (IndexError, TypeError):
+            # A line with no operands (hand-written input only: LLVM always prints them) fails the first
+            # operand read with IndexError, or TypeError where v_cmpx pads the source list with a None that
+            # never met a real operand. Report it as a rejection, not a translator error. With at least one
+            # operand printed either is internal and stays one.
+            if any(a is not None for a in ins["args"]):
+                raise
+            raise Unsupported(ins["op"] + ": no operands") from None
 
     def sdwa_src(self, v, a):
         off, width = self.SDWA_SEL[a["sdwa_sel"]]
