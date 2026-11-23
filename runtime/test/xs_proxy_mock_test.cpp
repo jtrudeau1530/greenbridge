@@ -96,6 +96,7 @@ struct Mock {
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
+    unsigned view_heap_limit;  // device: refuses a larger shader-visible CBV/SRV/UAV heap (0: no limit), as native D3D12
     Mock* last_child;        // device: the object its last creation or open made
     Mock* device10_alias;    // device: when set, QueryInterface(ID3D12Device10) answers this object, not itself
     UINT64 allocation_size;  // device: what GetResourceAllocationInfo (slot 25) answers
@@ -299,7 +300,14 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1) std::memcpy(&m->queue_desc, reinterpret_cast<const void*>(a1), sizeof(m->queue_desc));
                 return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
-            case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));      // CreateDescriptorHeap
+            case 14:                                                         // CreateDescriptorHeap(desc, riid, out)
+                if (const auto* d = reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1)) {
+                    m->array[14][m->calls[14] > 1 ? 1 : 0] = d->NumDescriptors;   // first and latest request
+                    if (m->view_heap_limit && d->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+                        (d->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && d->NumDescriptors > m->view_heap_limit)
+                        return static_cast<std::uint32_t>(E_INVALIDARG);
+                }
+                return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));
             case 15: return kMockDescriptorInc;                                                  // GetDescriptorHandleIncrementSize
             case 23:                                                                             // CopyDescriptors
                 copy_array(m, 23, a2, a1);                                                       // dest starts
@@ -2563,6 +2571,45 @@ static void no_dialogs() {
     SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 }
 
+// Slot 14: the title's 1,245,184-descriptor shader-visible CBV/SRV/UAV heap. A device that makes it (the Vulkan
+// device has no limit) keeps the full size. A device that refuses it, as native D3D12 does past
+// MaxViewDescriptorHeapSize (the mock reports none, so 1,000,000), gets a second request at that limit. CPU-only
+// heaps and heaps within the limit are passed through once, as asked.
+int check_view_heap_cap() {
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    void* made = nullptr;
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1245184,
+                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, 0, false);   // no view-heap limit
+        EXPECT(device);
+        raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+        EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 1245184);   // not capped when the device takes it
+        EXPECT(release(device) == 0);
+    }
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, false);
+    EXPECT(device);
+    mock->view_heap_limit = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
+    raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    EXPECT(mock->calls[14] == 2 && mock->array[14][0] == 1245184 &&
+           mock->array[14][1] == D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2);   // refused, then at the limit
+    EXPECT(heap.NumDescriptors == 1245184);   // the title's description is left as it was
+    mock->calls[14] = 0;
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 1245184);   // CPU-only: no limit, one request
+    mock->calls[14] = 0;
+    heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 4096);   // within the limit: one request, unchanged
+    EXPECT(release(device) == 0);
+    std::printf("%s: a view heap the device refuses past its limit is made again at the limit; one it takes is kept "
+                "at full size\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -2579,7 +2626,8 @@ int main(int argc, char** argv) {
         check_render_target_sizes() || check_allocation_descriptions_cleaned() || check_render_target_layout() ||
         check_xbox_slots() || check_xbox_queue_slots() || check_custom_heap_properties() || check_slot70() ||
         check_slot70_raw_buffer() || check_descriptor_heap_hooks() || check_committed_resource3_x() ||
-        check_committed_resource3_xmem_hook() || check_committed_buffers_on_xmem() || check_slot74())
+        check_committed_resource3_xmem_hook() || check_committed_buffers_on_xmem() || check_slot74() ||
+        check_view_heap_cap())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
