@@ -539,9 +539,70 @@ def find_dumps(containers: list | None = None) -> list:
     return list(found.values())
 
 
+PICK_TITLE = "Choose the folder that holds MicrosoftGame.Config"
+PICK_UNSUPPORTED = ("That folder isn't a supported version of the game. Choose the folder that holds "
+                    "MicrosoftGame.Config and the .rpf archives.")
+
+
+def native_picker():
+    """The desktop's own folder dialog on Linux and the BSDs, where Tk's is a bare one of its own: kdialog on
+    KDE, zenity elsewhere (GNOME and the rest), either one when only that one is installed. Returns
+    (tool, path) or None: on Windows and macOS Tk already opens the system dialog, and with no display there
+    is nothing to open."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return None
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return None
+    kde = "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+    for tool in (("kdialog", "zenity") if kde else ("zenity", "kdialog")):
+        exe = shutil.which(tool)
+        if exe:
+            return tool, exe
+    return None
+
+
+def native_ask(tool: str, exe: str, start: str) -> str:
+    """One folder dialog from `tool`: the chosen folder, or "" on cancel. OSError when the tool itself fails."""
+    if tool == "kdialog":
+        cmd = [exe, "--title", "Leonida", "--getexistingdirectory", start]
+    else:
+        cmd = [exe, "--file-selection", "--directory", "--title=" + PICK_TITLE,
+               "--filename=" + os.path.join(start, "")]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    if r.returncode == 1:       # both tools: the dialog was cancelled or closed
+        return ""
+    if r.returncode != 0:
+        raise OSError(f"{tool} exited with {r.returncode}")
+    return r.stdout.strip("\r\n")
+
+
+def native_warn(tool: str, exe: str, msg: str) -> None:
+    cmd = ([exe, "--title", "Leonida", "--sorry", msg] if tool == "kdialog"
+           else [exe, "--warning", "--title=Leonida", "--text=" + msg])
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def pick_game() -> str:
     """--pick: choose the game folder in the system's folder dialog. Asks again until the folder is a supported
     version; cancelling stops the build."""
+    native = native_picker()
+    if native:
+        start = os.path.expanduser("~")
+        try:
+            while True:
+                d = native_ask(*native, start)
+                if not d:
+                    fail("No folder chosen: choose one with --pick or --game.")
+                d = os.path.normpath(d)
+                v = match_version(d)
+                if v:
+                    log(f"chose {v['title']} {v['version']} in {d}")
+                    return d
+                notes = "".join(f"\n\n{container_message(p, h)}" for p, h in containers_in(d))
+                native_warn(*native, PICK_UNSUPPORTED + notes)
+                start = d           # open the next dialog where the last one left off
+        except OSError as e:        # the tool is there but won't run (no portal, broken install): try Tk
+            log(f"the {native[0]} folder dialog couldn't open ({e}); using Tk's")
     try:
         import tkinter
         from tkinter import filedialog, messagebox
@@ -552,8 +613,7 @@ def pick_game() -> str:
     root.attributes("-topmost", True)
     try:
         while True:
-            d = filedialog.askdirectory(parent=root, mustexist=True,
-                                        title="Choose the folder that holds MicrosoftGame.Config")
+            d = filedialog.askdirectory(parent=root, mustexist=True, title=PICK_TITLE)
             if not d:
                 fail("No folder chosen: choose one with --pick or --game.")
             d = os.path.normpath(d)
@@ -562,9 +622,7 @@ def pick_game() -> str:
                 log(f"chose {v['title']} {v['version']} in {d}")
                 return d
             notes = "".join(f"\n\n{container_message(p, h)}" for p, h in containers_in(d))
-            messagebox.showwarning("Leonida", "That folder isn't a supported version of the game. Choose the "
-                                   "folder that holds MicrosoftGame.Config and the .rpf archives." + notes,
-                                   parent=root)
+            messagebox.showwarning("Leonida", PICK_UNSUPPORTED + notes, parent=root)
     finally:
         root.destroy()
 
