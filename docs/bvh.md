@@ -386,8 +386,8 @@ it to return `S_OK`. It decodes standard DXGI vertex and index formats only, and
 geometry index the leaves use; fewer makes it read past the array.
 
 **The packing (completes §3.1).** A CPU model that reads the dehydrated stream as below writes the same bytes as the
-library on the 8 samples whose geometry is identified (0 differing bytes; 384 to 2,512,512 bytes per structure, 2 to
-21,814 leaves).
+library on the 8 samples whose geometry was identified first (0 differing bytes; 384 to 2,512,512 bytes per
+structure, 2 to 21,814 leaves). The other two were identified later (below) and have not been run through the library.
 
 * *Elements* start at `offsetToElements`, in chunks of 2,048 leaves at a 128 KiB stride. A chunk is five arrays,
   one entry per leaf: geometry index (3 bytes), flags (1 byte), base primitive (3 bytes), second primitive (3 bytes,
@@ -443,14 +443,18 @@ Roots:
   compared with stored values alone.
 
 **The instance transform.** The 3x4 at descriptor `+0x50` is applied to the geometry, `x' = M * x`, before the BLAS
-is built. The samples carry the identity or an axis-aligned 90-degree rotation. Without it, most leaves of the
+is built. The samples carry the identity or a rotation that permutes the axes: 4 of the 10, three of them a
+90-degree turn about one axis and one a 180-degree turn about a diagonal. Without it, most leaves of the
 rotated samples fall outside `sceneBounds` (175 of 181 and 207 of 273); with it, none do. The transposed matrix does
 not fit.
 
 **Where the triangles come from.** A leaf's geometry index is a position in the geometry list of a drawable's
-primary-LOD model in `levels.rpf`, counting only the geometries whose shader the BVH keeps. On the 8 BLAS whose
-drawable is a single resource, a geometry is left out exactly when its shader is one of two shaders: 48 geometries,
-8 distinct shaders, no exception. The two name hashes stay out of this repository (§8). They are the shader-group
+primary-LOD model in `levels.rpf`, counting only the geometries whose shader the BVH keeps. Over the 10 samples a geometry
+is left out exactly when its shader is one of a set of shaders: the 65 geometries left out use 7 shader hashes, the
+67 kept use 8 others, and no hash is in both. Two of the 7 cover 54 of the 65; the other five occur only in the two
+drawables that hold decals and baked room dressing. (On the 8 samples identified first, the skipped geometries were
+read as using only two shaders; the decals drawable among them skips geometries of all 7.) The hashes stay out of
+this repository (§8). They are the shader-group
 hashes (first word of the shader record; shader group at drawable `+0x10`, pointer array at group `+0x10`, `u16`
 count at `+0x18`, shader index per geometry in the model's `u16` array at `+0x20`) that only skipped geometries
 carry, so any identified BLAS that skips a geometry lets a user recover them locally. The positions in the samples
@@ -472,12 +476,74 @@ the library agree on any input. These checks use what the dehydrated stream reco
    test needs no positions.
 
 With these, 8 of the 10 BLAS each have exactly one matching drawable among all candidates of their triangle-count
-signature (up to 467), and the library output equals the model on all 8. The other two are interior rooms that
-aggregate props from several drawables in room-local coordinates: test 4 finds three of their pieces exactly, but
-placing them needs the interior's entity list (`CMloArchetypeDef`, see #1981), which the BLAS does not store.
+signature (up to 467 in that first pass), and the library output equals the model on all 8.
 
-**Open:** what the two excluded shaders are; the placement of aggregated rooms; whether the runtime rehydrates
-these packs at all (above).
+**None of the 10 is an aggregated room (ASSET-322).** Two of them were first read as interior rooms that aggregate
+props from several drawables, in room-local coordinates. They are not: every one of the 10 is one drawable, built
+the same way, as the window measurement in §7 also found. The 10 are the first 10 BVH streams of `core_bvh4.rpf`
+(archive offsets 69,728 to 720,992). Re-measured on a `rpf9dump models` export of the whole `levels.rpf` (343,327
+models, with the per-geometry counts that `bvh_match.py` needs), each has exactly one consistent drawable, and all 10
+drawables belong to one interior:
+
+| leaves | what the drawable is | geometries kept / in the model | triangles kept / in the model | candidates | outside, gap, overrides |
+|---:|---|---|---|---:|---|
+| 181 | room shell | 3 / 3 | 350 / 350 | 69 | 0, 1.4e-7, 0 / 0 |
+| 21,814 | ceiling dressing | 12 / 13 | 37,088 / 37,090 | 1 | 0, 4.2e-8, 335 / 0 |
+| 273 | fitting | 3 / 7 | 542 / 980 | 21 | 0, 1.7e-7, 0 / 0 |
+| 1,844 | ceiling panels | 7 / 8 | 3,352 / 3,440 | 1 | 0, 1.4e-7, 69 / 0 |
+| 2 | light proxy | 1 / 1 | 2 / 2 | 17 (interior only) | 0, 0, 0 / 0 |
+| 138 | decals | 2 / 35 | 236 / 1,965 | 848 | 0, 4.2e-8, 2 / 0 |
+| 62,479 | room dressing (props baked into one model) | 29 / 42 | 113,165 / 123,175 | 1 | 0, 4.0e-8, 1,328 / 0 |
+| 566 | decals | 3 / 12 | 1,127 / 2,173 | 37 | 0, 0, 0 / 0 |
+| 1,700 | room dressing | 6 / 10 | 3,242 / 3,426 | 1 | 0, 4.7e-8, 23 / 0 |
+| 103 | suspended ceiling | 1 / 1 | 201 / 201 | 4,173 | 0, 4.7e-8, 0 / 0 |
+
+"Candidates" are the (drawable, model) pairs whose geometry counts contain the BLAS's signature; one of them passes
+the checks. The 2-triangle light proxy matches every geometry of two triangles in the archive, so it was checked
+against the 141 drawables of the interior's 143 archetypes that the export holds. The kept geometries are an ordered
+subsequence of the model's list (the 62,479-leaf BLAS keeps geometries 0-22, 33-36, 38 and 41).
+
+Which two were the "aggregated rooms" follows from the counts. The 8 matched first span 2 to 21,814 leaves, so one was
+the 62,479-leaf BLAS, which skips 13 geometries. The 10 skip 65 in all and the first 8 skipped 48, so the other one
+skips 4: the 273-leaf or the 1,700-leaf BLAS. The 273-leaf one is in the rotation test above, so its geometry was
+known, and the second was the 1,700-leaf one. Rehydrated with `bvh_rehydrate.py`, both pass `xdxr_bvh.py validate`
+apart from children wider than the slot that points at them: 1,310 and 27 such slots, where they store 1,328 and 23 box
+overrides. The 21,814-leaf BLAS, which the library reproduces byte for byte, gives 282 such reports for its 335
+overrides: a stored override tightens the slot below its child's own box.
+
+**Placement comes from the interior, not from the BLAS.** The 10 drawables are entities of one interior archetype
+(`CMloArchetypeDef`, read with the interior reader of #1981, not merged yet). It has 242 entities: 11 in its base
+list and the others in three entity sets of 2, 77 and 152. 3 of the 10 are in the base list, 4 in the 77-entity set
+and 3 in the 152-entity set. The instance's `defaultEntitySets` lists the 152-entity set and the 2-entity one, not the
+77-entity set, so 4 of the 10 BLAS belong in the scene only while that set is active. The interior is placed once in
+the map (`CMloInstanceDef`). The join from drawable to entity is the joaat of the drawable's name; each of the 10
+entities' 64-bit `key` is also the Murmur3 key of that name (measured here; #3813 measured the same rule on
+`CMloArchetypeDef` keys). The descriptor's key at `+0x40` is not, nor the joaat or Murmur3 of the drawable name, so
+the BLAS does not name its entity.
+
+A BLAS's `sceneBounds` are in the space of its descriptor transform `M` (`x' = M * x`, above), so the BLAS sits in
+interior space at `E * M^-1`, with `E` the entity's translation and rotation (the conjugate of the stored quaternion,
+as for map entities). `M` is a rotation in all 10, so `M^-1 = M^T`. Mapped that way, the eight corners of each of the
+10 `sceneBounds` lie inside the interior's `bbMin`/`bbMax` (0 m outside), and their union reaches the interior's top
+exactly (3.459 m). This is a weak test: the interior box probably comes from its entities, 9 of the 10 entities have
+the identity rotation, and with the stored quaternion the one turned 90 degrees about z ends only 1.6 cm outside. A
+TLAS instance for one of these BLAS would therefore be `I * E * M^-1`, with `I` the interior instance's transform;
+its world-to-object record would also fold in the leaf frame (`compressionParams`), as the console's `LoadInstances`
+does in #4011 (open). That the game builds its instances this way is not observed.
+
+**The descriptor key (`+0x40`).** Over all 269,106 single-BLAS descriptors of `core_bvh4.rpf` and the BVH stream
+after each (the 235,533 distinct keys of §3.2; the descriptors that group several BLAS, #4199, are not counted here),
+2,873 keys occur more than once, 33,573 repeats in all, one key 3,198 times. A key always comes with
+the same transform, and with the same BLAS header (sizes, bounds, `crc32`) in all but one case: a 3-leaf BLAS seen 4
+times under one key, with the same sizes and bounds each time and a different `crc32` in one of the four. The
+converse fails: 1,008 (BLAS header, transform) pairs occur under more than one key, up to 60 keys. So distinct keys
+can share both the BLAS and its transform: the key identifies something finer than that pair. What it hashes is open;
+#4199 (open) finds no more matches between these keys and the values of the table descriptors than chance gives.
+
+**Open:** what decides the set of shaders whose geometries the BVH leaves out (7 hashes over these samples); what
+the descriptor key at `+0x40` hashes; how the game picks the entity of a BLAS when the BLAS does not name it (the
+drawable match does it here); whether the game composes TLAS instances as `I * E * M^-1`; whether the runtime
+rehydrates these packs at all (above).
 
 ## 5. Cross-check of the small packs
 
@@ -550,7 +616,7 @@ shared pack it reports 1,233 + 4 instance descriptors (1,233 + 8 BLAS tied) and 
 
 `tools/bvh_rehydrate.py` (standard library only) turns a dehydrated BLAS back into the runtime layout on the CPU,
 from float3 vertices, `uint16`/`uint32` or no indices and an optional 3x4 geometry transform, following the packing
-in §4a. On the 8 measured samples whose geometry is identified, its output is byte-identical to what
+in §4a. On the 8 samples whose geometry was identified first, its output is byte-identical to what
 `XboxBvhBuilder.dll`'s `RehydrateRaytracingAccelerationStructureX` writes (384 to 2,512,512 bytes per structure). It
 is the reference for checking the builder's `Box16Rehydration`, `Box32Rehydration` and `LeafRehydration` programs on
 a GPU ([embedded_shaders.md](embedded_shaders.md)). Its tests are synthetic.
@@ -569,7 +635,7 @@ python -I tests/test_bvh_rehydrate.py
 `tools/bvh_geometry_check.py` says whether the geometry given to a rehydration is the geometry the BLAS was built
 from, using what the dehydrated stream stores (§4a): leaves inside and equal to `sceneBounds`, stored box overrides
 consistent with the rehydrated slots, and paired leaves sharing an edge in the index buffer, which needs no positions.
-On the 8 samples the right geometry passes every check and a wrong decode fails (175 of 181 leaves outside, or 11 of
+On the 10 samples the right geometry passes every check and a wrong decode fails (175 of 181 leaves outside, or 11 of
 23 overrides inconsistent).
 
 ```powershell
@@ -607,7 +673,7 @@ export rather than a second decoder. It reads the leaf signature (triangles per 
 primitives counting as two), keeps every (drawable, model) of a `rpf9dump models` manifest whose per-geometry triangle
 counts contain that signature as an ordered subsequence, and checks the survivors with
 `tools/bvh_geometry_check.py` from the model's exported OBJ and the 3x4 at `+0x50` of the instance descriptor. The
-geometries of the two shaders the BVH leaves out are filtered with `--skip-shaders`: those name hashes are game data,
+geometries of the shaders the BVH leaves out are filtered with `--skip-shaders`: those name hashes are game data,
 as §4a says, so the rule is off unless the user passes them. A geometry whose shader index the manifest cannot resolve
 keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
 `levels.rpf` cut at 3 GB (exported as a whole slice): 1,228 models, 1 to 374 candidates from the signature per BLAS,
@@ -621,7 +687,7 @@ from its own compression blocks; a sub-range is never written to the index cache
 ```powershell
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
 dotnet tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll models <levels.rpf> <out> --start 3221225472 --length 1073741824
-python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--skip-shaders H,H]
+python -I tools/bvh_match.py <dehydrated.bin> <out>/levels/models/manifest.json --descriptor <instance208.bin> [--skip-shaders H,H,...]
 python -I tests/test_bvh_match.py
 ```
 
@@ -637,10 +703,10 @@ repository:
 4. `tools/bvh_rehydrate.py` on the same stream with those buffers and `--transform` gives the runtime layout,
    byte-identical to what `XboxBvhBuilder.dll` writes on these samples (§4a).
 
-With the two excluded shader hashes the run answers with one consistent candidate per sample; without them every
+With the excluded shader hashes the run answers with one consistent candidate per sample; without them every
 candidate is checked and the checks decide. Measured on the window above: 1,228 models in the export, 1 to 374
 candidates from the signature per sample, and a rehydrated structure of `64 * (totalSizeIn64BNodes + 1)` bytes from
-the header. Its root parent-table entry is `0xFFFFFFFF` in all eight identified samples (the entry at
+the header. Its root parent-table entry is `0xFFFFFFFF` in all eight samples identified first (the entry at
 `offsetToParents` read signed, plus `4 * ((root - offsetToElements) / 64)`), which is what the GPU builder writes
 for a root and what `tools/xdxr_bvh.py validate` requires since #2625.
 
