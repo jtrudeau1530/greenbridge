@@ -26,12 +26,14 @@ import bvh_tri_probe as probe  # noqa: E402
 import test_image_bvh_tri_hw as table  # noqa: E402  (the measured words; a module, so no test class is collected twice)
 from hw_oracle import asm as hw_asm, runner as hw_runner  # noqa: E402
 
-# sha256 of the lines of three kernels: the text the RX 6800 ran (the module the in-tree asm.module_text builds from
+# sha256 of the lines of five kernels: the text the RX 6800 ran (the module the in-tree asm.module_text builds from
 # these lines hashed to the reviewed specs' module_sha256). A change to a kernel's text must be deliberate.
 PINNED = {
     "tri_g1a": "048d468da740e304d01924b1ea7a19441ae3c8be7804b2bf6e75a6f64d58ca12",
     "tri_g3b": "1cdababaf441f0f9bfdd7b5dbcdd4c4088bbe5f134e404bf2ac93607ef19013d",
     "tri_lanes_w64": "bf80be19903a096d0bbc3ac74e177b64f0202fb9ad66ac26cc4a9adda4f7def4",
+    "tri_t1": "e6fe057700dd38cb26fa1f4fde137cb385720f09c9c63a1746ef21df9a54e536",
+    "tri_t8": "6b2dfb6dd701898ba9990c31b14f077a52024a151c255a1cd04444c5cdc48c4d",
 }
 
 
@@ -83,7 +85,7 @@ class Generation(unittest.TestCase):
             if k.threads == 1:
                 got += [(k.label, c["label"], k.slots[c["slot"]], c["type"], c["ray"]) for c in k.cases]
         want = [(kn, lb, table.NODES[n] + [w15], t, list(ray)) for kn, lb, n, w15, t, ray, _ in table.ROWS]
-        self.assertEqual(len(got), 308)
+        self.assertEqual(len(got), 564)
         self.assertEqual(got, want)
         for kn, lb, n, w15, t, ray, _ in table.LANE_ROWS:
             label, lane = lb.rsplit(", lane ", 1)
@@ -166,7 +168,7 @@ class HardwarePath(unittest.TestCase):
         single = [k for k in ks.values() if k.threads == 1]
         o = FakeOracle(ks)
         rows, bad = probe.compare(single, None, probe.run_hw(single, o, hw_asm))
-        self.assertEqual((len(rows), bad), (308, 0))
+        self.assertEqual((len(rows), bad), (564, 0))
         self.assertEqual(o.calls, [1] * len(single))                  # one kernel per dispatch
 
     def test_a_different_word_is_a_mismatch(self):

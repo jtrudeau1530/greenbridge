@@ -1,8 +1,9 @@
 r"""Measure the triangle step of image_bvh_intersect_ray / image_bvh64_intersect_ray natively on RDNA2 (node types 0-3).
 
 Builds the kernels of the RX 6800 measurement behind docs/design.md's Ray tracing row (and the rows of
-tests/semantic/test_image_bvh_tri_hw.py): 14 raw kernels for tools/hw_oracle, 308 single-lane cases and 7 cases on 64
-lanes. Each kernel writes hand-built 64-byte triangle nodes into the oracle's buffer and traces every case in both
+tests/semantic/test_image_bvh_tri_hw.py): 22 raw kernels for tools/hw_oracle, 564 single-lane cases and 7 cases on 64
+lanes (the 14 kernels of #4202, then the 8 tie kernels tri_t1..tri_t8: rays exactly on an edge or a vertex with x, y
+or z dominant, both windings and both signs of d[kz], and equal |d| components). Each kernel writes hand-built 64-byte triangle nodes into the oracle's buffer and traces every case in both
 forms: image_bvh_intersect_ray (32-bit node id, descriptor base = the node region) and image_bvh64_intersect_ray
 (descriptor base 0, the 64-bit address as the id). The four words of each are compared with the measured rule
 (rule_words below), with the translator (tools/rdna2spirv.py run on tests/semantic/spirv_mini_interp.py) and with
@@ -569,8 +570,153 @@ def g5_lanes(wave):
     return k
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# the tie cases (port of the measurement's ties/gen_ties.py and gen_bridge.py, the kernels tri_t1..t8 that ran): rays
+# exactly on an edge or a vertex with x, y or z dominant, both windings, both signs of d[kz], and equal |d|
+# components. Every kernel holds 32 cases, case i on its own slot i.
+# ---------------------------------------------------------------------------------------------------------------------
+TIE_SHARED = [("E01 (2,1)", (2, 1), (0, 1)), ("E03 (0,1)", (0, 1), (0, 3)), ("E12 (2,2)", (2, 2), (1, 2)),
+              ("E23 (-1,2.5)", (-1, 2.5), (2, 3))]
+TIE_VERTEX = [("fan vertex s2 (0,2)", (0, 2), (0, 1, 2, 3))]
+TIE_OUTER = [("outer edge s0-s1 (2,0)", (2, 0), (0,)), ("outer vertex s0 (0,0)", (0, 0), (0,)),
+             ("outer vertex s1 (4,0)", (4, 0), (0,))]
+EQ_CLASSES = {"|dx|=|dy|>|dz|": ((0, 1), 2, 0.25), "|dx|=|dz|>|dy|": ((0, 2), 1, 0.125),
+              "|dy|=|dz|>|dx|": ((1, 2), 0, 0.125), "|dx|=|dy|=|dz|": ((0, 1, 2), None, None)}
+# the equal-|d| tie rows that ran (class, d, mirrored leaf, tie point), chosen by gen_ties.group_t4 so that every two
+# possible dominant axes give different words on some row under the two registered rules
+EQ_TIES = [("|dx|=|dy|>|dz|", (0.5, 0.5, 0.25), False, "E01 (2,1)"),
+           ("|dx|=|dy|>|dz|", (0.5, -0.5, 0.25), False, "E12 (2,2)"),
+           ("|dx|=|dy|>|dz|", (-0.5, 0.5, 0.25), True, "E03 (0,1)"),
+           ("|dx|=|dy|>|dz|", (-0.5, -0.5, 0.25), False, "fan vertex s2 (0,2)"),
+           ("|dx|=|dz|>|dy|", (0.5, 0.125, 0.5), False, "E12 (2,2)"),
+           ("|dx|=|dz|>|dy|", (0.5, 0.125, -0.5), False, "E01 (2,1)"),
+           ("|dx|=|dz|>|dy|", (-0.5, 0.125, 0.5), True, "E12 (2,2)"),
+           ("|dx|=|dz|>|dy|", (-0.5, 0.125, -0.5), False, "E03 (0,1)"),
+           ("|dy|=|dz|>|dx|", (0.125, 0.5, 0.5), False, "E01 (2,1)"),
+           ("|dy|=|dz|>|dx|", (0.125, 0.5, -0.5), True, "E03 (0,1)"),
+           ("|dy|=|dz|>|dx|", (0.125, -0.5, 0.5), False, "E01 (2,1)"),
+           ("|dy|=|dz|>|dx|", (0.125, -0.5, -0.5), False, "E12 (2,2)"),
+           ("|dx|=|dy|=|dz|", (0.5, 0.5, 0.5), False, "fan vertex s2 (0,2)"),
+           ("|dx|=|dy|=|dz|", (0.5, 0.5, -0.5), True, "E03 (0,1)"),
+           ("|dx|=|dy|=|dz|", (0.5, 0.5, -0.5), False, "E01 (2,1)"),
+           ("|dx|=|dy|=|dz|", (0.5, -0.5, 0.5), False, "fan vertex s2 (0,2)"),
+           ("|dx|=|dy|=|dz|", (-0.5, 0.5, 0.5), False, "E01 (2,1)"),
+           ("|dx|=|dy|=|dz|", (-0.5, 0.5, 0.5), True, "E03 (0,1)")]
+# measured rows of the kernels above, repeated as controls (kernel, case label)
+TIE_CONTROLS = [("tri_g1a", "TRI0 hit +z"), ("tri_g4b", "shared edge E01 (2,1), TRI1, +z"),
+                ("tri_g4b", "shared edge E01 (2,1), TRI0, +z"), ("tri_g4a", "fan vertex s2 (0,2), TRI2, -z"),
+                ("tri_g4b", "shared edge E12 (2,2), TRI2, -z"), ("tri_g1b", "TRI0 dominant +x"),
+                ("tri_g4b", "shared edge E23 (-1,2.5), TRI3, oblique +z"), ("tri_g1b", "TRI2 dominant -y"),
+                ("tri_g4a", "fan vertex s2 (0,2), TRI1, oblique +z"),
+                ("tri_g1c", "TRI1 miss beyond edge opposite v2 -z (det>0)"),
+                ("tri_g4b", "outer vertex s0 (0,0), TRI0, +z"), ("tri_g1b", "TRI0 kz tie |dx|=|dy|=|dz|"),
+                ("tri_g4b", "shared edge E03 (0,1), TRI0, -z"), ("tri_g1a", "TRI1 mirrored leaf hit +z"),
+                ("tri_g4b", "shared edge E12 (2,2), TRI1, oblique +z"), ("tri_g1b", "TRI2 dominant +x")]
+BRIDGE_CONTROLS = [("tri_g1a", "TRI1 mirrored leaf hit +z"), ("tri_g4b", "shared edge E03 (0,1), TRI0, -z"),
+                   ("tri_g4a", "fan vertex s2 (0,2), TRI2, -z"), ("tri_g4b", "shared edge E12 (2,2), TRI1, oblique +z")]
+
+
+def tie_rows(points, d, a=0.0, b=0.0, mirrored=False, rot=False, perm=None, tag=""):
+    """[(label, node, type, ray)]: the fan turned 90 degrees in its plane ((x, y) -> (-y, x)) if rot, then mirrored
+    (x -> -x, the other winding) if mirrored, lifted onto z = 3 + a x + b y, then axis-permuted (perm); a ray that
+    reaches each tie point at t = 8."""
+    def xy(p):
+        x, y = (-p[1], p[0]) if rot else p
+        return (-x, y) if mirrored else (x, y)
+    pz = lambda x, y: 3 + a * x + b * y
+    slots = [(*xy((x, y)), pz(*xy((x, y)))) for x, y, _ in FAN]
+    node = leaf(permuted(slots, perm) if perm else slots)
+    nm = ("rotated " if rot else "") + ("mirrored fan" if mirrored else "fan")
+    if a or b:
+        nm += f" on z=3{a:+g}x{b:+g}y"
+    if perm:
+        nm += f", axes cycled ({ {PX: 'z->x', PY: 'z->y'}[perm] })"
+    out = []
+    for pn, p, ts in points:
+        q = xy(p)
+        for t in ts:
+            ray = ray_at(q, d, z=pz(*q), perm=perm)
+            dd = [u2f(x) for x in ray[4:7]]
+            out.append((f"{tag}{pn}, TRI{t}, {nm}, d=({dd[0]:g},{dd[1]:g},{dd[2]:g})", node, t, ray))
+    return out
+
+
+def eq_dirs(cls):
+    tied, other, mag = EQ_CLASSES[cls]
+    signs = [(1, 1, 1), (1, 1, -1), (1, -1, 1), (-1, 1, 1)] if len(tied) == 3 else \
+        [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+    out = []
+    for sg in signs:
+        d = [0.0, 0.0, 0.0]
+        for ax, s in zip(tied, sg):
+            d[ax] = 0.5 * s
+        if other is not None:
+            d[other] = mag
+        out.append(tuple(d))
+    return out
+
+
+def tie_kernels(measured):
+    """tri_t1..t7 (x / y dominant and equal |d|) and the z bridge tri_t8. measured: the kernels above, by label."""
+    def ctl(kn, lab):
+        k = measured[kn]
+        c = next(c for c in k.cases if c["label"] == lab)
+        return (f"control {kn}: {lab}", k.slots[c["slot"]], c["type"], c["ray"])
+    body = []
+    for perm, ax in ((PX, "x"), (PY, "y")):                    # T1: perpendicular fan, x / y dominant
+        for mirrored in (False, True):
+            for d, sn in ((D_POS, "+"), (D_NEG, "-")):
+                pts = TIE_SHARED + TIE_VERTEX + ([] if (not mirrored and d == D_POS) else TIE_OUTER)
+                body += tie_rows(pts, d, mirrored=mirrored, perm=perm, tag=f"T1 {sn}{ax}: ")
+                body += tie_rows(TIE_SHARED[:1], d, mirrored=mirrored, rot=True, perm=perm, tag=f"T1 {sn}{ax}: ")
+    for ax, a, b, mirrored, d in (("x", 1.0, 0.0, False, (0.125, -0.25, 0.5)),     # T2: tilted fans, oblique rays
+                                  ("y", 1.0, 1.0, True, (-0.125, -0.25, -0.5))):
+        body += tie_rows(TIE_SHARED + TIE_VERTEX, d, a=a, b=b, mirrored=mirrored, perm={"x": PX, "y": PY}[ax],
+                         tag=f"T2 {ax}-dominant: ")
+    i = 0                                                      # T3: equal |d|, no tie
+    for cls in EQ_CLASSES:
+        tied = EQ_CLASSES[cls][0]
+        for d in eq_dirs(cls)[1::2]:
+            t = i % 4
+            i += 1
+            body.append((f"T3 {cls}: TRI{t} interior hit, fan, d=({d[0]:g},{d[1]:g},{d[2]:g})", leaf(), t,
+                         ray_at(INSIDE[t], d)))
+        if len(tied) == 2 and tied != (0, 1):
+            continue
+        d = eq_dirs(cls)[3]
+        body.append((f"T3 {cls}: TRI0 miss (at TRI1's point), fan, d=({d[0]:g},{d[1]:g},{d[2]:g})", leaf(), 0,
+                     ray_at(INSIDE[1], d)))
+    by_name = {p[0]: p for p in TIE_SHARED + TIE_VERTEX}       # T4: ties under equal |d|
+    for cls, d, mirrored, pn in EQ_TIES:
+        body += tie_rows([by_name[pn]], d, mirrored=mirrored, tag=f"T4 {cls}: ")
+    ctls = [ctl(*c) for c in TIE_CONTROLS]
+    ks, ci = [], 0
+    for n in range(-(-len(body) // 31)):
+        chunk = body[31 * n:31 * (n + 1)]
+        cs = []
+        while len(chunk) + len(cs) < 32:
+            cs.append(ctls[ci % len(ctls)])
+            ci += 1
+        ks.append((f"tri_t{n + 1}", cs[:1] + chunk + cs[1:]))
+    bridge = []                                                # tri_t8: z dominant, the cells #4202 never measured
+    for d, sn in ((D_POS, "+z"), (D_NEG, "-z")):
+        bridge += tie_rows(TIE_SHARED[:3] + TIE_VERTEX, d, mirrored=True, tag=f"T5 {sn}: ")
+        bridge += tie_rows(TIE_SHARED[:1], d, mirrored=True, rot=True, tag=f"T5 {sn}: ")
+        bridge += tie_rows(TIE_SHARED[:1], d, rot=True, tag=f"T5 {sn}: ")
+    bctl = [ctl(*c) for c in BRIDGE_CONTROLS]
+    ks.append(("tri_t8", bctl[:1] + bridge + bctl[1:]))
+    out = []
+    for label, rows in ks:
+        k = Kernel(label)
+        for lab, node, t, ray in rows:
+            k.add_case(lab, k.add_node(node), t, ray)
+        out.append(k)
+    return out
+
+
 def build_kernels():
-    """The 14 kernels of the measurement, in the order of tests/semantic/test_image_bvh_tri_hw.py."""
+    """The 22 kernels of the two measurements (14 of #4202, then the tie cases tri_t1..t8), in the order of
+    tests/semantic/test_image_bvh_tri_hw.py."""
     for t, p in INSIDE.items():                  # each interior point is inside its own triangle only
         w = bary([FAN[s][:2] for s in VSLOTS[t]], p)
         assert all(x > 0 for x in w) and len(set(w)) == 3, (t, w)
@@ -579,6 +725,7 @@ def build_kernels():
                 assert min(bary([FAN[s][:2] for s in VSLOTS[u]], p)) < 0, (t, u)
     ks = [g1(), g1("_nsa", nsa=True), g1("_w64", wave=64), g1b(), g1c(), *g2(), *g3(), *g4(), g5_lanes(32),
           g5_lanes(64)]
+    ks += tie_kernels({k.label: k for k in ks})
     for k in ks:
         check_kernel(k)
     return ks
@@ -617,7 +764,9 @@ def rule_words(node, ntype, ray):
     then carry |d[kz]|^2, and T'' = U A[kz] + V B[kz] + W C[kz] carries sign(d[kz]) |d[kz]|^3 T, so the words are
     k (T, det, b_i, b_j) with k = |d[kz]|^3: (sign(d[kz]) T'', |d[kz]| det, |d[kz]| b_i, |d[kz]| b_j). A miss puts
     copysign(inf, word 1) in word 0. Every zero is +0 and every NaN 0xFFC00000. A NaN anywhere in the ray, or an
-    infinite origin, gives (inf, 1, 0, 0). The supplied inverse direction is read only for that NaN check."""
+    infinite origin, gives (inf, 1, 0, 0). The supplied inverse direction is read only for that NaN check. An edge
+    P -> Q whose edge function is exactly 0 counts as inside when, with (tx, ty) = Q - P in the sheared frame with the
+    d[kz] < 0 swap undone, ty == 0 ? sign(det) tx > 0 : sign(d[kz]) sign(det) ty > 0."""
     tmax = u2f(ray[0])
     o, d, inv = ([u2f(x) for x in ray[a:a + 3]] for a in (1, 4, 7))
     if any(math.isnan(x) for x in [tmax] + o + d + inv) or any(math.isinf(x) for x in o):
@@ -652,7 +801,9 @@ def rule_words(node, ntype, ray):
             if x != 0:
                 return x * sg > 0               # False for a NaN
             tx, ty = q[0] - p[0], q[1] - p[1]
-            return tx < 0 if ty == 0 else sg * ty > 0
+            if s < 0:                           # in the frame with the kx/ky swap of d[kz] < 0 undone
+                tx, ty = ty, tx
+            return sg * tx > 0 if ty == 0 else s * sg * ty > 0
         a2, b2, c2 = (ax, ay), (bx, by), (cx, cy)
         hit = passes(U, b2, c2) and passes(Vv, c2, a2) and passes(W, a2, b2) and sg * w[0] >= 0
     out = [0xFFC00000 if x != x else 0 if x == 0 else f2u(x) for x in w]
@@ -786,7 +937,7 @@ def compare(kernels, tr, hw):
 def self_test():
     ks = build_kernels()
     single = sum(len(k.cases) for k in ks if k.threads == 1)
-    assert single == 308 and [len(k.cases) for k in ks if k.threads == 64] == [7, 7], single
+    assert single == 564 and [len(k.cases) for k in ks if k.threads == 64] == [7, 7], single
     assert len({k.uid for k in ks}) == len(ks)
     for k in ks:                                  # a box node, type 6/7 or a free node id cannot be added
         for bad in (lambda: k.add_case("x", 0, 5, [0] * 10), lambda: k.add_case("x", 31, 0, [0] * 10)):
