@@ -273,6 +273,7 @@ def verify_manifest(
     total_pending_files = len(pending)
     completed_files = 0
     completed_bytes = 0
+    bytes_verified = 0
     t0 = time.time()
 
     def hash_worker(rel: str, abs_p: str, size: int, expected_hash: str) -> tuple[str, int, str, Optional[str]]:
@@ -285,9 +286,11 @@ def verify_manifest(
             return rel, size, "UNREADABLE", str(err)
 
     def on_file_done(rel: str, size: int, status: str, err_msg: Optional[str]) -> None:
-        nonlocal completed_files, completed_bytes
+        nonlocal completed_files, completed_bytes, bytes_verified
         completed_files += 1
         completed_bytes += size
+        if status != "UNREADABLE":
+            bytes_verified += size
         if status != "OK":
             problems[rel] = status
             if status == "UNREADABLE" and err_msg:
@@ -363,7 +366,7 @@ def verify_manifest(
         unreadable=unreadable,
         untracked=untracked,
         problems={rel: problems[rel] for rel in sorted(problems.keys())},
-        bytes_verified=completed_bytes,
+        bytes_verified=bytes_verified,
         elapsed_seconds=elapsed_total,
         strict=strict,
     )

@@ -436,19 +436,36 @@ class TestManifestVerifier(unittest.TestCase):
         self.assertTrue(any("[" in line for line in stream_output.splitlines()))
 
     def test_unreadable_file_graceful_handling(self) -> None:
-        # Simulate unreadable file by patching sha256_file to raise OSError
-        def mock_sha(path: str, chunk_size: int = mv.CHUNK, *, expected_size: int | None = None) -> str:
-            if "alpha.bin" in path:
-                raise OSError("Simulated permission denied")
-            with open(path, "rb") as f:
-                return hashlib.sha256(f.read()).hexdigest()
+        hash_file = mv.sha256_file
 
-        with patch("tools.manifest_verifier.sha256_file", side_effect=mock_sha):
-            report = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
-            self.assertFalse(report.passed)
-            self.assertEqual(report.problems.get("alpha.bin"), "UNREADABLE")
-            self.assertEqual(len(report.unreadable), 1)
-            self.assertEqual(report.unreadable[0][0], "alpha.bin")
+        def mock_sha(path: str, *, expected_size: int | None = None) -> str:
+            if os.path.basename(path) == "alpha.bin":
+                raise OSError("Simulated permission denied")
+            return hash_file(path, expected_size=expected_size)
+
+        # Change exactly one byte so bravo reaches hashing and reports CHANGED.
+        with open(os.path.join(self.game_dir, "bravo.bin"), "r+b") as f:
+            f.write(bytes([self.payloads["bravo.bin"][0] ^ 1]))
+
+        scheduled_bytes = sum(SYNTHETIC_SIZES.values())
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                events = []
+                with patch.object(mv, "sha256_file", side_effect=mock_sha):
+                    report = mv.verify_manifest(
+                        self.game_dir, self.manifest_path, jobs=jobs, progress_callback=events.append
+                    )
+                self.assertFalse(report.passed)
+                self.assertEqual(report.unreadable, [("alpha.bin", "Simulated permission denied")])
+                self.assertEqual(report.hash_mismatch, ["bravo.bin"])
+                self.assertEqual(set(report.matched), set(SYNTHETIC_SIZES) - {"alpha.bin", "bravo.bin"})
+                self.assertEqual(report.problem_count, 2)
+                self.assertEqual(events[-1].completed_files, len(SYNTHETIC_SIZES))
+                self.assertEqual(events[-1].completed_bytes, scheduled_bytes)
+                self.assertEqual(events[-1].pct, 1.0)
+                verified_bytes = scheduled_bytes - SYNTHETIC_SIZES["alpha.bin"]
+                self.assertEqual(report.bytes_verified, verified_bytes)
+                self.assertEqual(report.to_dict()["bytes_verified"], verified_bytes)
 
     def test_empty_manifest_and_zero_byte_file(self) -> None:
         zero_p = os.path.join(self.game_dir, "empty.bin")
