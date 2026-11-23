@@ -1438,6 +1438,28 @@ def dds_to_png_bytes(
     return _preview_png(_decode_dds(data, mip=mip, layer=layer, face=face, z=z), max_size)
 
 
+def read_half_texel(path: str, *, x: int, y: int, mip: int = 0, layer: int = 0,
+                    z: int = 0) -> dict[str, str]:
+    """Return exact stored channel values as text, including signed zero and nonfinite values."""
+    with open(path, "rb") as source:
+        info = parse_dds_header(_read_header(source))
+        fmt = info["format"]
+        if fmt not in _HALF_FLOAT_LAYOUT:
+            raise DdsError(f"Expected a half-float DDS, got {fmt}")
+        stride, channels = _HALF_FLOAT_LAYOUT[fmt]
+        plane = _locate_plane(info, mip=mip, layer=layer, z=z)
+        if (type(x) is not int or not 0 <= x < plane.width or
+                type(y) is not int or not 0 <= y < plane.height):
+            raise DdsError("Texel outside the selected mip")
+        if plane.offset + plane.byte_length > source.seek(0, os.SEEK_END):
+            raise DdsError("Truncated DDS plane")
+        source.seek(plane.offset + y * plane.row_pitch + x * stride)
+        raw = source.read(stride)
+        if len(raw) != stride:
+            raise DdsError("Truncated DDS texel")
+    return dict(zip("RGBA", map(str, struct.unpack(f"<{channels}e", raw))))
+
+
 def dds_file_to_png_bytes(
     path: str, max_size: int = 0, *, mip: int = 0, layer: int = 0, face: str | None = None, z: int = 0,
 ) -> bytes:

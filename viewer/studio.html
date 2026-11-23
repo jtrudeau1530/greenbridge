@@ -335,6 +335,8 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
   align-items: center;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
+#dds-controls:not(:empty) { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 8px 16px; }
+#dds-controls input { width: 5em; }
 .modal-body {
   padding: 16px;
   display: flex;
@@ -441,6 +443,7 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
       <span id="modal-title" style="font-size: 13px; font-weight: 600;">Просмотр текстуры</span>
       <button class="tool-btn" onclick="closeModal()">✕</button>
     </div>
+    <div id="dds-controls"></div>
     <div class="modal-body">
       <img id="modal-img" src="" alt="">
     </div>
@@ -958,7 +961,7 @@ function renderTexturesGrid() {
         </div>
       </div>
     `;
-    card.onclick = () => openModal(t.preview, t.name);
+    card.onclick = () => openModal(t);
     grid.appendChild(card);
   });
 
@@ -985,7 +988,7 @@ function renderTexturesGrid() {
             </div>
           </div>
         `;
-        card.onclick = () => openModal(t.preview, t.name);
+        card.onclick = () => openModal(t);
         grid.appendChild(card);
       });
     };
@@ -993,13 +996,119 @@ function renderTexturesGrid() {
   }
 }
 
-function openModal(imgUrl, name) {
-  document.getElementById('modal-title').innerText = name;
-  document.getElementById('modal-img').src = imgUrl;
+let modalVersion = 0;
+
+async function openModal(texture) {
+  const version = ++modalVersion;
+  const controls = document.getElementById('dds-controls');
+  const image = document.getElementById('modal-img');
+  controls.replaceChildren();
+  document.getElementById('modal-title').innerText = texture.name;
+  image.src = texture.preview;
   document.getElementById('tex-modal').classList.add('active');
+  if (!texture.ddsPreview) return;
+
+  try {
+    const response = await fetch(texture.ddsPreview + '?info');
+    if (!response.ok) return;
+    const info = await response.json();
+    if (version !== modalVersion) return;
+    const volume = info.dimension === '3d';
+    const axis = volume ? 'z' : 'layer';
+    const indices = {mip: 0, [axis]: 0};
+    let sliceInput;
+    let updateTexel;
+    const dimensions = document.createElement('span');
+    function updatePreview() {
+      const scale = 2 ** indices.mip;
+      if (sliceInput) {
+        const lastSlice = Math.max(1, Math.floor(info.depth / scale)) - 1;
+        indices.z = Math.min(indices.z, lastSlice);
+        sliceInput.max = lastSlice;
+        sliceInput.value = indices.z;
+        sliceInput.disabled = lastSlice === 0;
+      }
+      dimensions.textContent = Math.max(1, Math.floor(info.width / scale)) + ' × ' +
+                               Math.max(1, Math.floor(info.height / scale));
+      image.src = texture.ddsPreview + '?' + new URLSearchParams(indices);
+      if (updateTexel) updateTexel();
+    }
+    const axisLabel = volume ? (currentLang === 'ru' ? 'Срез Z ' : 'Z slice ') :
+                               (currentLang === 'ru' ? 'Слой ' : 'Layer ');
+    for (const [key, count] of [['mip', info.mip_count], [axis, volume ? info.depth : info.array_size]]) {
+      if (count <= 1) continue;
+      const label = document.createElement('label');
+      label.textContent = key === 'mip' ? 'Mip ' : axisLabel;
+      const input = document.createElement('input');
+      input.type = 'number';
+      if (key === 'z') sliceInput = input;
+      input.min = 0;
+      input.max = count - 1;
+      input.value = 0;
+      input.onchange = () => {
+        if (!input.value || !input.validity.valid) {
+          input.value = indices[key];
+          return;
+        }
+        indices[key] = input.valueAsNumber;
+        updatePreview();
+      };
+      label.appendChild(input);
+      controls.appendChild(label);
+    }
+    if (['R16_FLOAT', 'RGBA16_FLOAT'].includes(info.format)) {
+      const coords = {};
+      const result = document.createElement('output');
+      let request = 0;
+      for (const axis of ['x', 'y']) {
+        const label = document.createElement('label');
+        label.textContent = axis.toUpperCase() + ' ';
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = 0;
+        input.value = 0;
+        input.onchange = () => updateTexel();
+        coords[axis] = input;
+        label.appendChild(input);
+        controls.appendChild(label);
+      }
+      controls.appendChild(result);
+      updateTexel = async () => {
+        const ticket = ++request;
+        const query = new URLSearchParams(indices);
+        for (const [axis, size] of [['x', info.width], ['y', info.height]]) {
+          const input = coords[axis];
+          input.max = Math.max(1, Math.floor(size / 2 ** indices.mip)) - 1;
+          const value = Number(input.value);
+          input.value = Number.isSafeInteger(value) ? Math.min(input.max, Math.max(0, value)) : 0;
+          query.set(axis, input.value);
+        }
+        result.textContent = '…';
+        try {
+          const reply = await fetch(texture.ddsPreview + '?' + query);
+          if (!reply.ok) throw new Error('DDS texel unavailable');
+          const values = await reply.json();
+          if (ticket === request && version === modalVersion) {
+            result.textContent = Object.entries(values).map(([c, v]) => c + ' = ' + v).join('   ');
+          }
+        } catch {
+          if (ticket === request && version === modalVersion) {
+            result.textContent = currentLang === 'ru' ? 'Значение недоступно' : 'Texel unavailable';
+          }
+        }
+      };
+    }
+    if (controls.childElementCount) {
+      controls.appendChild(dimensions);
+      updatePreview();
+    }
+  } catch (error) {
+    console.error('Failed to inspect DDS texture', error);
+  }
 }
 
 function closeModal() {
+  ++modalVersion;
   document.getElementById('tex-modal').classList.remove('active');
 }
 
