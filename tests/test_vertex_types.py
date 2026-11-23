@@ -475,6 +475,32 @@ class Rpf9ValidationTests(unittest.TestCase):
             finally:
                 os.chmod(sub, 0o755)
 
+    def test_unlistable_subfolder_fails_when_chmod_is_not_enough(self):
+        # The test above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard would go unexercised there. Forcing os.scandir to raise for
+        # one folder reproduces the same PermissionError os.walk hits for real, on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            sub = root / "sub"
+            sub.mkdir()
+            (sub / "x.rpf").write_bytes(b"RPF9" + struct.pack("<I", 8))
+            real_scandir = os.scandir
+            locked = os.path.normcase(os.path.abspath(str(sub)))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == locked:
+                    raise PermissionError(13, "Access is denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch.object(vt.os, "scandir", scandir):
+                with contextlib.redirect_stderr(err):
+                    code = vt.main([str(root)])
+            self.assertEqual(code, 2, err.getvalue())
+            self.assertIn("error:", err.getvalue())
+            self.assertIn("sub", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
