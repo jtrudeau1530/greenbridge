@@ -57,21 +57,35 @@ endif()
 set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
 
 # The Vulkan headers are the same on every platform, but /usr/include also holds glibc's, which must not shadow the
-# MSVC CRT. Point Vulkan_INCLUDE_DIR at a folder that holds only vulkan/ and vk_video/ (links to the host copies),
-# unless another folder was given (-DVulkan_INCLUDE_DIR=<Vulkan-Headers>/include). The links are (re)made on every
-# configure, so deleting the folder doesn't silently drop the Vulkan targets.
+# MSVC CRT. Point Vulkan_INCLUDE_DIR at a folder that holds only vulkan/ and vk_video/ (links to $ENV{VULKAN_SDK} or
+# the host copies), unless another folder was given (-DVulkan_INCLUDE_DIR=<Vulkan-Headers>/include). The links are
+# refreshed on every configure, and FORCE replaces a stale Vulkan_INCLUDE_DIR-NOTFOUND cache entry. A custom folder
+# without vulkan/vulkan.h (moved or deleted since it was cached) is dropped too, so the lookup below and find_path in
+# CMakeLists.txt search again instead of reusing it; make_game.py's preflight only trusts a cached folder that has it.
 if(CMAKE_BINARY_DIR)
   set(_xwin_vulkan "${CMAKE_BINARY_DIR}/xwin-vulkan-include")
+  if(Vulkan_INCLUDE_DIR AND NOT Vulkan_INCLUDE_DIR STREQUAL _xwin_vulkan
+     AND NOT EXISTS "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.h")
+    message(STATUS "Ignoring Vulkan_INCLUDE_DIR=${Vulkan_INCLUDE_DIR}: it has no vulkan/vulkan.h")
+    unset(Vulkan_INCLUDE_DIR CACHE)
+    unset(Vulkan_INCLUDE_DIR)
+  endif()
   if(NOT Vulkan_INCLUDE_DIR OR Vulkan_INCLUDE_DIR STREQUAL _xwin_vulkan)
-    foreach(_host_include /usr/include /usr/local/include)
+    set(_xwin_vulkan_sources)
+    if(DEFINED ENV{VULKAN_SDK} AND NOT "$ENV{VULKAN_SDK}" STREQUAL "")
+      list(APPEND _xwin_vulkan_sources "$ENV{VULKAN_SDK}/Include" "$ENV{VULKAN_SDK}/include")
+    endif()
+    list(APPEND _xwin_vulkan_sources /usr/include /usr/local/include)
+    foreach(_host_include IN LISTS _xwin_vulkan_sources)
       if(EXISTS "${_host_include}/vulkan/vulkan.h")
         file(MAKE_DIRECTORY "${_xwin_vulkan}")
         foreach(_sub vulkan vk_video)
-          if(EXISTS "${_host_include}/${_sub}" AND NOT EXISTS "${_xwin_vulkan}/${_sub}")
+          file(REMOVE "${_xwin_vulkan}/${_sub}")
+          if(EXISTS "${_host_include}/${_sub}")
             file(CREATE_LINK "${_host_include}/${_sub}" "${_xwin_vulkan}/${_sub}" SYMBOLIC)
           endif()
         endforeach()
-        set(Vulkan_INCLUDE_DIR "${_xwin_vulkan}" CACHE PATH "Vulkan headers without the host's libc headers")
+        set(Vulkan_INCLUDE_DIR "${_xwin_vulkan}" CACHE PATH "Vulkan headers without the host's libc headers" FORCE)
         break()
       endif()
     endforeach()

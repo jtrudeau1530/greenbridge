@@ -109,15 +109,30 @@ class CrossBuildMissingTest(unittest.TestCase):
         self.sdk = self.enterContext(tempfile.TemporaryDirectory())
         os.makedirs(os.path.join(self.sdk, "VC", "Tools", "MSVC"))
         os.makedirs(os.path.join(self.sdk, "Windows Kits", "10", "Lib", "10.0.26100", "um", "x64"))
+        self.root = self.enterContext(tempfile.TemporaryDirectory())
+        self.vulkan_sdk = self.enterContext(tempfile.TemporaryDirectory())
+        os.makedirs(os.path.join(self.vulkan_sdk, "include", "vulkan"))
+        open(os.path.join(self.vulkan_sdk, "include", "vulkan", "vulkan.h"), "w").close()
 
-    def missing(self, have=("cmake", *make_game.CROSS_TOOLS), major=23, sdk=None, configured=None):
+    def missing(self, have=("cmake", *make_game.CROSS_TOOLS), major=23, sdk=None, configured=None,
+                vulkan_sdk=..., host_vulkan=(), fetch=None):
         def which(t):
             return t if t.startswith("/") and t in have else f"/usr/bin/{t}" if t in have else None
         majors = major if callable(major) else (lambda exe="clang-cl": major)
+        env = {k: v for k, v in os.environ.items() if k not in ("VULKAN_SDK", "LEONIDA_VULKAN_HEADERS_FETCH")}
+        env["XWIN_DIR"] = sdk if sdk is not None else self.sdk
+        if vulkan_sdk is ...:
+            env["VULKAN_SDK"] = self.vulkan_sdk
+        elif vulkan_sdk is not None:
+            env["VULKAN_SDK"] = vulkan_sdk
+        if fetch is not None:
+            env["LEONIDA_VULKAN_HEADERS_FETCH"] = fetch
         with mock.patch.object(make_game.shutil, "which", side_effect=which), \
+                mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.object(make_game, "CROSS_VULKAN_INCLUDE_DIRS", host_vulkan), \
                 mock.patch.object(make_game, "clang_cl_major", side_effect=majors) as self.major, \
                 mock.patch.object(make_game, "configured_cross_tools", return_value=configured or {}), \
-                mock.patch.dict(os.environ, {"XWIN_DIR": sdk if sdk is not None else self.sdk}):
+                mock.patch.dict(os.environ, env, clear=True):
             return make_game.cross_build_missing()
 
     def test_a_full_versioned_set_counts(self):
@@ -163,6 +178,67 @@ class CrossBuildMissingTest(unittest.TestCase):
         self.assertEqual(len(missing), 2)
         self.assertEqual(missing[0], "CMake 3.24 or newer")
         self.assertIn("xwin", missing[1])
+
+    def test_missing_vulkan_headers_are_reported(self):
+        (item,) = self.missing(vulkan_sdk=None)
+        self.assertIn("Vulkan headers", item)
+        self.assertIn("LEONIDA_D3D12=vulkan", item)
+        self.assertIn("VULKAN_SDK", item)
+        self.assertIn("LEONIDA_VULKAN_HEADERS_FETCH=1", item)
+        # A VULKAN_SDK without vulkan/vulkan.h does not satisfy the check.
+        (item,) = self.missing(vulkan_sdk=os.path.join(self.vulkan_sdk, "empty"))
+        self.assertIn("Vulkan headers", item)
+
+    def test_vulkan_headers_accepted_from_host_sdk_fetch_or_cache(self):
+        # Host include folder (/usr/include or /usr/local/include).
+        host_inc = os.path.join(self.vulkan_sdk, "include")
+        self.assertEqual(self.missing(vulkan_sdk=None, host_vulkan=(host_inc,)), [])
+        # Windows-style Include/ under VULKAN_SDK.
+        win_sdk = self.enterContext(tempfile.TemporaryDirectory())
+        os.makedirs(os.path.join(win_sdk, "Include", "vulkan"))
+        open(os.path.join(win_sdk, "Include", "vulkan", "vulkan.h"), "w").close()
+        self.assertEqual(self.missing(vulkan_sdk=win_sdk), [])
+        # Opt-in fetch via environment variable.
+        for truthy in ("1", "ON", "true", "YES"):
+            with self.subTest(fetch=truthy):
+                self.assertEqual(self.missing(vulkan_sdk=None, fetch=truthy), [])
+        for falsy in ("", "0", "OFF", "false", "nan"):
+            with self.subTest(fetch=falsy):
+                self.assertEqual(len(self.missing(vulkan_sdk=None, fetch=falsy)), 1)
+        # Pre-configured runtime/build/windows/CMakeCache.txt.
+        build = os.path.join(self.root, "runtime", "build", "windows")
+        os.makedirs(build)
+        cache = os.path.join(build, "CMakeCache.txt")
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write("Vulkan_INCLUDE_DIR:PATH=Vulkan_INCLUDE_DIR-NOTFOUND\nLEONIDA_VULKAN_HEADERS_FETCH:BOOL=OFF\n")
+        self.assertEqual(len(self.missing(vulkan_sdk=None)), 1)
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(f"Vulkan_INCLUDE_DIR:PATH={host_inc}\n")
+        self.assertEqual(self.missing(vulkan_sdk=None), [])
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write("LEONIDA_VULKAN_HEADERS_FETCH:BOOL=ON\n")
+        self.assertEqual(self.missing(vulkan_sdk=None), [])
+        # An explicit opt-out in the environment beats a cached opt-in (cross_configure() passes OFF).
+        for falsy in ("0", "OFF"):
+            with self.subTest(fetch=falsy):
+                self.assertEqual(len(self.missing(vulkan_sdk=None, fetch=falsy)), 1)
+        # A cached folder without vulkan/vulkan.h (moved or deleted) is not trusted.
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(f"Vulkan_INCLUDE_DIR:PATH={os.path.join(self.vulkan_sdk, 'gone')}\n")
+        self.assertEqual(len(self.missing(vulkan_sdk=None)), 1)
+        # FETCHCONTENT_SOURCE_DIR_VULKANHEADERS must be a Vulkan-Headers checkout (a CMake project), not an SDK-style
+        # include folder; VulkanHeaders_SOURCE_DIR alone does not reach the FetchContent route in CMakeLists.txt.
+        for key in ("FETCHCONTENT_SOURCE_DIR_VULKANHEADERS", "VulkanHeaders_SOURCE_DIR"):
+            with self.subTest(key=key), open(cache, "w", encoding="utf-8") as f:
+                f.write(f"{key}:PATH={self.vulkan_sdk}\n")
+            self.assertEqual(len(self.missing(vulkan_sdk=None)), 1)
+        open(os.path.join(self.vulkan_sdk, "CMakeLists.txt"), "w").close()
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(f"VulkanHeaders_SOURCE_DIR:PATH={self.vulkan_sdk}\n")
+        self.assertEqual(len(self.missing(vulkan_sdk=None)), 1)
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(f"FETCHCONTENT_SOURCE_DIR_VULKANHEADERS:PATH={self.vulkan_sdk}\n")
+        self.assertEqual(self.missing(vulkan_sdk=None), [])
 
     def test_xwin_dir_defaults_to_the_documented_folder(self):
         home = self.enterContext(tempfile.TemporaryDirectory())
@@ -373,7 +449,7 @@ class CrossBuildTest(unittest.TestCase):
         self.out = os.path.join(self.root, "out")
         os.makedirs(self.game)
 
-    def runtime(self, xwin="/sdk", ninja=True, suffix="", configured=None):
+    def runtime(self, xwin="/sdk", ninja=True, suffix="", configured=None, fetch=None):
         def which(t):
             if t == "ninja":
                 return "/usr/bin/ninja" if ninja else None
@@ -384,12 +460,16 @@ class CrossBuildTest(unittest.TestCase):
                 for name in make_game.RUNTIME_FILES:
                     with open(os.path.join(self.build, name), "wb") as f:
                         f.write(name.encode())
+        env = {k: v for k, v in os.environ.items() if k != "LEONIDA_VULKAN_HEADERS_FETCH"}
+        if fetch is not None:
+            env["LEONIDA_VULKAN_HEADERS_FETCH"] = fetch
         with mock.patch.object(make_game.os, "name", "posix"), \
                 mock.patch.object(make_game, "ROOT", self.root), \
                 mock.patch.object(make_game, "xwin_dir", return_value=xwin), \
                 mock.patch.object(make_game.shutil, "which", side_effect=which), \
                 mock.patch.object(make_game, "cross_tool_suffix", return_value=suffix), \
                 mock.patch.object(make_game, "configured_cross_tools", return_value=configured or {}), \
+                mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(make_game, "run", side_effect=fake_run) as self.run_mock, \
                 mock.patch.object(make_game, "log"):
             make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, None, 4)
@@ -400,13 +480,29 @@ class CrossBuildTest(unittest.TestCase):
         toolchain = os.path.join(self.root, "runtime", "cmake", "clang-cl-xwin.cmake")
         self.assertEqual(configure, ["cmake", "-S", os.path.join(self.root, "runtime"), "-B", self.build,
                                      "-G", "Ninja", "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-                                     "--toolchain", toolchain, "-DXWIN_DIR=/sdk"])
+                                     "--toolchain", toolchain, "-DXWIN_DIR=/sdk", "-DLEONIDA_REQUIRE_VULKAN=ON"])
         self.assertEqual(build, ["cmake", "--build", self.build, "--parallel", "4",
                                  "--target", "gta6rt", "gta6rt_tls_host"])
         for name in make_game.RUNTIME_FILES:
             with open(os.path.join(self.out, name), "rb") as f:
                 self.assertEqual(f.read(), name.encode())
         self.assertTrue(os.path.isfile(os.path.join(self.out, "gta6rt.sh")))
+
+    def test_vulkan_headers_fetch_env_is_forwarded_to_cmake(self):
+        for truthy in ("1", "ON"):
+            with self.subTest(fetch=truthy):
+                configure, _ = self.runtime(fetch=truthy)
+                self.assertIn("-DLEONIDA_REQUIRE_VULKAN=ON", configure)
+                self.assertIn("-DLEONIDA_VULKAN_HEADERS_FETCH=ON", configure)
+        for falsy in ("0", "OFF"):
+            with self.subTest(fetch=falsy):
+                configure, _ = self.runtime(fetch=falsy)
+                self.assertIn("-DLEONIDA_REQUIRE_VULKAN=ON", configure)
+                self.assertIn("-DLEONIDA_VULKAN_HEADERS_FETCH=OFF", configure)
+                self.assertNotIn("-DLEONIDA_VULKAN_HEADERS_FETCH=ON", configure)
+        with self.subTest(fetch="unset"):
+            configure, _ = self.runtime()
+            self.assertFalse([a for a in configure if a.startswith("-DLEONIDA_VULKAN_HEADERS_FETCH")])
 
     def test_versioned_tools_are_passed_until_the_folder_records_its_tools(self):
         for cache in (False, True):

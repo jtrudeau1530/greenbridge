@@ -986,6 +986,73 @@ def clang_cl_major(exe: str = "clang-cl") -> "int | None":
     return int(m.group(1)) if m else None
 
 
+CROSS_VULKAN_INCLUDE_DIRS = ("/usr/include", "/usr/local/include")
+CMAKE_TRUE = frozenset({"1", "on", "true", "yes", "y"})
+
+
+def cmake_bool(value: str) -> bool:
+    """True for CMake truthy strings (1, ON, TRUE, YES, Y, or a non-zero number)."""
+    v = value.strip().lower()
+    if v in CMAKE_TRUE:
+        return True
+    return bool(re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", v)) and float(v) != 0.0
+
+
+def vulkan_headers_fetch_setting() -> "bool | None":
+    """LEONIDA_VULKAN_HEADERS_FETCH from the environment as a CMake bool, or None when it is unset or empty.
+
+    An explicit value overrides the build folder's cached option in both the preflight and the configure, so an
+    opt-out (=0/OFF) after an earlier opt-in really turns the download off."""
+    value = os.environ.get("LEONIDA_VULKAN_HEADERS_FETCH", "").strip()
+    return cmake_bool(value) if value else None
+
+
+def has_vulkan_header(include_dir: str) -> bool:
+    return bool(include_dir) and os.path.isfile(os.path.join(include_dir, "vulkan", "vulkan.h"))
+
+
+def cross_vulkan_cache_ready(build: str | None = None, fetch: "bool | None" = None) -> bool:
+    """True if an existing cross-build folder already has usable Vulkan headers or fetch configured.
+
+    Mirrors runtime/CMakeLists.txt: a cached Vulkan_INCLUDE_DIR that holds vulkan/vulkan.h, the cached
+    LEONIDA_VULKAN_HEADERS_FETCH option (unless ``fetch`` overrides it, as cross_configure() then does), or a
+    FETCHCONTENT_SOURCE_DIR_VULKANHEADERS that is a Vulkan-Headers checkout (a CMake project providing
+    Vulkan::Headers, not just an SDK-style include folder)."""
+    cache = os.path.join(build or cross_build_dir(), "CMakeCache.txt")
+    try:
+        with open(cache, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False
+    entries = {}
+    for line in lines:
+        if not line or line.startswith(("#", "//")) or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        entries[key.split(":", 1)[0]] = value.strip()
+    inc = entries.get("Vulkan_INCLUDE_DIR", "")
+    if inc and not inc.endswith("-NOTFOUND") and has_vulkan_header(inc):
+        return True
+    if fetch is None and cmake_bool(entries.get("LEONIDA_VULKAN_HEADERS_FETCH", "")):
+        return True
+    src = entries.get("FETCHCONTENT_SOURCE_DIR_VULKANHEADERS", "")
+    return bool(src) and os.path.isfile(os.path.join(src, "CMakeLists.txt")) and \
+        has_vulkan_header(os.path.join(src, "include"))
+
+
+def cross_vulkan_headers_ready() -> bool:
+    """True when the Linux cross-build can find Vulkan headers (or is allowed to fetch them)."""
+    fetch = vulkan_headers_fetch_setting()
+    if fetch:
+        return True
+    sdk = os.environ.get("VULKAN_SDK", "").strip()
+    if sdk and any(has_vulkan_header(os.path.join(sdk, sub)) for sub in ("Include", "include")):
+        return True
+    if any(has_vulkan_header(d) for d in CROSS_VULKAN_INCLUDE_DIRS):
+        return True
+    return cross_vulkan_cache_ready(fetch=fetch)
+
+
 def cross_build_missing() -> list:
     """What the clang-cl + xwin cross-build of runtime/ (runtime/cmake/clang-cl-xwin.cmake) lacks here."""
     missing = []
@@ -1010,6 +1077,10 @@ def cross_build_missing() -> list:
         missing.append("an xwin splat made with `xwin splat --use-winsysroot-style --preserve-ms-arch-notation` "
                        "(VC/Tools/MSVC and Windows Kits/10/Lib/<version>/um/x64) in XWIN_DIR or "
                        "~/.local/share/xwin-sdk, see docs/testing.md, \"The Windows runtime on Linux\"")
+    if not cross_vulkan_headers_ready():
+        missing.append("Vulkan headers (vulkan/vulkan.h, needed for LEONIDA_D3D12=vulkan): install your "
+                       "distribution's Vulkan headers package (e.g. libvulkan-dev or vulkan-headers), set "
+                       "VULKAN_SDK, or set LEONIDA_VULKAN_HEADERS_FETCH=1 to download the pinned Khronos headers")
     return missing
 
 
@@ -2220,8 +2291,12 @@ def cross_configure() -> str:
     suffix = "" if configured_cross_tools() else cross_tool_suffix() or ""
     tools = [f"-DCMAKE_{var}={shutil.which(name + suffix) or name + suffix}" for var, name in CROSS_VARS.items()
              ] if suffix else []
+    vulkan = ["-DLEONIDA_REQUIRE_VULKAN=ON"]
+    fetch = vulkan_headers_fetch_setting()
+    if fetch is not None:
+        vulkan.append(f"-DLEONIDA_VULKAN_HEADERS_FETCH={'ON' if fetch else 'OFF'}")
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
-                    f"-DXWIN_DIR={xwin}", *tools, *sdl3_fetch_args(),
+                    f"-DXWIN_DIR={xwin}", *tools, *sdl3_fetch_args(), *vulkan,
                     hint="CMake's error above says what the cross-build lacks "
                     "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
                     "runtime from --stages (the default without it: check,shaders,assets,pipelines).")
