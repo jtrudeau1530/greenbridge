@@ -217,6 +217,7 @@ int main(int argc, char** argv) {
         // the PC device's for the cleaned description (the raw 0x101 layout makes WARP answer UINT64_MAX).
         const D3D12_RESOURCE_DESC clean = rt::d3d12_xs::pc_resource_desc(desc);
         const D3D12_RESOURCE_ALLOCATION_INFO want = real->GetResourceAllocationInfo(0, 1, &clean);
+        check(want.SizeInBytes != UINT64_MAX, "WARP accepts the normalized slot-25 buffer description");
         check(returned == &got, "slot 25 returns the caller's buffer in RAX");
         check(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment,
               "slot 25 (C ABI) writes the PC device's GetResourceAllocationInfo into the caller's buffer");

@@ -892,6 +892,18 @@ int check_allocation_descriptions_cleaned() {
     EXPECT(std::memcmp(kept, titles, sizeof(kept)) == 0);
     EXPECT(info.SizeInBytes == 8847360 + 131072);
 
+    // PC calls must keep their layout and flags so the host can reject an invalid descriptor.
+    using PcFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(void*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT,
+                                                          const D3D12_RESOURCE_DESC*);
+    const auto get_pc_info = reinterpret_cast<PcFn>(vtable[25]);
+    D3D12_RESOURCE_DESC pc_buffer = titles[1];
+    pc_buffer.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    pc_buffer.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x1000);
+    g_seen_calls = 0;
+    EXPECT(get_pc_info(device, &info, 0, 1, &pc_buffer) == &info);
+    EXPECT(g_seen_desc_count == 1 && g_seen_descs[0].Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+    EXPECT(g_seen_descs[0].Flags == pc_buffer.Flags);
+
     // A null array with a zero count reaches the PC device as it came.
     g_seen_desc_count = 99;
     g_seen_calls = 0;
