@@ -1,5 +1,5 @@
 // Script the Vulkan size and data calls without loading a driver.
-#include "pipeline_cache_snapshot.h"
+#include "../src/pipeline_cache_snapshot.h"
 
 #include <cstdio>
 #include <cstring>

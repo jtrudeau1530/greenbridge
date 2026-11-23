@@ -2458,6 +2458,8 @@ if [ "$mode_count" -eq 1 ] && [ "$has_image" -eq 0 ] && [ "$expect_val" -eq 0 ];
     fi
     # Wine maps the Unix filesystem root to Z:. The game reads from its package and writes to the port's overlay.
 {moved_catalog}    export LEONIDA_D3D12="${{LEONIDA_D3D12:-vulkan}}"
+    # The session cache starts from the corpus seed (1.5 GB and up), over the 1 GiB default save limit.
+    export LEONIDA_PIPELINE_CACHE_MAX_MB="${{LEONIDA_PIPELINE_CACHE_MAX_MB:-8192}}"
     n=$#
     resolve_next=0
     in_game_args=0

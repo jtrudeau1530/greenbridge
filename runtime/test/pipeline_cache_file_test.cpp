@@ -1,5 +1,5 @@
 // Exercise checkpoint replacement and real filesystem errors without a Vulkan device.
-#include "pipeline_cache_file.h"
+#include "../src/pipeline_cache_file.h"
 
 #include <chrono>
 #include <cstdio>

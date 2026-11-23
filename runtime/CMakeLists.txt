@@ -2764,6 +2764,18 @@ if(TARGET Vulkan::Headers)
     target_compile_options(dxgi_swapchain_count_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_swapchain_count COMMAND dxgi_swapchain_count_test)
 
+    # The device saves its VkPipelineCache when it is destroyed and the next one starts from it (no GPU shader compiler
+    # needed: its shaders are hand-written SPIR-V).
+    add_executable(d3d12_pipeline_cache_persist_test test/d3d12_pipeline_cache_persist_test.cpp)
+    target_link_libraries(d3d12_pipeline_cache_persist_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_pipeline_cache_persist_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_pipeline_cache_persist_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_pipeline_cache_persist COMMAND d3d12_pipeline_cache_persist_test)
+    set_tests_properties(d3d12_pipeline_cache_persist PROPERTIES SKIP_RETURN_CODE 77)
+    # The save while a session runs (LEONIDA_PIPELINE_CACHE_SAVE_SECONDS is read once, so its own process).
+    add_test(NAME d3d12_pipeline_cache_persist_periodic COMMAND d3d12_pipeline_cache_persist_test --periodic)
+    set_tests_properties(d3d12_pipeline_cache_persist_periodic PROPERTIES SKIP_RETURN_CODE 77)
+
     # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
     add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)
     target_link_libraries(d3d12_indirect_rt_test PRIVATE gta6rt_d3d12_com)
@@ -3295,6 +3307,10 @@ if(TARGET Vulkan::Headers)
     add_executable(pipeline_cache_snapshot_test test/pipeline_cache_snapshot_test.cpp)
     target_link_libraries(pipeline_cache_snapshot_test PRIVATE Vulkan::Headers)
     add_test(NAME pipeline_cache_snapshot COMMAND pipeline_cache_snapshot_test)
+    # The session cache's frame, save gate and file identity: pure stdlib plus the Vulkan headers.
+    add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
+    target_link_libraries(pipeline_cache_store_test PRIVATE Vulkan::Headers)
+    add_test(NAME pipeline_cache_store COMMAND pipeline_cache_store_test)
     add_executable(predicated_copy_test test/predicated_copy_test.cpp)
     target_link_libraries(predicated_copy_test PRIVATE Vulkan::Headers)
     if(WIN32)
@@ -3459,3 +3475,12 @@ if(WIN32 AND MSVC)
     target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
   endforeach()
 endif()
+
+# A test that creates a D3D12 device would otherwise save pipeline_cache.user.bin beside its executable (and the next run
+# would start from it). Only d3d12_pipeline_cache_persist chooses its own file, in a scratch folder it removes.
+get_directory_property(_leonida_tests TESTS)
+foreach(_test ${_leonida_tests})
+  if(NOT _test MATCHES "^d3d12_pipeline_cache_persist(_periodic)?$")
+    set_property(TEST ${_test} APPEND PROPERTY ENVIRONMENT "LEONIDA_PIPELINE_CACHE=off")
+  endif()
+endforeach()

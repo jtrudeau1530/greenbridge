@@ -47,8 +47,8 @@
 //                 pipelines stage's retry.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
-#include "pipeline_cache_file.h"
-#include "pipeline_cache_snapshot.h"
+#include "../src/pipeline_cache_file.h"
+#include "../src/pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
 #include "pipeline_summary.h"
 #include "../src/spirv_words.h"
@@ -1182,6 +1182,9 @@ int main(int argc, char** argv) {
         mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = mesh.meshShaderQueries = VK_FALSE;
         mesh.taskShader = VK_FALSE;
     }
+    // RADV keys its cache on robustness, which the runtime's device leaves off: a robust device's cache misses in-game.
+    f2.features.robustBufferAccess = VK_FALSE;
+    f13.robustImageAccess = VK_FALSE;
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = 0; qci.queueCount = 1; qci.pQueuePriorities = &prio;
