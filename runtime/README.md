@@ -213,6 +213,12 @@ Current limits, by design:
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
   missing.
 
+- `dstorage_xs.dll` / `xcrdapi.dll` / `dstorage.dll` — `DStorageGetFactory`: the console DirectStorage API
+  (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
+  overlay; each queue reads file or memory ranges into memory in order on its own worker thread and reports through
+  status arrays, `ID3D12Fence` signals and events. zlib, BCPack, swizzle and physical-page requests are not done yet.
+  See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
+
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
   and trigger haptics where SDL opens the pad as a haptic device, and on a DualSense adaptive-trigger effects and the
