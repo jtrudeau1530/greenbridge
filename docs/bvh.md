@@ -448,8 +448,9 @@ is built. The samples carry the identity or a rotation that permutes the axes: 4
 rotated samples fall outside `sceneBounds` (175 of 181 and 207 of 273); with it, none do. The transposed matrix does
 not fit.
 
-**Where the triangles come from.** A leaf's geometry index is a position in the geometry list of a drawable's
-primary-LOD model in `levels.rpf`, counting only the geometries whose shader the BVH keeps. Over the 10 samples a geometry
+**Where the triangles come from.** A leaf's geometry index is a position in the geometry list of one model of a
+drawable in `levels.rpf`, counting only the geometries whose shader the BVH keeps: a model of its primary LOD on
+the 10 samples, of its second LOD for most of the interior's other BLAS (below). Over the 10 samples a geometry
 is left out exactly when its shader is one of a set of shaders: the 65 geometries left out use 7 shader hashes, the
 67 kept use 8 others, and no hash is in both. Two of the 7 cover 54 of the 65; the other five occur only in the two
 drawables that hold decals and baked room dressing. (On the 8 samples identified first, the skipped geometries were
@@ -531,6 +532,60 @@ TLAS instance for one of these BLAS would therefore be `I * E * M^-1`, with `I` 
 its world-to-object record would also fold in the leaf frame (`compressionParams`), as the console's `LoadInstances`
 does in #4011 (open). That the game builds its instances this way is not observed.
 
+**Where the other entities' BLAS are (ASSET-351).** The 10 streams above cover 10 of the interior's 242 entities.
+Every BVH stream of `core_bvh4.rpf` (271,637) and of `shared_minigame000_bvh4.rpf` (1,237) was matched against the
+141 drawables of the interior that the export holds, with the signature and the checks of
+`bvh_geometry_check.py`; `story000_bvh4.rpf` holds no BVH (§5). `rpf9dump models` decodes only a drawable's first
+LOD (the LOD pointer at drawable `+0x50`), so the drawables were also exported at their second, third and fourth LOD
+(`+0x58`, `+0x60`, `+0x68`) with a local change to the decoder that follows the other pointer; 117, 90 and 67 of the
+141 decode at those LODs. The second LOD was suggested by streams whose `sceneBounds` equal, within 2 mm and up to an
+axis permutation, the box of an unmatched first-LOD drawable's kept geometry while holding fewer triangles (a quarter
+to a half in most cases).
+
+| | archetypes | entities |
+|---|---:|---:|
+| BLAS built from the first LOD | 23 | 32 |
+| BLAS built from the second LOD | 101 | 188 |
+| 2-triangle light proxy, cannot be attributed | 1 | 1 |
+| no BLAS, drawable exported | 16 | 19 |
+| no BLAS, drawable not in the export | 2 | 2 |
+| total | 143 | 242 |
+
+* **All of them are in `core_bvh4.rpf`.** The shared pack has no stream consistent with any of the 141 drawables at
+  any LOD.
+* **One BLAS per drawable, not per entity.** The 31 matched archetypes that the interior places more than once (127
+  entities, up to 18 of one archetype) have 32 streams between them; 120 of the 124 archetypes have exactly one
+  stream, 4 have 2 to 4. Every one of the 130 streams follows a 208-byte instance descriptor (§3.2), 57 of them with a
+  transform that is not the identity.
+* **Entity sets.** The base list has 9 of its 11 entities with a BLAS (plus the light proxy), the 2-entity set 2 of 2,
+  the 77-entity set 67 of 77 and the 152-entity set 142 of 152.
+* **LOD.** Of the 130 streams, 25 fit only the first LOD, 103 only the second, and 2 fit more than one (the first to
+  third, and the second and third). The third LOD adds no archetype and the fourth fits no stream. The 9 drawables of
+  the first 10 streams other than the light proxy are first-LOD; 17 of the other 121 streams are.
+* **Position in the pack.** The other 121 streams are not next to the first 10. They lie between BVH stream 231,012 and
+  261,585 (archive offsets 7,662,866,512 to 7,948,582,992), in 85 runs of 1 to 6 consecutive streams. The band holds
+  30,574 streams, so this interior is about 0.4 % of it. A pack is therefore not one block per interior: the 10
+  drawables of the table above (from the base list and two entity sets) open the pack, and the interior's other 115
+  archetypes with a BLAS are some 231,000 streams later, among streams this measurement does not attribute; no
+  archetype has a stream in both places. The data area also holds 1,282 `9FPR` tags after the file's own (1,281 of
+  them 16-byte aligned), which read as nested packs: taking each tag as the start of one, the first 10 streams are
+  the whole first nested pack, and the other 121 lie in 31 other packs, up to 19 in one; one archetype has streams
+  in two of those 31 packs.
+* **The light proxy.** 21 streams fit its 2-triangle drawable, 20 of them with the same header, one of which is
+  stream 4; a quad of that size cannot be told from another drawable's.
+* **No BLAS.** Of the 16 exported archetypes without one, 11 have only geometries whose shaders the matched drawables
+  leave out, so the rule predicts none; 4 have a geometry with a shader that other drawables keep, and 1 has only
+  shaders that occur in none of the matched drawables.
+* **The shader rule is not a list of shaders alone.** Over the 130 streams, 267 geometries are kept and 114 left out;
+  the kept ones use 14 shader hashes, the left-out ones 13, and one hash is in both: kept in 171 geometries of 86
+  drawables, left out in 3 geometries of 3 drawables, whose materials have the same render bucket and preset as kept
+  ones.
+
+How specific the matches are: of the first-LOD streams, the 12 with at most 3,000 candidates in the whole export have
+exactly one consistent drawable among its 343,327 models each; the other 13 (3,951 to 47,664 candidates) and all
+second-LOD matches were checked against the interior's drawables only, where no stream fits two archetypes. A drawable
+elsewhere with the same geometry would fit as well.
+
 **The descriptor key (`+0x40`).** Over all 269,106 single-BLAS descriptors of `core_bvh4.rpf` and the BVH stream
 after each (the 235,533 distinct keys of §3.2; the descriptors that group several BLAS, #4199, are not counted here),
 2,873 keys occur more than once, 33,573 repeats in all, one key 3,198 times. A key always comes with
@@ -540,7 +595,9 @@ converse fails: 1,008 (BLAS header, transform) pairs occur under more than one k
 can share both the BLAS and its transform: the key identifies something finer than that pair. What it hashes is open;
 #4199 (open) finds no more matches between these keys and the values of the table descriptors than chance gives.
 
-**Open:** what decides the set of shaders whose geometries the BVH leaves out (7 hashes over these samples); what
+**Open:** what decides which geometries the BVH leaves out (13 shader hashes over the interior's 130 BLAS, and one
+hash both kept and left out); what decides the LOD a BLAS is built from; what the rest of the band of streams 231,012
+to 261,585 holds, and how the pack is ordered; why 4 exported archetypes with a kept shader have no BLAS; what
 the descriptor key at `+0x40` hashes; how the game picks the entity of a BLAS when the BLAS does not name it (the
 drawable match does it here); whether the game composes TLAS instances as `I * E * M^-1`; whether the runtime
 rehydrates these packs at all (above).
@@ -678,7 +735,10 @@ as §4a says, so the rule is off unless the user passes them. A geometry whose s
 keeps its place and the checks decide. Measured on the ten BLAS of the sample pack, against the first 1 GiB window of
 `levels.rpf` cut at 3 GB (exported as a whole slice): 1,228 models, 1 to 374 candidates from the signature per BLAS,
 and exactly one consistent candidate each. A window holds one region's drawables, so a BLAS whose drawable is
-elsewhere in the archive finds no candidate in it at all, and the tool says so instead of reporting a rejection.
+elsewhere in the archive finds no candidate in it at all, and the tool says so instead of reporting a rejection. The
+same holds for a BLAS built from another LOD: `rpf9dump models` decodes only the first LOD of a drawable (`+0x50`),
+and 101 of the 124 archetypes of the §4a interior that have a BLAS are built from the second (`+0x58`), so an export
+of the whole archive finds no candidate for them either.
 
 `rpf9dump models` and `rpf9dump textures` take `--start`/`--length` to export a window of a file. A window need not be a
 valid archive - a slice of `levels.rpf` cut at an offset has no `9FPR` header - because both modes read every resource
