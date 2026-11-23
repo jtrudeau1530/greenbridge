@@ -3,6 +3,7 @@
 
 These blocks use the same 0x60-byte slot-word header as `63 30 00 00` mesh blocks,
 but with different vertex formats. This tool finds and measures their strides.
+Usage: `python -I tools/analyze_4240_full.py --help` lists the options.
 """
 
 import argparse
