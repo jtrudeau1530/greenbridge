@@ -542,7 +542,7 @@ NAN_PAYLOAD_TEST = "ps_nan_payload"
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_persp_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
-                      "ps_texoff_implicit", "ps_texoff_forms",
+                      "ps_texoff_implicit", "ps_texoff_forms", "ps_cbv_modulate",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
                       "ps_mandelbrot", NAN_PAYLOAD_TEST))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
@@ -1302,13 +1302,15 @@ def bary_persp_problem(px):
     return f"{wrong} pixels off the perspective-correct reference ({covered} covered); {first}" if wrong else ""
 
 
-def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
+def pixels(tools, spirv, name, fmt, vertex="vs_ids", *, settings=None):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
     sg = subgroup_size(spirv, name)
     env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else None
-    if name in PIXEL_ENV:
-        env = dict(env or os.environ, **PIXEL_ENV[name])
+    if settings is None:
+        settings = PIXEL_ENV.get(name)
+    if settings:
+        env = dict(env or os.environ, **settings)
     gs = os.path.join(spirv, name + ".bary_gs.spv")
     if BARY_FALLBACK and os.path.isfile(gs):
         env = dict(env or os.environ, VKH_GS=gs, VKH_GS_HELPER="1")
@@ -1324,6 +1326,30 @@ def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     if len(data) != 64 * 64 * 16:  # default harness viewport, four 32-bit components per pixel
         return None, out
     return list(struct.iter_unpack(fmt, data)), out
+
+
+def cbv_modulate_test(tools, spirv):
+    # Both buffers are in bounds. Word zero of each is a decoy for a lost member offset.
+    # A third buffer (gain 2) makes reading descriptor 0 observable in either draw.
+    heap = ("0x1000=0x4000,0x1008=32,0x1018=32,"
+            "0x2000=0x3f800000,0x2010=0x3f000000,"
+            "0x3000=0x3f800000,0x3010=0,0x4010=0x40000000")
+    for address, gain in ((0x2000, 0.5), (0x3000, 0.0)):
+        settings = {"VKH_SGPRS": "0x1000,0", "VKH_HEAP": f"{heap},0x1010={address}"}
+        px, out = pixels(tools, spirv, "ps_cbv_modulate", "<4f", settings=settings)
+        if isinstance(px, Skip):
+            return Skip(out.strip() or "unsupported device")
+        if not px:
+            return f"gain {gain}: {out.strip() or 'no complete readback'}"
+        for i, rgba in enumerate(px):
+            y, x = divmod(i, 64)
+            expected = ((x + 0.5) / 64 * gain, (y + 0.5) / 64 * gain, gain, 1.0)
+            # Interpolated colors use the same tolerance as ps_flat. Black, gain and alpha are exact.
+            tolerance = 1e-6 if gain else 0.0
+            if not (abs(rgba[0] - expected[0]) <= tolerance and abs(rgba[1] - expected[1]) <= tolerance
+                    and rgba[2:] == expected[2:]):
+                return f"gain {gain} at ({x},{y}): got {rgba}, expected {expected}"
+    return ""
 
 
 def texture_constant_test(tools, spirv, name):
@@ -1669,6 +1695,8 @@ def pixel_test(tools, spirv, name):
         return Skip("SKIP (computed I/J pairs need PerVertexKHR inputs: no --bary-fallback / --f16-interp-fallback)")
     if not os.path.isfile(path):
         return f"missing {name}.spv"
+    if name == "ps_cbv_modulate":
+        return cbv_modulate_test(tools, spirv)
     if name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
         return texoff_test(tools, spirv, name)
     if name == "ps_interp_f16_high" and BARY_FALLBACK and not F16_HALVES:   # with F16_HALVES it reads decoded halves
