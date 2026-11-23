@@ -1906,24 +1906,30 @@ public:
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
         if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
-        if (!address || !desc_.Width || (start & (alignment - 1)) || desc_.Width > UINT64_MAX - alignment)
-            return E_INVALIDARG;
-        const VkDeviceSize bytes = (desc_.Width + alignment - 1) & ~(alignment - 1);
+        if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
+        // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
+        // title places small buffers inside a page too (a 16-byte UAV at a 64-byte-aligned address on an RTX 5090,
+        // found in review), which an import of `address` itself would refuse.
+        const std::uintptr_t base = start & ~static_cast<std::uintptr_t>(alignment - 1);
+        void* const base_address = reinterpret_cast<void*>(base);
+        const VkDeviceSize offset = start - base;
+        const VkDeviceSize bytes = (offset + desc_.Width + alignment - 1) & ~(alignment - 1);
         // The whole imported range must be committed, possibly across several allocations (the retail buffer spans
-        // three mapped windows): anything else is undefined in Vulkan, so it is E_INVALIDARG here (found in review).
-        // A write-combined page is not imported: on an RTX 5090 such an import succeeded but GPU reads returned
-        // wrong bytes (found in review), so it takes the ordinary-buffer fallback instead.
-        bool write_combined = false;
+        // three mapped windows); a page not committed yet (xmem commits on first touch) or a write-combined one (on
+        // an RTX 5090 such an import succeeded but GPU reads returned wrong bytes, found in review) is not imported,
+        // and the ordinary-buffer fallback answers instead.
+        bool importable = true;
         for (VkDeviceSize at = 0; at < bytes;) {
             MEMORY_BASIC_INFORMATION region{};
-            if (!VirtualQuery(static_cast<const char*>(address) + at, &region, sizeof(region)) ||
-                region.State != MEM_COMMIT)
-                return E_INVALIDARG;
-            if (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) write_combined = true;
+            if (!VirtualQuery(static_cast<const char*>(base_address) + at, &region, sizeof(region)) ||
+                region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
+                importable = false;
+                break;
+            }
             const auto region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
-            at = region_end - start;
+            at = region_end - base;
         }
-        if (write_combined) return E_NOTIMPL;
+        if (!importable) return E_NOTIMPL;
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -1941,14 +1947,15 @@ public:
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         if (device_.get_host_pointer_properties(device_.info.device,
-                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, address,
+                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base_address,
                                                 &host) != VK_SUCCESS)
-            return E_INVALIDARG;
+            return E_NOTIMPL;
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
-        if (!types || bytes < requirements.size) return E_NOTIMPL;
+        // An offset off the buffer's own alignment cannot be bound: the fallback answers.
+        if (!types || (offset % requirements.alignment) || bytes < offset + requirements.size) return E_NOTIMPL;
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-        import.pHostPointer = address;
+        import.pHostPointer = base_address;
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         // Host-visible and coherent first, as the caller's pages are; then any type both the import and the
@@ -1970,7 +1977,7 @@ public:
             if (memory_) break;
         }
         if (!memory_) return E_OUTOFMEMORY;
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS) return E_OUTOFMEMORY;
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS) return E_OUTOFMEMORY;
         mapped_ = address;
         host_import_ = true;
         va_ = start;

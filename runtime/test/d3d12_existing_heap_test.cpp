@@ -224,9 +224,11 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     Ref<ID3D12Resource> refused;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, IID_PPV_ARGS(&refused.p)), E_NOTIMPL);
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, IID_PPV_ARGS(&refused.p)),
-              E_INVALIDARG);
     EXPECT(refused.p == nullptr);
+    // An address off the buffer alignment can't be bound inside the import: the ordinary-buffer fallback answers.
+    Ref<ID3D12Resource> fallback;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+    EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(bytes + 1));
     std::printf("%s: %s, %llu bytes: GPU VA is the address, a GPU copy reads the CPU's writes\n", who, kind,
                 static_cast<unsigned long long>(size));
     return 0;
@@ -238,6 +240,9 @@ int check_title_placed_all(ID3D12Device* device) {
     void* pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!pages) return 1;
     failures += check_title_placed(device, "VirtualAlloc range", pages, size);
+    // Inside a page, as the title places small UAV buffers (64-byte aligned, found in review on an RTX 5090): the
+    // import starts at the page and the buffer is bound at the offset.
+    failures += check_title_placed(device, "64 bytes into a page", static_cast<char*>(pages) + 64, 0x1000 - 64);
     VirtualFree(pages, 0, MEM_RELEASE);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
@@ -247,8 +252,8 @@ int check_title_placed_all(ID3D12Device* device) {
     CloseHandle(section);
 
     // Not imported: a write-combined range (an RTX 5090 imported it but read wrong bytes back, found in review)
-    // falls back to an ordinary buffer, so the resource exists but is not at the pages' address; a range only partly
-    // committed is E_INVALIDARG.
+    // falls back to an ordinary buffer, so the resource exists but is not at the pages' address; so does a range only
+    // partly committed.
     const char* who = "vulkan slot-133 buffer";
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -267,14 +272,13 @@ int check_title_placed_all(ID3D12Device* device) {
     char* partial = static_cast<char*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
     EXPECT(partial != nullptr && VirtualAlloc(partial, size / 2, MEM_COMMIT, PAGE_READWRITE) == partial);
     {
-        Ref<ID3D12Resource> refused;
-        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, IID_PPV_ARGS(&refused.p)),
-                  E_INVALIDARG);
-        EXPECT(refused.p == nullptr);
+        // Pages not committed yet (xmem commits on first touch) are not imported either: the fallback answers.
+        Ref<ID3D12Resource> fallback;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+        EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(partial));
     }
     VirtualFree(partial, 0, MEM_RELEASE);
-    std::printf("%s: a write-combined range falls back to an ordinary buffer, a partly committed one is refused\n",
-                who);
+    std::printf("%s: a write-combined range and a partly committed one fall back to an ordinary buffer\n", who);
     return failures;
 }
 
