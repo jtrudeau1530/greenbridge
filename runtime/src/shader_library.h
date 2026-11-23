@@ -811,11 +811,16 @@ private:
         return n >= 0 && n <= 4294967295.0 ? std::uint32_t(n) : 0;
     }
 
-    using Entries = std::map<std::pair<std::string, std::string>, std::vector<ShaderEntry>>;
+    using LookupKey = std::pair<std::string_view, std::string_view>;
+    struct KeyLess {
+        using is_transparent = void;
+        bool operator()(LookupKey a, LookupKey b) const { return a < b; }
+    };
+    using Entries = std::map<std::pair<std::string, std::string>, std::vector<ShaderEntry>, KeyLess>;
 
     static std::vector<const ShaderEntry*> lookup(const Entries& entries, std::string_view stage, std::string_view key) {
         std::vector<const ShaderEntry*> out;
-        const auto it = entries.find({std::string(stage), std::string(key)});
+        const auto it = entries.find(LookupKey{stage, key});
         if (it != entries.end())
             for (const ShaderEntry& e : it->second) out.push_back(&e);
         return out;

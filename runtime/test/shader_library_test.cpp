@@ -384,6 +384,10 @@ int main() {
     // out-of-range number (register -1) reads as 0 instead of wrapping.
     const auto vs_all = library.candidates("vs", hash);
     CHECK(vs_all.size() == 2 && vs_all[0] == vs && vs_all[1]->name == "vs_same_program");
+    const std::string tagged_hash = hash + "-suffix";
+    CHECK(library.candidates(std::string_view("vs-extra", 2),
+                             std::string_view(tagged_hash).substr(0, hash.size())) == vs_all);
+    CHECK(library.candidates("vs", tagged_hash).empty());
     CHECK(vs_all[1]->input_signature.size() == 1 && vs_all[1]->input_signature[0].semantic_index == 3 &&
           vs_all[1]->input_signature[0].register_index == 0);
     const ShaderEntry* ps = library.find("ps", hash);
