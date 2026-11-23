@@ -156,6 +156,15 @@ When exporting a directory, `awc_opus.py` keeps the path to each bank below the 
 `a/music.awc` writes under `<out>/a/music/`. Passing that file on its own writes under `<out>/music/`.
 To regenerate a flat export from an earlier version, run `awc_opus.py` with the original bank directory and a fresh output directory.
 
+To import music cues into Audacity, run
+`python -I tools/awc_cue_labels.py <bank>/cue_regions.json <new-label-directory>` on a sheet
+exported by `awc_opus.py --cue-sheet`. Open the channel Ogg in Audacity at time zero, then use
+**File > Import > Labels** to load the matching `.txt` by filename stem. Each region shows its
+hexadecimal cue hash followed by its one-based row number in the bank sheet. Overlapping and
+repeated regions keep individual labels. Start and end times use nine decimal places in seconds
+so rounding back to the nearest 48 kHz frame recovers both endpoints.
+[Audacity label file format](https://manual.audacityteam.org/man/importing_and_exporting_labels.html)
+
 `audio_manifest.json` is the bank index: each bank's `Path`, `Offset`, `Size`, and its `Streams` with `Index`,
 `Id` (hex), `Codec`, `Channels`, `SampleRate`, `DurationSeconds` and `IsStreamed`. For streamed music,
 `Channels` is the Opus packet channel count and `DurationSeconds` is per channel: the tag `0x48` descriptor's
