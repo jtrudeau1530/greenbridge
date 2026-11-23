@@ -458,8 +458,14 @@ on the executable, the rest is not:
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
-  closes). Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
-  endpoint of its own (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
+  closes). `XUserRegisterForDeviceAssociationChanged` (slot 4) and
+  `XUserRegisterForDefaultAudioEndpointUtf16Changed` (7) keep each registration (its queue, duplicated, its context
+  and callback) under a token unique across both kinds and never 0; a null callback or token is `E_INVALIDARG`, and
+  queue and context are optional. The matching unregister (5, 8) removes it at once, with or without `wait`, and
+  returns true for every token, as `XUserUnregisterForChangeEvent` does: a token already removed, never handed out or
+  of the other kind changes nothing. Offline the device association and the default audio endpoint never change, so
+  no event is raised and no callback is ever queued or called. The user has no audio endpoint of its own
+  (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
   documented for desktop. `APP_LOCAL_DEVICE_ID` is taken to be 32 bytes; no caller in the executable confirms it.
 
 `xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with
