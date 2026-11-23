@@ -789,6 +789,17 @@ if(BUILD_TESTING)
       )
       set_tests_properties(${_context_test} PROPERTIES TIMEOUT 15)
     endforeach()
+
+    add_executable(wait_registration_test test/wait_registration_test.cpp)
+    target_include_directories(wait_registration_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims/xtaskqueue ${XTASKQUEUE_DIR}/Source/Task ${XTASKQUEUE_DIR}/Source/Common)
+    target_link_libraries(wait_registration_test PRIVATE gta6rt_xtaskqueue)
+    foreach(_case unregister undispatched terminate parked self presignaled monitor close composite snapshot
+                  cross concurrent held_snapshot admission cancel_unregister reentrant_admission
+                  reentrant_vs_external_unregister multi_dispatcher_terminate multi_dispatcher_unregister_replace)
+      add_test(NAME wait_registration_${_case} COMMAND wait_registration_test ${_case})
+      set_tests_properties(wait_registration_${_case} PROPERTIES TIMEOUT 15)
+    endforeach()
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
