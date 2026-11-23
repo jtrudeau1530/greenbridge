@@ -236,7 +236,10 @@ struct Format {
     bool typeless = false;  // created with MUTABLE_FORMAT so typed views can reinterpret it
     bool d24_as_float = false;  // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU)
     bool d24 = false;           // a D24_UNORM_S8_UINT family format, native or stored as D32
-    bool r9g9b9e5_as_r32_uint = false;  // R9G9B9E5_SHAREDEXP UAV stored as mutable R32_UINT (no E5B9G9R9 storage)
+    // A UAV texture whose format has no storage support, stored as the mutable unsigned image `format` names (R32_UINT
+    // for R9G9B9E5_SHAREDEXP, R16_UINT for B5G5R5A1_UNORM): the format its SRVs, RTVs and T#s use. Its storage view is
+    // `format`, in the uint class; shaders write the packed bits. UNDEFINED for every other texture.
+    VkFormat uint_backed = VK_FORMAT_UNDEFINED;
     // A 96-bit R32G32B32 format, held in the R32G32B32A32 image `format` names (ResourceBinding::rgb96).
     bool rgb96 = false;
 };
@@ -514,10 +517,11 @@ struct TextureCreateInfo {
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         }
         if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-        if (format.r9g9b9e5_as_r32_uint) {
-            // R32_UINT owns storage and attachment usages; E5B9G9R9 views restrict usage to SAMPLED_BIT.
+        if (format.uint_backed) {
+            // The unsigned format owns the storage usage; views in the logical format restrict their usage (SAMPLED_BIT
+            // for SRVs, COLOR_ATTACHMENT_BIT for RTVs).
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-            view_formats = {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32};
+            view_formats = {format.format, format.uint_backed};
             format_list.viewFormatCount = 2;
             format_list.pViewFormats = view_formats.data();
             info.pNext = &format_list;
@@ -623,6 +627,8 @@ struct DeviceState {
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
     // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
     bool r9g9b9e5_uav_emulated = false;
+    // The same for B5G5R5A1_UNORM: VK_FORMAT_A1R5G5B5_UNORM_PACK16 without STORAGE_IMAGE, backed by mutable R16_UINT.
+    bool b5g5r5a1_uav_emulated = false;
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
@@ -819,18 +825,17 @@ struct DeviceState {
         return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
     }
 
-    // Whether the GPU needs and supports backing R9G9B9E5_SHAREDEXP UAV textures with a mutable R32_UINT image.
-    bool probe_r9g9b9e5_uav_emulation() const {
-        if (storage_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)) return false;
-        if (!image_format_properties2 || !storage_usable(VK_FORMAT_R32_UINT) ||
-            !sampled_usable(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32))
-            return false;
-        constexpr VkFormat view_formats[2] = {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32};
+    // Whether the GPU needs and supports backing UAV textures of `logical` (no storage support) with a mutable image of
+    // the unsigned format `backing` of the same size.
+    bool probe_uint_backed_uav(VkFormat logical, VkFormat backing) const {
+        if (storage_usable(logical)) return false;
+        if (!image_format_properties2 || !storage_usable(backing) || !sampled_usable(logical)) return false;
+        const VkFormat view_formats[2] = {backing, logical};
         VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
         list.viewFormatCount = 2;
         list.pViewFormats = view_formats;
         VkPhysicalDeviceImageFormatInfo2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &list};
-        query.format = VK_FORMAT_R32_UINT;
+        query.format = backing;
         query.type = VK_IMAGE_TYPE_2D;
         query.tiling = VK_IMAGE_TILING_OPTIMAL;
         query.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -963,7 +968,9 @@ struct DeviceState {
                 return {};
             if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && r9g9b9e5_uav_emulated) {
                 log_once("R9G9B9E5_SHAREDEXP UAV unavailable natively, using mutable R32_UINT; format", desc.Format);
-                return {VK_FORMAT_R32_UINT, VK_IMAGE_ASPECT_COLOR_BIT, false, false, false, true};
+                Format backed{VK_FORMAT_R32_UINT, VK_IMAGE_ASPECT_COLOR_BIT};
+                backed.uint_backed = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+                return backed;
             }
         }
         if (rgb96_refused(desc)) {
@@ -977,6 +984,19 @@ struct DeviceState {
             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("B8G8R8X8 textures cannot allow unordered access; format", desc.Format);
             return {};
+        }
+        // A B5G5R5A1 UAV texture where VK_FORMAT_A1R5G5B5_UNORM_PACK16 has no storage support: a mutable R16_UINT image
+        // (Format::uint_backed). Its RTVs and SRVs view it as A1R5G5B5; shaders store the packed 16 bits.
+        if (desc.Format == DXGI_FORMAT_B5G5R5A1_UNORM && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            !storage_usable(VK_FORMAT_A1R5G5B5_UNORM_PACK16)) {
+            if (!b5g5r5a1_uav_emulated || desc.SampleDesc.Count > 1 ||
+                ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+                 !color_attachment_usable(VK_FORMAT_A1R5G5B5_UNORM_PACK16)))
+                return {};
+            log_once("B5G5R5A1_UNORM UAV unavailable natively, using mutable R16_UINT; format", desc.Format);
+            Format backed{VK_FORMAT_R16_UINT, VK_IMAGE_ASPECT_COLOR_BIT};
+            backed.uint_backed = VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+            return backed;
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -1102,7 +1122,7 @@ struct DeviceState {
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                    bool allow_channel_cast = false, bool r9g9b9e5_as_r32_uint = false) {
+                    bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED) {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
@@ -1131,7 +1151,7 @@ struct DeviceState {
         // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
         // format is 8_UINT reads it from X.
         const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
-        const VkFormat logical_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : image_format;
+        const VkFormat logical_format = uint_backed ? uint_backed : image_format;
         VkFormat view_format =
             stencil ? image_format : g::vulkan_view_format(logical_format, image.format, allow_channel_cast);
         VkFormat channels_format = view_format;  // whose channels the T#'s swizzle selects from
@@ -1155,7 +1175,7 @@ struct DeviceState {
         view_info.viewType = g::vulkan_view_type(image.type);
         view_info.format = view_format;
         VkImageViewUsageCreateInfo sampled_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-        if (r9g9b9e5_as_r32_uint) {
+        if (uint_backed) {
             sampled_usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
             view_info.pNext = &sampled_usage;
         }
@@ -1194,8 +1214,8 @@ struct DeviceState {
             VkImageViewCreateInfo storage_info = view_info;
             storage_info.components = {};
             VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-            const VkFormat storage_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_R32_UINT : view_format;
-            if (r9g9b9e5_as_r32_uint) {
+            const VkFormat storage_format = uint_backed ? image_format : view_format;
+            if (uint_backed) {
                 storage_info.format = storage_format;
                 storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
                 storage_info.pNext = &storage_usage;
@@ -1748,7 +1768,7 @@ public:
         return std::find(castable_formats_.begin(), castable_formats_.end(), format) != castable_formats_.end();
     }
     bool has_castable_formats() const { return !castable_formats_.empty(); }
-    bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
+    VkFormat uint_backed() const { return uint_backed_; }  // Format::uint_backed
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
@@ -1996,9 +2016,9 @@ public:
             view_formats_ = castable;
             if (std::find(view_formats_.begin(), view_formats_.end(), format.format) == view_formats_.end())
                 view_formats_.push_back(format.format);
-            if (format.r9g9b9e5_as_r32_uint) {
-                // The R9G9B9E5 emulation needs its E5B9G9R9 views whatever the list names (TextureCreateInfo).
-                for (VkFormat pair : {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32})
+            if (format.uint_backed) {
+                // An unsigned-backed UAV texture needs both its formats whatever the list names (TextureCreateInfo).
+                for (VkFormat pair : {format.format, format.uint_backed})
                     if (std::find(view_formats_.begin(), view_formats_.end(), pair) == view_formats_.end())
                         view_formats_.push_back(pair);
             }
@@ -2044,6 +2064,7 @@ public:
         binding.image = image_;
         binding.typeless = format.typeless && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT;  // views name their format
         binding.castable_view_formats = !view_formats_.empty();  // a castable list made the image mutable
+        binding.uint_backed = format.uint_backed;
         binding.rgb96 = format.rgb96;
         binding.depth24_as_float = format.d24_as_float;
         binding.depth24 = format.d24;
@@ -2064,7 +2085,7 @@ public:
         // With the bindless set, a view's descriptor has one layout for as long as it lives (bind_image).
         binding.sampled_in_general = device_.bindless != nullptr;
         format_ = format.format;
-        r9g9b9e5_as_r32_uint_ = format.r9g9b9e5_as_r32_uint;
+        uint_backed_ = format.uint_backed;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         binding_ = binding;
@@ -2406,7 +2427,7 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
-    bool r9g9b9e5_as_r32_uint_ = false;
+    VkFormat uint_backed_ = VK_FORMAT_UNDEFINED;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
@@ -4446,8 +4467,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             return false;
         }
     }
-    const VkFormat resource_format =
-        resource.r9g9b9e5_as_r32_uint() ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : resource.format();
+    const VkFormat resource_format = resource.uint_backed() ? resource.uint_backed() : resource.format();
     VkFormat named = resource_format;
     if (volume) {
         const bool compatible = vulkan_format(desc.Format, false).typeless
@@ -4774,7 +4794,10 @@ public:
         if (!get_device || !state_.format_properties || !state_.image_format_properties || !memory_properties ||
             !device_properties || !queue_families)
             return;
-        state_.r9g9b9e5_uav_emulated = state_.probe_r9g9b9e5_uav_emulation();
+        state_.r9g9b9e5_uav_emulated =
+            state_.probe_uint_backed_uav(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_FORMAT_R32_UINT);
+        state_.b5g5r5a1_uav_emulated =
+            state_.probe_uint_backed_uav(VK_FORMAT_A1R5G5B5_UNORM_PACK16, VK_FORMAT_R16_UINT);
         memory_properties(info.physical, &state_.memory);
         {
             char text[4] = {};
@@ -5953,6 +5976,13 @@ public:
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
                 view = {};
+            } else if (r && r->uint_backed() == VK_FORMAT_A1R5G5B5_UNORM_PACK16) {
+                // An R16_UINT-backed B5G5R5A1 UAV texture (Format::uint_backed) renders through an A1R5G5B5 view, in
+                // its own format only.
+                if (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format)
+                    view = {};
+                else
+                    view.format = static_cast<leonida::ColorViewFormat>(VK_FORMAT_A1R5G5B5_UNORM_PACK16);
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
                        (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
@@ -7923,7 +7953,7 @@ private:
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
-                                                  resource.r9g9b9e5_as_r32_uint());
+                                                  resource.uint_backed());
         if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
