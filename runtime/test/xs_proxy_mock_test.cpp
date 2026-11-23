@@ -718,7 +718,9 @@ int check_allocators() {
 int check_xbox_slots() {
 #ifdef __ID3D12Device11_INTERFACE_DEFINED__
     Mock* mock = nullptr;
-    void* device = make_device(mock, 11, true);
+    // Full-chain lists: the console IID maps to ID3D12GraphicsCommandList6, which a command_list-kind mock
+    // does not answer.
+    void* device = make_device(mock, 11, true, true, true);
     EXPECT(device && xs::device_proxy_slot_count(device) == 80);
     xs::reset_device_proxy_stats();
 
@@ -762,13 +764,25 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
     // A console device answers with the console-shaped list proxy over the real list, as slot 12 does.
     EXPECT(xs::is_list_proxy(list) &&
-           reinterpret_cast<Mock*>(xs::list_proxy_real_list(list))->kind == Kind::command_list);
+           reinterpret_cast<Mock*>(xs::list_proxy_real_list(list))->kind == Kind::list);
     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
     // The real list is created as ID3D12GraphicsCommandList; the console IID the caller asked for is answered by
     // the proxy's QueryInterface instead.
     EXPECT(mock->args[12][4] == word(&__uuidof(ID3D12GraphicsCommandList)));
+
+    // The measured console list IID (the 1.0.2.1 executable's only GUID of that form) maps to
+    // ID3D12GraphicsCommandList6: slot 73 answers it, and a QueryInterface for it on the proxy returns the proxy.
+    const IID console_list_iid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    void* console_list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&console_list_iid),
+                     word(&console_list))) == S_OK);
+    EXPECT(xs::is_list_proxy(console_list));
+    EXPECT(mock->calls[12] == 2);
+    void* asked = nullptr;
+    EXPECT(hr_of(raw(console_list, 0, word(&console_list_iid), word(&asked))) == S_OK && asked == console_list);
+    EXPECT(release(asked) == 1 && release(console_list) == 0);
 
     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
     // output on failure, so an invalid call would clear this pointer.

@@ -49,6 +49,8 @@
 #include <utility>
 #include <vector>
 
+#include "d3d12_xs_command_list_iid.h"
+
 namespace rt::d3d12_xs {
 namespace {
 
@@ -1628,11 +1630,14 @@ HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
-    if (!is_list_iid(*riid)) {
-        if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
+    // A console title asks for the console command-list IID (device slot 73 forwards it): it maps to a PC IID the
+    // real list answers, and the caller gets this console-shaped object back.
+    const IID& pc_iid = command_list_iid_for_pc(*riid);
+    if (!is_list_iid(pc_iid)) {
+        if (supports_iid(self->real, pc_iid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
     }
-    if (!supports_iid(self->real, *riid)) return E_NOINTERFACE;
+    if (!supports_iid(self->real, pc_iid)) return E_NOINTERFACE;
     *out = self;
     list_add_ref(self);
     return S_OK;
@@ -1947,7 +1952,8 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
     if (!self->console_lists)
-        return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+        return self->real->CreateCommandList(0, type, allocator, initial_state,
+                                             command_list_iid_for_pc(*riid), out);
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
                                                    __uuidof(ID3D12GraphicsCommandList), &created);
