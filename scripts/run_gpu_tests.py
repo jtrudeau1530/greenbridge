@@ -1141,7 +1141,13 @@ def run_suite(a, work: str) -> int:
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
                 cs_env = dict(os.environ, **WAVE32_LANE_ENV)
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
-            skip = wave32_lane_skip(msg) if name in WAVE32_LANE_DUMPS else None
+            skip = None
+            if name in WAVE32_LANE_DUMPS:
+                if rc == UNSUPPORTED:
+                    results.append((name, None, unsupported_skip(msg)))
+                    continue
+                if rc == 0:
+                    skip = wave32_lane_skip(msg)
             if skip is None and name in WAVE32_PIN_DUMPS:
                 # the device may not be able to run the wave size this fixture was written for (a 64-only device
                 # can't pin 32, so cs_barrier_loop's words mean nothing); check.py skips it too

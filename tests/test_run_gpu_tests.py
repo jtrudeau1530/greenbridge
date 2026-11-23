@@ -344,6 +344,35 @@ class UniformBranchCheck(unittest.TestCase):
 
 class Wave32LaneDumps(unittest.TestCase):
     """run_gpu_tests.py skips cs_wqm_w32 and cs_w32_lane_wrap below 32 lanes with check.py's rule."""
+    def test_process_exit_takes_precedence_in_both_runners(self):
+        import check
+        name = "cs_w32_lane_wrap"
+        narrow = "device: synthetic (subgroup 8..16)\n"
+        for code, msg, skipped in ((1, narrow, False), (0, narrow, True),
+                                   (77, "unsupported: device feature unavailable\n", True)):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                with patch.object(check, "run", return_value=(code, msg)):
+                    verdict = check.compute_test(tmp, tmp, name, "1", "dump", needs_32_lanes=True)
+                with self.subTest(runner="check.py"):
+                    self.assertEqual(isinstance(verdict, check.Skip), skipped, verdict)
+                    if not skipped:
+                        self.assertIn("exit 1", verdict)
+
+                def launch(cmd, **kwargs):
+                    if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                        (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                        return 0, ""
+                    return code, msg
+
+                args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda mc, src, dst, n: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"), patch.object(rgt, "run_cmd", side_effect=launch),
+                      contextlib.redirect_stdout(output)):
+                    status = rgt.run_suite(args, tmp)
+                self.assertEqual(status, 0 if skipped else 1, output.getvalue())
+                self.assertIn(f"{'SKIP' if skipped else 'FAIL'}  {name}", output.getvalue())
+
     def test_uses_check_py_rule(self):
         import check
         self.assertIs(rgt.narrow_subgroup_skip, check.narrow_subgroup_skip)

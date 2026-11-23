@@ -897,8 +897,11 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args, **extra)
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
-    if needs_32_lanes and (skip := wave32_lane_skip(out)):
-        return skip
+    if needs_32_lanes:
+        if code == UNSUPPORTED:
+            return Skip(f"SKIP ({out.strip() or 'unsupported device'})")
+        if code == 0 and (skip := wave32_lane_skip(out)):
+            return skip
     if sg and (skip := unpinned_subgroup_skip(out)):
         return skip
     if code != 0:
