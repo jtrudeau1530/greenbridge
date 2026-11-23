@@ -127,7 +127,40 @@ class TestGalleryCommandLine(unittest.TestCase):
                 self.assertEqual(gallery.main([*args, "--no-browser"]), 0)
                 start_server.assert_called_once_with(
                     port=port, models_dir=None, textures_dir=None, open_browser=False,
+                    retry_next_port=not args,
                 )
+
+    def test_reports_unavailable_listen_ports(self) -> None:
+        cases = ((["--port", "65535"], [65535]), (["--port", "8080"], [8080]), ([], [8080, 8081]))
+        for args, ports in cases:
+            with (
+                self.subTest(ports=ports),
+                tempfile.TemporaryDirectory() as assets,
+                mock.patch.object(gallery.http.server.HTTPServer, "__init__", side_effect=OSError("address in use")) as bind,
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    gallery.main([*args, "--models-dir", assets, "--textures-dir", assets, "--no-browser"])
+
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(f"can't listen on port {ports[-1]}", stderr.getvalue())
+                self.assertEqual([attempt.args[0] for attempt in bind.call_args_list],
+                                 [("127.0.0.1", port) for port in ports])
+
+    def test_implicit_port_can_use_the_next_port(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as assets,
+            mock.patch.object(gallery.http.server.HTTPServer, "__init__",
+                              side_effect=[OSError("address in use"), None]) as bind,
+            mock.patch.object(gallery.http.server.HTTPServer, "server_port", 8081, create=True),
+            mock.patch.object(gallery.http.server.HTTPServer, "serve_forever") as serve,
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+        ):
+            self.assertEqual(gallery.main(["--models-dir", assets, "--textures-dir", assets, "--no-browser"]), 0)
+            self.assertEqual([attempt.args[0] for attempt in bind.call_args_list],
+                             [("127.0.0.1", 8080), ("127.0.0.1", 8081)])
+            self.assertIn("http://localhost:8081", stdout.getvalue())
+            serve.assert_called_once_with()
 
 
 if __name__ == "__main__":
