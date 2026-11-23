@@ -184,6 +184,12 @@ Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (
 as CI does: `WINEPREFIX="$HOME/.local/share/leonida-wine" xvfb-run -a ctest --test-dir runtime/build/windows`
 (packages `xvfb` and `xauth`, which `xvfb-run` needs). With Mesa installed, the tests then run on llvmpipe.
 
+A virtual X server has no presentable surface, so presentation cannot be judged under it. With a real display (here
+Wine 11.22 on a Wayland session, through XWayland) the same 123-test list gives 92 passed, 6 failed and 25 skipped,
+and `vk_presenter_sync`, `xbox_present` and `dxgi_swapchain` pass, while they fail under `xvfb-run`. Use a real
+compositor for those three. Six still failed with a real display: `device_proxy`, `d3d12_xs_root_signature`,
+`xdxr_build`, `d3d12_xdxr_rt`, `d3d12_present` and `d3d12_compute`.
+
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
 runtime/build/windows` takes a folder made by hand like a Windows build). CMake packages are
