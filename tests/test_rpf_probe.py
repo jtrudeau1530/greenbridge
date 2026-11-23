@@ -240,6 +240,18 @@ class MainTests(unittest.TestCase):
         with open(archive, "rb") as f:
             self.assertEqual(f.read(), original)
 
+    def test_replace_retry_failure_preserves_the_existing_report(self):
+        previous = '[{"previous": true}]\n'
+        out_dir = os.path.dirname(self.out)
+        os.makedirs(out_dir, exist_ok=True)
+        with open(self.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(probe, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                probe._write_json_report(self.out, [{"new": True}])
+        with open(self.out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+
     @unittest.skipUnless(os.name == "posix", "requires a POSIX file size limit")
     def test_failed_write_preserves_the_existing_report(self):
         self.write("demo.rpf", b"9FPR" + struct.pack("<I", 16) + bytes(32))
