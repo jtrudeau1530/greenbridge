@@ -114,6 +114,7 @@ class TestManifestVerifier(unittest.TestCase):
         posix_os.stat.side_effect = os.stat
         posix_os.path.getsize.return_value = len(payload)
         posix_os.walk.return_value = [(target, [], [literal_name])]
+        posix_os.stat.side_effect = lambda path: os.stat(self.game_dir if path == target else path)
         with (patch.object(mv, "os", posix_os),
               patch.object(mv, "sha256_file", return_value=hashlib.sha256(payload).hexdigest()) as hash_file):
             report = mv.verify_manifest(target, self.manifest_path)
@@ -349,6 +350,37 @@ class TestManifestVerifier(unittest.TestCase):
     def test_verify_target_dir_missing(self) -> None:
         with self.assertRaises(mv.ManifestError):
             mv.verify_manifest(os.path.join(self.root, "missing_dir"), self.manifest_path)
+
+    def test_cli_distinguishes_target_path_errors(self) -> None:
+        stat_path = os.stat
+
+        def stat_with_denied_target(path, *args, **kwargs):
+            if path == self.game_dir:
+                raise PermissionError("Simulated permission denied")
+            return stat_path(path, *args, **kwargs)
+
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags, case="denied"):
+                with (
+                    patch.object(mv.os, "stat", side_effect=stat_with_denied_target),
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    rc = mv.main([self.game_dir, "--manifest", self.manifest_path, "--quiet", *flags])
+                self.assertEqual(rc, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("cannot access target directory", stderr.getvalue())
+                self.assertIn("Simulated permission denied", stderr.getvalue())
+
+            for target, message in (
+                (self.manifest_path, "target path is not a directory"),
+                (os.path.join(self.root, "absent"), "target directory does not exist"),
+            ):
+                with self.subTest(flags=flags, target=target):
+                    res = self.run_cli(target, "--manifest", self.manifest_path, "--quiet", *flags)
+                    self.assertEqual(res.returncode, 2)
+                    self.assertEqual(res.stdout, "")
+                    self.assertIn(message, res.stderr)
 
     def test_clean_verification_serial_and_parallel(self) -> None:
         serial_report = mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
