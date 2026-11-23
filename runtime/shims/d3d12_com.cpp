@@ -377,7 +377,13 @@ public:
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        if (!count || !rects) return;
+        // A zero-count call disables all previously bound rectangles; it is not a no-op.
+        // With no scissor bound, the rasterizer clips every fragment, as on native D3D12.
+        if (!count) {
+            scissor_ = {};
+            return;
+        }
+        if (!rects) return;
         if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
         scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
     }
