@@ -356,6 +356,10 @@ if(BUILD_TESTING)
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+
+  add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
+  add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
+
   # vk_pipeline_check's memory budget for large modules: pure stdlib, no Vulkan device.
   add_executable(large_module_gate_test test/large_module_gate_test.cpp)
   find_package(Threads REQUIRED)

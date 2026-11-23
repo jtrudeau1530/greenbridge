@@ -17,6 +17,7 @@
 // one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
 // (refits) of the same structure, and writes nothing.
 #include "vk_test_device.h"
+#include "xdxr_build_output.h"
 #include "../src/xdxr_build.h"
 
 #include <algorithm>
@@ -25,7 +26,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
@@ -245,13 +245,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string dir = argv[1];
-    // A failed run must not leave the previous run's cases for the checker to pass.
-    if (argc == 2) {
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-            const auto ext = entry.path().extension();
-            if (ext == ".bin" || ext == ".json") std::filesystem::remove(entry.path(), ec);
-        }
+    if (const auto ec = prepare_xdxr_build_output(dir, argc > 2)) {
+        std::fprintf(stderr, "cannot create output directory %s: %s\n", dir.c_str(), ec.message().c_str());
+        return 1;
     }
     vktest::Device gpu;
     gpu.request_buffer_device_address = true;
