@@ -208,7 +208,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   )
   target_include_directories(xmem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(xmem_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
+  target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8 $<$<CXX_COMPILER_ID:Clang>:/EHa>)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
