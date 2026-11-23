@@ -671,6 +671,46 @@ def test_gpu_timeout_is_a_harness_error_and_next_program_runs(monkeypatch, capsy
     assert "1/1 programs that ran match" in out and "1 harness errors" in out
 
 
+def test_failed_gpu_child_with_unpinned_warning_is_a_harness_error(monkeypatch, capsys, tmp_path):
+    """vk_compute_test prints the unpinned-subgroup warning, writes a full dump and then exits 1: that is a failed
+    run, not a skip, so the fuzzer exits 2 even when the other program matches."""
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / ("vk_compute_test" + (".exe" if os.name == "nt" else ""))).touch()
+    progs = vf.programs("f16", 1, 2, (32,))
+
+    def translate(progs, work, _emulate):
+        (work / "spirv").mkdir()
+        for p in progs:
+            (work / "spirv" / (p.name + ".spv")).touch()
+        return {p.name: {} for p in progs}, ""
+
+    def run(cmd, *, env, timeout, **kwargs):
+        name = os.path.splitext(os.path.basename(cmd[1]))[0]
+        prog = next(p for p in progs if p.name == name)
+        with open(env["VKC_DUMP"], "wb") as dump:
+            dump.write(bytes(4 * prog.out_words()))
+        if name == progs[0].name:
+            return subprocess.CompletedProcess(cmd, 1, UNPINNED + "\n", "vkQueueSubmit failed\n")
+        return subprocess.CompletedProcess(cmd, 0, "compute subgroup size: 32", "")
+
+    def compare(prog, data):
+        prog.uncertain_words = 0
+        return []
+
+    monkeypatch.delenv("LEONIDA_PC_TAIL_UBO", raising=False)
+    monkeypatch.setattr(vf, "translate", translate)
+    monkeypatch.setattr(vf.subprocess, "run", run)
+    monkeypatch.setattr(vf, "compare", compare)
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--programs", "2", "--wave", "32",
+                                      "--build", str(build), "--work", str(tmp_path)])
+
+    assert vf.main() == 2
+    out = capsys.readouterr().out
+    assert f"ERROR {progs[0].name}: exit 1" in out and f"SKIP {progs[0].name}" not in out
+    assert "1/1 programs that ran match" in out and "0 skipped" in out and "1 harness errors" in out
+
+
 def test_pc_tail_ubo_forwarded_to_translator_and_vk_compute_test(monkeypatch, tmp_path):
     cmds = []
 
