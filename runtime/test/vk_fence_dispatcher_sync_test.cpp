@@ -335,33 +335,30 @@ int main() {
 
         std::mutex mu;
         std::condition_variable cv;
-        bool a_ran = false, b_ran = false, cancel_done = false;
+        bool a_done = false, cancel_returned = false, b_after_cancel = false;
 
         context.enqueue_fence_callback(sem_a, 1, [&] {
             context.cancel_fence_waits(sem_b);
-            {
-                std::lock_guard lk(mu);
-                cancel_done = true;
-            }
-            cv.notify_all();
             std::lock_guard lk(mu);
-            a_ran = true;
+            // B may legitimately run inside cancel() when it was still pending; it must not run after this point.
+            cancel_returned = true;
+            a_done = true;
+            cv.notify_all();
         });
         EXPECT(wait_until_wait_sem_count(2));  // wakeup + A
         context.enqueue_fence_callback(sem_b, 1, [&] {
             std::lock_guard lk(mu);
-            b_ran = true;
+            if (cancel_returned) b_after_cancel = true;
             cv.notify_all();
         });
         EXPECT(wait_until_wait_sem_count(3));  // wakeup + A + B: one ready batch
 
         EXPECT(fence_a.signal(1));
         EXPECT(fence_b.signal(1));
-        EXPECT(wait_flag(mu, cv, cancel_done));
-        EXPECT(a_ran);
+        EXPECT(wait_flag(mu, cv, a_done));
         // Give the dispatcher time to walk the rest of the batch.
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        EXPECT(!b_ran);
+        EXPECT(!b_after_cancel);
 
         context.cancel_fence_waits(sem_a);
         context.cancel_fence_waits(sem_b);

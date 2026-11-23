@@ -508,6 +508,10 @@ public:
     // A dispatch runs outside mutex_. Each entry in a ready batch gets its own slot: a callback may re-entrantly
     // call cancel() for a later entry in the same batch, which marks that entry cancelled so it is skipped before
     // it can use the semaphore. A callback running on another thread must still be waited for.
+    // A cancelled entry still in pending_ is dispatched by cancel() itself (callback and bookkeeping both run);
+    // one already in a ready batch is skipped and only its event is signalled. The held Signal op's count is
+    // therefore not decremented for a skipped batch entry. That is safe because only ~Fence cancels a wait, but
+    // keep it in mind if cancel() gains other callers.
     struct DispatchSlot {
         VkSemaphore semaphore = VK_NULL_HANDLE;
         std::thread::id owner;
