@@ -18399,7 +18399,9 @@ def main():
             why[str(e)] += 1
             drop_stale(name)
             continue
-        except (IndexError, KeyError, ValueError) as e:
+        except (IndexError, KeyError, ValueError, AssertionError) as e:
+            # An internal check that fails on one program (an AssertionError, such as wave64 emulation's barrier
+            # check) is that program's translator error too: the rest of the folder still translates.
             why[f"translator error {type(e).__name__}"] += 1
             drop_stale(name)
             continue

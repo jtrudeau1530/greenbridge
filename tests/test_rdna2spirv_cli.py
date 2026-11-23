@@ -540,6 +540,19 @@ class ValidatedOutput(unittest.TestCase):
         self.assertFalse(self.module.exists())
         self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
 
+    def test_translator_assertion_is_one_shaders_error(self):
+        """A failed internal assert in one program (wave64 emulation's "unexpected OpControlBarrier in sync-free
+        multi-wave block", seen on one pipeline-library program) is counted and retires that shader, as a ValueError
+        does, instead of ending the run before the rest of the folder."""
+        self.module.write_bytes(b"old module")
+        self.index.write_text(json.dumps({"ps_fixture": {"stage": "ps"}}), encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(rdna2spirv, "translate", side_effect=AssertionError("synthetic internal check")),                 mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]),                 redirect_stdout(output):
+            rdna2spirv.main()
+        self.assertIn("translator error AssertionError", output.getvalue())
+        self.assertFalse(self.module.exists())
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+
     def test_validation_success_publishes_binary_and_metadata(self):
         self.assertIn("1 pass spirv-val", self.translate())
         self.assertEqual(self.module.read_bytes(), b"new module")
