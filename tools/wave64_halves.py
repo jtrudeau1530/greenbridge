@@ -461,6 +461,81 @@ class Analysis:
                     else:
                         st[key].pop(r, None)
 
+    def operand_literal(self, n, i, x):
+        """The literal value of a scalar source before instruction `i` of block `n`, else None."""
+        if x.get("abs") or x.get("neg"):
+            return None
+        if x.get("k") == "imm":
+            return x["v"] & 0xFFFFFFFF
+        if x.get("k") == "special" and x.get("t") == "null":
+            return 0
+        if x.get("k") == "sgpr" and x.get("n", 1) == 1:
+            return self.literal_sgpr(n, i, x["r"])
+        return None
+
+    def literal_sgpr(self, n, i, r):
+        """The 32-bit literal SGPR `r` holds before instruction `i` of block `n`, as rdna2spirv's `sgpr_imm` knows
+        it: the value the last writer in this basic block gave it, when that writer is one of the scalar ops below
+        and its sources are literals too. None for any other writer, or none in the block (a run-time value).
+
+        MIRROR of rdna2spirv's `sgpr_imm` folding (it cannot be imported here: this analysis runs before the
+        translator emits a block, so its `sgpr_imm` is empty): s_mov_b32, s_movk_i32, s_mov_b64 (an immediate or an
+        SGPR pair), s_pack_ll/lh/hh_b32_b16, s_bfm_b32, s_not_b32, and the S2 folds s_and_b32, s_lshl_b32,
+        s_lshr_b32, s_mul_i32 (not s_or_b32: rdna2spirv does not record it). Not mirrored, so treated as run-time:
+        s_abs, s_sext, s_min/max, s_add/sub, s_xor/andn2 family, s_bfe, s_absdiff, s_lshlN_add. Keep the two lists
+        in step when rdna2spirv folds another op."""
+        for j in range(i - 1, -1, -1):
+            ins = self.blocks[n][j]
+            if ("s", r) not in [x for d in operands(ins)[0] for x in _regs(d)]:
+                continue
+            op, a = base_op(ins["op"]), ins["args"]
+            if op == "s_mov_b64" and len(a) == 2 and a[0].get("k") == "sgpr" and a[0].get("n") == 2:
+                half = r - a[0]["r"]
+                if a[1].get("k") == "imm":
+                    return (a[1]["v"] & 0xFFFFFFFFFFFFFFFF) >> (32 * half) & 0xFFFFFFFF
+                if a[1].get("k") == "sgpr" and a[1].get("n") == 2:
+                    return self.literal_sgpr(n, j, a[1]["r"] + half)
+                return None
+            if not (a and a[0].get("k") == "sgpr" and a[0].get("n", 1) == 1):
+                return None
+            x = self.operand_literal(n, j, a[1]) if len(a) > 1 else None
+            y = self.operand_literal(n, j, a[2]) if len(a) > 2 else None
+            if op == "s_mov_b32" and len(a) == 2:
+                return x
+            if op == "s_movk_i32" and len(a) == 2 and a[1].get("k") == "imm":
+                v = a[1]["v"] & 0xFFFF
+                return (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF
+            if op == "s_not_b32" and x is not None:
+                return ~x & 0xFFFFFFFF
+            if x is None or y is None or len(a) != 3:
+                return None
+            if op in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
+                lo = x >> 16 if op == "s_pack_hh_b32_b16" else x & 0xFFFF
+                hi = (y & 0xFFFF) << 16 if op == "s_pack_ll_b32_b16" else y & 0xFFFF0000
+                return lo | hi
+            if op == "s_bfm_b32":
+                return (((1 << (x & 31)) - 1) << (y & 31)) & 0xFFFFFFFF
+            folds = {"s_and_b32": x & y, "s_lshl_b32": x << (y & 31), "s_lshr_b32": x >> (y & 31), "s_mul_i32": x * y}
+            return folds[op] & 0xFFFFFFFF if op in folds else None
+        return None
+
+    def add_tid_lane(self, n, i, a, mods):
+        """LANE when a MUBUF/MTBUF access (vdata, vaddr, V#, ...) has no idxen and its V# word3 is a literal with
+        ADD_TID_ENABLE (bit 23) set: the effective index is then the wave lane (idxen ignores the bit), so the
+        result or the address is the lane id. A run-time V# cannot be judged here: tiers A and B assume the bit is
+        0 there (docs/design.md, SHADER-10)."""
+        if "idxen" in mods or len(a) < 3:
+            return 0
+        rsrc = a[2]
+        if rsrc.get("k") == "sgpr" and rsrc.get("n") == 4:
+            w3 = rsrc["r"] + 3
+        elif rsrc.get("k") == "slist" and len(rsrc["r"]) == 4 and isinstance(rsrc["r"][3], int):
+            w3 = rsrc["r"][3]
+        else:
+            return 0
+        lit = self.literal_sgpr(n, i, w3)
+        return LANE if lit is not None and lit >> 23 & 1 else 0
+
     def transfer(self, n, i, ins, st, ev):
         op, a = base_op(ins["op"]), ins["args"]
         mods = ins.get("mods") or []
@@ -555,6 +630,8 @@ class Analysis:
             at = 0
             for x in addr:
                 at |= self.rd(st, ins, x)
+            if op.startswith(("buffer_store", "tbuffer_store")):
+                at |= self.add_tid_lane(n, i, a, mods)
             bits_violation(dt)
             bits_violation(at, BASE | RNK)
             if at & RNK and at & BASE:
@@ -594,6 +671,8 @@ class Analysis:
             addr_t = 0
             for x in addr_ops:
                 addr_t |= self.rd(st, ins, x)
+            if op.startswith("buffer_atomic"):
+                addr_t |= self.add_tid_lane(n, i, a, mods)
             elected = bool(st["xg"] and st["xg"][0] == "elect")
             bits_violation(addr_t, ELECT if elected else 0)
             if data_t & CNT:
@@ -628,6 +707,8 @@ class Analysis:
                         x.get("k") == "special" and x.get("t") in ("vcc", "exec") and self.is_mask(ins, x)):
                     md |= MASKD | X
         t_src |= md
+        if op.startswith(("buffer_load", "tbuffer_load")):
+            t_src |= self.add_tid_lane(n, i, a, mods)
 
         # --- lane masks and counts
         if op in ("s_bcnt1_i32_b64", "s_ff1_i32_b64") and len(a) == 2 and self.is_mask(ins, a[1]):

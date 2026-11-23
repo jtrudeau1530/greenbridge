@@ -1090,6 +1090,81 @@ class KillExit(unittest.TestCase):
         self.assertEqual([w[:2] for w in halves[:32]], [(0, 0)] * 32)      # the first half took the exit
 
 
+class AddTidBuffer(unittest.TestCase):
+    """A MUBUF/MTBUF access with no idxen through a literal V# whose word3 has ADD_TID_ENABLE (bit 23) takes the
+    wave lane as its index (idxen ignores the bit), so what it reads or writes depends on the lane id: tier C
+    `lane-id`. A literal with the bit clear and any access with idxen are tier A. (A run-time V# is assumed to
+    have the bit clear: docs/design.md, SHADER-10.)"""
+    TID, NO_TID = 0x31816fac, 0x31016fac
+
+    def v_sharp(self, word3):
+        # SWIZZLE_ENABLE, stride 4, 8-index swizzle: with ADD_TID_ENABLE, lane i reads the dword at base + 4 * i
+        return ["s_mov_b32 s0, 0x1000", "s_mov_b32 s1, 0x80040000", "s_mov_b32 s2, 0x1000",
+                f"s_mov_b32 s3, {word3:#x}", "v_mov_b32_e32 v9, 0"]
+
+    def program(self, word3, access):
+        return vs(self.v_sharp(word3) + [access, "s_waitcnt vmcnt(0)"])
+
+    def test_literal_add_tid_without_idxen_is_lane_dependent(self):
+        for load in ("buffer_load_dword v6, off, s[0:3], 0", "buffer_load_format_x v6, off, s[0:3], 0"):
+            lines = self.program(self.TID, load)
+            (tier, reasons, _), _ = meta_of("vs_add_tid", lines)
+            self.assertEqual((tier, "lane-id" in reasons), ("C", True), load)
+
+    def test_literal_add_tid_clear_is_tier_a(self):
+        lines = self.program(self.NO_TID, "buffer_load_dword v6, off, s[0:3], 0")
+        (tier, reasons, _), _ = meta_of("vs_no_tid", lines)
+        self.assertEqual((tier, reasons), ("A", []))
+
+    def test_idxen_ignores_add_tid(self):
+        lines = self.program(self.TID, "buffer_load_dword v6, v9, s[0:3], 0 idxen")
+        (tier, reasons, _), _ = meta_of("vs_idxen_tid", lines)
+        self.assertEqual((tier, reasons), ("A", []))
+
+    def test_literal_copied_through_another_sgpr_still_counts(self):
+        lines = vs(self.v_sharp(self.NO_TID)[:3] + ["s_mov_b32 s20, 0x31816fac", "s_mov_b32 s3, s20",
+                   "buffer_load_dword v6, off, s[0:3], 0"])
+        self.assertEqual(meta_of("vs_tid_copy", lines)[0][0], "C")
+
+    def test_word3_built_by_other_scalar_ops_counts(self):
+        # rdna2spirv folds these into the literal word3; the analysis must see the same bit
+        head = ["s_mov_b32 s0, 0x1000", "s_mov_b32 s1, 0x80040000", "s_mov_b32 s2, 0x1000"]
+        load = "buffer_load_dword v6, off, s[0:3], 0"
+        for name, build, tier in (
+                ("mov64_set", ["s_mov_b64 s[2:3], 0x31816fac00001000"], "C"),
+                ("mov64_clear", ["s_mov_b64 s[2:3], 0x31016fac00001000"], "A"),
+                ("mov64_pair_copy", ["s_mov_b64 s[20:21], 0x31816fac00001000", "s_mov_b64 s[2:3], s[20:21]"], "C"),
+                ("pack_set", ["s_pack_ll_b32_b16 s3, 0x6fac, 0x3181"], "C"),
+                ("pack_clear", ["s_pack_ll_b32_b16 s3, 0x6fac, 0x3101"], "A"),
+                ("bfm_set", ["s_bfm_b32 s3, 9, 23"], "C"),
+                ("bfm_clear", ["s_bfm_b32 s3, 3, 12"], "A"),
+                ("movk_clear", ["s_movk_i32 s3, 0x1234"], "A")):
+            lines = vs(head + (["s_mov_b32 s3, 0"] if name.startswith("mov64") else []) + build
+                       + ["v_mov_b32_e32 v9, 0", load, "s_waitcnt vmcnt(0)"])
+            self.assertEqual(meta_of("vs_w3_" + name, lines)[0][0], tier, name)
+
+    def test_offen_tbuffer_and_store_format_follow_the_bit(self):
+        for access in ("buffer_load_dword v6, v9, s[0:3], 0 offen",
+                       "tbuffer_load_format_x v6, off, s[0:3], 0 format:[BUF_FMT_32_FLOAT]",
+                       "buffer_store_format_x v6, off, s[0:3], 0"):
+            (tier, reasons, _), _ = meta_of("vs_tid_variant", self.program(self.TID, access))
+            self.assertEqual((tier, "lane-id" in reasons), ("C", True), access)
+            (tier, reasons, _), _ = meta_of("vs_notid_variant", self.program(self.NO_TID, access))
+            self.assertEqual((tier, reasons), ("A", []), access)
+
+    def test_stores_and_atomics_by_lane_are_tier_c(self):
+        for access in ("buffer_store_dword v6, off, s[0:3], 0", "buffer_atomic_add v6, off, s[0:3], 0"):
+            (tier, reasons, _), _ = meta_of("vs_tid_write", self.program(self.TID, access))
+            self.assertEqual((tier, "lane-id" in reasons), ("C", True), access)
+            (tier, _, _), _ = meta_of("vs_notid_write", self.program(self.NO_TID, access))
+            self.assertEqual(tier, "A", access)
+
+    def test_run_time_v_sharp_is_assumed_to_have_the_bit_clear(self):
+        # the word3 comes from user data: nothing in the code says the bit is set (design.md, SHADER-10)
+        lines = vs(["buffer_load_dword v6, off, s[4:7], 0", "s_waitcnt vmcnt(0)"])
+        self.assertEqual(meta_of("vs_runtime_vsharp", lines)[0][0], "A")
+
+
 class Refusal(unittest.TestCase):
     def test_error_mode_refuses_tier_c(self):
         old = rdna2spirv.WAVE64_GRAPHICS
