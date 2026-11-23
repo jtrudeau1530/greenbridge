@@ -38,12 +38,14 @@ import math
 import os
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import report_paths  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 DX10_HEADER = 148
 DXGI_R16_UNORM = 56
@@ -622,6 +624,34 @@ def report_lines(summary: dict) -> list:
     return out
 
 
+def write_json(path, data):
+    """Publish `data` as JSON at `path` through a unique temporary file in the same folder.
+
+    A fixed `path + ".tmp"` would block every later run while a stale file or folder keeps that name, and two
+    runs writing one output would share it. On any failure the temporary file is removed and `path` is untouched.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(data, f, indent=1)
+        os.chmod(tmp, published_mode(path))   # mkstemp creates 0600
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)   # a read-only destination's mode would stop the unlink on Windows
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("work", help="make_game.py work folder (with assets/<archive>/textures/manifest.json)")
@@ -649,12 +679,8 @@ def main(argv=None) -> int:
     for line in report_lines(summary):
         print(line)
     if a.json:
-        tmp = a.json + ".tmp"
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(summary, f, indent=1)
-            os.replace(tmp, a.json)
+            write_json(a.json, summary)
         except OSError as e:
             print(f"world_grid_atlas: cannot write {a.json}: {e}", file=sys.stderr)
             return 2

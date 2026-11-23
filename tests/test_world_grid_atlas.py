@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -207,6 +208,49 @@ def mhiu(width, height, bounds, heights):
 def terrain(x, y):
     """Synthetic ground height in metres, rising to the north so a flipped row order shows."""
     return 100.0 + 0.04 * (y + 3072) + 20.0 * math.sin(x / 300.0)
+
+
+class WriteJsonTest(unittest.TestCase):
+    """--json publishes through a unique temporary file (stdlib only)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def leftovers(self, name, keep=()):
+        return [n for n in os.listdir(self.root) if n.startswith(name + ".") and n not in keep]
+
+    def test_stale_fixed_temp_folder_does_not_block_the_write(self):
+        out = os.path.join(self.root, "grid.json")
+        os.makedirs(out + ".tmp")
+        wga.write_json(out, {"a": 1})
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"a": 1})
+        self.assertTrue(os.path.isdir(out + ".tmp"))
+        self.assertEqual(self.leftovers("grid.json", keep=("grid.json.tmp",)), [])
+
+    def test_failed_replace_keeps_the_old_file_and_no_temp(self):
+        out = os.path.join(self.root, "grid.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("old")
+        with mock.patch.object(wga.os, "replace", side_effect=OSError("replace denied")):
+            with self.assertRaises(OSError):
+                wga.write_json(out, {"a": 1})
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old")
+        self.assertEqual(self.leftovers("grid.json"), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_keeps_the_replaced_file_mode(self):
+        out = os.path.join(self.root, "grid.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("old")
+        os.chmod(out, 0o640)
+        wga.write_json(out, [1, 2])
+        self.assertEqual(os.stat(out).st_mode & 0o777, 0o640)
 
 
 @unittest.skipUnless(HAVE_NUMPY, "needs numpy and Pillow")
