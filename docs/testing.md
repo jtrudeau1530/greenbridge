@@ -315,8 +315,8 @@ fails.
 machine without that reference, use `--emulated-only` to time the current Vulkan device instead:
 
 ```sh
-python3 -I scripts/bench_wave64.py --build runtime/build/linux \
-  --llvm-mc "$(brew --prefix llvm)/bin/llvm-mc" --emulated-only
+export LLVM_MC="$(brew --prefix llvm)/bin/llvm-mc"   # bench_wave64.py reads --llvm-mc from LLVM_MC
+python3 -I scripts/bench_wave64.py --build runtime/build/linux --emulated-only
 ```
 
 This mode builds only the emulated shader, requires every benchmark process to finish the shader's `0 mismatches`

@@ -123,6 +123,13 @@ defaults one of them hooks the process: the package DLLs mapped after it then fa
 `TOMBOX_GDK_EARLY=0 TOMBOX_GDK_RUNTIME=0 TOMBOX_OSHOST=0 TOMBOX_PAD=0 TOMBOX_TIMER_1MS=0` they map; their network
 guard stays on and denies all traffic. `loader_test` covers the step with a synthetic DLL (no game data).
 
+### Repeatable random bytes: `LEONIDA_RNG_SEED`
+
+With `LEONIDA_RNG_SEED=<number>` (decimal, or hexadecimal with `0x`; read once when the `bcrypt` shim starts),
+`BCryptGenRandom` on the RNG algorithms answers from a seeded splitmix64 generator instead of the host's, so two
+runs with the same seed get the same bytes. The shim prints `[rt] bcrypt: deterministic LEONIDA_RNG_SEED enabled`
+with the seed on stderr; a seed of 0 uses a fixed non-zero state. Unset, the host's generator answers as before.
+
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
