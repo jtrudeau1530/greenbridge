@@ -1016,6 +1016,33 @@ void run_checks(const std::filesystem::path& root) {
               "CreateFile2 reads a GAME: file from the package");
         if (h_read != INVALID_HANDLE_VALUE) ::CloseHandle(h_read);
 
+        // FILE_FLAG_NO_BUFFERING is dropped: the retail exe reads unbuffered handles at unaligned offsets and sizes.
+        // Left in, Windows fails these reads with ERROR_INVALID_PARAMETER (87).
+        {
+            std::string big(8880, 'x');
+            for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>('a' + i % 23);
+            write_path(package / "data" / "unbuffered.bin", big);
+            const auto unaligned_read = [&](HANDLE h, const char* what) {
+                char buf[0xd50]{};
+                OVERLAPPED ov{};
+                ov.Offset = 0x1560;
+                DWORD got = 0;
+                const BOOL ok = h != INVALID_HANDLE_VALUE && ::ReadFile(h, buf, sizeof(buf), &got, &ov);
+                check(ok && got == sizeof(buf) && std::memcmp(buf, big.data() + 0x1560, sizeof(buf)) == 0, what);
+                if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            };
+            unaligned_read(create_w(L"GAME:\\data\\unbuffered.bin", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                    OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr),
+                           "CreateFileW: an unaligned read succeeds on a FILE_FLAG_NO_BUFFERING open");
+            CREATEFILE2_EXTENDED_PARAMETERS nb{};
+            nb.dwSize = sizeof(nb);
+            nb.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+            nb.dwFileFlags = FILE_FLAG_NO_BUFFERING;
+            unaligned_read(create2(L"GAME:\\data\\unbuffered.bin", GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, &nb),
+                           "CreateFile2: an unaligned read succeeds on a FILE_FLAG_NO_BUFFERING open");
+            check((nb.dwFileFlags & FILE_FLAG_NO_BUFFERING) != 0, "CreateFile2 leaves the caller's parameters alone");
+        }
+
         // CreateFile2 write goes to the overlay, leaving the package untouched.
         const HANDLE h_write = create2(L"GAME:\\data\\cf2.txt", GENERIC_WRITE, 0, CREATE_ALWAYS, &ext);
         check(h_write != INVALID_HANDLE_VALUE, "CreateFile2 creates a new GAME: file in the overlay");

@@ -776,6 +776,17 @@ void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* c
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
+// The retail exe opens its archives with FILE_FLAG_NO_BUFFERING and then reads them at unaligned offsets and sizes.
+// Windows requires sector-aligned offset, size and buffer on an unbuffered handle and fails such a read with
+// ERROR_INVALID_PARAMETER (87); the console accepts it, and the exe's read wrapper treats 87 as end of data, so
+// startup waits forever. Dropping the flag changes only caching: the bytes read are the same.
+void note_no_buffering_dropped() {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[rt] file_system: FILE_FLAG_NO_BUFFERING dropped: a PC requires sector-aligned unbuffered "
+                             "reads, the console does not (logged once)\n");
+}
+
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
@@ -788,7 +799,9 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    if (flags & FILE_FLAG_NO_BUFFERING) note_no_buffering_dropped();
+    const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition,
+                                   flags & ~static_cast<DWORD>(FILE_FLAG_NO_BUFFERING), template_file);
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
         note_open_failure("CreateFileW", name, error, _ReturnAddress());
@@ -818,6 +831,13 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         note_open_failure("CreateFile2", name, t.error, _ReturnAddress());
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
+    }
+    CREATEFILE2_EXTENDED_PARAMETERS unbuffered_free{};
+    if (params && (params->dwFileFlags & FILE_FLAG_NO_BUFFERING)) {
+        note_no_buffering_dropped();
+        unbuffered_free = *params;
+        unbuffered_free.dwFileFlags &= ~static_cast<DWORD>(FILE_FLAG_NO_BUFFERING);
+        params = &unbuffered_free;
     }
     const HANDLE h = ::CreateFile2(t.path.c_str(), access, share, disposition, params);
     if (h == INVALID_HANDLE_VALUE) {
