@@ -3526,12 +3526,17 @@ class Gen:
             self.emit(f"{m3} = OpIEqual %bool {md} {self.cu(3)}")
             sel = (m1, m2, m3)
 
+        ends = {}   # (offset id, end) -> the ulong sum: modes 0 and 3 share it when soffset is 0
+
         def end_ok(which, end_bytes):
             """The access ends inside its limit: offset + end <= stride (mode 0) or <= num_records (mode 3);
             end_bytes is a Python int or the id of a ulong."""
             x, limit = lim[which]
-            end, ok = self.tmp(), self.tmp()
-            self.emit(f"{end} = OpIAdd %ulong {x} {self.cl(end_bytes) if isinstance(end_bytes, int) else end_bytes}")
+            end = ends.get((x, end_bytes))
+            if end is None:
+                end = ends[(x, end_bytes)] = self.tmp()
+                self.emit(f"{end} = OpIAdd %ulong {x} {self.cl(end_bytes) if isinstance(end_bytes, int) else end_bytes}")
+            ok = self.tmp()
             self.emit(f"{ok} = OpULessThanEqual %bool {end} {limit}")
             return ok
 
@@ -3631,8 +3636,12 @@ class Gen:
             return addr, d3, in_b, None
         in_b = check(0)
         if parts:
-            # modes 0 and 3 end-check every dword on its own; 1 and 2 (a literal V#) share the first-byte check
-            return addr, d3, in_b, (check if mode in (None, 0, 3) else None), step
+            # modes 0 and 3 end-check every dword on its own; 1 and 2 (a literal V#) share the first-byte check.
+            # Dword 0's check is in_b itself: computed here, before any of the caller's branches, so it dominates
+            # every use (the loads and stores used to compute it a second time).
+            def part(k):
+                return in_b if k == 0 else check(k)
+            return addr, d3, in_b, (part if mode in (None, 0, 3) else None), step
         return addr, d3, in_b, step
 
     def format_encode_call(self, fmt, fc, normalized, unorm_view, ic, signed_ic, two):
