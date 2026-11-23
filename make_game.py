@@ -1317,7 +1317,118 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    captured_shaders(work, jobs)
     log("shaders: done")
+
+
+# <work>/shaders/captured: where a run writes the shader containers it could not resolve, when
+# LEONIDA_SHADER_CAPTURE names it (runtime/src/shader_capture.h).
+CAPTURED = "captured"
+
+
+def captured_shaders(work: str, jobs: "int | None" = None) -> None:
+    """Translate the containers a run captured with LEONIDA_SHADER_CAPTURE (#8851 A40/A44).
+
+    The title builds some shader programs at run time, so they sit in no archive and the carve never produces them:
+    the run stops at the pipeline that first asks for one (31 of them on retail 1.0.2.1). With
+    LEONIDA_SHADER_CAPTURE=<work>/shaders/captured the runtime writes each container it cannot resolve next to a
+    sidecar naming its stage. This step turns each into a module with the same three tools the carve uses and adds
+    it to the library, so the next run finds it.
+
+    These captures are game data: they stay in the work folder and are never committed. Idempotent - a container
+    whose program is already in the library is skipped - and free when the folder is absent or empty.
+    """
+    caught = os.path.join(work, "shaders", CAPTURED)
+    containers = []
+    for path in sorted(glob.glob(os.path.join(caught, "*.dxbc"))):
+        sidecar = os.path.splitext(path)[0] + ".json"
+        stage = ""
+        try:
+            with open(sidecar, encoding="utf-8") as f:
+                stage = str(json.load(f).get("stage", ""))
+        except (OSError, ValueError):
+            pass
+        if stage not in ("vs", "ps", "cs", "ms", "gs"):
+            log(f"captured: skipping {os.path.basename(path)}: its sidecar names no stage")
+            continue
+        containers.append((path, stage))
+    if not containers:
+        return
+
+    spirv = require_translated_shaders(work)
+    index = os.path.join(spirv, "index.json")
+    try:
+        with open(index, encoding="utf-8") as f:
+            library = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"captured: {index} is unreadable ({getattr(e, 'strerror', None) or e}).")
+    known = {entry.get("fssm_sha256") for entry in library.values()}
+    # The runtime names each capture after its program's SHA-256, so a program already in the library is recognised
+    # without unpacking anything: the common case (a tree that has caught up) does no work at all.
+    containers = [(path, stage) for path, stage in containers if os.path.splitext(os.path.basename(path))[0] not in known]
+    if not containers:
+        log(f"captured: every container in {caught} is already translated")
+        return
+
+    # One staging folder with the layout rdna2spirv.py reads: <root>/index.json, <root>/<name>.dxbc,
+    # <root>/fssm/<name>.fssm and <root>/disasm/<name>.s.
+    staging = os.path.join(work, "shaders", "captured_work")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    entries = []
+    for path, stage in containers:
+        name = "captured_" + os.path.splitext(os.path.basename(path))[0][:8]
+        shutil.copyfile(path, os.path.join(staging, name + ".dxbc"))
+        entries.append({"file": name + ".dxbc", "stage": stage})
+
+    def write_index(rows):
+        with open(os.path.join(staging, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(rows, f, indent=1)
+
+    write_index(entries)
+    py("fssm_unpack.py", staging)
+    fssm = os.path.join(staging, "fssm")
+    todo = []
+    for entry in entries:
+        name = entry["file"][: -len(".dxbc")]
+        blob = os.path.join(fssm, name + ".fssm")
+        if not os.path.isfile(blob):
+            log(f"captured: {name} holds no FSSM program; skipped")
+            continue
+        with open(blob, "rb") as f:
+            if hashlib.sha256(f.read()).hexdigest() in known:
+                # A rename by hand: the file name no longer says which program it is, the bytes still do.
+                continue
+        todo.append(entry)
+    if not todo:
+        shutil.rmtree(staging, ignore_errors=True)
+        log(f"captured: {len(containers)} container(s) in {caught}, all translated already")
+        return
+    write_index(todo)
+
+    disasm = os.path.join(staging, "disasm")
+    py("shader_disasm.py", fssm, "--out", disasm, *(["--jobs", str(jobs)] if jobs else []))
+    out = os.path.join(staging, "spirv")
+    py("rdna2spirv.py", disasm, "--out", out, "--no-asm")
+    fresh_index = os.path.join(out, "index.json")
+    if not os.path.isfile(fresh_index):
+        fail("captured: rdna2spirv.py wrote no index for the captured shaders.")
+    try:
+        with open(fresh_index, encoding="utf-8") as f:
+            fresh = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"captured: {fresh_index} is unreadable ({getattr(e, 'strerror', None) or e}).")
+    if not fresh:
+        fail("captured: rdna2spirv.py translated none of the captured shaders; its output above names the reason.")
+    for name in fresh:
+        shutil.copyfile(os.path.join(out, name + ".spv"), os.path.join(spirv, name + ".spv"))
+    library.update(fresh)
+    marker = index + ".tmp"
+    with open(marker, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(library, f, sort_keys=True)
+    os.replace(marker, index)
+    shutil.rmtree(staging, ignore_errors=True)
+    log(f"captured: {len(fresh)} of {len(containers)} container(s) translated and added from {caught}")
 
 
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
