@@ -99,9 +99,15 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertRegex(cmake, r"target_link_options\(gta6rt PRIVATE [^)]*\$\{GTA6RT_HOST_BASE\}")
         lines = [line for line in self.body.splitlines() if "/Fe:gta6rt.exe" in line]
         self.assertEqual(len(lines), 1)
-        pattern = rf"/Fe:gta6rt\.exe /link (\S+ )*{re.escape(base)}( |$)"
-        self.assertNotRegex(lines[0].replace(base, ""), pattern)
-        self.assertRegex(lines[0], pattern)
+        def has_exactly_the_cmake_base(line):
+            before, separator, after = line.partition(" /link ")
+            if not separator or "/Fe:gta6rt.exe" not in before:
+                return False
+            return [option for option in after.split() if option.upper().startswith("/BASE:")] == [base]
+
+        self.assertFalse(has_exactly_the_cmake_base(lines[0].replace(base, "")))
+        self.assertFalse(has_exactly_the_cmake_base(lines[0] + " /BASE:0x140000000"))
+        self.assertTrue(has_exactly_the_cmake_base(lines[0]))
 
     def test_build_cmd_sets_utf8_codepage_for_ninja_showincludes(self):
         text = SCRIPT.read_text(encoding="utf-8")
