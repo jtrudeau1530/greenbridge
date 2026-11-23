@@ -563,3 +563,15 @@ failures**, in 236 s. Both test suites build synthetic archives in memory/tempdi
 The package is read-only. Do not commit, upload or share the archive, any carved page, a key, an extracted name,
 or a report that quotes payload bytes. Only aggregate counts, offsets, verified layouts and four-byte magics belong in
 this repository.
+
+## Inspect one tile locally
+
+Run `python -I tools/navmesh_tile_obj.py navmeshes.rpf --tile 0 --out <private-folder>/tile.obj`
+with a zero-based tile ordinal. The reader walks complete navmesh resources in archive order and stops at the
+selection. Dynamic tiles count toward the ordinal and lack the static world-space placement required for export.
+
+Each `polygon_N` group corresponds to record N in the selected tile. A single slot becomes a point, two slots
+become a line, and three or more become a polyline closed back to the first slot. Empty records keep their group.
+Repeated or collinear slots remain in order, including zero-length edges. OBJ vertex numbers are local to this
+export. The boundary drawing makes no claim about surface triangulation, connections or navigability.
+Keep generated OBJ files in your private work folder.
