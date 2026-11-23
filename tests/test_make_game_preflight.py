@@ -813,7 +813,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
     def setUp(self):
         super().setUp()
         # The fingerprint assets() compares each model and texture folder with, without asking git for it.
-        patcher = mock.patch("make_game.decoder_digest", return_value=self.DECODER)
+        patcher = mock.patch("make_game.compute_decoder_digest", return_value=self.DECODER)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1103,6 +1103,26 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with tempfile.TemporaryDirectory() as work, self.mixed_resume(work, model_fingerprint="older-decoder"):
             self.run_preflight(work, free_gb=276)       # 30 + 300 - 54
             self.assert_fails(self.run_preflight, work, free_gb=275, match="about 276 GB is needed")
+
+    def test_the_credit_does_not_cache_a_decoder_digest_before_the_submodule_is_fetched(self):
+        # preflight credits the exports before ensure_submodule(): a digest cached then (made from a missing or
+        # changed checkout) would be the one assets() compares with afterwards.
+        make_game.decoder_digest.cache_clear()
+        self.addCleanup(make_game.decoder_digest.cache_clear)
+        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work):
+            self.run_preflight(work, free_gb=180)
+        self.assertEqual(make_game.decoder_digest.cache_info().currsize, 0)
+
+    def test_a_decoder_that_cannot_be_hashed_credits_nothing_and_does_not_stop_preflight(self):
+        with tempfile.TemporaryDirectory() as work, self.mixed_resume(work),                 mock.patch("make_game.compute_decoder_digest", side_effect=FileNotFoundError("Program.cs")):
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
+            self.assert_fails(self.run_preflight, work, free_gb=329, match="about 330 GB is needed")
+
+    def test_the_decoder_is_not_hashed_when_there_is_room_or_nothing_is_exported(self):
+        with tempfile.TemporaryDirectory() as work, mock.patch("make_game.compute_decoder_digest") as digest:
+            self.run_preflight(work, free_gb=500)
+            self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
+            digest.assert_not_called()
 
     def test_wav_ignores_the_unfinished_output_too(self):
         with tempfile.TemporaryDirectory() as work, self.mixed_resume(work):

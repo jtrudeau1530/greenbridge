@@ -549,9 +549,12 @@ def assets_bytes_on_disk(work: str) -> int:
             record = os.path.join(folder, DECODER_RECORD)
             if not os.path.isfile(record):
                 continue   # no fingerprint: assets() exports this folder again, so none of it is kept
-            if decoder is None:   # read lazily: a work folder without exports never asks git for the decoder
-                decoder = decoder_digest()
-            if read_shader_setting(record) == decoder:
+            if decoder is None:   # read lazily: a work folder without exports never hashes the decoder
+                try:   # not the cached decoder_digest(): the submodule may not be fetched yet (ensure_submodule)
+                    decoder = compute_decoder_digest()
+                except OSError:
+                    decoder = ""   # can't tell what the exports came from: credit none of them
+            if decoder and read_shader_setting(record) == decoder:
                 total += _tree_bytes(folder, ignore_suffix=".partial")
     for top in ("ttpf", "ttpf_pack"):
         total += sum(_tree_bytes(d) for d in _finished_pool_dirs(os.path.join(out, top)))
@@ -1374,8 +1377,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 DECODER_RECORD = "decoder.sha256"   # beside each model and texture manifest.json: the decoder_digest() that made it
 
 
-@functools.cache
-def decoder_digest() -> str:
+def compute_decoder_digest() -> str:
     """SHA-256 over the checked-out third_party/rpf9-explorer commit and the name and exact bytes of each
     tools/rpf9dump source file: what the model and texture exports come from."""
     sub = os.path.join(ROOT, "third_party", "rpf9-explorer")
@@ -1390,6 +1392,11 @@ def decoder_digest() -> str:
     folder = os.path.join(TOOLS, "rpf9dump")
     names = sorted(n for n in os.listdir(folder) if n.endswith((".cs", ".csproj", ".json")))
     return sources_digest(folder, names, pin)
+
+
+# assets() asks for it once, after preflight's ensure_submodule() has fetched the submodule. Anything earlier (the
+# preflight credit) calls compute_decoder_digest() instead, so a digest made from a missing checkout is never cached.
+decoder_digest = functools.cache(compute_decoder_digest)
 
 
 def rpf9dump(work: str) -> str:
