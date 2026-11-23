@@ -26,16 +26,21 @@ namespace driver {
 PFN_vkGetInstanceProcAddr real_instance = nullptr;
 PFN_vkGetDeviceProcAddr real_device = nullptr;
 PFN_vkGetSemaphoreCounterValue real_counter = nullptr;
-std::atomic<bool> fail_next_counter{false};
+std::atomic<VkResult> fail_next_counter{VK_SUCCESS};
 std::atomic<unsigned> failed_count{0};
 DWORD test_thread = 0;
 
 VKAPI_ATTR VkResult VKAPI_CALL get_counter(VkDevice device, VkSemaphore semaphore, std::uint64_t* value) {
     // A pending fence may also be polled by the dispatcher thread. Only the explicitly armed
     // synchronous GetCompletedValue call gets the test failure, so it is deterministic.
-    if (GetCurrentThreadId() == test_thread && fail_next_counter.exchange(false)) {
-        failed_count.fetch_add(1);
-        return VK_ERROR_DEVICE_LOST;
+    if (GetCurrentThreadId() == test_thread) {
+        const VkResult injected = fail_next_counter.exchange(VK_SUCCESS);
+        if (injected != VK_SUCCESS) {
+            // Even a bogus output counter from a failed query may not be treated as completion.
+            *value = 999;
+            failed_count.fetch_add(1);
+            return injected;
+        }
     }
     return real_counter(device, semaphore, value);
 }
@@ -112,7 +117,18 @@ int main() {
             return 1;
         if (FAILED(fence->SetEventOnCompletion(7, pending.handle)) || pending.ready(0)) return 1;
 
-        driver::fail_next_counter.store(true);
+        driver::fail_next_counter.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+        const UINT64 ignored = fence->GetCompletedValue();
+        const HRESULT still_alive = device->GetDeviceRemovedReason();
+        const bool false_completion = pending.ready(0);
+        std::printf("Leonida Vulkan: injected VK_ERROR_OUT_OF_HOST_MEMORY with bogus counter 999: "
+                    "value=%016llx, device_removed=%08x, pending_event=%d\n",
+                    static_cast<unsigned long long>(ignored), static_cast<unsigned>(still_alive),
+                    int(false_completion));
+        if (ignored != 0 || still_alive != S_OK || false_completion || driver::failed_count.load() != 1)
+            ++failures;
+
+        driver::fail_next_counter.store(VK_ERROR_DEVICE_LOST);
         const UINT64 first = fence->GetCompletedValue();
         const HRESULT removed = device->GetDeviceRemovedReason();
         const bool waiter_released = pending.ready(1500);
@@ -122,7 +138,7 @@ int main() {
                     static_cast<unsigned long long>(first), static_cast<unsigned>(removed),
                     int(waiter_released), faults);
         if (first != UINT64_MAX || removed != DXGI_ERROR_DEVICE_REMOVED ||
-            !waiter_released || faults != 1 || driver::fail_next_counter.load())
+            !waiter_released || faults != 2 || driver::fail_next_counter.load() != VK_SUCCESS)
             ++failures;
         // COM releases the fence before its externally owned VkDevice; on failure the cancel
         // path still drains the pending event rather than leaving a dispatcher thread blocked.
