@@ -34,6 +34,7 @@ class TextureAssets(unittest.TestCase):
         self.pool.parent.mkdir(parents=True)
         self.folder = self.work / "assets/ttpf/pool"
         self.folder.mkdir(parents=True)
+        (self.folder / make_game.DECODER_RECORD).write_text(make_game.decoder_digest(), encoding="utf-8")
         self.catalog = self.folder / "manifest.json"
         self.row = dict(Index=0, AssetKey="CAFEBABE12345678", SourceMips=5, BaseMipLevel=0,
                         Mips=0, File=None, DxgiFormat=71, Limitation="BCPack")

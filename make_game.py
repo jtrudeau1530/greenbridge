@@ -486,7 +486,7 @@ def assets_exported(work: str) -> bool:
     too. A marker counts only when it holds what mark() writes, not because a file of that name exists.
     xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
     ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again.
-    Models and textures made by another decoder (DECODER_RECORD) don't change the answer: assets() removes each
+    Models, textures and pools made by another decoder (DECODER_RECORD) don't change the answer: assets() removes each
     such folder before it exports it again, so the new export goes into the space the old one held."""
     audio = os.path.join(work, "assets", "audio")
     for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
@@ -1470,7 +1470,8 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 
 
 # ---------------------------------------------------------------- assets
-DECODER_RECORD = "decoder.sha256"   # beside each model and texture manifest.json: the decoder_digest() that made it
+# Beside each model, texture and pool manifest.json: the decoder_digest() that made it.
+DECODER_RECORD = "decoder.sha256"
 
 
 @functools.cache
@@ -1593,9 +1594,18 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         if counts[(os.path.normcase(dest), os.path.normcase(name))] > 1:
             root = os.path.join(dest, f"{name}~{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:12]}")
         pool_dir = os.path.join(root, name)
+        # rpf9dump ttpf decodes with the same rpf9-explorer Core and keeps the DDS it finds, so a pool takes the
+        # same decoder record as the model and texture exports above.
+        record = os.path.join(pool_dir, DECODER_RECORD)
+        if os.path.isdir(pool_dir) and read_shader_setting(record) != decoder:
+            log(f"assets: no matching decoder fingerprint for texture pool {os.path.relpath(p, game)}: exporting again")
+            shutil.rmtree(pool_dir)
         manifest = ttpf_manifest(pool_dir)
         if manifest is None:
             log(f"assets: texture pool {os.path.relpath(p, game)}")
+            os.makedirs(pool_dir, exist_ok=True)
+            with open(record, "w", encoding="utf-8", newline="\n") as f:
+                f.write(decoder + "\n")
             run([get_exporter(work), "ttpf", p, root])
             manifest = ttpf_manifest(pool_dir)
             if manifest is None:

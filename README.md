@@ -178,8 +178,9 @@ The build records which translator sources produced the shaders. A change to tho
 saved disassembly. Older work folders need one translation after upgrading to record this information.
 
 The build also records which decoder (the `third_party/rpf9-explorer` commit and the `tools/rpf9dump` sources) exported
-each archive's models and textures. When it changes, the assets stage removes that export and makes it again. Older
-work folders have no record, so their models and textures are exported once more after upgrading.
+each archive's models and textures and each texture pool. When it changes, the assets stage removes that export and
+makes it again. Older work folders have no record, so their models, textures and pools are exported once more after
+upgrading.
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and checks that it compiles, reports any it has to skip, and saves a pipeline cache to

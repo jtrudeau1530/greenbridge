@@ -504,6 +504,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             src.touch()
             (dest / "sample").mkdir(parents=True)
             (dest / "sample" / "first.dds").write_bytes(b"completed sibling")
+            (dest / "sample" / make_game.DECODER_RECORD).write_text(make_game.decoder_digest(), encoding="utf-8")
         (pack_dest / "sample" / "second.dds").mkdir()
 
         valid = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": None}]})
