@@ -5748,8 +5748,12 @@ int main() {
                    E_INVALIDARG);
         }
         {
+            // On the Xbox device proxy, slot 61 is the title's CreateSamplerX (#7115), so the PC meta-command methods
+            // are checked on the Vulkan device behind it.
+            ID3D12Device* pc = rt::d3d12_xs::is_device_proxy(device.p) ? rt::d3d12_xs::device_proxy_real_device(device.p)
+                                                                        : device.p;
             Ref<ID3D12Device5> device5;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p))));
+            EXPECT(SUCCEEDED(pc->QueryInterface(IID_PPV_ARGS(&device5.p))));
             UINT meta_count = 7;
             EXPECT(device5->EnumerateMetaCommands(&meta_count, nullptr) == S_OK && meta_count == 0);
             EXPECT(device5->EnumerateMetaCommands(nullptr, nullptr) == E_INVALIDARG);

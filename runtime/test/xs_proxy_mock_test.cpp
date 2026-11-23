@@ -1634,8 +1634,7 @@ int check_xbox_slots() {
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens, slot 61 to "
                 "CreateSampler and slot 41 creates argument type 105 as DISPATCH, without reaching the mock's own PC "
-                "slots
-", g_label);
+                "slots\n", g_label);
     return 0;
 #else
     std::printf("%s: ID3D12Device11 is not in this SDK; Xbox slot 80's beyond-table case is not built\n", g_label);
@@ -2284,7 +2283,7 @@ int check_committed_resource3_x() {
 // ---- Device slot 127 takes the resource's memory through the title's XMem hook ----
 //
 // The console runtime allocates a committed resource's memory with XMemAlloc, and a title's hook may count it (a budget
-// check after its first render targets). The proxy calls the installed hook with the PC allocation size and the
+// check after its first render targets). The proxy calls the installed hook with the console allocation size and the
 // committed-resource attributes, and gives the memory back through the hook's free when the resource dies.
 int check_committed_resource3_xmem_hook() {
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
@@ -2317,7 +2316,7 @@ int check_committed_resource3_xmem_hook() {
     EXPECT(g_heap_hook.alloc_calls == 1 && g_heap_hook.last_alloc_size == kSize);
     EXPECT(g_heap_hook.last_alloc_attr == xs::kXmemCommittedResourceAttributes);
     EXPECT(((g_heap_hook.last_alloc_attr >> 14) & 3) == 2 && ((g_heap_hook.last_alloc_attr >> 16) & 0xff) == 0x80);
-    EXPECT(mock->calls[25] == 1);
+    EXPECT(mock->calls[25] == 0);  // a listed render target takes its console tiles, not the PC size
     Mock* const res = reinterpret_cast<Mock*>(resource);
     EXPECT(res->private_data != nullptr && g_heap_hook.free_calls == 0);  // held while the resource lives
     EXPECT(release(resource) == 0);
@@ -2585,6 +2584,7 @@ int check_view_heap_cap() {
         void* device = make_device(mock, 0, false);   // no view-heap limit
         EXPECT(device);
         raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+        if (made) release(made);  // the heap proxy holds a device reference
         EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 1245184);   // not capped when the device takes it
         EXPECT(release(device) == 0);
     }
@@ -2593,16 +2593,19 @@ int check_view_heap_cap() {
     EXPECT(device);
     mock->view_heap_limit = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    if (made) release(made);  // the heap proxy holds a device reference
     EXPECT(mock->calls[14] == 2 && mock->array[14][0] == 1245184 &&
            mock->array[14][1] == D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2);   // refused, then at the limit
     EXPECT(heap.NumDescriptors == 1245184);   // the title's description is left as it was
     mock->calls[14] = 0;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    if (made) release(made);  // the heap proxy holds a device reference
     EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 1245184);   // CPU-only: no limit, one request
     mock->calls[14] = 0;
     heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    if (made) release(made);  // the heap proxy holds a device reference
     EXPECT(mock->calls[14] == 1 && mock->array[14][0] == 4096);   // within the limit: one request, unchanged
     EXPECT(release(device) == 0);
     std::printf("%s: a view heap the device refuses past its limit is made again at the limit; one it takes is kept "
