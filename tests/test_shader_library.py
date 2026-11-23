@@ -5,6 +5,7 @@
 Zero game data: every library and archive is built here from synthetic bytes.
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -18,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import shader_library as sl  # noqa: E402
+import shader_meta  # noqa: E402
 
 ENDPGM = struct.pack("<I", 0xBF810000)
 CODE_END = struct.pack("<I", 0xBF9F0000)
@@ -222,6 +224,16 @@ class Main(unittest.TestCase):
                 summary = json.load(f)
             self.assertEqual(summary["graphics"][1]["stages"], {"ps": "lib_ps_00000", "ms": "lib_ms_00002"})
             self.assertEqual(summary["compute"][0]["program"], "lib_cs_00003")
+            # The compute program gets its record's state blob as kind 0, which the run time finds a slot-67
+            # pipeline by (fspx_state_sha256); a graphics program gets none.
+            with open(os.path.join(out, "fspx", "lib_cs_00003.state"), "rb") as f:
+                self.assertEqual(f.read(), kind0())
+            self.assertFalse(os.path.exists(os.path.join(out, "fspx", "lib_vs_00001.state")))
+            disasm_file = os.path.join(out, "disasm", "lib_cs_00003.s")
+            self.assertEqual(shader_meta.fspx_state_sha256_file(disasm_file, "lib_cs_00003"),
+                             hashlib.sha256(kind0()).hexdigest())
+            self.assertEqual(shader_meta.fspx_code_sha256_file(disasm_file, "lib_cs_00003"),
+                             hashlib.sha256(sl.program(sample(), sl.parse(sample()), 3)).hexdigest())
 
     def test_stage_filter_and_saved_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,7 +244,8 @@ class Main(unittest.TestCase):
             rc, text = self.run_main(src, "--out", out, "--stages", "cs,vs")
             self.assertEqual(rc, 0)
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
-                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
+                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_cs_00003.state", "lib_vs_00001.code",
+                              "lib_vs_00001.json"])
 
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:

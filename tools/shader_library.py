@@ -17,7 +17,10 @@ stage, a table of state blobs and a table of native RDNA2 programs. Layout (docs
 A missing stage is program 0xFFFFFFFF. Stage slots: 0 pixel, 1 vertex, 2 mesh (6 is used once and not identified).
 A compute state blob has the 28-byte layout of an FSPX kind-0 entry (tools/fspx_unpack.py), and every program starts
 with the same 36-byte hash prologue as an FSPX program, so the programs are written in the layout fspx_unpack.py uses
-and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
+and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json). A compute program also gets its
+record's state blob as fspx/<name>.state, as fspx_unpack.py writes kind 0: the runtime finds a program the executable
+passes to Xbox device slot 67 by the SHA-256 of both (docs/fspx.md, "Build and run-time lookup"). In the 1.0.2.1
+library every compute program has exactly one state blob (2,684 programs, 2,693 records).
 
 Usage:
     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
@@ -304,8 +307,9 @@ def main(argv=None) -> int:
         start, end = code_range(code)
         meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),
                 "code": {"start": start, "end": end, "prologue": start == fspx_unpack.PROLOGUE_SIZE}}
-        if i in cs_state:
-            meta.update(fspx_unpack.decode_kind0(blob(b, lib, cs_state[i])))
+        state = blob(b, lib, cs_state[i]) if i in cs_state else None
+        if state is not None:
+            meta.update(fspx_unpack.decode_kind0(state))
         name = names[i]
         entry = {"file": name + ".dxbc", "stage": st, "program": i}
         digests = sorted(lib["digest"].get(i, ()))
@@ -325,6 +329,12 @@ def main(argv=None) -> int:
                 entry[k] = meta[k]
         with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
             f.write(code)
+        state_path = os.path.join(a.out, "fspx", name + ".state")
+        if state is not None:
+            with open(state_path, "wb") as f:   # kind 0 as it is: its SHA-256 is the index's fspx_state_sha256
+                f.write(state)
+        elif os.path.exists(state_path):
+            os.unlink(state_path)   # a program that lost its compute record must not keep an old state key
         with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(meta, f, indent=1)
         if disasm and end:

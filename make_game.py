@@ -1317,6 +1317,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1388,6 +1389,69 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
     if clash:
         drop(translated)   # the runtime must not load an index whose keys pick between different modules
         fail(f"shaders: FSPX programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
+             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
+             "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
+LIBRARY_ARCHIVE = "shaders.rpf"
+LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")  # with TRANSLATION_SOURCES
+
+
+def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the pipeline library's compute translations depend on, as one line: shaders.rpf, the unpacking and
+    translating tools, llvm-mc, the wave64 mode and the fallback flags."""
+    tools = hashlib.sha256()
+    for name in LIBRARY_TOOLS:
+        tools.update(f"{name}\0".encode() + bytes.fromhex(file_sha256(os.path.join(TOOLS, name))))
+    return json.dumps({"archive": file_sha256(archive), "tools": tools.hexdigest(),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
+
+
+def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate: bool = False,
+                    fallbacks: tuple[str, ...] = ()) -> None:
+    """The compute pipelines of the pipeline library in shaders.rpf (docs/shader_library.md). The executable reads
+    the library through DirectStorage and creates each compute pipeline with Xbox device slot 67
+    (DeserializeComputePipelineStateX), passing the record's four parts as FSPX kinds 0, 1, 6 and 7 (docs/fspx.md).
+    tools/shader_library.py unpacks the compute programs with their kind-0 state into <work>/shaders/library, and
+    rdna2spirv.py translates them into <work>/shaders/spirv/library, where the runtime's shader library finds them by
+    fspx_code_sha256 and fspx_state_sha256 as it finds the FidelityFX DLL's. Graphics pipelines are not translated
+    here. The game's own shaders neither feed nor depend on this step, apart from the carve that names each program's
+    source container (the translator reads its signatures).
+
+    The step runs whole. Reuse requires the translation index, its named modules and a matching library_build.json
+    (library_settings)."""
+    archive = os.path.join(game, LIBRARY_ARCHIVE)
+    unpacked = os.path.join(work, "shaders", "library")
+    spirv = os.path.join(work, "shaders", "spirv", "library")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "library_build.json")
+    if not os.path.isfile(archive):
+        log(f"shaders: no {LIBRARY_ARCHIVE} in the game folder, so no pipeline library to translate")
+        return
+    settings = library_settings(archive, mc_signature, emulate, fallbacks)
+    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
+        return
+    log(f"shaders: unpacking and translating the compute pipelines of the pipeline library in {LIBRARY_ARCHIVE}")
+    drop(translated, settings_file)
+    # A program that no longer translates must not keep a module from the run before.
+    for folder, suffixes in ((os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    carve = os.path.join(work, "shaders", "dxbc")
+    py("shader_library.py", archive, "--out", unpacked, "--stages", "cs", "--disasm", "--jobs", str(jobs),
+       *(["--carve", carve] if os.path.isdir(carve) else []))
+    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
+    py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
+    clash = fspx_key_clash(spirv)
+    if clash:
+        drop(translated)   # the runtime must not load an index whose keys pick between different modules
+        fail(f"shaders: pipeline library programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
              "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
              "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
