@@ -710,6 +710,8 @@ void test_close_and_release(Env& env) {
     DSTORAGE_REQUEST r = file_request(big, 0, tmp.data(), 8);
     q->EnqueueRequest(&r);
     q->EnqueueStatus(s, 0);
+    check(s->IsComplete(0), "a status enqueued after Close completes");
+    check_hr(s->GetHResult(0), E_DSTORAGE_QUEUE_CLOSED, "a status enqueued after Close reports the closed queue");
     q->Submit();
     q->Close();  // a second Close is harmless
     Sleep(20);
