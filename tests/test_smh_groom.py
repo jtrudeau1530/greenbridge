@@ -5,6 +5,7 @@ Run with:
 """
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -12,7 +13,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -633,6 +636,73 @@ class RngAndInterpolationTests(unittest.TestCase):
         self.assertEqual(capped["points"], trimmed["points"][:10])
         self.assertEqual(capped["live"], trimmed["live"][:10])
 
+    def test_scatter_max_accepted_skips_culled_and_matches_full(self):
+        # 10 triangles where 9 are in blocked region 1 and 1 is in unblocked region 2,
+        # ensuring early candidates are culled before reaching 1 or 5 accepted strands.
+        triangles = [(0, 1, 2), (0, 2, 3)] * 5
+        tri_count = [(20, 4, 0, 0)] * 10
+        tri_region = [1] * 9 + [2]
+        sysd, gpu = build_synthetic_groom_buffers(
+            triangles=triangles,
+            tri_count=tri_count,
+            tri_region=tri_region,
+            length_random=(0.5, 0.4),
+            seeds=(0x5EED1234, 0xCAFEBABE),
+        )
+        groom = smh_groom.parse(sysd, gpu)
+
+        # Non-positive max_accepted returns empty lists immediately.
+        for cap in (0, -1):
+            empty = smh_groom.scatter(groom, count=500, strand_class=0, region_mask={1}, max_accepted=cap)
+            self.assertEqual(empty, {"tri": [], "culled": [], "bary": [], "seed": []})
+
+        full = smh_groom.scatter(groom, count=500, strand_class=0, region_mask={1})
+        self.assertEqual(len(full["tri"]), 500)
+        accepted_idx = [i for i, c in enumerate(full["culled"]) if not c]
+        self.assertGreaterEqual(len(accepted_idx), 5)
+        self.assertGreater(accepted_idx[0], 0, "expected at least one culled candidate before first accepted")
+        self.assertGreater(accepted_idx[4], 4, "expected culled candidates before fifth accepted")
+
+        original_scatter = smh_groom.scatter
+        for limit in (1, 5):
+            with self.subTest(max_accepted=limit):
+                capped_roots = smh_groom.scatter(
+                    groom, count=500, strand_class=0, region_mask={1}, max_accepted=limit,
+                )
+                expected_idx = accepted_idx[:limit]
+                for key in ("tri", "culled", "bary", "seed"):
+                    self.assertEqual(len(capped_roots[key]), limit)
+                self.assertFalse(any(capped_roots["culled"]))
+                self.assertEqual(capped_roots["tri"], [full["tri"][i] for i in expected_idx])
+                self.assertEqual(capped_roots["bary"], [full["bary"][i] for i in expected_idx])
+                self.assertEqual(capped_roots["seed"], [full["seed"][i] for i in expected_idx])
+
+                fast_strands = smh_groom.generate_strands(
+                    groom, count=500, strand_class=0, region_mask={1}, max_strands=limit,
+                )
+                with mock.patch.object(
+                    smh_groom,
+                    "scatter",
+                    lambda g, c, sc, ds, rm, _ma=None: original_scatter(g, c, sc, ds, rm, None),
+                ):
+                    full_strands = smh_groom.generate_strands(
+                        groom, count=500, strand_class=0, region_mask={1}, max_strands=limit,
+                    )
+                self.assertEqual(fast_strands, full_strands)
+
+        # When max_accepted exceeds total accepted, all accepted roots are returned in order.
+        all_accepted = smh_groom.scatter(
+            groom, count=500, strand_class=0, region_mask={1}, max_accepted=10000,
+        )
+        self.assertEqual(len(all_accepted["tri"]), len(accepted_idx))
+        self.assertEqual(all_accepted["tri"], [full["tri"][i] for i in accepted_idx])
+
+        # When every region is masked, max_accepted returns empty lists without error.
+        none_accepted = smh_groom.scatter(
+            groom, count=500, strand_class=0, region_mask={1, 2}, max_accepted=5,
+        )
+        self.assertEqual(none_accepted, {"tri": [], "culled": [], "bary": [], "seed": []})
+
 
 class GlbExportTests(unittest.TestCase):
     def test_glb_export_all_geometry_modes(self):
@@ -686,6 +756,67 @@ class GlbExportTests(unittest.TestCase):
         groom = smh_groom.parse(sysd, gpu)
         with self.assertRaises(smh_groom.GroomError):
             smh_groom.to_glb(groom, scalp=False, guides=False, classes=())
+
+    def test_glb_max_strands_early_stop_byte_identical_and_bounded_memory(self):
+        # 128 triangles x density 255 = 32,640 total candidates; max_strands=1 should
+        # produce a byte-identical GLB while keeping scatter allocations O(max_strands).
+        groom = smh_groom.parse(
+            *build_synthetic_groom_buffers(
+                triangles=[(0, 1, 2)] * 128,
+                tri_count=[(255, 0, 0, 0)] * 128,
+            )
+        )
+        self.assertEqual(groom.strand_totals[0], 32640)
+
+        roots_capped = smh_groom.scatter(groom, count=32640, strand_class=0, max_accepted=1)
+        for key in ("tri", "culled", "bary", "seed"):
+            self.assertEqual(len(roots_capped[key]), 1)
+
+        original_scatter = smh_groom.scatter
+        if not tracemalloc.is_tracing():
+            gc.collect()
+            tracemalloc.start()
+            try:
+                blob_fast, meta_fast = smh_groom.to_glb(
+                    groom, max_strands=1, classes=(0,), scalp=False, guides=False, geometry="curves",
+                )
+                peak_fast = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+
+            gc.collect()
+            tracemalloc.start()
+            try:
+                with mock.patch.object(
+                    smh_groom,
+                    "scatter",
+                    lambda g, c, sc, ds, rm, _ma=None: original_scatter(g, c, sc, ds, rm, None),
+                ):
+                    blob_full, meta_full = smh_groom.to_glb(
+                        groom, max_strands=1, classes=(0,), scalp=False, guides=False, geometry="curves",
+                    )
+                peak_full = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+
+            self.assertLess(peak_fast * 10, peak_full)
+        else:
+            blob_fast, meta_fast = smh_groom.to_glb(
+                groom, max_strands=1, classes=(0,), scalp=False, guides=False, geometry="curves",
+            )
+            with mock.patch.object(
+                smh_groom,
+                "scatter",
+                lambda g, c, sc, ds, rm, _ma=None: original_scatter(g, c, sc, ds, rm, None),
+            ):
+                blob_full, meta_full = smh_groom.to_glb(
+                    groom, max_strands=1, classes=(0,), scalp=False, guides=False, geometry="curves",
+                )
+
+        self.assertEqual(blob_fast, blob_full)
+        self.assertEqual(meta_fast, meta_full)
+        self.assertEqual(meta_fast["strandsShown"][0], 1)
+        self.assertEqual(meta_fast["strandTotals"][0], 32640)
 
 
 class ErrorHandlingTests(unittest.TestCase):

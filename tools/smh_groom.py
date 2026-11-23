@@ -736,6 +736,7 @@ def scatter(
     strand_class: int = 0,
     density_scale: float | None = None,
     region_mask: Iterable[int] | None = None,
+    max_accepted: int | None = None,
 ) -> dict:
     """Scatter strand roots with the exact integer RNG of ``smh_gen_1_CS_InterpolateStrands``.
 
@@ -749,6 +750,11 @@ def scatter(
         density_scale: Acceptance factor in ``saturate(tri_count * density_scale)``. Defaults to
             ``1.0 / max(max_tri_count, 1.0)`` so the densest triangle is always accepted.
         region_mask: Optional iterable of region IDs (1..255) to cull; region 0 is never culled.
+        max_accepted: Optional cap on accepted (non-culled) strand roots to collect. When ``None``
+            (default), all ``count`` candidates are returned (including culled entries). When set,
+            candidates are evaluated in thread order ``0..count-1``, culled candidates are skipped,
+            and iteration stops once ``max_accepted`` accepted roots are collected, bounding memory
+            to ``O(max_accepted)`` instead of ``O(count)``.
 
     Returns:
         Dict with keys ``tri`` (list[int]), ``culled`` (list[bool]),
@@ -762,6 +768,11 @@ def scatter(
         count = groom.strand_totals[strand_class] or sum(per_tri)
     if count < 0:
         raise GroomError(f"strand count must be non-negative, got {count}")
+
+    if max_accepted is not None and max_accepted <= 0:
+        return {"tri": [], "culled": [], "bary": [], "seed": []}
+    if count == 0:
+        return {"tri": [], "culled": [], "bary": [], "seed": []}
 
     if density_scale is None:
         max_c = max(per_tri) if per_tri else 0
@@ -784,10 +795,20 @@ def scatter(
     c3_s0, c3_s8 = _ATTEMPT_CONSTS[3]
     attempts = ((c0_s0, c0_s8), (c1_s0, c1_s8), (c2_s0, c2_s8), (c3_s0, c3_s8))
 
-    tris_out: list[int] = [0] * count
-    culled_out: list[bool] = [False] * count
-    bary_out: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * count
-    seed_out: list[int] = [0] * count
+    if max_accepted is None:
+        tris_out: list[int] = [0] * count
+        culled_out: list[bool] = [False] * count
+        bary_out: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * count
+        seed_out: list[int] = [0] * count
+    else:
+        tris_out = []
+        culled_out = []
+        bary_out = []
+        seed_out = []
+        t_append = tris_out.append
+        c_append = culled_out.append
+        b_append = bary_out.append
+        s_append = seed_out.append
 
     sqrt = math.sqrt
     for t in range(count):
@@ -820,6 +841,9 @@ def scatter(
             if ((v6 & _M24) * _INV_2_24) < thresh[per_tri[pick]]:
                 break
 
+        if max_accepted is not None and culled_t:
+            continue
+
         # Barycentric sample via 24-bit multiply cascade (v_mad_u32_u24, k = 0xC083C5).
         seed_t = (0x3C1 * (tri_t & 0xFFFF) + seed_base + v20_t * 31) & _M32
         x1 = (0xC083C5 * (seed_t & _M24) + 0x3C6EF35F) & _M32
@@ -836,10 +860,18 @@ def scatter(
         u1 = a * _INV_2_24
         u2 = b * _INV_2_24
         r = sqrt(u1)
-        tris_out[t] = tri_t
-        culled_out[t] = culled_t
-        bary_out[t] = (1.0 - r, (1.0 - u2) * r, u2 * r)
-        seed_out[t] = seed_t
+        if max_accepted is None:
+            tris_out[t] = tri_t
+            culled_out[t] = culled_t
+            bary_out[t] = (1.0 - r, (1.0 - u2) * r, u2 * r)
+            seed_out[t] = seed_t
+        else:
+            t_append(tri_t)
+            c_append(False)
+            b_append((1.0 - r, (1.0 - u2) * r, u2 * r))
+            s_append(seed_t)
+            if len(tris_out) >= max_accepted:
+                break
 
     return {"tri": tris_out, "culled": culled_out, "bary": bary_out, "seed": seed_out}
 
@@ -863,7 +895,7 @@ def generate_strands(
         - ``tri``: ``list[int]`` scalp triangle index
         - ``bary``: ``list[tuple[float, float, float]]`` barycentric weights
     """
-    roots = scatter(groom, count, strand_class, density_scale, region_mask)
+    roots = scatter(groom, count, strand_class, density_scale, region_mask, max_strands)
     r_tri = roots["tri"]
     r_culled = roots["culled"]
     r_bary = roots["bary"]
