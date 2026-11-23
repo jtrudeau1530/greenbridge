@@ -277,6 +277,20 @@ To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W
 `check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
 fails.
 
+`scripts/bench_wave64.py` normally compares emulation on AMD and NVIDIA with a native-wave64 AMD reference. On a
+machine without that reference, use `--emulated-only` to time the current Vulkan device instead:
+
+```sh
+python3 -I scripts/bench_wave64.py --build runtime/build/linux \
+  --llvm-mc "$(brew --prefix llvm)/bin/llvm-mc" --emulated-only
+```
+
+This mode builds only the emulated shader, requires every benchmark process to finish the shader's `0 mismatches`
+self-check and requires the output hash to stay identical between processes. It says `no native reference` in the
+result: the run establishes deterministic self-consistency on that device, not equality with native Wave64. The mode
+leaves `LEONIDA_VK_DEVICE`, `VK_DRIVER_FILES` and `VK_LOADER_DRIVERS_SELECT` untouched; on macOS the test tools use
+MoltenVK directly by default.
+
 `ps_bitmask_perm` is a wave32 pixel shader, and a pixel shader's width can't be requested on every device. Intel
 drivers report subgroups of 8..32 and may run it 8 or 16 wide; its second pattern reads lanes 16-31, which then
 don't run. The test skips when the frame shows that (#1318), and the translation gives 0 for a source lane that
