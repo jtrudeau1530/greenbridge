@@ -94,7 +94,8 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   slot 86 routes `CreatePipelineState(desc, riid, out)` to PC slot 47 (`ID3D12Device2::CreatePipelineState`),
   slot 101 routes `CreateStateObject(desc, riid, out)` to PC slot 62 (`ID3D12Device5::CreateStateObject`), and
   slot 108 routes `GetResourceAllocationInfo2` (accepting the console C-ABI struct return with the return buffer in
-  `RCX` and the device in `RDX`, and normalizing Xbox layout words and flag bits on a copy of the descriptors) to PC
+  `RCX` and the device in `RDX`, expanding 56-byte `D3D12_RESOURCE_DESC` entries to `D3D12_RESOURCE_DESC1` and
+  normalizing Xbox layout words and flag bits on the copy) to PC
   slot 68 (`ID3D12Device8::GetResourceAllocationInfo2`). Device 11 adds `CreateSampler2`; command list 8 adds
   `OMSetFrontAndBackStencilRef` (public SDK).
 - **Unknown IIDs and slots.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the

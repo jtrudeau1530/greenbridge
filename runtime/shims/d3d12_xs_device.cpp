@@ -1507,10 +1507,11 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
 
 // Xbox slot 108: GetResourceAllocationInfo2, forwarded to PC ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68).
 // The retail executable calls struct-returning device methods with the C ABI (return buffer in RCX, device proxy in
-// RDX); a PC C++ caller passes the proxy in RCX and the return buffer in RDX. Both orders are accepted. Each resource
-// description's Xbox layout word (e.g. 0x101, 0x105) and console flag bits above the PC D3D12_RESOURCE_FLAGS are
-// normalized on a copy before the PC call, with SamplerFeedbackMipRegion zeroed so 56-byte D3D12_RESOURCE_DESC inputs
-// do not read trailing stack bytes.
+// RDX); a PC C++ caller passes the proxy in RCX and the return buffer in RDX. Both orders are accepted. The title's
+// descriptor builder populates 56-byte D3D12_RESOURCE_DESC entries, so the input array is indexed with a 56-byte
+// stride (sizeof(D3D12_RESOURCE_DESC)), each entry is expanded into a zeroed D3D12_RESOURCE_DESC1 with
+// SamplerFeedbackMipRegion cleared, and Xbox layout words (e.g. 0x101, 0x105) and console flag bits above the PC
+// D3D12_RESOURCE_FLAGS are normalized on the copy before the PC call.
 std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2,
                                                   std::uint64_t a3, std::uint64_t a4, std::uint64_t a5) {
     note_slot(108);
@@ -1535,17 +1536,16 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     }
     const auto visible_mask = static_cast<UINT>(a2);
     const auto count = static_cast<UINT>(a3);
-    const auto* raw_descs = reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4);
+    const auto* raw_descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4);
     auto* info1 = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
 
     std::vector<D3D12_RESOURCE_DESC1> cleaned;
-    const D3D12_RESOURCE_DESC1* descs_to_pass = raw_descs;
+    const D3D12_RESOURCE_DESC1* descs_to_pass = reinterpret_cast<const D3D12_RESOURCE_DESC1*>(raw_descs);
     if (raw_descs && count > 0 && count <= 1024) {
         cleaned.resize(count);
         for (UINT i = 0; i < count; ++i) {
             D3D12_RESOURCE_DESC1 d{};
-            std::memcpy(&d, reinterpret_cast<const std::uint8_t*>(raw_descs) + i * sizeof(D3D12_RESOURCE_DESC1),
-                        sizeof(D3D12_RESOURCE_DESC));
+            std::memcpy(&d, &raw_descs[i], sizeof(D3D12_RESOURCE_DESC));
             d.SamplerFeedbackMipRegion = {};
             if (static_cast<std::uint32_t>(d.Layout) >
                 static_cast<std::uint32_t>(D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)) {

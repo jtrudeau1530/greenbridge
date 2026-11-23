@@ -20,8 +20,9 @@
 //             Xbox by compute-PSO slot 62).
 //   slot 108  GetResourceAllocationInfo2(ret, this, visible_mask, count, descs, info1) -> PC
 //             ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68), accepting the console C-ABI struct return
-//             (return buffer in RCX, device in RDX) as well as the PC C++ order, with Xbox layout words and flag bits
-//             normalized on a copy of the descriptors.
+//             (return buffer in RCX, device in RDX) as well as the PC C++ order, with each 56-byte
+//             D3D12_RESOURCE_DESC expanded to a zero-initialized D3D12_RESOURCE_DESC1 and Xbox layout words and
+//             flag bits normalized on the copy.
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
 // LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).

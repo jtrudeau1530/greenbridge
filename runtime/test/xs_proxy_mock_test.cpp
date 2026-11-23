@@ -208,6 +208,10 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                     m->array[68][2] = descs[0].SamplerFeedbackMipRegion.Width |
                                       descs[0].SamplerFeedbackMipRegion.Height |
                                       descs[0].SamplerFeedbackMipRegion.Depth;
+                    if (count > 1) {
+                        m->array[68][3] = (static_cast<std::uint64_t>(descs[1].Layout) << 32) |
+                                          static_cast<std::uint32_t>(descs[1].Flags);
+                    }
                 }
                 if (ret) *ret = {0x40000, 0x10000};
                 if (info1 && count > 0) info1[0] = {0, 0x10000, 0x40000};
@@ -824,44 +828,46 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 101, word(&state_obj_desc), 0, word(&so_out))) == E_POINTER && !so_out);
 
     // 108 GetResourceAllocationInfo2 -> PC slot 68 (ID3D12Device8::GetResourceAllocationInfo2), called with the
-    // retail executable's C-ABI struct return (return buffer in RCX, device proxy in RDX) and an Xbox layout/flag
-    // word, as well as the PC C++ argument order.
+    // retail executable's C-ABI struct return (return buffer in RCX, device proxy in RDX), 56-byte D3D12_RESOURCE_DESC
+    // entries, and an Xbox layout/flag word, as well as the PC C++ argument order.
     void* const* proxy_vtable = *reinterpret_cast<void* const* const*>(device);
     using CAbiSlot108Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
-        D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
+        D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*,
         D3D12_RESOURCE_ALLOCATION_INFO1*);
     const auto call_slot108_c_abi = reinterpret_cast<CAbiSlot108Fn>(proxy_vtable[108]);
-    D3D12_RESOURCE_DESC1 xbox_rt_desc{};
-    xbox_rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    xbox_rt_desc.Width = 3840;
-    xbox_rt_desc.Height = 2160;
-    xbox_rt_desc.DepthOrArraySize = 1;
-    xbox_rt_desc.MipLevels = 1;
-    xbox_rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    xbox_rt_desc.SampleDesc.Count = 1;
-    xbox_rt_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
-    xbox_rt_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+    D3D12_RESOURCE_DESC xbox_descs[2]{};
+    xbox_descs[0].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    xbox_descs[0].Width = 3840;
+    xbox_descs[0].Height = 2160;
+    xbox_descs[0].DepthOrArraySize = 1;
+    xbox_descs[0].MipLevels = 1;
+    xbox_descs[0].Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    xbox_descs[0].SampleDesc.Count = 1;
+    xbox_descs[0].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    xbox_descs[0].Flags = static_cast<D3D12_RESOURCE_FLAGS>(
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | 0x300000u);
-    xbox_rt_desc.SamplerFeedbackMipRegion = {4, 4, 1};
+    xbox_descs[1].Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    xbox_descs[1].Width = 4096;
+    xbox_descs[1].Height = 1;
+    xbox_descs[1].DepthOrArraySize = 1;
+    xbox_descs[1].MipLevels = 1;
+    xbox_descs[1].SampleDesc.Count = 1;
+    xbox_descs[1].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    xbox_descs[1].Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | 0x200000u);
     D3D12_RESOURCE_ALLOCATION_INFO ret_info{};
-    D3D12_RESOURCE_ALLOCATION_INFO1 detail_info{};
-    EXPECT(call_slot108_c_abi(&ret_info, device, 1, 1, &xbox_rt_desc, &detail_info) == &ret_info);
+    D3D12_RESOURCE_ALLOCATION_INFO1 detail_info[2]{};
+    EXPECT(call_slot108_c_abi(&ret_info, device, 1, 2, xbox_descs, detail_info) == &ret_info);
     EXPECT(ret_info.SizeInBytes == 0x40000 && ret_info.Alignment == 0x10000);
-    EXPECT(detail_info.SizeInBytes == 0x40000 && detail_info.Alignment == 0x10000);
+    EXPECT(detail_info[0].SizeInBytes == 0x40000 && detail_info[0].Alignment == 0x10000);
     EXPECT(mock->calls[108] == 0 && mock->calls[68] == 1 && xs::device_slot_hits(108) == 1);
     EXPECT(mock->array[68][0] == static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_UNKNOWN));
     EXPECT(mock->array[68][1] == static_cast<std::uint64_t>(
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
     EXPECT(mock->array[68][2] == 0);
+    EXPECT(mock->array[68][3] == ((static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR) << 32) |
+                                  static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)));
 
-    D3D12_RESOURCE_DESC1 xbox_buf_desc{};
-    xbox_buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    xbox_buf_desc.Width = 4096;
-    xbox_buf_desc.Height = 1;
-    xbox_buf_desc.DepthOrArraySize = 1;
-    xbox_buf_desc.MipLevels = 1;
-    xbox_buf_desc.SampleDesc.Count = 1;
-    xbox_buf_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    D3D12_RESOURCE_DESC xbox_buf_desc = xbox_descs[1];
     xbox_buf_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x200000u);
     D3D12_RESOURCE_ALLOCATION_INFO buf_ret{};
     EXPECT(raw(device, 108, word(&buf_ret), 1, 1, word(&xbox_buf_desc), 0) == word(&buf_ret));

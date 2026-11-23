@@ -480,43 +480,58 @@ int main(int argc, char** argv) {
         check(rt::d3d12_xs::device_slot_hits(101) == 1, "slot 101 hit counter is 1");
     }
 
-    // Slot 108: GetResourceAllocationInfo2(ret, this, visible_mask, count, descs, info1) with C-ABI struct return
-    // and Xbox layout/flag words, compared against direct PC ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68).
+    // Slot 108: GetResourceAllocationInfo2(ret, this, visible_mask, count, descs, info1) with C-ABI struct return,
+    // 56-byte D3D12_RESOURCE_DESC entries, and Xbox layout/flag words, compared against direct PC
+    // ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68).
     if (slots > 68) {
         ComPtr<ID3D12Device8> real_device8;
         if (real && SUCCEEDED(real->QueryInterface(IID_PPV_ARGS(real_device8.GetAddressOf()))) && real_device8) {
-            D3D12_RESOURCE_DESC1 xbox_rt{};
-            xbox_rt.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            xbox_rt.Width = 64;
-            xbox_rt.Height = 64;
-            xbox_rt.DepthOrArraySize = 1;
-            xbox_rt.MipLevels = 1;
-            xbox_rt.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            xbox_rt.SampleDesc.Count = 1;
-            xbox_rt.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
-            xbox_rt.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+            D3D12_RESOURCE_DESC xbox_descs[2]{};
+            xbox_descs[0].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            xbox_descs[0].Width = 64;
+            xbox_descs[0].Height = 64;
+            xbox_descs[0].DepthOrArraySize = 1;
+            xbox_descs[0].MipLevels = 1;
+            xbox_descs[0].Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            xbox_descs[0].SampleDesc.Count = 1;
+            xbox_descs[0].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+            xbox_descs[0].Flags = static_cast<D3D12_RESOURCE_FLAGS>(
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | 0x300000u);
+            xbox_descs[1].Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            xbox_descs[1].Width = 4096;
+            xbox_descs[1].Height = 1;
+            xbox_descs[1].DepthOrArraySize = 1;
+            xbox_descs[1].MipLevels = 1;
+            xbox_descs[1].SampleDesc.Count = 1;
+            xbox_descs[1].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+            xbox_descs[1].Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x200000u);
 
-            D3D12_RESOURCE_DESC1 pc_rt = xbox_rt;
-            pc_rt.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-            pc_rt.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            D3D12_RESOURCE_DESC1 pc_descs[2]{};
+            std::memcpy(&pc_descs[0], &xbox_descs[0], sizeof(D3D12_RESOURCE_DESC));
+            pc_descs[0].SamplerFeedbackMipRegion = {};
+            pc_descs[0].Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            pc_descs[0].Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            std::memcpy(&pc_descs[1], &xbox_descs[1], sizeof(D3D12_RESOURCE_DESC));
+            pc_descs[1].SamplerFeedbackMipRegion = {};
+            pc_descs[1].Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            pc_descs[1].Flags = D3D12_RESOURCE_FLAG_NONE;
 
-            D3D12_RESOURCE_ALLOCATION_INFO1 pc_info1{};
+            D3D12_RESOURCE_ALLOCATION_INFO1 pc_info1[2]{};
             const D3D12_RESOURCE_ALLOCATION_INFO pc_info =
-                real_device8->GetResourceAllocationInfo2(1, 1, &pc_rt, &pc_info1);
+                real_device8->GetResourceAllocationInfo2(1, 2, pc_descs, pc_info1);
 
             using XboxGetAllocInfo2CAbiFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
-                D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
+                D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*,
                 D3D12_RESOURCE_ALLOCATION_INFO1*);
             auto get_alloc_info2 = reinterpret_cast<XboxGetAllocInfo2CAbiFn>(proxy_vtbl[108]);
             D3D12_RESOURCE_ALLOCATION_INFO xbox_info{};
-            D3D12_RESOURCE_ALLOCATION_INFO1 xbox_info1{};
+            D3D12_RESOURCE_ALLOCATION_INFO1 xbox_info1[2]{};
             D3D12_RESOURCE_ALLOCATION_INFO* ret_ptr =
-                get_alloc_info2(&xbox_info, device.Get(), 1, 1, &xbox_rt, &xbox_info1);
+                get_alloc_info2(&xbox_info, device.Get(), 1, 2, xbox_descs, xbox_info1);
             check(ret_ptr == &xbox_info && xbox_info.SizeInBytes == pc_info.SizeInBytes &&
-                      xbox_info.Alignment == pc_info.Alignment && xbox_info1.SizeInBytes == pc_info1.SizeInBytes &&
-                      xbox_info1.Alignment == pc_info1.Alignment,
-                  "slot 108 C-ABI GetResourceAllocationInfo2 with Xbox layout/flags matches PC Device8");
+                      xbox_info.Alignment == pc_info.Alignment && xbox_info1[0].SizeInBytes == pc_info1[0].SizeInBytes &&
+                      xbox_info1[1].SizeInBytes == pc_info1[1].SizeInBytes,
+                  "slot 108 C-ABI GetResourceAllocationInfo2 with 56-byte Xbox descs matches PC Device8");
             check(rt::d3d12_xs::device_slot_hits(108) == 1, "slot 108 hit counter is 1");
         }
     }
