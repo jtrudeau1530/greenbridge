@@ -94,6 +94,11 @@ instruction family per file; the list below describes some of them, not every fi
 - `test_image_bvh_tri.py` runs `image_bvh64_intersect_ray` on hand-built triangle nodes. It checks the vertex
   slots of each node type (TRI0–TRI3) and every selector of the barycentric remap byte at +60, against weights
   written by hand and a plain-Python solve (docs/design.md, Ray tracing row).
+- `test_image_bvh_tri_hw.py` runs both forms of the instruction on the triangle nodes and rays measured natively on
+  an RX 6800 (gfx1030) with `tools/bvh_tri_probe.py`'s kernels and compares the four words bit for bit: all 308
+  single-lane rows (slots, both windings, misses, remap byte, t max and t sign, zero area, NaN and inf in the node
+  and the ray, shared edges and vertices) and 84 lane results. The table is written from the raw outputs, not by
+  hand.
 - `test_interp.py` tests the interpreter against the SPIR-V / GLSL.std.450 definitions. The interpreter raises
   `UnsupportedConstruct` for anything it does not model instead of approximating it. It can seed Input variables,
   PushConstant words and a flat physical-address memory map for the tests above.

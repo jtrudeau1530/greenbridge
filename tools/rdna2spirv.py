@@ -12901,9 +12901,11 @@ class Gen:
         taken in 256-byte units (ASSUMPTION: RADV only ever uses base 0). Box nodes return the four child ids
         (misses and inactive boxes = 0xFFFFFFFF), sorted by entry distance when the descriptor's box_sort_enable
         (bit 63) is set. Triangle nodes read the vertex slots of their type (TRI0 0,1,2; TRI1 1,3,2; TRI2 2,3,4;
-        TRI3 2,4,0) and return (t/|det|, sign(det), b_i/|det|, b_j/|det|), or (inf, 1, 0, 0) on a miss, with i and j
-        chosen by the node type's byte of the triangle-ID word at +60 (AMD GPURT; 0x09 is RADV's v, w). Consumers
-        divide by .y, which gives the same values as the hardware's numerator/denominator form."""
+        TRI3 2,4,0) and return the words measured on RDNA2 (docs/design.md, Ray tracing row): with T, det and the
+        edge functions of the watertight test, k = |d[kz]|^3, a hit gives k*(T, det, b_i, b_j) and a miss
+        (copysign(inf, k*det), k*det, k*b_i, k*b_j), i and j chosen by the node type's byte of the triangle-ID word
+        at +60 (AMD GPURT; 0x09 is RADV's v, w). A NaN anywhere in the ray, or an infinite origin, gives
+        (inf, 1, 0, 0). Consumers divide by .y: t = T/det and the barycentrics b/det."""
         if "a16" in mods:
             raise Unsupported(op + " a16")
         is64 = op.startswith("image_bvh64")
@@ -13034,9 +13036,8 @@ class Gen:
         e(f"{kx0} = OpBitwiseAnd %uint {pk} {self.cu(3)}")
         e(f"{ky0} = OpBitFieldUExtract %uint {pk} {self.cu(2)} {self.cu(2)}")
         e(f"{kz} = OpShiftRightLogical %uint {pk} {self.cu(4)}")
-        dvec, ivec = T(), T()
+        dvec = T()
         e(f"{dvec} = OpCompositeConstruct %v3float {' '.join(dirv)}")
-        e(f"{ivec} = OpCompositeConstruct %v3float {' '.join(inv)}")
 
         def vx(vec, i):
             r = T()
@@ -13046,9 +13047,17 @@ class Gen:
         neg = bop("OpFOrdLessThan", dkz, "%f0")
         kx = sel(neg, ky0, kx0, "%uint")
         ky = sel(neg, kx0, ky0, "%uint")
-        sz = vx(ivec, kz)
-        sx = fop("OpFMul", vx(dvec, kx), sz)
-        sy = fop("OpFMul", vx(dvec, ky), sz)
+        # Measured on RDNA2 (docs/design.md, Ray tracing row): the words are the watertight test's T, det and edge
+        # functions, scaled by k = |d[kz]|^3. They are computed here without a division, with the shear multiplied
+        # through by |d[kz]| (A'' = |d[kz]| A' = A[kx] |d[kz]| - sign(d[kz]) d[kx] A[kz]), so U, V, W and det carry
+        # |d[kz]|^2 and the sum below sign(d[kz]) |d[kz]|^3 T. The supplied inverse direction is not used. A shear
+        # divided by d[kz] gives the same words on every measured row but d.z = +inf (and divides by zero at d = 0);
+        # this form gives that row too, a fit after the runs.
+        adz = fext("FAbs", dkz)
+        NEG1 = self.tof(self.cu(0xBF800000))
+        sgz = sel(neg, NEG1, ONE)
+        sx = fop("OpFMul", sgz, vx(dvec, kx))          # sign(d[kz]) d[kx], sign(d[kz]) d[ky]
+        sy = fop("OpFMul", sgz, vx(dvec, ky))
         rel = []
         for j in range(3):
             vv = T()
@@ -13057,8 +13066,8 @@ class Gen:
             rel.append(vv)
         def shear(vv):
             zk = vx(vv, kz)
-            return (fop("OpFSub", vx(vv, kx), fop("OpFMul", sx, zk)),
-                    fop("OpFSub", vx(vv, ky), fop("OpFMul", sy, zk)), zk)
+            return (fop("OpFSub", fop("OpFMul", vx(vv, kx), adz), fop("OpFMul", sx, zk)),
+                    fop("OpFSub", fop("OpFMul", vx(vv, ky), adz), fop("OpFMul", sy, zk)), zk)
         (ax, ay, az0), (bx, by, bz0), (cx, cy, cz0) = (shear(r) for r in rel)
         uu = fop("OpFSub", fop("OpFMul", cx, by), fop("OpFMul", cy, bx))
         vv_ = fop("OpFSub", fop("OpFMul", ax, cy), fop("OpFMul", ay, cx))
@@ -13066,48 +13075,29 @@ class Gen:
         lt0 = lambda x: bop("OpFOrdLessThan", x, "%f0")
         gt0 = lambda x: bop("OpFOrdGreaterThan", x, "%f0")
         eq0 = lambda x: bop("OpFOrdEqual", x, "%f0")
-        le0 = lambda x: bop("OpFOrdLessThanEqual", x, "%f0")
         orr = lambda x, y: bop("OpLogicalOr", x, y)
         andd = lambda x, y: bop("OpLogicalAnd", x, y)
-        cback = orr(orr(lt0(uu), lt0(vv_)), lt0(ww))
-        cfront = orr(orr(gt0(uu), gt0(vv_)), gt0(ww))
-        cond = T()
-        e(f"{cond} = OpLogicalNot %bool {andd(cback, cfront)}")
-        ea, eb, ec = eq0(uu), eq0(vv_), eq0(ww)
-
-        def edge(v0x, v0y, v1x, v1y):
-            tx = fop("OpFSub", v1x, v0x)
-            ty = fop("OpFSub", v1y, v0y)
-            return sel(eq0(tx), lt0(ty), lt0(tx), "%bool")
-
-        def vert(v0x, v1x, v2x):
-            return andd(le0(fop("OpFSub", v1x, v0x)), gt0(fop("OpFSub", v2x, v0x)))
-        iea = andd(ea, edge(bx, by, cx, cy))
-        ieb = andd(eb, edge(cx, cy, ax, ay))
-        iec = andd(ec, edge(ax, ay, bx, by))
-        ie = andd(cond, orr(orr(iea, ieb), iec))
-        isva, isvb, isvc = andd(eb, ec), andd(ea, ec), andd(ea, eb)
-        iva = andd(isva, vert(ax, bx, cx))
-        ivb = andd(isvb, vert(bx, cx, ax))
-        ivc = andd(isvc, vert(cx, ax, bx))
-        isv = orr(orr(isva, isvb), isvc)
-        nisv = T()
-        e(f"{nisv} = OpLogicalNot %bool {isv}")
-        iv = orr(nisv, orr(orr(iva, ivb), ivc))
-        ie2 = andd(ie, iv)
-        cedge = orr(orr(ea, eb), ec)
-        hitc = sel(cedge, ie2, cond, "%bool")
         det = fop("OpFAdd", uu, fop("OpFAdd", vv_, ww))
-        azz, bzz, czz = (fop("OpFMul", sz, z) for z in (az0, bz0, cz0))
-        tt = fop("OpFAdd", fop("OpFAdd", fop("OpFMul", uu, azz), fop("OpFMul", vv_, bzz)), fop("OpFMul", ww, czz))
-        sg = fext("FSign", det)
-        ts = fop("OpFMul", sg, tt)
-        front = T()
-        e(f"{front} = OpLogicalNot %bool {lt0(ts)}")
-        hit = andd(hitc, front)
-        dab = fext("FAbs", det)
-        rt = sel(hit, fop("OpFDiv", tt, dab), INF)
-        rs = sel(hit, sg, ONE)
+        tt = fop("OpFAdd", fop("OpFAdd", fop("OpFMul", uu, az0), fop("OpFMul", vv_, bz0)), fop("OpFMul", ww, cz0))
+        tk = fop("OpFMul", sgz, tt)                    # k*T
+        # Inside: det is not 0 or NaN, and every edge function has det's sign, or is 0 and its edge passes RDNA2's tie
+        # rule (docs/design.md, Ray tracing row; measured with x, y and z dominant, both windings, both signs of
+        # d[kz]): the edge from P to Q, with (tx, ty) = Q - P in the sheared frame with the d[kz] < 0 swap undone,
+        # passes when ty == 0 ? sign(det) tx > 0 : sign(d[kz]) sign(det) ty > 0. Hit: inside and sign(det) T >= 0
+        # (t = 0 hits); there is no test against the ray extent. Every compare is ordered, so a NaN fails it.
+        dpos, dneg = gt0(det), lt0(det)
+        sd = sel(dpos, ONE, NEG1)
+        sdz = fop("OpFMul", sgz, sd)                   # sign(d[kz]) sign(det)
+
+        def inside(x, p, q):
+            tx, ty = fop("OpFSub", q[0], p[0]), fop("OpFSub", q[1], p[1])
+            tx, ty = sel(neg, ty, tx), sel(neg, tx, ty)        # undo the kx/ky swap of d[kz] < 0
+            tie = sel(eq0(ty), gt0(fop("OpFMul", sd, tx)), gt0(fop("OpFMul", sdz, ty)), "%bool")
+            return sel(eq0(x), tie, gt0(fop("OpFMul", sd, x)), "%bool")
+        a2, b2, c2 = (ax, ay), (bx, by), (cx, cy)
+        front = bop("OpFOrdGreaterThanEqual", fop("OpFMul", sd, tk), "%f0")
+        hit = andd(andd(orr(dpos, dneg), andd(inside(uu, b2, c2), inside(vv_, c2, a2))),
+                   andd(inside(ww, a2, b2), front))
         # The node's triangle-ID word (byte offset 60) holds one byte per node type: bits [1:0] pick which vertex's
         # weight is returned first, bits [3:2] the second (0 = vertex 0's, U; 1 = V; 2 = W; 3 is not used by a
         # builder and reads U, as in the XDXR software path). 0x09 is the plain (V, W). AMD GPURT
@@ -13124,10 +13114,29 @@ class Gen:
             e(f"{is1} = OpIEqual %bool {s_} {self.cu(1)}")
             e(f"{is2} = OpIEqual %bool {s_} {self.cu(2)}")
             return sel(is2, ww, sel(is1, vv_, uu))
-        rv = sel(hit, fop("OpFDiv", pick(0), dab), "%f0")
-        rw = sel(hit, fop("OpFDiv", pick(2), dab), "%f0")
-        for k, v in enumerate((rt, rs, rv, rw)):
-            out(k, self.tou(v))
+        # The four words, hit or miss: (k*T, k*det, k*b_i, k*b_j). The hardware returns every zero as +0, where IEEE
+        # arithmetic gives -0 for some (t = 0, an edge function through a vertex on the ray), and every NaN as
+        # 0xFFC00000. SPIR-V leaves a NaN's bits to the driver, and a zero's sign too without float controls, so both
+        # are fixed by a select on the integer side. A miss replaces word 0 with copysign(inf, word 1): det = 0 gives
+        # +inf, a NaN det -inf.
+        def canon(x):
+            u, nan = self.tou(x), T()
+            e(f"{nan} = OpIsNan %bool {x}")
+            return sel(nan, self.cu(0xFFC00000), sel(eq0(x), self.cu(0), u, "%uint"), "%uint")
+        w = [canon(x) for x in [tk] + [fop("OpFMul", adz, x) for x in (det, pick(0), pick(2))]]
+        sgn, minf = T(), T()
+        e(f"{sgn} = OpBitwiseAnd %uint {w[1]} {self.cu(0x80000000)}")
+        e(f"{minf} = OpBitwiseOr %uint {sgn} {self.cu(0x7F800000)}")
+        w[0] = sel(hit, w[0], minf, "%uint")
+        # A NaN in t max, the origin, the direction or the inverse direction (an axis nothing else reads included),
+        # or an infinite origin, returns (inf, 1, 0, 0) whatever the node holds.
+        bad = None
+        for x, test in [(tmax, "OpIsNan")] + [(x, "OpIsNan") for x in org + dirv + inv] + [(x, "OpIsInf") for x in org]:
+            b = T()
+            e(f"{b} = {test} %bool {x}")
+            bad = b if bad is None else orr(bad, b)
+        for k, (v, c) in enumerate(zip(w, (0x7F800000, 0x3F800000, 0, 0))):
+            out(k, sel(bad, self.cu(c), v, "%uint"))
         e(f"OpBranch {L['end1']}")
 
         # ---------------- not a triangle ----------------
