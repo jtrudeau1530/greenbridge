@@ -359,6 +359,30 @@ class XmlGroupingRegressionTest(GamedataIndexTest):
             ],
         )
 
+    def test_declarationless_xml_keeps_utf8_continuation_stream(self):
+        # A 64 KiB continuation of non-ASCII UTF-8 text falls below printable()'s ASCII ratio
+        # and classifies as "binary", yet must stay part of the open declarationless XML document.
+        accent = "é".encode("utf-8")
+        # Split an "é" (0xC3 0xA9) across the 64 KiB chunk boundary as well.
+        head = b"<Doc>" + b" " * (65536 - len(b"<Doc>") - 1) + accent[:1]
+        middle = accent[1:] + b"<t>" + accent * 32766
+        self.assertEqual(len(head), 65536)
+        self.assertEqual(len(middle), 65536)
+        tail = b"</t></Doc>"
+        self.add(head)
+        self.add(middle)
+        self.add(tail)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual(
+            [(r["type"], r["root"], r["complete"], r["chunks"]) for r in rows],
+            [("xml", "Doc", True, 3)],
+        )
+
 
 class BuildRowsReadCountTest(unittest.TestCase):
     """The XML-shaped text branch must join the chunks it already read, not reinflate the group twice."""
