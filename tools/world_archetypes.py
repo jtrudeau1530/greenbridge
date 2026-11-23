@@ -32,6 +32,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 import world_census as WC  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import world_index as WI  # noqa: E402
 
 
@@ -148,11 +149,17 @@ def _rotation(q, conjugate):
             (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)))
 
 
+def _scale(entity, key):
+    """Missing scales use one; an explicit zero collapses the corresponding axes."""
+    value = entity.get(key)
+    return 1.0 if value is None else value
+
+
 def world_box(entity, lo, hi, conjugate, use_scale):
     """World AABB of archetype box [lo, hi] placed by ``entity`` (T * R * S, scale XY on X/Y and Z on Z)."""
     r = _rotation(entity.get("rotation"), conjugate)
-    sxy = (entity.get("scale_xy") or 1.0) if use_scale else 1.0
-    sz = (entity.get("scale_z") or 1.0) if use_scale else 1.0
+    sxy = _scale(entity, "scale_xy") if use_scale else 1.0
+    sz = _scale(entity, "scale_z") if use_scale else 1.0
     s = (sxy, sxy, sz)
     c = [(lo[i] + hi[i]) * 0.5 * s[i] for i in range(3)]
     e = [(hi[i] - lo[i]) * 0.5 * abs(s[i]) for i in range(3)]
@@ -201,7 +208,7 @@ def check_extents(maps, defs):
             continue
         out["maps_fully_defined"] += 1
         rotated = any(e.get("rotation") and [round(c, 6) for c in e["rotation"]] != [0, 0, 0, 1] for e in ents)
-        scaled = any(abs((e.get("scale_xy") or 1.0) - 1) > 1e-4 or abs((e.get("scale_z") or 1.0) - 1) > 1e-4
+        scaled = any(abs(_scale(e, "scale_xy") - 1) > 1e-4 or abs(_scale(e, "scale_z") - 1) > 1e-4
                      for e in ents)
         if rotated:
             rot = out["rotation"]
@@ -282,11 +289,24 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error("no such file or folder: %s" % a.path)
+    # Check the report path before the scan: --out equal to the archive used to truncate the input after the run, and
+    # an --out under a regular file or naming a folder raised a traceback once all the work was done.
+    if same_report_path(a.out, a.path):
+        ap.error("--out would overwrite the input %s" % a.path)
+    if os.path.isdir(a.out):
+        ap.error("--out %s is a folder, not a file" % a.out)
+    out_dir = os.path.dirname(os.path.abspath(a.out))
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
     doc = run(a.path, a.start, a.limit, a.check_extents)
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=1, sort_keys=True)
+    try:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=1, sort_keys=True)
+    except OSError as e:
+        ap.error("--out %s: %s" % (a.out, e.strerror or e))
     print(json.dumps({k: doc[k] for k in ("summary", "extents") if k in doc}, indent=1, sort_keys=True))
     return 0
 

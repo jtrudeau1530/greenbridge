@@ -58,6 +58,23 @@ struct Ref {
 
 void* slot(void* object, unsigned index) { return (*reinterpret_cast<void***>(object))[index]; }
 
+// A root signature blob from the PC runtime's own serializer; empty when it has none for that version.
+std::vector<std::uint8_t> serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
+    using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto fn = d3d12 ? reinterpret_cast<SerializeFn>(
+                                reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature")))
+                          : nullptr;
+    std::vector<std::uint8_t> out;
+    ID3DBlob* blob = nullptr;
+    if (fn && SUCCEEDED(fn(&desc, &blob, nullptr)) && blob) {
+        const auto* bytes = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
+        out.assign(bytes, bytes + blob->GetBufferSize());
+        blob->Release();
+    }
+    return out;
+}
+
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes, D3D12_RESOURCE_FLAGS flags) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -869,6 +886,90 @@ int main() {
         const g::SamplerWords biased_samplers[] = {negative_bias, positive_bias};
         EXPECT(rt::d3d12::register_samplers(device.p, biased_samplers) == S_OK);
 
+        // Static samplers of a root signature (docs/d3d12_vulkan.md section 3.5): no heap slot and no root argument,
+        // the shader holds the S# by value, so CreateRootSignature has to register it. One per blob version, each
+        // the wrapping sampler above with its own LOD range (so its own key), and one that only the fourth has:
+        // a border sampler with the UINT white border of the static enum. None is in the hash table before its
+        // root signature is created, all are after. A version the PC serializer here does not write is skipped.
+        const auto sampler_index = [&](const g::SamplerWords& words) {
+            std::uint32_t key[8]{~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+            std::memcpy(key, words.data(), sizeof(words));
+            return rt::d3d12::bindless_hash_lookup(device.p, key);
+        };
+        struct StaticCase {
+            D3D_ROOT_SIGNATURE_VERSION version;
+            const char* name;
+            float max_lod;
+            bool uint_white_border;
+            g::SamplerWords words;
+            bool created;
+        } static_cases[] = {{D3D_ROOT_SIGNATURE_VERSION_1_0, "1.0", 6.0f, false, {}, false},
+                            {D3D_ROOT_SIGNATURE_VERSION_1_1, "1.1", 7.0f, false, {}, false},
+                            {D3D_ROOT_SIGNATURE_VERSION_1_2, "1.2", 8.0f, false, {}, false},
+                            {D3D_ROOT_SIGNATURE_VERSION_1_1, "1.1, UINT white border", 9.0f, true, {}, false}};
+        std::vector<Ref<ID3D12RootSignature>> static_roots(std::size(static_cases));
+        UINT static_created = 0;
+        for (std::size_t c = 0; c < std::size(static_cases); ++c) {
+            StaticCase& test = static_cases[c];
+            g::Sampler expected = sampler;
+            expected.max_lod = test.max_lod;
+            if (test.uint_white_border) {
+                expected.address_u = g::AddressMode::clamp_border;
+                expected.border_color = g::BorderColor::opaque_white;
+                expected.integer_border = true;
+            }
+            test.words = g::encode(expected);
+            EXPECT(test.words != sampler_words && sampler_index(test.words) == 0);
+
+            D3D12_STATIC_SAMPLER_DESC1 fixed{};
+            fixed.Filter = sampler_desc.Filter;
+            fixed.AddressU = test.uint_white_border ? D3D12_TEXTURE_ADDRESS_MODE_BORDER : sampler_desc.AddressU;
+            fixed.AddressV = sampler_desc.AddressV;
+            fixed.AddressW = sampler_desc.AddressW;
+            fixed.MaxAnisotropy = sampler_desc.MaxAnisotropy;
+            fixed.ComparisonFunc = sampler_desc.ComparisonFunc;
+            fixed.BorderColor = test.uint_white_border ? D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT
+                                                       : D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+            fixed.MaxLOD = test.max_lod;
+            fixed.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            // D3D12_STATIC_SAMPLER_DESC is D3D12_STATIC_SAMPLER_DESC1 without the trailing Flags.
+            D3D12_STATIC_SAMPLER_DESC fixed0{};
+            std::memcpy(&fixed0, &fixed, sizeof(fixed0));
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+            root_desc.Version = test.version;
+            if (test.version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
+                root_desc.Desc_1_0.NumStaticSamplers = 1;
+                root_desc.Desc_1_0.pStaticSamplers = &fixed0;
+            } else if (test.version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+                root_desc.Desc_1_1.NumStaticSamplers = 1;
+                root_desc.Desc_1_1.pStaticSamplers = &fixed0;
+            } else {
+                root_desc.Desc_1_2.NumStaticSamplers = 1;
+                root_desc.Desc_1_2.pStaticSamplers = &fixed;
+            }
+            const std::vector<std::uint8_t> blob = serialize_root_signature(root_desc);
+            if (blob.empty()) {
+                std::printf("static sampler, root signature %s: the PC serializer does not write it, skipped\n",
+                            test.name);
+                continue;
+            }
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(),
+                                                         IID_PPV_ARGS(&static_roots[c].p))));
+            EXPECT(sampler_index(test.words) != 0);
+            test.created = true;
+            ++static_created;
+        }
+        // The entries outlive their root signatures, as a heap slot's S# outlives the heap: the shader pass below
+        // samples with them after the last reference is gone.
+        for (std::size_t c = 0; c < std::size(static_cases); ++c) {
+            const std::uint32_t before = sampler_index(static_cases[c].words);
+            static_roots[c].reset();
+            EXPECT(sampler_index(static_cases[c].words) == before);
+        }
+        std::printf("static samplers: %u of %u root signatures registered their S#\n", static_created,
+                    UINT(std::size(static_cases)));
+        EXPECT(static_created >= 3);  // 1.0 and 1.1 are in every d3d12.dll; 1.2 came later
+
         // The UINT texture's view in slot 0, and three border samplers after the first: UINT (0,0,0,0) and
         // (1,1,1,1) from CreateSampler2, which the proxy does not have (the inner device does), and float white.
         constexpr UINT uint_slot = 0, uint_black = 1, uint_white = 2, float_white = 3;
@@ -1550,6 +1651,24 @@ int main() {
             std::printf("literal S#s: registered %u/%u texels wrapped, unregistered %u/%u clamped\n", wrapped, texels,
                         clamped, texels);
             EXPECT(wrapped == texels && clamped == texels);
+
+            // The static samplers' S#s: the three wrapping ones give the texture, texel for texel, as the registered
+            // literal does. Unregistered (CreateRootSignature dropping them) they would clamp like the second above.
+            for (const StaticCase& test : static_cases) {
+                if (!test.created || test.uint_white_border) continue;
+                SampleKeys key = keys[0];
+                std::memcpy(key.ssharp, test.words.data(), sizeof(key.ssharp));
+                std::array<std::uint8_t, bytes> pixels{};
+                EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
+                UINT static_wrapped = 0, static_clamped = 0;
+                for (UINT i = 0; i < texels; ++i) {
+                    static_wrapped += std::memcmp(pixels.data() + 4 * i, texel(i % size, i / size).data(), 4) == 0;
+                    static_clamped += std::memcmp(pixels.data() + 4 * i, texel(size - 1, i / size).data(), 4) == 0;
+                }
+                std::printf("static sampler, root signature %s: %u/%u texels wrapped (%u would match a clamp)\n",
+                            test.name, static_wrapped, texels, static_clamped);
+                EXPECT(static_wrapped == texels && static_clamped < texels);
+            }
 
             // With LOD zero requested, opposite bias extremes select the first and last mips.
             for (const auto& words : biased_samplers) {

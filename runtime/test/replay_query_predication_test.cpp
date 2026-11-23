@@ -5,7 +5,7 @@
 // how resolves inside a pipeline-statistics query are replayed; cases 7 and 8 cover the other helper dispatches
 // and their no-pool fallback (D3D-162). Cases 9 to 13 check overlapping queries: statistics over statistics, binary
 // inside ordinary, the composite sum-and-normalize binary resolve, helper dispatches inside overlapping statistics
-// queries, and the single-list refusal (D3D-252). No GPU or game data.
+// queries, and the single-list refusal (D3D-252) and, with a pool, its replay (D3D-399). No GPU or game data.
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
@@ -569,6 +569,54 @@ int main() {
         expect(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::unsupported,
                "no segment pool: overlapping statistics queries are refused instead of run whole");
         expect(trace.events.empty(), "no segment pool: nothing was emitted for the refused list");
+    }
+
+    // 14. D3D-399, the single-list replay() with a segment pool: the list case 13 refuses replays as on the batched
+    //     path, and so does case 10's occlusion pair. The pools are created to the planned size and handed to `keep`.
+    {
+        Trace trace;
+        g_trace = &trace;
+        std::vector<std::pair<VkQueryType, std::uint32_t>> created;
+        ReplayFunctions pooled = vk;
+        pooled.create_segment_pool = [&](VkQueryType type, std::uint32_t count) {
+            created.emplace_back(type, count);
+            auto pool = std::make_shared<OcclusionSegmentPool>();
+            pool->pool = handle<VkQueryPool>(type == VK_QUERY_TYPE_OCCLUSION ? 8 : 9);
+            pool->destroy = mock_destroy_pool;
+            return std::shared_ptr<const OcclusionSegmentPool>(pool);
+        };
+        CommandList statistics_list;  // case 13's list
+        expect(statistics_list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record pooled begin 0");
+        expect(statistics_list.begin_query({6, d3d12_query::pipeline_statistics, 1}), "record pooled begin 1");
+        expect(statistics_list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record pooled end 0");
+        expect(statistics_list.end_query({6, d3d12_query::pipeline_statistics, 1}), "record pooled end 1");
+        expect(statistics_list.close(), "close pooled statistics list");
+        CommandList occlusion_list;  // case 10's list
+        expect(occlusion_list.begin_query({1, d3d12_query::occlusion, 0}), "record pooled occlusion begin");
+        expect(occlusion_list.begin_query({1, d3d12_query::binary_occlusion, 1}), "record pooled binary begin");
+        expect(occlusion_list.end_query({1, d3d12_query::binary_occlusion, 1}), "record pooled binary end");
+        expect(occlusion_list.end_query({1, d3d12_query::occlusion, 0}), "record pooled occlusion end");
+        expect(occlusion_list.resolve_queries({1, d3d12_query::occlusion, 0, 1, 1, 0}), "record pooled resolve");
+        expect(occlusion_list.close(), "close pooled occlusion list");
+        expect(replay(statistics_list, VK_NULL_HANDLE, resolve, pooled) == ReplayResult::unsupported &&
+                   replay(occlusion_list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::unsupported &&
+                   created.empty() && trace.events.empty(),
+               "pooled: without `keep` or a pool both lists are still refused and no pool is made");
+        std::vector<std::shared_ptr<const OcclusionSegmentPool>> keep;
+        const auto r0 = replay(statistics_list, VK_NULL_HANDLE, resolve, pooled, nullptr, &keep);
+        const auto r1 = replay(occlusion_list, VK_NULL_HANDLE, resolve, pooled, nullptr, &keep);
+        expect(r0 == ReplayResult::success && r1 == ReplayResult::success,
+               "pooled: overlapping statistics and occlusion queries replay on the single-list path");
+        const std::vector<std::pair<VkQueryType, std::uint32_t>> sizes{{VK_QUERY_TYPE_PIPELINE_STATISTICS, 3},
+                                                                        {VK_QUERY_TYPE_OCCLUSION, 3}};
+        expect(created == sizes, "pooled: one pool of each type, sized to the planned segments");
+        expect(keep.size() == 2, "pooled: both pools are handed to the caller");
+        const std::vector<std::string> want{"begin_query 9:0", "end_query 9:0",  "begin_query 9:1",
+                                            "end_query 9:1",   "begin_query 9:2", "end_query 9:2",
+                                            "begin_query 8:0", "end_query 8:0",  "begin_query 8:1",
+                                            "end_query 8:1",   "begin_query 8:2", "end_query 8:2",
+                                            "sum_occlusion 8:0+3"};
+        expect(trace.events == want, "pooled: the same segments and sums as the batched path");
     }
 
     if (failures) return 1;

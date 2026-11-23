@@ -166,8 +166,10 @@ public:
         {
             std::lock_guard lock(context_.submit_mutex());
             vk.vkQueueWaitIdle(queue_);
+            // A WSI layer may perform a device-wide idle while destroying the swapchain.
+            // Keep that implicit idle serialized with submits from every context queue.
+            release(swapchain_);
         }
-        release(swapchain_);
         swapchain_ = VK_NULL_HANDLE;
         release_capture();
         composer_.reset();
@@ -299,7 +301,9 @@ public:
     }
 
     // The last presented frame as the swapchain stores it (4 bytes a texel, rows tightly packed, format() order).
-    // Waits for the frame to finish. False if no captured frame is available or the wait fails.
+    // Waits for the frame to finish. False when nothing was presented since enable_capture(), after a present
+    // that was skipped because the window is minimised (it returned VK_SUCCESS but showed nothing), until the next
+    // frame that is shown (the frame before it is not what the window was last asked to show), or when the wait fails.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
         if (!capture_ || !capture_ptr_ || !captured_) return false;
         const Frame& frame = frames_[(frame_index_ + frames_.size() - 1) % frames_.size()];
@@ -331,6 +335,7 @@ public:
         }
         if (!swapchain_) {  // minimised: try again next frame
             stale_ = true;
+            captured_ = false;  // nothing was shown: read_back() must not hand out the frame before
             return VK_SUCCESS;
         }
         if (binding && !presentable(source)) return VK_ERROR_UNKNOWN;  // checked before an image is acquired for it
@@ -347,7 +352,10 @@ public:
         VkResult acquired = acquire(frame.acquired, &image);
         if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
             if (!recreate(vsync, swapchain_srgb_, swapchain_hdr_req_)) return acquired;
-            if (!swapchain_) return VK_SUCCESS;
+            if (!swapchain_) {  // minimised since the last present: skipped, as above
+                captured_ = false;
+                return VK_SUCCESS;
+            }
             acquired = acquire(frame.acquired, &image);
         }
         if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
@@ -873,7 +881,10 @@ private:
             }
         }
         if (extent.width == 0 || extent.height == 0) {
-            release(swapchain_);
+            {
+                std::lock_guard lock(context_.submit_mutex());
+                release(swapchain_);
+            }
             swapchain_ = VK_NULL_HANDLE;
             vsync_ = vsync;
             swapchain_srgb_ = srgb;
@@ -985,13 +996,18 @@ private:
         info.oldSwapchain = old;
         VkSwapchainKHR fresh = VK_NULL_HANDLE;
         const VkResult created = vkCreateSwapchainKHR_(device, &info, nullptr, &fresh);
-        release(old);  // retired by the creation attempt, whether or not it succeeded
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            release(old);  // retired by the creation attempt, whether or not it succeeded
+        }
         if (created != VK_SUCCESS) return false;
 
         std::vector<VkImage> images;
         std::vector<VkSemaphore> ready;
         const auto discard = [&] {
             for (VkSemaphore semaphore : ready) vk.vkDestroySemaphore(device, semaphore, nullptr);
+            // The WSI implementation may block on the device here too.
+            std::lock_guard lock(context_.submit_mutex());
             vkDestroySwapchainKHR_(device, fresh, nullptr);
             return false;
         };

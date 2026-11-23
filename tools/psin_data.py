@@ -285,7 +285,13 @@ class Walker:
         if t == 0x05:
             return self.struct(m["ref"], at, depth + 1)
         if t == 0x07:
-            r = c.resolve(at, 1, st, "struct pointer")
+            number, _ = c.pointer(at)
+            need = 1
+            if 1 <= number <= len(c.blocks):
+                s = c.structs.get(c.blocks[number - 1][0])
+                if s is not None:
+                    need = max(1, s["size"])
+            r = c.resolve(at, need, st, "struct pointer")
             if r is None:
                 return None
             btype, absolute, number = r

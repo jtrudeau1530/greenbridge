@@ -39,11 +39,10 @@ import csv
 import json
 import os
 import sys
-import unicodedata
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from report_paths import same_report_path  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 
 SLOT_ROLES = {
     "C8E8C282": "diffusetex",
@@ -246,7 +245,7 @@ def model_files(targets: list) -> list[str]:
     unique = []
     seen = set()
     for path in found:
-        key = _path_key(path)
+        key = path_key(path)
         if key not in seen:
             seen.add(key)
             unique.append(path)
@@ -338,31 +337,6 @@ def write_json(path: str, report: dict, rows: list) -> None:
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(public, f, indent=2)
         f.write("\n")
-
-
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
 
 
 def check_report_path(parser: argparse.ArgumentParser, flag: str, path: str, sources: list) -> None:

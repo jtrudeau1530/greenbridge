@@ -28,7 +28,7 @@ struct Ref {
     T* operator->() const { return p; }
 };
 
-int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool test_null_in_params) {
+int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool is_vulkan_layer) {
     // {7c83f2a1-4b5e-4d19-9a32-1f2e3d4c5b6a}
     const GUID id1 = {0x7c83f2a1, 0x4b5e, 0x4d19, {0x9a, 0x32, 0x1f, 0x2e, 0x3d, 0x4c, 0x5b, 0x6a}};
     const GUID id2 = {0x1b74e9d0, 0x2c3a, 0x4f81, {0x8e, 0x11, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f}};
@@ -42,9 +42,9 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool test_null_
 
     // 1. CreateShaderCacheSession argument validation & capability check (null output -> S_FALSE).
     // Passing nullptr for SAL _In_/_Inout_ parameters (pDesc, pKey, pValue, pValueSize) is undefined
-    // behaviour on older in-box Windows D3D12 runtimes (e.g. Win11 23H2 22621.5415 AVs), so those
-    // null-pointer guards are exercised only on the Vulkan layer.
-    if (test_null_in_params) {
+    // behaviour on older in-box Windows D3D12 runtimes, so those null-pointer guards are exercised
+    // only on the Vulkan layer.
+    if (is_vulkan_layer) {
         EXPECT(dev->CreateShaderCacheSession(nullptr, __uuidof(ID3D12ShaderCacheSession), nullptr) == E_INVALIDARG);
     }
     EXPECT(dev->CreateShaderCacheSession(&desc, __uuidof(ID3D12ShaderCacheSession), nullptr) == S_FALSE);
@@ -81,16 +81,16 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool test_null_
     UINT sz = sizeof(out_v);
     EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_NOT_FOUND);
     EXPECT(sz == sizeof(out_v));
-    if (test_null_in_params) {
+    if (is_vulkan_layer) {
         EXPECT(s1->FindValue(nullptr, sizeof(k1), &out_v, &sz) == E_INVALIDARG);
     }
     EXPECT(s1->FindValue(&k1, 0, &out_v, &sz) == E_INVALIDARG);
-    if (test_null_in_params) {
+    if (is_vulkan_layer) {
         EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, nullptr) == E_INVALIDARG);
         EXPECT(s1->StoreValue(nullptr, sizeof(k1), &v1, sizeof(v1)) == E_INVALIDARG);
     }
     EXPECT(s1->StoreValue(&k1, 0, &v1, sizeof(v1)) == E_INVALIDARG);
-    if (test_null_in_params) {
+    if (is_vulkan_layer) {
         EXPECT(s1->StoreValue(&k1, sizeof(k1), nullptr, sizeof(v1)) == E_INVALIDARG);
     }
     EXPECT(s1->StoreValue(&k1, sizeof(k1), &v1, 0) == E_INVALIDARG);
@@ -118,17 +118,21 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool test_null_
     EXPECT(s2->FindValue(&k1, sizeof(k1), &out_v, &sz) == S_OK && sz == sizeof(v1) && out_v == v1);
 
     // Different Identifier does not see k1.
+    // Older in-box Windows D3D12 runtimes (e.g. Win11 23H2 d3d12.dll 10.0.22621.5415) AV (0xC0000005)
+    // when releasing a D3D12_SHADER_CACHE_MODE_MEMORY session after SetDeleteOnDestroy(), so exercise
+    // SetDeleteOnDestroy() on MODE_MEMORY only on the Vulkan layer; MODE_MEMORY still discards on final
+    // release on both runtimes.
     D3D12_SHADER_CACHE_SESSION_DESC desc2 = desc;
     desc2.Identifier = id2;
     Ref<ID3D12ShaderCacheSession> other;
     EXPECT(SUCCEEDED(dev->CreateShaderCacheSession(&desc2, IID_PPV_ARGS(&other.p))) && other.p);
     sz = sizeof(out_v);
     EXPECT(other->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_NOT_FOUND);
-    other->SetDeleteOnDestroy();
+    if (is_vulkan_layer) other->SetDeleteOnDestroy();
     other.reset();
 
-    // Marking s1 delete-on-destroy keeps data alive while s2 is still open, then deletes once s2 releases.
-    s1->SetDeleteOnDestroy();
+    // Releasing s1 keeps data alive while s2 is still open, then discards once s2 releases.
+    if (is_vulkan_layer) s1->SetDeleteOnDestroy();
     s1.reset();
     sz = sizeof(out_v);
     out_v = 0;
@@ -139,7 +143,7 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool test_null_
     EXPECT(SUCCEEDED(dev->CreateShaderCacheSession(&desc, IID_PPV_ARGS(&s3.p))) && s3.p);
     sz = sizeof(out_v);
     EXPECT(s3->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_NOT_FOUND);
-    s3->SetDeleteOnDestroy();
+    if (is_vulkan_layer) s3->SetDeleteOnDestroy();
     s3.reset();
 
     // 4. ShaderCacheControl invalid-argument checks (same on host and layer).

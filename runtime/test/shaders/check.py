@@ -163,6 +163,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
 BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           ("cs_smem_bounds", [0, 0x5eed0010, 0x5eed000c, 0, 0x5eed000c, 0x5eed0010, 0, 0]),
           ("cs_smem_stride_align", [0x5eed0010, 0, 0, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0000, 0x5eed0004]),
+          # SHADER-328: a constant SGPR offset gives what the run-time one gives (no 32-bit wrap)
+          ("cs_smem_sconst_off", [0, 0x5eed0018, 0x5eed0018, 0x5eed0014]),
           ("cs_smem_sload_neg", [0x5eed0004, 0x5eed0000, 0x5eed0004, 0x5eed0004, 0x5eed0008, 0x5eed000c,
                                  0xeeeeeeee, 0xeeeeeeee]),
           ("cs_buf_tail", [0, 0x5eed000c, 0x5eed0008, 0x5eed000c, 0, 0, 0x5eed0010, 0]),
@@ -364,6 +366,8 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_fnan_fract": (0x3f7fffff, 0x00003bff, 0xc0200000, 0xc0200000),
               # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
               "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
+              # far branches: s_getpc/s_add|s_sub/s_addc|s_subb/s_setpc forward, backward loops, conditional (.asm header)
+              "ps_far_branch": (0x00000007, 0x00000013, 0x00000051, 0x0000000b),
               # 16-bit float v_cmp, all 16 predicates, e32 and e64 with swapped operands (.asm headers)
               "ps_vcmp_f16": (0x48a12080, 0x4ce9b1a2, 0x4ba72c98, 0x4fefbdba),
               "ps_vcmp_f16_e64": (0x44c11100, 0x4cf171c1, 0x47c71d18, 0x4ff77dd9),
@@ -533,6 +537,19 @@ def run(*cmd, env=None):
     return r.returncode, r.stdout + r.stderr
 
 
+def run_readback(path, launch, *args, **kwargs):
+    """Require this invocation to write its framebuffer before comparing it."""
+    path = Path(path)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as err:
+        return 1, f"could not remove the previous readback {path.name}: {err}"
+    code, output = launch(*args, **kwargs)
+    if code == 0 and not path.is_file():
+        return 1, f"{output.rstrip()}\nmissing readback: {path.name}".lstrip()
+    return code, output
+
+
 def failure(code, output, lines):
     details = "\n".join(output.strip().splitlines()[-lines:])
     return f"exit {code}: {details or 'no test output'}"
@@ -643,11 +660,11 @@ def mesh_v5_test(tools, spirv, raw):
     fs = Path(spirv) / "fs_passthru.spv"
     if not fs.is_file():
         return "missing fs_passthru.spv"
-    code, out = run(os.path.join(tools, "vk_harness" + EXE), shader, fs, raw, "--mesh-group-readback", "2", "3", "4",
-                    env=mesh_env(spirv, "ms_v5_workgroup"))
+    code, out = run_readback(raw, run, os.path.join(tools, "vk_harness" + EXE), shader, fs, raw,
+                             "--mesh-group-readback", "2", "3", "4", env=mesh_env(spirv, "ms_v5_workgroup"))
     if code == UNSUPPORTED:
         return Skip("SKIP (mesh shading unavailable)")
-    if code or not raw.is_file():
+    if code:
         return failure(code, out, 3)
     return check_mesh_v5(raw.read_bytes())
 
@@ -688,7 +705,9 @@ def narrow_subgroup_skip(out):
 
 def unpinned_subgroup_skip(out):
     """A Skip when vk_compute_test says the VKC_SUBGROUP_SIZE it was given can't be pinned on this device, else None.
-    Output without the line (an older vk_compute_test) is judged as before."""
+    Output without the line (an older vk_compute_test) is judged as before. "compute subgroup size: 32 (observed: ...)"
+    (MoltenVK: not requirable, but its probe saw 32 lanes) is judged, and "observed wrong" comes with exit 1, a
+    failure."""
     m = re.search(r"^compute subgroup size: (\d+) not available$", out, re.MULTILINE)
     if m:
         return Skip(f"SKIP (the device can't run this shader at {m.group(1)} lanes on request)")
@@ -939,14 +958,17 @@ def bindless_test(tools, spirv, pixel="ps_tex"):
 # Samples with a16 coordinates after whole-VGPR arguments (gradients, a bias, a clamp). On the 8x8 gradient every
 # pixel must be the texel its own (u, v) reads. ps_texture_grad_cl_a16 draws on the two-mip texture instead, where its
 # clamp picks mip 0 left of x = 32 and mip 1 from there on.
-GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16")
+GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16", "ps_texture_cl", "ps_texture_b_cl")
+# ps_texture_cl / ps_texture_b_cl (image_sample_cl / _b_cl) draw on the two-mip texture too: the left half reads mip 0 (red,
+# the top-left quadrant), the right half mip 1 (cyan) where the clamp is 1.
+CLAMP_TESTS = ("ps_texture_cl", "ps_texture_b_cl")
 
 
 def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_grad_a16") -> str:
     """Check every pixel of one of the GRADIENT_TESTS samples."""
     vs = os.path.join(spirv, "vs_ids.spv")
     fs = os.path.join(spirv, name + ".spv")
-    two_mip = name == "ps_texture_grad_cl_a16"
+    two_mip = name == "ps_texture_grad_cl_a16" or name in CLAMP_TESTS
     with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
         raw = Path(tmp) / "pixels.raw"
         code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw,
@@ -963,7 +985,9 @@ def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_gr
     first = ""
     for index, pixel in enumerate(struct.iter_unpack("<4f", data)):
         x, y = index % 64, index // 64
-        if two_mip:   # mip 1 (cyan) where the clamp is 1, else mip 0's red and blue quadrants
+        if name in CLAMP_TESTS:   # mip 1 (cyan) where the clamp is 1, else mip 0's top-left quadrant (red)
+            want = (0.0, 1.0, 1.0, 1.0) if x >= 32 else (1.0, 0.0, 0.0, 1.0)
+        elif two_mip:   # mip 1 (cyan) where the clamp is 1, else mip 0's red and blue quadrants
             want = (0.0, 1.0, 1.0, 1.0) if x >= 32 else (1.0, 0.0, 0.0, 1.0) if y < 32 else (0.0, 0.0, 1.0, 1.0)
         else:
             want = (32 * (x // 8) / 255, 32 * (y // 8) / 255, 128 / 255, 1.0)

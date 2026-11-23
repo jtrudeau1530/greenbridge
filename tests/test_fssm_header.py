@@ -359,15 +359,19 @@ class CliTest(unittest.TestCase):
                     json.dump(data, f)
                 self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps", "b": "ps"})
 
-    def test_stage_index_skips_malformed_rows_and_normalizes_subpaths(self):
+    def test_stage_index_skips_malformed_or_conflicting_rows_and_normalizes_subpaths(self):
         with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
             json.dump([
                 {"missing_file": True, "stage": "ps"},
                 {"file": None, "stage": "ps"},
                 {"file": "a.dxbc", "stage": None},
                 {"file": "dxbc/a.dxbc", "stage": "ps"},
+                {"file": "other/a.dxbc", "stage": "ps"},
+                {"file": "dxbc\\b.dxbc", "stage": "vs"},
+                {"file": "x/conflict.dxbc", "stage": "vs"},
+                {"file": "y/conflict.dxbc", "stage": "ps"},
             ], f)
-        self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps"})
+        self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps", "b": "vs"})
 
     def test_unindexed_blob_falls_back_to_table_only_tally(self):
         unlisted = os.path.join(self.fssm_dir, "unlisted.fssm")
@@ -382,6 +386,11 @@ class CliTest(unittest.TestCase):
         self.assertEqual(tally["entries"], 2)
         self.assertEqual(tally["entry_counts"], {"2": 1})
         self.assertEqual(tally["read_methods"], {"interp": 1, "mov": 1})
+        p_txt = subprocess.run([sys.executable, "-I", TOOL, unlisted],
+                               capture_output=True, text=True)
+        self.assertEqual(p_txt.returncode, 0, p_txt.stderr)
+        self.assertIn("(no inspected blob in index.json: counted every blob with a non-empty table as a PS)",
+                      p_txt.stdout)
 
 
 

@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc_command import mc_command  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
+import rdna2_decode  # noqa: E402
 
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
@@ -67,7 +68,10 @@ def probe(mcpu: str) -> None:
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
-def disasm(code: bytes, mcpu: str):
+def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
+    if backend == "python":
+        asm, bad = rdna2_decode.disasm_bytes(code, wave32=wave32)
+        return asm, bad, ""
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
@@ -81,10 +85,31 @@ def disasm(code: bytes, mcpu: str):
     return p.stdout, bad, p.stderr
 
 
+MAX_DATA_DWORDS = 1 << 16
+
+
+def data_block_start(b: bytes, start: int, end: int) -> int:
+    """Where a constant-data block begins at the end of the code range [start, end), or `end` if there is none.
+
+    Some blobs carry, after the last real s_endpgm, a block laid out as: s_endpgm, a dword count N, N dwords
+    of data, then one more s_endpgm (the one the range ends on) and s_code_end padding. The data is not code:
+    llvm-mc reports its words as invalid (and reads a 0xBF810000 inside it as a second program end). The
+    block is recognised only when the count N matches the distance to the closing s_endpgm and the dword
+    before the count is itself an s_endpgm, so ordinary code is not cut."""
+    last = end - 4
+    for n in range(min(MAX_DATA_DWORDS, (last - start) // 4 - 1) + 1):
+        count = last - 4 * (n + 1)
+        if count - 4 < start:
+            break
+        if struct.unpack_from("<I", b, count)[0] == n and b[count - 4:count] == ENDPGM:
+            return count
+    return end
+
+
 def code_range(b: bytes):
     """The code section offset is the u32 at 0xC0; instructions start 0x28 bytes into it and run to the last
-    4-byte-aligned s_endpgm in the blob (some blobs hold several programs). Found by correlating against
-    clean decodes of 154 random shaders."""
+    4-byte-aligned s_endpgm in the blob (some blobs hold several programs), minus a trailing constant-data
+    block (see data_block_start). Found by correlating against clean decodes of 154 random shaders."""
     # A blob too short to hold the offset goes to the scan like any other header miss; reading it anyway raised
     # struct.error, which stopped the whole run (and make_game.py at the same blob on every rerun).
     off = struct.unpack_from("<I", b, 0xC0)[0] if len(b) >= 0xC4 else 0
@@ -94,7 +119,7 @@ def code_range(b: bytes):
         while last >= 0 and (last - start) % 4:
             last = b.rfind(ENDPGM, start, last)
         if last >= 0:
-            return start, last + 4, "header"
+            return start, data_block_start(b, start, last + 4), "header"
     end = b.find(ENDPGM)
     # Fallback instructions are dword-aligned in the blob. A matching byte sequence can straddle metadata words.
     while end >= 0 and end % 4:
@@ -102,7 +127,7 @@ def code_range(b: bytes):
     return None, end + 4 if end >= 0 else None, "scan"
 
 
-def one(path, out, mcpu):
+def one(path, out, mcpu, backend="llvm-mc"):
     with open(path, "rb") as f:
         b = f.read()
     start, end, how = code_range(b)
@@ -112,13 +137,13 @@ def one(path, out, mcpu):
         # Walk back in 4-byte steps from the end and keep the longest clean decode.
         start, best = end - 4, None
         for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
-            _, bad, _ = disasm(b[s:end], mcpu)
+            _, bad, _ = disasm(b[s:end], mcpu, backend=backend)
             if bad == 0:
                 best = s
         if best is None:
             return "scan failed"
         start = best
-    asm, bad, err = disasm(b[start:end], mcpu)
+    asm, bad, err = disasm(b[start:end], mcpu, backend=backend)
     if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
         reason = (err.strip().splitlines() or ["no output"])[0]
         FAILED.append((path, reason))
@@ -147,6 +172,8 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--skip-existing", action="store_true", help="reuse complete listings from a matching run")
     ap.add_argument("--mcpu", default="gfx1013")
+    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
+                    help="disassembler backend: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
@@ -168,6 +195,9 @@ def main():
                                    if entry.name.endswith(".fssm") and entry.is_file())
         except (OSError, ValueError) as e:
             fail(f"cannot list shaders in {a.src}: {e}")
+    elif not os.path.exists(a.src):
+        print(f"ERROR: {a.src}: does not exist", file=sys.stderr)
+        return 2
     else:
         fail(f"{a.src} is not a file or folder")
     if not files:
@@ -192,9 +222,10 @@ def main():
                 pending.append(path)
         files = pending
     if files:
-        probe(a.mcpu)
+        if a.backend == "llvm-mc":
+            probe(a.mcpu)
         with ThreadPoolExecutor(a.jobs) as ex:
-            res.update(ex.map(lambda p: one(p, out, a.mcpu), files))
+            res.update(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files))
     print(f"{total} shaders -> {os.path.abspath(out)}: {dict(res)}")
     if FAILED:
         path, reason = FAILED[0]

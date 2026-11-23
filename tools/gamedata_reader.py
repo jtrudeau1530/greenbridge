@@ -270,7 +270,8 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
             continue
         try:
             tag, _, value = reader.read(doc["data"])
-        except ET.ParseError as e:
+        except (ET.ParseError, LookupError, ValueError) as e:
+            # Unsupported encodings and malformed content arrays fail outside ET.ParseError too.
             failed[str(e).split(":")[0]] += 1
             continue
         read += 1

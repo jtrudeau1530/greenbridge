@@ -3,9 +3,9 @@
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
 // The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
 // back (the presenter's capture) and must hold the clear colour at the swapchain's size. Last, the colour on screen
-// is read back with GDI on native Windows when the window is in front, the display is in SDR and GDI can read the
-// screen. Under Wine, rootless XWayland can return black for desktop reads, so the swapchain checks confirm the
-// colour there. No shaders or game data.
+// is read back with GDI on native Windows when the window is in front with no other window over its centre, the
+// display is in SDR and GDI can read the screen. Under Wine, rootless XWayland can return black for desktop reads,
+// so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -88,6 +88,17 @@ bool has_interactive_window_station() {
     DWORD bytes = 0;
     if (!GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &bytes)) return true;
     return (flags.dwFlags & WSF_VISIBLE) != 0;
+}
+
+// True when the window manager reports this window as the top-level window at a screen point. Being the foreground
+// window does not make it so: an always-on-top window, or one another process showed without taking the foreground,
+// can lie over it, and a GDI read of the screen then returns that window's pixel. WindowFromPoint passes over hidden
+// and disabled windows and over windows that are transparent to hit testing (a click-through overlay,
+// WS_EX_LAYERED | WS_EX_TRANSPARENT), so an overlay of that kind drawn over the point is not noticed, and neither
+// is anything the compositor draws there itself.
+bool is_top_window_at(HWND window, POINT screen_point) {
+    const HWND hit = WindowFromPoint(screen_point);
+    return hit && GetAncestor(hit, GA_ROOT) == window;
 }
 
 void set_client_size(HWND window, int width, int height) {
@@ -478,16 +489,44 @@ int main() {
                 GetClientRect(window, &client);
                 POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
                 ClientToScreen(window, &centre);
-                HDC screen = GetDC(nullptr);
-                const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
-                ReleaseDC(nullptr, screen);
-                if (pixel == CLR_INVALID) {
+                const auto is_clear_colour = [](COLORREF c) {
+                    return std::abs(GetRValue(c) - 51) <= 3 && std::abs(GetGValue(c) - 153) <= 3 &&
+                           std::abs(GetBValue(c) - 230) <= 3;
+                };
+                // The foreground window can still be covered at its centre, so a read counts only when this window
+                // was the top one there both before and after it. How long the compositor takes to show the last
+                // frame, or to stop showing a window that has just gone, is not known (the 200 ms above is a guess),
+                // so a pixel that is not the clear colour is read again for up to a second. Nothing is presented
+                // meanwhile: a late frame passes, a wrong colour that stays fails.
+                COLORREF pixel = CLR_INVALID, first_pixel = CLR_INVALID;
+                bool covered = false;
+                int reads = 0;
+                for (;;) {
+                    covered = !is_top_window_at(window, centre);
+                    if (covered) break;
+                    HDC screen = GetDC(nullptr);
+                    pixel = GetPixel(screen, centre.x, centre.y);
+                    ReleaseDC(nullptr, screen);
+                    covered = !is_top_window_at(window, centre);
+                    if (covered) break;
+                    if (++reads == 1) first_pixel = pixel;
+                    if (pixel == CLR_INVALID || is_clear_colour(pixel) || reads > 20) break;
+                    Sleep(50);
+                    pump();
+                }
+                if (covered) {
+                    std::printf("another window covers the window centre: on-screen colour check skipped, the "
+                                "colour was checked in the presented images\n");
+                } else if (pixel == CLR_INVALID) {
                     std::printf("GDI cannot read the screen here (GetPixel on the screen DC returns CLR_INVALID): "
                                 "on-screen colour check skipped, the colour was checked in the presented images\n");
                 } else {
                     const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
                     std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
-                    EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
+                    if (reads > 1)
+                        std::printf("read %d times, 50 ms apart; the first read was %d,%d,%d\n", reads,
+                                    GetRValue(first_pixel), GetGValue(first_pixel), GetBValue(first_pixel));
+                    EXPECT(is_clear_colour(pixel));
                     screen_checked = true;
                 }
             }

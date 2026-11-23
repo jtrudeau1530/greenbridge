@@ -44,35 +44,30 @@ MAGICS = (
 )
 
 
-def is_pe(head):
-    """MZ header whose e_lfanew points at a PE signature inside the bytes read."""
-    if not head.startswith(b"MZ") or len(head) < 0x40:
-        return False
-    offset = int.from_bytes(head[0x3C:0x40], "little")
-    return head[offset:offset + 4] == b"PE\0\0"
-
-
-def classify(head):
-    """The format `head` (the first bytes of a file) starts like, or None."""
+def classify(head, pe_signature=None):
+    """The format a file starts like, or None. `head` is its first bytes; `pe_signature` the 4 bytes at e_lfanew."""
     for name, offset, magic in MAGICS:
         if head[offset:offset + len(magic)] == magic:
             return name
     if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
         return "RIFF WAVE audio"
-    if is_pe(head):
+    if head.startswith(b"MZ") and pe_signature == b"PE\0\0":
         return "PE executable"
     return None
 
 
 def read_head(path):
+    """(first bytes, the 4 bytes at e_lfanew or None). The PE signature is read where e_lfanew points, even past
+    the first bytes or straddling their end; a file too short for it gives fewer than 4 bytes and no match."""
     with open(path, "rb") as f:
         head = f.read(HEAD)
-        if head.startswith(b"MZ") and len(head) >= 0x40:
-            offset = int.from_bytes(head[0x3C:0x40], "little")
-            if HEAD <= offset < 1 << 20:  # the PE signature sits past the first bytes read
-                f.seek(offset)
-                head += b"\0" * (offset - len(head)) + f.read(4)
-        return head
+        if not head.startswith(b"MZ") or len(head) < 0x40:
+            return head, None
+        offset = int.from_bytes(head[0x3C:0x40], "little")
+        if offset + 4 <= len(head):
+            return head, head[offset:offset + 4]
+        f.seek(offset)
+        return head, f.read(4)
 
 
 def tracked_files(root):
@@ -86,7 +81,7 @@ def check(paths):
     for path in paths:
         if os.path.islink(path) or not os.path.isfile(path):
             continue  # submodules, symlinks, files deleted in the working tree
-        name = classify(read_head(path))
+        name = classify(*read_head(path))
         if name:
             found.append((path, name))
     return found
@@ -94,9 +89,10 @@ def check(paths):
 
 def display(path):
     try:
-        return os.path.relpath(path)
+        path = os.path.relpath(path)
     except ValueError:  # Windows: another drive than the working directory
-        return path
+        pass
+    return path.replace("\n", "\\n").replace("\r", "\\r")  # one line per file, even for a name with a newline
 
 
 def main(argv):

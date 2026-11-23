@@ -9,6 +9,7 @@ Integer and f16 formats are used: their decode is exact, so the expected words n
 """
 from __future__ import annotations
 
+import atexit
 import os
 import struct
 import sys
@@ -40,11 +41,21 @@ DST_SEL_X_0_1_1 = 4 | 0 << 3 | 1 << 6 | 1 << 9
 
 _TMP_DIR = None
 _SRC_PATH = None
+_EXIT_CLEANUP = False
 
 
 def setUpModule():
-    global _TMP_DIR, _SRC_PATH
+    global _TMP_DIR, _SRC_PATH, _EXIT_CLEANUP
+    if _TMP_DIR is not None:
+        return  # load_format() may have created it already; replacing it would leak the first one
     _TMP_DIR = tempfile.TemporaryDirectory()
+    # test_norm_decode imports load_format() and runs after this module's teardown, which recreates the folder;
+    # unittest never tears this module down again. Registered once, after the first TemporaryDirectory, so it runs
+    # before tempfile's own exit finalizer (atexit is last in, first out) and that finalizer stays quiet;
+    # tearDownModule() cleans whichever folder is live at exit.
+    if not _EXIT_CLEANUP:
+        atexit.register(tearDownModule)
+        _EXIT_CLEANUP = True
     disasm_dir = os.path.join(_TMP_DIR.name, "disasm")
     os.mkdir(disasm_dir)
     _SRC_PATH = os.path.join(disasm_dir, "ps_buf_fmt.s")

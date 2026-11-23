@@ -528,6 +528,20 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIn("is a file, not a folder", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
 
+    def test_output_under_a_regular_file_is_one_line_error(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        blocker = os.path.join(self.dir, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"x")
+        res = self.run_carve(self.archive, os.path.join(blocker, "out"))
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("cannot create", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"x")
+
     def test_carve_preserves_existing_index_temp_sibling(self):
         dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
         with open(self.archive, "wb") as f:

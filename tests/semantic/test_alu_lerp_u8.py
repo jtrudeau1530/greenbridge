@@ -35,15 +35,15 @@ SIMD Multi-Lane Execution:
   contents unmodified.
 
 SPIR-V Lowering in rdna2spirv:
-  Lowers to 4 parallel lane extractions via OpBitFieldUExtract (offset 0, 8, 16, 24 with
-  widths 8 for src0/src1 and width 1 for src2), two OpIAdd operations, OpShiftRightLogical
-  by 1, and OpBitwiseOr reassembly into a 32-bit dword.
+  Computes all four bytes together using the shared and differing bits of src0/src1.
+  A mask before the one right shift prevents bits crossing byte boundaries.
 
 Standard library only: Python 3.9+ compatible, zero game data, synthetic shaders only.
 """
 import gc
 import itertools
 import os
+from pathlib import Path
 import random
 import struct
 import sys
@@ -63,6 +63,7 @@ if HERE not in sys.path:
 
 import rdna2spirv  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
+from support import mrt0_words, translate_listing  # noqa: E402
 
 MASK8 = 0xFF
 MASK32 = 0xFFFFFFFF
@@ -885,6 +886,14 @@ class TestLerpU8NegativeControlsAndSabotageSensitivities(unittest.TestCase):
 
 class TestLerpU8SyntheticShaderTranslation(unittest.TestCase):
     """End-to-end SPIR-V translation and spirv_mini_interp execution tests."""
+
+    def test_packed_lowering(self) -> None:
+        fixture = Path(HERE) / "fixtures" / "lerp_packed_bytes.asm"
+        text = translate_listing("ps_lerp_packed_bytes", fixture.read_bytes())
+        self.assertEqual(mrt0_words(text), [0x40FF7F80, 0x40807F80, 0x41800080, 0x41123456])
+        self.assertEqual(text.count("OpBitFieldUExtract"), 0)
+        self.assertEqual(text.count("OpShiftRightLogical %uint"), 4)
+        self.assertEqual(text.count("OpIAdd %uint"), 8)
 
     def test_reference_known_vectors(self) -> None:
         """Verify baseline test vectors against ref_lerp_u8_word."""

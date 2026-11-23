@@ -158,6 +158,26 @@ class ParseTest(unittest.TestCase):
         with self.assertRaises(rbf0_index.RbfError):
             rbf0_index.parse_rbf0(b"PSIN" + bytes(16))
 
+    def test_attribute_mismatch_counted_once_per_element_and_not_filled_after_content(self):
+        # One element declares 1 attribute, has 0 attributes, three child elements, and a trailing value:
+        # must report 1 attribute mismatch (not 4), and the value after child elements must not satisfy it.
+        b = bytearray(b"RBF0")
+        b += _open(0, b"Root", attrs=1)
+        b += _open(1, b"A") + b"\xff\xff"
+        b += _open(2, b"B") + b"\xff\xff"
+        b += _open(3, b"C") + b"\xff\xff"
+        b += _value(4, 0x10, struct.pack("<I", 9), b"after")
+        b += b"\xff\xff"
+        r = rbf0_index.parse_rbf0(bytes(b))
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["attributes"], 1)
+
+        # Truncated after content starts must still record the already-observed attribute mismatch once.
+        trunc = bytearray(b"RBF0") + _open(0, b"Root", attrs=1) + _text(b"hi")
+        rt = rbf0_index.parse_rbf0(bytes(trunc))
+        self.assertEqual(rt["status"], "truncated")
+        self.assertEqual(rt["attributes"], 1)
+
     def test_attribute_count(self):
         b = bytearray(WIDE)
         b += _open(0, b"Root", attrs=2)

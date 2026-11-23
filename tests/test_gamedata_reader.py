@@ -258,6 +258,12 @@ class Dispatch(unittest.TestCase):
 
 
 class Run(unittest.TestCase):
+    BAD_DOCUMENTS = (
+        ("truncated array", b'<CBroken><v content="vec3v_array">1 2 3 4</v></CBroken>'),
+        ("unknown encoding", b'<?xml version="1.0" encoding="x-no-such-encoding"?><CBroken/>'),
+        ("unsupported encoding", b'<?xml version="1.0" encoding="UTF-32"?><CBroken/>'),
+    )
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -279,6 +285,37 @@ class Run(unittest.TestCase):
     def test_root_filter(self):
         s = R.run([self.dir], root_filter="COther", reader=R.Reader(root_handlers={}, type_handlers={}))
         self.assertEqual(s["documents"], 1)
+
+    def test_conversion_and_encoding_errors_do_not_abort_batch(self):
+        bad = os.path.join(self.tmp.name, "bad.xml")
+        good = os.path.join(self.dir, "c.xml")
+        for name, data in self.BAD_DOCUMENTS:
+            with self.subTest(name=name):
+                with open(bad, "wb") as f:
+                    f.write(data)
+                s = R.run([bad, good], reader=R.Reader(root_handlers={}, type_handlers={}))
+                self.assertEqual((s["documents"], s["roots"], s["not_well_formed"]), (1, 1, 1))
+                self.assertEqual(s["per_root_documents"], {"COther": 1})
+                self.assertEqual(sum(s["parse_errors"].values()), 1)
+
+    def test_cli_continues_after_conversion_and_encoding_errors(self):
+        bad = os.path.join(self.tmp.name, "bad.xml")
+        good = os.path.join(self.dir, "c.xml")
+        for name, data in self.BAD_DOCUMENTS:
+            with self.subTest(name=name):
+                with open(bad, "wb") as f:
+                    f.write(data)
+                out = os.path.join(self.tmp.name, name)
+                r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"),
+                                    bad, good, "--out", out], capture_output=True, text=True, timeout=10)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("1 documents read, 1 roots, 1 not well-formed", r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+                files = os.listdir(out)
+                self.assertEqual(len(files), 1)
+                self.assertTrue(files[0].startswith("COther_"))
+                with open(os.path.join(out, files[0]), encoding="utf-8") as f:
+                    self.assertEqual(json.load(f), {"x": 2})
 
     def test_cli_prints_counts_and_writes_json(self):
         out = os.path.join(self.tmp.name, "json", "nested")

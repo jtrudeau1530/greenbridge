@@ -27,8 +27,8 @@ Meshlet group (first u32 has bit 31 set):
          u32 w1: low u16 = first vertex reference, high u16 = first triangle (running sums)
          u32 w2, w3: bits 0-11 and 12-23 of w2 and bits 0-11 of w3 are the meshlet's centre in x, y and z as
                      12-bit steps around 2047, (field - 2047) * step (measured on `42 40` geometry; the default
-                     0x007FF7FF / 0x7FF is the origin). The step is 1/16 m, or 1/8 m when w2 bit 28 is set (large
-                     meshlets out to +-256 m; the other w2 bits 24-31 are 0). w3 bits 14-30 are the normal cone: axis
+                     0x007FF7FF / 0x7FF is the origin). The step is 2^e / 16 m with e = w2 bits 28-31 (0 to 4
+                     seen; larger meshlets further out), and w2 bits 24-27 are 0. w3 bits 14-30 are the normal cone: axis
                      octahedral u = bits 14-19, v = bits 20-25 (x / 31.5 - 1), sin(half-angle) = (31 - bits 26-30)
                      / 31; all zero = no cone.
     then T u32 triangles: three 7-bit meshlet-local indices (bits 0-6, 7-13, 14-20), meshlet index in bits 21-31
@@ -233,8 +233,8 @@ def face_agreement(positions, triangles):
 
 
 def centre_step(w2):
-    """Metres per step of a meshlet record's centre fields: 1/16, or 1/8 when w2 bit 28 is set."""
-    return 0.125 if (w2 >> 28) & 1 else 0.0625
+    """Metres per step of a meshlet record's centre fields: 2^e / 16 with the exponent e in w2 bits 28-31."""
+    return 2.0 ** ((w2 >> 28) & 15) / 16
 
 
 def meshlet_centre(w2, w3):
@@ -316,7 +316,7 @@ def centre_agreement(data, group, positions):
         if len(pts) != vc:
             raise PageError("meshlet references a vertex past its block")
         stored, size = meshlet_centre(w2, w3), centre_step(w2)
-        out["coarse_steps"] += size > 0.0625
+        out["coarse_steps"] += (w2 >> 28) != 0
         for i in range(3):
             step = round(((min(p[i] for p in pts) + max(p[i] for p in pts)) / 2 - stored[i]) / size)
             out["axes_exact"] += step == 0
@@ -763,8 +763,8 @@ def _resource_pointer(system, at, base, segment, size):
     return address
 
 
-def drawable_geometries(system, drawable):
-    """Read the primary LOD geometry list at a caller-identified drawable."""
+def drawable_geometries(system, drawable, lod_index=0):
+    """Read one LOD geometry list at a caller-identified drawable."""
     def pointer(at, size):
         return _resource_pointer(system, at, 0x50000000, system, size)
 
@@ -776,7 +776,9 @@ def drawable_geometries(system, drawable):
 
     if not 0 <= drawable <= len(system) - 176:
         raise PageError("drawable outside the system segment")
-    lod = pointer(drawable + 80, 16)
+    if lod_index not in range(4):
+        raise PageError("drawable LOD index must be between 0 and 3")
+    lod = pointer(drawable + 80 + 8 * lod_index, 16)
     models = count(lod + 8)
     table = pointer(lod, 8 * models)
     for i in range(models):
@@ -873,8 +875,11 @@ def main(argv=None):
     select.add_argument("--geometry-offset", action="append", type=lambda s: int(s, 0),
                         help="known geometry record offset in the system segment (repeatable)")
     select.add_argument("--drawable-offset", type=lambda s: int(s, 0),
-                        help="walk primary LOD geometry records from this system-segment drawable")
+                        help="walk geometry records from this system-segment drawable")
+    ap.add_argument("--lod", type=int, choices=range(4), help="drawable LOD index (default: 0)")
     args = ap.parse_args(argv)
+    if args.lod is not None and args.drawable_offset is None:
+        ap.error("--lod requires --drawable-offset")
     if args.json:
         if os.path.isdir(args.json):
             print(f"error: --json {args.json} is a directory", file=sys.stderr)
@@ -895,7 +900,7 @@ def main(argv=None):
             with open(args.inputs[0], "rb") as source:
                 graphics = source.read()
             rows = []
-            offsets = args.geometry_offset or drawable_geometries(system, args.drawable_offset)
+            offsets = args.geometry_offset or drawable_geometries(system, args.drawable_offset, args.lod or 0)
             try:
                 for offset in offsets:
                     try:

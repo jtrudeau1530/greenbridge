@@ -136,6 +136,37 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["page_counts"], {"6": 1})
         self.assertEqual(doc["pages"][0]["source"], "page.bin")
 
+    def test_folder_name_with_glob_characters_is_a_path(self):
+        # glob read "[v1]" as a character class, so a folder named like this indexed nothing and exited 0.
+        folder = os.path.join(self.root, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "page.bin"), "wb") as f:
+            f.write(page(pages=2))
+        out = os.path.join(self.root, "glob.json")
+        self.run_tool(folder, "--out", out)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["summary"]["streams"], 1)
+        self.assertEqual(doc["summary"]["matched"], 1)
+
+    def test_hard_link_to_a_scanned_file_in_a_glob_named_input_is_refused(self):
+        folder = os.path.join(self.root, "carve [v1]")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "page.bin")
+        with open(carved, "wb") as f:
+            f.write(page())
+        alias = os.path.join(folder, "alias.dat")   # not matched by *.bin: only the scan's own glob finds the file
+        try:
+            os.link(carved, alias)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("hard links are not available here")
+        r = subprocess.run([sys.executable, "-I", TOOL, folder, "--out", alias], cwd=ROOT,
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("would overwrite the input", r.stderr)
+        with open(carved, "rb") as f:
+            self.assertEqual(f.read(), page())
+
     def test_out_and_csv_in_missing_folders_are_created(self):
         # Before: write_outputs opened both paths directly, so a missing folder ended a finished scan in a
         # FileNotFoundError traceback and lost the index.
@@ -384,7 +415,7 @@ class MissingInputTest(unittest.TestCase):
             out = os.path.join(tmp, "n.json")
             p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "missing.rpf"), "--out", out],
                                capture_output=True, text=True, timeout=60)
-            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertEqual(p.returncode, 2, p.stderr)
             self.assertIn("missing.rpf", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
@@ -511,6 +542,21 @@ class PublishTest(unittest.TestCase):
         os.chmod(self.out, 0o640)
         self.tool.write_outputs([], {"streams": 0}, self.out, None)
         self.assertEqual(os.stat(self.out).st_mode & 0o777, 0o640)
+
+
+class OutputPathTest(unittest.TestCase):
+    """A report path that is already a folder is a usage error, not a PermissionError traceback."""
+
+    def test_out_that_is_a_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "carved"), os.path.join(tmp, "reports")
+            os.makedirs(source)
+            os.makedirs(out)
+            r = subprocess.run([sys.executable, "-I", TOOL, source, "--out", out],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--out is a directory", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

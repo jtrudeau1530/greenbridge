@@ -20,8 +20,10 @@
 #include "d3d12_trace.h"
 
 #include <windows.h>
+#include <dxgi1_4.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -45,6 +47,11 @@ struct DeviceProxy {
     void** real_vtable;
     unsigned slot_count;    // number of valid entries in real_vtable
     std::atomic<unsigned long> refs;
+    // The device's IDXGIDevice1 (see "IDXGIDevice1 on the device" below): a title's IDXGIDevice1* points here.
+    void** dxgi_vtable;
+    DxgiAdapterProvider adapter_provider;
+    std::atomic<int> gpu_thread_priority;
+    std::atomic<unsigned> max_frame_latency;
 };
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
@@ -200,6 +207,12 @@ HRESULT proxy_query_interface(DeviceProxy* self, const IID* riid, void** out) {
         proxy_add_ref(self);
         return S_OK;
     }
+    if (IsEqualIID(*riid, __uuidof(IDXGIObject)) || IsEqualIID(*riid, __uuidof(IDXGIDevice)) ||
+        IsEqualIID(*riid, __uuidof(IDXGIDevice1))) {
+        *out = &self->dxgi_vtable;
+        proxy_add_ref(self);
+        return S_OK;
+    }
     if (!is_device_iid(*riid)) return E_NOINTERFACE;
 
     // Only claim an interface the PC device really implements; the proxy vtable covers its slots.
@@ -211,6 +224,142 @@ HRESULT proxy_query_interface(DeviceProxy* self, const IID* riid, void** out) {
     *out = self;
     proxy_add_ref(self);
     return S_OK;
+}
+
+// ---- IDXGIDevice1 on the device ---------------------------------------------------------------------------------
+//
+// A GDKX title finds its output through the device: QueryInterface for IDXGIDevice1, GetAdapter, EnumOutputs(0),
+// and hands that output to SetFrameIntervalX (docs/d3d12_vulkan.md section 4.5, from the public samples). A PC
+// ID3D12Device has no IDXGIDevice, so the proxy answers it itself: a second vtable pointer inside the proxy object,
+// with the proxy's reference count and QueryInterface, so the two pointers are one COM object. Only IDXGIDevice and
+// IDXGIDevice1 are answered (what the samples ask for). The 14 slots are the public dxgi.h order; that the console
+// keeps it is the same assumption as for the queue and the fence.
+//
+// GetAdapter and GetParent hand out the adapter of the device behind the proxy. The provider says how: the default
+// asks the host's DXGI for the adapter with the device's LUID (the host backend); set_device_adapter_provider puts
+// the Vulkan layer's own adapter there, so that backend never loads the host's dxgi.dll for it.
+constexpr unsigned kDxgiDeviceSlots = 14;  // IUnknown 3, IDXGIObject 4, IDXGIDevice 5, IDXGIDevice1 2
+
+DeviceProxy* dxgi_owner(void* self) {
+    return reinterpret_cast<DeviceProxy*>(static_cast<char*>(self) - offsetof(DeviceProxy, dxgi_vtable));
+}
+
+HRESULT host_adapter(ID3D12Device* real, REFIID riid, void** out) {
+    using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+    static const CreateFactoryFn create_factory = [] {
+        const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return dxgi ? reinterpret_cast<CreateFactoryFn>(
+                          reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")))
+                    : nullptr;
+    }();
+    if (!create_factory) return DXGI_ERROR_NOT_FOUND;
+    IDXGIFactory4* factory = nullptr;
+    HRESULT hr = create_factory(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory));
+    if (FAILED(hr) || !factory) return FAILED(hr) ? hr : DXGI_ERROR_NOT_FOUND;
+    hr = factory->EnumAdapterByLuid(real->GetAdapterLuid(), riid, out);
+    factory->Release();
+    return hr;
+}
+
+HRESULT dxgi_adapter(DeviceProxy* self, REFIID riid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    const DxgiAdapterProvider provider = self->adapter_provider ? self->adapter_provider : &host_adapter;
+    const HRESULT hr = provider(self->real, riid, out);
+    if (FAILED(hr)) *out = nullptr;
+    return hr;
+}
+
+void note_dxgi(const char* method) {
+    d3d12_trace::record(method);
+}
+
+HRESULT WINAPI dxgi_query_interface(void* self, const IID* riid, void** out) {
+    return proxy_query_interface(dxgi_owner(self), riid, out);
+}
+ULONG WINAPI dxgi_add_ref(void* self) { return proxy_add_ref(dxgi_owner(self)); }
+ULONG WINAPI dxgi_release(void* self) { return proxy_release(dxgi_owner(self)); }
+
+// IDXGIObject's private data is the device's: ID3D12Object has the same three methods with the same arguments.
+HRESULT WINAPI dxgi_set_private_data(void* self, const GUID* name, UINT size, const void* data) {
+    if (!name) return E_INVALIDARG;
+    return dxgi_owner(self)->real->SetPrivateData(*name, size, data);
+}
+HRESULT WINAPI dxgi_set_private_data_interface(void* self, const GUID* name, const IUnknown* object) {
+    if (!name) return E_INVALIDARG;
+    return dxgi_owner(self)->real->SetPrivateDataInterface(*name, object);
+}
+HRESULT WINAPI dxgi_get_private_data(void* self, const GUID* name, UINT* size, void* data) {
+    if (!name) return E_INVALIDARG;
+    return dxgi_owner(self)->real->GetPrivateData(*name, size, data);
+}
+HRESULT WINAPI dxgi_get_parent(void* self, const IID* riid, void** out) {
+    note_dxgi("XboxIDXGIDevice::GetParent");
+    if (!riid) return E_POINTER;
+    return dxgi_adapter(dxgi_owner(self), *riid, out);
+}
+HRESULT WINAPI dxgi_get_adapter(void* self, IDXGIAdapter** out) {
+    note_dxgi("XboxIDXGIDevice::GetAdapter");
+    return dxgi_adapter(dxgi_owner(self), __uuidof(IDXGIAdapter), reinterpret_cast<void**>(out));
+}
+// CreateSurface and QueryResourceResidency are D3D10/11-era methods no D3D12 title has a use for; what the console
+// answers is not measured, so they are refused and say so once.
+HRESULT WINAPI dxgi_create_surface(void*, const DXGI_SURFACE_DESC*, UINT, DXGI_USAGE, const DXGI_SHARED_RESOURCE*,
+                                   IDXGISurface** out) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: IDXGIDevice::CreateSurface is not implemented; returning E_NOTIMPL\n");
+    if (out) *out = nullptr;
+    return E_NOTIMPL;
+}
+HRESULT WINAPI dxgi_query_resource_residency(void*, IUnknown* const*, DXGI_RESIDENCY*, UINT) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: IDXGIDevice::QueryResourceResidency is not implemented; returning E_NOTIMPL\n");
+    return E_NOTIMPL;
+}
+// The priority and the frame latency are kept and read back; nothing acts on them (the Xbox presenter's latency is
+// SetFrameIntervalX's). The ranges are the documented ones: -7..7, and 1..16 with 0 for the default of 3.
+HRESULT WINAPI dxgi_set_gpu_thread_priority(void* self, INT priority) {
+    if (priority < -7 || priority > 7) return E_INVALIDARG;
+    dxgi_owner(self)->gpu_thread_priority.store(priority, std::memory_order_relaxed);
+    return S_OK;
+}
+HRESULT WINAPI dxgi_get_gpu_thread_priority(void* self, INT* priority) {
+    if (!priority) return E_POINTER;
+    *priority = dxgi_owner(self)->gpu_thread_priority.load(std::memory_order_relaxed);
+    return S_OK;
+}
+HRESULT WINAPI dxgi_set_maximum_frame_latency(void* self, UINT latency) {
+    if (latency > 16) return DXGI_ERROR_INVALID_CALL;
+    dxgi_owner(self)->max_frame_latency.store(latency ? latency : 3, std::memory_order_relaxed);
+    return S_OK;
+}
+HRESULT WINAPI dxgi_get_maximum_frame_latency(void* self, UINT* latency) {
+    if (!latency) return E_POINTER;
+    *latency = dxgi_owner(self)->max_frame_latency.load(std::memory_order_relaxed);
+    return S_OK;
+}
+
+void** get_dxgi_vtable() {
+    static void* table[kDxgiDeviceSlots] = {
+        reinterpret_cast<void*>(&dxgi_query_interface),          // 0
+        reinterpret_cast<void*>(&dxgi_add_ref),                  // 1
+        reinterpret_cast<void*>(&dxgi_release),                  // 2
+        reinterpret_cast<void*>(&dxgi_set_private_data),         // 3  IDXGIObject
+        reinterpret_cast<void*>(&dxgi_set_private_data_interface),
+        reinterpret_cast<void*>(&dxgi_get_private_data),
+        reinterpret_cast<void*>(&dxgi_get_parent),
+        reinterpret_cast<void*>(&dxgi_get_adapter),              // 7  IDXGIDevice
+        reinterpret_cast<void*>(&dxgi_create_surface),
+        reinterpret_cast<void*>(&dxgi_query_resource_residency),
+        reinterpret_cast<void*>(&dxgi_set_gpu_thread_priority),
+        reinterpret_cast<void*>(&dxgi_get_gpu_thread_priority),
+        reinterpret_cast<void*>(&dxgi_set_maximum_frame_latency),  // 12 IDXGIDevice1
+        reinterpret_cast<void*>(&dxgi_get_maximum_frame_latency),
+    };
+    return table;
 }
 
 unsigned long heap_add_ref(HeapProxy* self) {
@@ -1256,6 +1405,10 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     proxy->real_vtable = *reinterpret_cast<void***>(real);
     proxy->slot_count = detect_slot_count(real);
     proxy->refs.store(1, std::memory_order_relaxed);
+    proxy->dxgi_vtable = get_dxgi_vtable();
+    proxy->adapter_provider = nullptr;
+    proxy->gpu_thread_priority.store(0, std::memory_order_relaxed);
+    proxy->max_frame_latency.store(3, std::memory_order_relaxed);
 
     const unsigned slot_count = proxy->slot_count;
     HRESULT hr = proxy_query_interface(proxy, &riid, out);
@@ -1273,6 +1426,28 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
 
 bool is_device_proxy(const void* device) {
     return device && *reinterpret_cast<void* const*>(device) == reinterpret_cast<void*>(get_vtable());
+}
+
+void* device_proxy_from_dxgi_device(void* dxgi_device) {
+    if (!dxgi_device || *static_cast<void***>(dxgi_device) != get_dxgi_vtable()) return nullptr;
+    return dxgi_owner(dxgi_device);
+}
+
+void* device_proxy_primary(void* device) {
+    if (is_device_proxy(device)) return device;
+    return device_proxy_from_dxgi_device(device);
+}
+
+bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) {
+        // Not installing one silently would leave the host's adapter in its place.
+        std::fprintf(stderr, "[rt] d3d12_xs: set_device_adapter_provider: %p is not a device proxy; no provider set\n",
+                     device);
+        return false;
+    }
+    proxy->adapter_provider = provider;
+    return true;
 }
 
 bool is_heap_proxy(const void* heap) {

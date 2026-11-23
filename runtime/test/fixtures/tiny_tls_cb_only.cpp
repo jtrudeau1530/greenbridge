@@ -2,6 +2,15 @@
 // and SizeOfZeroFill == 0 while providing a TLS callback (no CRT .tls section). Ordinary test code, not game data.
 #include <windows.h>
 
+#ifdef __MSVC_RUNTIME_CHECKS
+// Debug builds compile with /RTC1 (the Visual Studio generator's default), whose checks call into the CRT; /NODEFAULTLIB
+// leaves these unresolved (LNK1120). The checks have nothing to check here, so they do nothing.
+extern "C" {
+void __cdecl _RTC_InitBase() {}
+void __cdecl _RTC_Shutdown() {}
+}
+#endif
+
 namespace {
 
 ULONG g_tls_index = 0;

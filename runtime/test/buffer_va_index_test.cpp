@@ -27,10 +27,10 @@ void check(bool ok, const char* what) {
     ++failures;
 }
 
-// The id that holds `va`, 0 for none.
-std::uintptr_t at(const Index& index, std::uint64_t va) {
+// The id that holds `va` (preferring one that holds `bytes` from it), 0 for none.
+std::uintptr_t at(const Index& index, std::uint64_t va, std::uint64_t bytes = 1) {
     Index::Hit hit{};
-    return index.find(va, hit) ? hit.id : 0;
+    return index.find(va, hit, bytes) ? hit.id : 0;
 }
 
 void fixed_cases() {
@@ -63,6 +63,13 @@ void fixed_cases() {
     check(at(alias, 0x11100) == 10, "past the short buffer, the long one still holds the VA");
     check(at(alias, 0x1f000) == 10, "past every short buffer");
     check(at(alias, 0x20000) == 0, "past the long buffer");
+
+    // A view that starts in a short buffer and runs past its end: the long buffer around it holds all of it.
+    check(at(alias, 0x11080, 0x80) == 11, "a view that fits in the short buffer stays in it");
+    check(at(alias, 0x11080, 0x81) == 10, "a view past the short buffer's end goes to the long one around it");
+    check(at(alias, 0x1ff00, 0x200) == 10, "a view no range holds: the closest that holds its start");
+    check(at(alias, 0x11080, 0x10000) == 11, "a view past the long buffer too: the closest start, as without a size");
+    check(at(alias, 0x11080, 0) == 11, "a size of 0 counts as one byte");
 
     // Two resources placed at the same offset: the larger ID, either way they were added.
     alias.insert(0x30000, 0x100, 21);
@@ -100,19 +107,25 @@ void fixed_cases() {
     check(bound.longest() == 0 && bound.size() == 0, "an empty index has no bound");
 }
 
-// The rule BufferVaIndex follows, by a scan: among the ranges that hold va, the greatest (start, id).
+// The rule BufferVaIndex follows, by a scan: among the ranges that hold all of [va, va + bytes), the greatest
+// (start, id); when none does, the greatest among those that hold va.
 struct Range {
     std::uint64_t start, size;
     std::uintptr_t id;
 };
 
-std::uintptr_t scan(const std::vector<Range>& ranges, std::uint64_t va) {
+std::uintptr_t scan(const std::vector<Range>& ranges, std::uint64_t va, std::uint64_t bytes = 1) {
     const Range* best = nullptr;
+    const Range* whole = nullptr;
+    const auto greater = [](const Range& a, const Range* b) {
+        return !b || a.start > b->start || (a.start == b->start && a.id > b->id);
+    };
     for (const Range& r : ranges) {
         if (va < r.start || va - r.start >= r.size) continue;
-        if (!best || r.start > best->start || (r.start == best->start && r.id > best->id)) best = &r;
+        if (greater(r, best)) best = &r;
+        if (bytes <= r.size - (va - r.start) && greater(r, whole)) whole = &r;
     }
-    return best ? best->id : 0;
+    return whole ? whole->id : best ? best->id : 0;
 }
 
 void random_tables() {
@@ -148,9 +161,12 @@ void random_tables() {
         }
         for (int q = 0; q < 2000; ++q) {
             const std::uint64_t va = 0x8000 + rng() % (next + 0x20000);
-            if (at(index, va) != scan(ranges, va)) {
-                std::printf("FAIL: round %d va 0x%llx: index %llu, scan %llu\n", round, (unsigned long long)va,
-                            (unsigned long long)at(index, va), (unsigned long long)scan(ranges, va));
+            // A quarter of the lookups name one byte, the rest a view of up to twice the largest buffer.
+            const std::uint64_t bytes = q % 4 ? 1 + rng() % 0x8000 : 1;
+            if (at(index, va, bytes) != scan(ranges, va, bytes)) {
+                std::printf("FAIL: round %d va 0x%llx bytes 0x%llx: index %llu, scan %llu\n", round,
+                            (unsigned long long)va, (unsigned long long)bytes,
+                            (unsigned long long)at(index, va, bytes), (unsigned long long)scan(ranges, va, bytes));
                 ++failures;
                 return;
             }

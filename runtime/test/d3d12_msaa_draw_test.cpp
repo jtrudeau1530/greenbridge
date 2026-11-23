@@ -11,6 +11,7 @@
 // (invalid_subresource) instead of reaching the driver. Shaders: test/glsl/vs_draw.vert, ps_draw.frag. No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -54,10 +55,10 @@ int main() {
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_msaa_draw_test";
-    std::filesystem::create_directories(library);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
+    const testfiles::ScratchDir scratch("leonida_msaa_draw_test");
+    const auto& library = scratch.path();
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -310,7 +311,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     // Pixel centre in clip space; the triangle covers y > x. Sample offsets are under half a pixel on each axis,
     // so a pixel whose centre is more than one pixel width (2 / size in clip space, over both axes) from the edge
