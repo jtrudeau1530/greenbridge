@@ -426,6 +426,58 @@ class AsavTest(unittest.TestCase):
             saves.parse_asav(b"JSAV" + bytes(0x200))
 
 
+class ProfileRecordTest(unittest.TestCase):
+    def test_parse_synthetic_profile(self):
+        # 1644-byte profile record: first 112 bytes non-zero starting u32 10, u32 3
+        dwords = [10, 3, 1, 0x100, 0x12345678, 0x9abcdef0] + list(range(22))
+        payload = saves.build_profile(dwords=dwords, account_id=0x9abcdef012345678)
+        self.assertEqual(len(payload), 1644)
+        prof = saves.parse_profile(payload)
+        self.assertEqual(prof["version"], 10)
+        self.assertEqual(prof["kind"], 3)
+        self.assertEqual(prof["active_bytes"], 112)
+        self.assertEqual(prof["zero_padding_bytes"], 1532)
+        self.assertTrue(prof["zero_padding_clean"])
+        self.assertEqual(prof["account_id"], 0x9abcdef012345678)
+        self.assertEqual(prof["subversion"], 1)
+        self.assertEqual(prof["flags"], 0x100)
+        self.assertEqual(len(prof["dwords"]), 28)
+
+    def test_profile_extract_writes_profile_json(self):
+        payload = saves.build_profile(account_id=0xCAFEF00D)
+        d = make_asav(kind=3, title="Player", slot="Player", payload=payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = os.path.join(tmp, "prof_save"), os.path.join(tmp, "out")
+            write(src, d)
+            quiet(saves.extract, src, out)
+            self.assertTrue(os.path.isfile(os.path.join(out, "profile.json")))
+            pjson = rd_json(os.path.join(out, "profile.json"))
+            self.assertEqual(pjson["version"], 10)
+            self.assertEqual(pjson["kind"], 3)
+            self.assertEqual(pjson["account_id"], 0xCAFEF00D)
+            self.assertEqual(rd(os.path.join(out, "payload.bin")), payload)
+
+    def test_profile_info_output(self):
+        payload = saves.build_profile(account_id=0x11223344)
+        d = make_asav(kind=3, title="Player", slot="Player", payload=payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "prof_save")
+            write(src, d)
+            out = quiet(saves.info, [src])
+            self.assertIn("profile record", out)
+            self.assertIn("version=10", out)
+            self.assertIn("kind=3", out)
+            self.assertIn("active=112B", out)
+
+    def test_profile_rejects_invalid_version_or_kind(self):
+        with self.assertRaises(ValueError):
+            saves.parse_profile(struct.pack("<II", 9, 3) + bytes(1636))
+        with self.assertRaises(ValueError):
+            saves.parse_profile(struct.pack("<II", 10, 2) + bytes(1636))
+        with self.assertRaises(ValueError):
+            saves.parse_profile(b"\x0a\x00")
+
+
 class MalformedAsavTest(unittest.TestCase):
     """A truncated or lying ASAV is a ValueError with a readable message, not a struct.error (#980)."""
 
