@@ -389,7 +389,8 @@ def scan_window(args):
             size = len(m)
             pos = start
             while pos < end:
-                mt = I.ZHDR.search(m, pos, end)
+                # ZHDR is 2 bytes; end + 1 lets a header starting at end - 1 match without entering [end, ...).
+                mt = I.ZHDR.search(m, pos, min(end + 1, size))
                 if not mt:
                     break
                 s = mt.start()
