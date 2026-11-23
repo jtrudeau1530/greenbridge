@@ -12491,18 +12491,23 @@ class Gen:
             if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
                 raise Unsupported(op)
             implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
-            grads_fb = None
-            if off is not None and TEXEL_OFFSET_FALLBACK:
-                uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias,
-                                                       a[3])
-                off = None
-
             # A min-LOD clamp (_cl): MinLod goes with the implicit-LOD forms and Grad. Without derivatives (outside the
-            # PS) the LOD is 0 and the clamp raises it, so the explicit LOD is max(0, clamp) and no MinLod operand.
+            # PS) the base LOD is 0 (or bias for _b / _c_b) and the clamp raises it, so the explicit LOD is
+            # max(base, clamp) and no MinLod operand.
             lod_zero = "%f0"
-            if minlod is not None and not implicit and kind != "_d":
+            if minlod is not None and not implicit and kind not in ("_d", "_b", "_c_b"):
                 lod_zero = self.tmp()
                 self.emit(f"{lod_zero} = OpExtInst %float %glsl FMax %f0 {minlod}")
+            bias_lod = bias
+            if kind in ("_b", "_c_b") and not implicit and minlod is not None:
+                bias_lod = self.tmp()
+                self.emit(f"{bias_lod} = OpExtInst %float %glsl FMax {bias} {minlod}")
+            grads_fb = None
+            if off is not None and TEXEL_OFFSET_FALLBACK:
+                fb_lod = bias_lod if (not implicit and kind in ("_b", "_c_b")) else lod
+                uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, fb_lod, bias,
+                                                       a[3])
+                off = None
 
             def opnd(mask, args):
                 """Image operands in SPIR-V mask order: Bias / Lod, Offset (0x10), MinLod (0x80, implicit forms)."""
@@ -12527,16 +12532,15 @@ class Gen:
                           f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod_zero)}")
             elif kind in ("_lz", "_l"):
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod)}")
-            elif kind == "_b" and self.stage == "ps":
-                self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('Bias', bias)}")
+            elif kind == "_b":
+                self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('Bias', bias)}" if self.stage == "ps" else
+                          f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', bias_lod)}")
             elif kind in ("_c_lz", "_c_l", "_c", "_c_b"):
                 d = self.tmp()
-                if kind in ("_c_lz", "_c_l") or (self.stage != "ps" and kind == "_c"):
-                    # _c outside the PS has no derivatives and samples LOD 0, like image_sample
-                    lod = f[ncoord] if kind == "_c_l" else lod_zero
-                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', lod)}")
-                elif self.stage != "ps":
-                    raise Unsupported(op)
+                if kind in ("_c_lz", "_c_l") or (self.stage != "ps" and kind in ("_c", "_c_b")):
+                    # _c / _c_b outside the PS have no derivatives (base LOD 0, or bias / max(bias, minlod) for _c_b)
+                    d_lod = f[ncoord] if kind == "_c_l" else (bias_lod if kind == "_c_b" else lod_zero)
+                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', d_lod)}")
                 elif grads_fb is not None:
                     self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref} Grad{'|MinLod' if minlod else ''} "
                               f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
@@ -13373,6 +13377,8 @@ class Gen:
                 qb = self.tmp()
                 self.emit(f"{qb} = OpFAdd %float {qx} {bias}")
                 level_f = qb
+        elif kind in ("_b", "_c_b"):
+            level_f = lod if lod is not None else bias
         mip = None
         if level_f is not None:
             lit = self.sgpr_imm.get(s_op["r"] + 2)

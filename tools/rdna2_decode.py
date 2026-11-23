@@ -363,11 +363,12 @@ def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
     if name.startswith("image_atomic_"):
         return (base + 1) // 2 if a16 else base
     # Separate 32-bit address components (offset, bias, z-compare, derivatives) from a16-packable coords/lod/clamp.
-    base_name = name[:-3] if name.endswith("_cl") else name
-    has_cl = name.endswith("_cl")
-    fixed32 = 0
-    if base_name.endswith("_o") or "_o_" in base_name:
-        fixed32 += 1
+    has_o = name.endswith("_o") or "_o_" in name
+    base_name = name[:-2] if name.endswith("_o") else name
+    has_cl = base_name.endswith("_cl")
+    if has_cl:
+        base_name = base_name[:-3]
+    fixed32 = 1 if has_o else 0
     if "_b" in base_name and not base_name.startswith("image_bvh"):
         fixed32 += 1
     if "_c" in base_name and not base_name.startswith(("image_atomic", "image_get")):
