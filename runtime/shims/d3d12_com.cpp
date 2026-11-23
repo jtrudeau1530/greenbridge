@@ -1156,10 +1156,16 @@ private:
         return is_compute(state) ? p.compute_offset : p.user_offset;
     }
 
-    // The parameter, if it exists and has the expected type; null after recording an invalid call.
+    // The parameter, if it exists and has the expected type; null when the argument has no destination, after
+    // recording an invalid call. A root argument with no root signature bound has nowhere to go: D3D12 without the
+    // debug layer closes that list and drops the call, on the graphics and the compute bind point alike
+    // (d3d12_close_parity_test measures both), so it is ignored here instead of failing the whole submission.
     const RootArgumentLayout::Parameter* parameter(RootState& state, UINT index, rt::rootsig::ParamType type) {
-        if (!state.layout || index >= state.layout->parameters.size() ||
-            state.layout->parameters[index].type != type) {
+        if (!state.layout) {
+            note_once("root argument set before a root signature: ignored");
+            return nullptr;
+        }
+        if (index >= state.layout->parameters.size() || state.layout->parameters[index].type != type) {
             check(false);
             return nullptr;
         }
