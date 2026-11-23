@@ -460,6 +460,25 @@ def icloud_default_notes() -> list:
 MIN_FREE_GB = {"shaders": 30, "assets": 300}
 
 
+def tree_bytes(path: str) -> int:
+    """Bytes in the files under path (0 when it is missing); links are not followed."""
+    total, stack = 0, [path]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return total
+
+
 def assets_exported(work: str) -> bool:
     """Whether an earlier run finished the assets stage's exports, so its space is already in use. xma.done is the
     last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
@@ -619,6 +638,12 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if need.get("assets") and not wav and assets_exported(work):
         log(f"preflight: the assets are already exported in {work}; not counting their {need['assets']} GB")
         need["assets"] = 0
+    elif need.get("assets") and not wav:
+        # A stopped export resumes: what it already wrote is on the disk, so it isn't needed free a second time.
+        done_gb = int(tree_bytes(os.path.join(work, "assets")) / 2**30)
+        if done_gb:
+            log(f"preflight: {done_gb} GB of assets are already exported in {work}; not counting them")
+            need["assets"] = max(0, need["assets"] - done_gb)
     os.makedirs(work, exist_ok=True)
     free_gb = shutil.disk_usage(work).free / 2**30
     need_gb = sum(need.values())
