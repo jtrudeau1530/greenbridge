@@ -72,6 +72,8 @@ _DXGI_MAP: dict[int, str] = {
     92: "BGRX8",
     93: "BGRX8",
     26: "R11G11B10_FLOAT",
+    56: "R16_UNORM",
+    65: "A8_UNORM",
     70: "BC1",
     71: "BC1",
     72: "BC1",
@@ -881,6 +883,33 @@ def _decode_r11g11b10(payload: memoryview, width: int, height: int, pitch: int) 
     return bytes(rgba)
 
 
+def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: int, fmt: str) -> bytes:
+    """R16_UNORM (opaque, red only) and A8_UNORM (alpha only, as D3D samples it)."""
+    bpp = 2 if fmt == "R16_UNORM" else 1
+    row_bytes = width * bpp
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
+
+    rgba = bytearray(width * height * 4)
+    if fmt == "R16_UNORM":
+        rgba[3::4] = b"\xff" * (width * height)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        row = payload[start:start + row_bytes]
+        if bpp == 2:
+            for (v,) in struct.iter_unpack("<H", row):
+                rgba[dst] = (v * 255 + 32767) // 65535
+                dst += 4
+        else:
+            rgba[dst + 3:dst + 4 * width:4] = row
+            dst += 4 * width
+    return bytes(rgba)
+
+
 def _bc7_read_indices(bits: int, index_bits: int, is_anchor: tuple[int, ...]) -> tuple[list[int], int]:
     """Read 16 LSB-first pixel indices; anchor pixels omit their implicit zero MSB."""
     indices = []
@@ -1065,6 +1094,10 @@ def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
         rgba = _decode_r11g11b10(memoryview(data)[offset:], width, height, pitch)
+    elif fmt in ("R16_UNORM", "A8_UNORM"):
+        flags = struct.unpack_from("<I", data, 8)[0]
+        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
+        rgba = _decode_single_channel(memoryview(data)[offset:], width, height, pitch, fmt)
     elif fmt == "BC7":
         rgba = _decode_bc7(data, offset, width, height)
     else:
