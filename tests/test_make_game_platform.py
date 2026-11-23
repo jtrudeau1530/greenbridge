@@ -356,6 +356,75 @@ class RuntimePackagingTest(unittest.TestCase):
         result = subprocess.check_output([os.path.join(moved, "gta6rt.sh"), "--dry-run"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[2], "Z:" + moved + "/Shader cache '$HOME'/shaders/spirv")
 
+    @unittest.skipIf(os.name == "nt", "executes the generated POSIX launcher")
+    def test_wine_launcher_packaged_mode_with_extra_flags(self):
+        image = "Player's test.exe"
+        self.write_artifact("gta6rt_tls_host.dll", b"")
+        self.write_artifact("gta6rt.exe", b"import os, sys, json\n"
+                            b"print(json.dumps([os.getcwd(), sys.argv[1:], os.getenv('LEONIDA_SHADERS'), "
+                            b"os.getenv('LEONIDA_D3D12')]))\n")
+        make_game.runtime(self.game, self.out, {"expected_exe": image}, self.build)
+        with open(os.path.join(self.game, image), "wb"):
+            pass
+        launcher = os.path.join(self.out, "gta6rt.sh")
+        caller = os.path.join(self.root, "Caller Dir '$HOME'")
+        os.makedirs(caller)
+        env = dict(os.environ, WINE=sys.executable)
+        env.pop("LEONIDA_D3D12", None)
+        env.pop("LEONIDA_SHADERS", None)
+        overlay = "Z:" + self.out + "/overlay"
+
+        cases = [
+            (["--run", "--trace-d3d12"],
+             self.game, ["--run", "./" + image, "--overlay", overlay, "--trace-d3d12"], "vulkan"),
+            (["--init", "--trace-d3d12", "--trace", "boot.jsonl"],
+             self.game, ["--init", "./" + image, "--overlay", overlay, "--trace-d3d12",
+                         "--trace", "Z:" + caller + "/boot.jsonl"], "vulkan"),
+            (["--run", "--trace", "Z:\\tmp\\boot.jsonl", "--trace-d3d12"],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--trace", "Z:\\tmp\\boot.jsonl", "--trace-d3d12"], "vulkan"),
+            (["--run", "--trace", "/tmp/boot.jsonl", "--mods", "my mods"],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--trace", "/tmp/boot.jsonl", "--mods", "Z:" + caller + "/my mods"], "vulkan"),
+            (["--run", "--overlay", "custom_overlay", "--trace-d3d12"],
+             self.game, ["--run", "./" + image, "--overlay", "Z:" + caller + "/custom_overlay",
+                         "--trace-d3d12"], "vulkan"),
+            (["--run", "--trace", "\\\\server\\share\\boot.jsonl", "--game-dir", "alt_pkg"],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--trace", "\\\\server\\share\\boot.jsonl",
+                         "--game-dir", "Z:" + caller + "/alt_pkg"], "vulkan"),
+            (["--run", "--archetype-lookup", "1234,1", "--view-mode-getter", "5678", "--trace", ""],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--archetype-lookup", "1234,1", "--view-mode-getter", "5678",
+                         "--trace", ""], "vulkan"),
+            (["--run", "--", "--trace", "game arg", "two words"],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--", "--trace", "game arg", "two words"], "vulkan"),
+            (["--trace-d3d12", "--run"],
+             self.game, ["./" + image, "--overlay", overlay, "--trace-d3d12", "--run"], "vulkan"),
+            (["--run", "--log", "run.log"],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--log", "Z:" + caller + "/run.log"], "vulkan"),
+            (["--run", "--log", "Z:\\tmp\\run.log", "--trace", "boot.jsonl"],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--log", "Z:\\tmp\\run.log", "--trace", "Z:" + caller + "/boot.jsonl"], "vulkan"),
+            # Explicit image path, multiple modes, missing option value, or mode only after -- stay pass-through.
+            (["--run", "--trace-d3d12", "other.exe"],
+             caller, ["--run", "--trace-d3d12", "other.exe"], None),
+            (["--dry-run", "--run"],
+             caller, ["--dry-run", "--run"], None),
+            (["--run", "--trace"],
+             caller, ["--run", "--trace"], None),
+            (["--run", "--log"],
+             caller, ["--run", "--log"], None),
+            (["--", "--run"],
+             caller, ["--", "--run"], None),
+        ]
+        for args, expected_cwd, expected_argv, expected_d3d12 in cases:
+            with self.subTest(args=args):
+                result = subprocess.check_output([launcher, *args], cwd=caller, env=env)
+                self.assertEqual(json.loads(result), [expected_cwd, expected_argv, None, expected_d3d12])
+
     def test_runtime_records_shader_work_directory(self):
         self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
         work = os.path.join(self.root, "Shader Work \u03bb")

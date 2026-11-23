@@ -2255,7 +2255,27 @@ def wine_launcher(out: str, work: str, image: str) -> str:
     return f"""#!/bin/sh
 # Starts the Windows build of the loader with Wine. WINE picks another one, e.g. a Proton build's bin/wine.
 here=$(dirname "$(readlink -f "$0")")
-if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
+mode_count=0
+has_image=0
+has_overlay=0
+expect_val=0
+for arg in "$@"; do
+    if [ "$expect_val" -eq 1 ]; then
+        expect_val=0
+        continue
+    fi
+    case "$arg" in
+        --) break ;;
+        --dry-run|--init|--run) mode_count=$((mode_count + 1)) ;;
+        --trace-d3d12) ;;
+        --overlay) has_overlay=1; expect_val=1 ;;
+        --trace|--log|--game-dir|--mods|--view-mode-getter|--archetype-lookup) expect_val=1 ;;
+        -*) ;;
+        *) has_image=1 ;;
+    esac
+done
+if [ "$mode_count" -eq 1 ] && [ "$has_image" -eq 0 ] && [ "$expect_val" -eq 0 ]; then
+    caller_pwd=$(pwd) || exit 1
     game=$(cat "$here/game_path.txt" && printf .) || exit 1
     cd "${{game%.}}" || exit 1
     image={shlex.quote(image)}
@@ -2265,7 +2285,38 @@ if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --
     fi
     # Wine maps the Unix filesystem root to Z:. The game reads from its package and writes to the port's overlay.
 {moved_catalog}    export LEONIDA_D3D12="${{LEONIDA_D3D12:-vulkan}}"
-    set -- "$1" "./$image" --overlay "Z:$here/overlay"
+    n=$#
+    resolve_next=0
+    in_game_args=0
+    while [ "$n" -gt 0 ]; do
+        arg=$1
+        shift
+        n=$((n - 1))
+        if [ "$resolve_next" -eq 1 ]; then
+            resolve_next=0
+            case "$arg" in
+                ""|/*|\\\\*|[A-Za-z]:*) ;;
+                *) arg="Z:${{caller_pwd%/}}/$arg" ;;
+            esac
+        elif [ "$in_game_args" -eq 0 ]; then
+            case "$arg" in
+                --) in_game_args=1 ;;
+                --trace|--log|--game-dir|--overlay|--mods) resolve_next=1 ;;
+            esac
+        fi
+        set -- "$@" "$arg"
+    done
+    if [ "$has_overlay" -eq 1 ]; then
+        case "$1" in
+            --dry-run|--init|--run) mode=$1; shift; set -- "$mode" "./$image" "$@" ;;
+            *) set -- "./$image" "$@" ;;
+        esac
+    else
+        case "$1" in
+            --dry-run|--init|--run) mode=$1; shift; set -- "$mode" "./$image" --overlay "Z:$here/overlay" "$@" ;;
+            *) set -- "./$image" --overlay "Z:$here/overlay" "$@" ;;
+        esac
+    fi
 fi
 exec "${{WINE:-wine}}" "$here/gta6rt.exe" "$@"
 """
