@@ -443,6 +443,7 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(code, 2, err.getvalue())
         self.assertIn("ERROR", err.getvalue())
         self.assertIn("cannot read", err.getvalue())
+        self.assertIn(str(sub), err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
 
 

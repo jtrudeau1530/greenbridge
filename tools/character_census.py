@@ -876,7 +876,8 @@ def main(argv=None) -> int:
     try:
         sources = list(input_files(args.target))
     except (OSError, ValueError) as exc:
-        print(f"ERROR: cannot read {args.target}: {getattr(exc, 'strerror', None) or exc}",
+        print(f"ERROR: cannot read {getattr(exc, 'filename', None) or args.target}: "
+              f"{getattr(exc, 'strerror', None) or exc}",
               file=sys.stderr)
         return 2
     for flag, path in (("--json", args.json), ("--csv", args.csv)):
@@ -894,7 +895,8 @@ def main(argv=None) -> int:
     try:
         rows = list(load_rows(args.target))
     except OSError as exc:
-        print(f"ERROR: cannot read {args.target}: {getattr(exc, 'strerror', None) or exc}",
+        print(f"ERROR: cannot read {getattr(exc, 'filename', None) or args.target}: "
+              f"{getattr(exc, 'strerror', None) or exc}",
               file=sys.stderr)
         return 2
     rows.sort(key=lambda row: (row["name"].lower(), row["source"].lower()))
