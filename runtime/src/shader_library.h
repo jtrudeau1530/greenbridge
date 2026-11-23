@@ -726,9 +726,13 @@ public:
     // when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
-    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
-    // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
+    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
+    //   - <dir>/captured/index.json, the shader programs the title builds at run time and a run captured
+    //     (LEONIDA_SHADER_CAPTURE, make_game.py's captured_shaders()), entries named "captured/<name>" and found by
+    //     fssm_sha256 like the game's own. They sit here rather than in the main index so that index stays exactly
+    //     what the carve translated (#8851 A44).
+    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The folders
+    // are optional: a missing or unreadable index there leaves the main one, and the others', loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
@@ -740,7 +744,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* folder : {"fspx", "bvh"}) {
+        for (const char* folder : {"fspx", "bvh", "captured"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = dir / folder;

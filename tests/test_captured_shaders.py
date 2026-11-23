@@ -89,6 +89,10 @@ class CapturedShadersTest(unittest.TestCase):
     def library_now(self):
         return json.loads((self.spirv / "index.json").read_text(encoding="utf-8"))
 
+    def captured_now(self):
+        path = self.spirv / "captured" / "index.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
     # -- tests -----------------------------------------------------------------------------------------------
     def test_no_captures_is_a_no_op(self):
         self.run_step()
@@ -98,13 +102,14 @@ class CapturedShadersTest(unittest.TestCase):
     def test_a_capture_becomes_a_module_and_keeps_the_rest_of_the_library(self):
         digest = self.write_capture("a" * 64)
         self.run_step()
-        library = self.library_now()
-        self.assertIn("existing_shader", library, "the library's own entries survive")
-        added = [name for name in library if name.startswith("captured_")]
-        self.assertEqual(added, ["captured_" + digest[:16]])
-        self.assertEqual(library[added[0]]["stage"], "cs")
-        self.assertTrue((self.spirv / (added[0] + ".spv")).is_file(), "the module is copied beside the index")
+        added = self.captured_now()
+        self.assertEqual(list(added), ["captured_" + digest[:16]])
+        self.assertEqual(added["captured_" + digest[:16]]["stage"], "cs")
+        self.assertTrue((self.spirv / "captured" / ("captured_" + digest[:16] + ".spv")).is_file(),
+                        "the module is copied into the sub-index's folder")
         self.assertFalse((self.work / "shaders" / "captured_work").exists(), "the staging folder is removed")
+        self.assertEqual(self.library_now(), self.library,
+                         "the carve's index is untouched: more entries than containers would fail the next run")
 
     def test_a_second_run_translates_nothing_new(self):
         self.write_capture("b" * 64)
@@ -112,19 +117,19 @@ class CapturedShadersTest(unittest.TestCase):
         self.calls.clear()
         self.run_step()
         self.assertEqual(self.calls, [], "a translated program is not translated again")
-        self.assertEqual(len([n for n in self.library_now() if n.startswith("captured_")]), 1)
+        self.assertEqual(len(self.captured_now()), 1)
 
     def test_a_capture_without_a_stage_is_skipped(self):
         self.write_capture("c" * 64, stage=None)
         self.run_step()
         self.assertEqual(self.calls, [])
-        self.assertFalse([n for n in self.library_now() if n.startswith("captured_")])
+        self.assertEqual(self.captured_now(), {})
 
     def test_a_capture_with_an_unknown_stage_is_skipped(self):
         self.write_capture("d" * 64, stage="xx")
         self.run_step()
         self.assertEqual(self.calls, [])
-        self.assertFalse([n for n in self.library_now() if n.startswith("captured_")])
+        self.assertEqual(self.captured_now(), {})
 
     def test_the_stage_reaches_the_translator(self):
         digest = self.write_capture("e" * 64, stage="ps")
@@ -136,7 +141,7 @@ class CapturedShadersTest(unittest.TestCase):
         self.assertIsNotNone(staging_index, "fssm_unpack.py ran on the staging folder")
         # The stub rewrote nothing: captured_shaders() wrote the index the translator reads, and the merged entry
         # carries that same stage.
-        self.assertEqual(self.library_now()["captured_" + digest[:16]]["stage"], "ps")
+        self.assertEqual(self.captured_now()["captured_" + digest[:16]]["stage"], "ps")
 
     def test_two_captures_sharing_a_prefix_both_land(self):
         """A capture's name comes from its file name, so two that agree on their first 8 characters must not collide.
@@ -150,16 +155,32 @@ class CapturedShadersTest(unittest.TestCase):
             (self.caught / (stem + ".dxbc")).write_bytes(body)
             (self.caught / (stem + ".json")).write_text(json.dumps({"stage": stage}), encoding="utf-8")
         self.run_step()
-        added = sorted(n for n in self.library_now() if n.startswith("captured_"))
-        self.assertEqual(added, sorted(["captured_" + first[:16], "captured_" + second[:16]]),
+        self.assertEqual(sorted(self.captured_now()), sorted(["captured_" + first[:16], "captured_" + second[:16]]),
                          "both captures land, and neither overwrites the other's staging file")
+
+    def test_the_next_shaders_run_is_not_refused(self):
+        """icecreammule277-dot's regression: the carve/index comparison must not count a captured module.
+
+        verify_translation_completeness() runs before captured_shaders() in the stage and compares the carve index
+        with the top-level one; a capture added there made every later run fail with "-1 were refused".
+        """
+        dxbc = self.work / "shaders" / "dxbc"
+        dxbc.mkdir(parents=True)
+        (dxbc / "index.json").write_text(json.dumps([{"file": "one.dxbc", "stage": "cs"}]), encoding="utf-8")
+        carved_only = {"one": {"stage": "cs", "fssm_sha256": "1" * 64}}
+        (self.spirv / "index.json").write_text(json.dumps(carved_only), encoding="utf-8")
+        make_game.verify_translation_completeness(str(dxbc), str(self.spirv))  # one carved, one translated
+
+        self.write_capture("i" * 64)
+        self.run_step()
+
+        make_game.verify_translation_completeness(str(dxbc), str(self.spirv))
 
     def test_two_captures_both_land(self):
         one = self.write_capture("f" * 64, stage="vs")
         two = self.write_capture("1" * 64, stage="cs")
         self.run_step()
-        added = sorted(n for n in self.library_now() if n.startswith("captured_"))
-        self.assertEqual(added, sorted(["captured_" + one[:16], "captured_" + two[:16]]))
+        self.assertEqual(sorted(self.captured_now()), sorted(["captured_" + one[:16], "captured_" + two[:16]]))
 
 
 if __name__ == "__main__":

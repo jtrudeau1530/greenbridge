@@ -295,8 +295,11 @@ carve them: a run stops at the first pipeline that asks for one (31 of them on r
 `LEONIDA_SHADER_CAPTURE=<work>/shaders/captured` the layer writes each container it cannot resolve into that folder,
 with a sidecar naming the stage (`{"stage":"cs"}` - what `rdna2spirv.py` reads from an index entry and a container
 does not carry). The next `--stages shaders` run translates whatever it finds there with the same three tools the
-carve uses - `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` - and adds the module to the library, so the run
-gets past that pipeline.
+carve uses - `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` - and adds the module to the library's
+`captured/` sub-index (`<work>/shaders/spirv/captured/index.json`, read like `fspx/` and `bvh/`), so a later run
+finds it and the top-level index stays exactly what the carve translated. The modules are translated in the mode the
+rest of the library was - the recorded wave64 emulation and fallback flags - so a capture is never the one entry
+built differently.
 
 A compute program that is a bare FSPX payload (the slot-67 form) is reported, not captured: the step translates
 FSSM programs, and an FSPX payload written out as a `.dxbc` is not something `fssm_unpack.py` can read. Carrying its
