@@ -88,6 +88,7 @@ struct Mock {
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
+    Mock* device10_alias;    // device: when set, QueryInterface(ID3D12Device10) answers this object, not itself
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -157,6 +158,9 @@ HRESULT mock_query(Mock* m, const IID* riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid || !mock_has(m, *riid)) return E_NOINTERFACE;
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    if (m->device10_alias && IsEqualIID(*riid, __uuidof(ID3D12Device10))) m = m->device10_alias;
+#endif
     *out = m;
     ++m->refs;
     return S_OK;
@@ -251,6 +255,7 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
 // keeps all of them: the resource description is copied because the caller's copy is a local of the proxy.
 struct CommittedResource3Call {
     unsigned calls;
+    const Mock* device;  // the PC object the call arrived on
     const D3D12_HEAP_PROPERTIES* heap;
     D3D12_HEAP_FLAGS heap_flags;
     D3D12_RESOURCE_DESC1 desc;
@@ -269,7 +274,7 @@ HRESULT WINAPI mock_create_committed_resource3(Mock* self, const D3D12_HEAP_PROP
                                                const D3D12_CLEAR_VALUE* clear, const void* session,
                                                std::uint32_t castable_count, const DXGI_FORMAT* castable_formats,
                                                const IID* riid, void** out) {
-    g_committed3 = {g_committed3.calls + 1, heap, flags, *desc, layout, clear, session, castable_count,
+    g_committed3 = {g_committed3.calls + 1, self, heap, flags, *desc, layout, clear, session, castable_count,
                     castable_formats, riid, out};
     return mock_create(self, Kind::resource, reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out));
 }
@@ -968,6 +973,9 @@ int run_fault_mode(const char* mode) {
 int check_committed_resource3_x() {
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
     constexpr std::uint32_t kXboxLayoutTiled = 0x101, kXboxFlagBit = 0x40000, kBarrierLayoutUndefined = 0xFFFFFFFFu;
+    constexpr std::uint32_t kTightAlignment = 0x400,   // D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT, a PC bit
+        kHeapNotZeroed = 0x1000;                       // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED
+    static const int session_sentinel = 0;
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_CLEAR_VALUE clear{};
@@ -983,7 +991,7 @@ int check_committed_resource3_x() {
     texture.SampleDesc.Count = 1;
     texture.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(kXboxLayoutTiled);
     texture.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlagBit);
+                                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlagBit | kTightAlignment);
 
     // A PC device with ID3D12Device10: the render target comes back, as the console's call returns it.
     Mock* mock = nullptr;
@@ -992,22 +1000,25 @@ int check_committed_resource3_x() {
     xs::reset_device_proxy_stats();
     g_committed3 = {};
     void* resource = nullptr;
-    std::uint64_t words[10] = {word(&heap), D3D12_HEAP_FLAG_NONE, word(&texture), kBarrierLayoutUndefined,
-                               word(&clear), 0, 2, word(castable), word(&kResourceIid), word(&resource)};
+    std::uint64_t words[10] = {word(&heap), kHeapNotZeroed, word(&texture), kBarrierLayoutUndefined,
+                               word(&clear), word(&session_sentinel), 2, word(castable), word(&kResourceIid), word(&resource)};
     EXPECT(hr_of(raw10(device, 127, words)) == S_OK);
     EXPECT(resource && reinterpret_cast<Mock*>(resource)->kind == Kind::resource);
     EXPECT(g_committed3.calls == 1 && xs::device_slot_hits(127) == 1);
-    EXPECT(g_committed3.heap == &heap && g_committed3.clear == &clear && !g_committed3.session);
+    EXPECT(g_committed3.heap == &heap && g_committed3.clear == &clear);
+    EXPECT(g_committed3.heap_flags == static_cast<D3D12_HEAP_FLAGS>(kHeapNotZeroed));  // the title's heap flags
+    EXPECT(g_committed3.session == &session_sentinel);                                  // and protected session
     EXPECT(g_committed3.layout == kBarrierLayoutUndefined);
     EXPECT(g_committed3.castable_count == 2 && g_committed3.castable_formats == castable);
     EXPECT(g_committed3.riid == &kResourceIid);
     EXPECT(g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
-    EXPECT(g_committed3.desc.Flags ==
-           (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    // The Xbox-only bit goes; every PC bit stays, tight alignment included.
+    EXPECT(static_cast<std::uint32_t>(g_committed3.desc.Flags) ==
+           (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kTightAlignment));
     EXPECT(g_committed3.desc.Width == 1920 && g_committed3.desc.Height == 1080 &&
            g_committed3.desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS && g_committed3.desc.SampleDesc.Count == 1);
     EXPECT(texture.Layout == static_cast<D3D12_TEXTURE_LAYOUT>(kXboxLayoutTiled));  // the title's description is read only
-    static_cast<void>(release(resource));
+    EXPECT(release(resource) == 0);  // the title's one reference is the only one: nothing leaked, nothing extra
 
     // A buffer takes the row-major layout.
     D3D12_RESOURCE_DESC1 buffer = texture;
@@ -1020,6 +1031,7 @@ int check_committed_resource3_x() {
     resource = nullptr;
     EXPECT(hr_of(raw10(device, 127, words)) == S_OK && resource);
     EXPECT(g_committed3.calls == 2 && g_committed3.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+    EXPECT(release(resource) == 0);
 
     // The PC device's own refusal reaches the title with a null object.
     mock->create_result = E_OUTOFMEMORY;
@@ -1028,9 +1040,12 @@ int check_committed_resource3_x() {
     EXPECT(hr_of(raw10(device, 127, words)) == E_OUTOFMEMORY && !resource);
     mock->create_result = S_OK;
 
-    // A null description, IID or output is refused before the PC device is called.
+    // A null heap, description, IID or output is refused before the PC device is called.
     const unsigned before = g_committed3.calls;
     std::uint64_t bad[10];
+    std::memcpy(bad, words, sizeof(bad));
+    bad[0] = 0;
+    EXPECT(hr_of(raw10(device, 127, bad)) == E_POINTER);
     std::memcpy(bad, words, sizeof(bad));
     bad[2] = 0;
     EXPECT(hr_of(raw10(device, 127, bad)) == E_POINTER);
@@ -1043,6 +1058,24 @@ int check_committed_resource3_x() {
     EXPECT(g_committed3.calls == before);
     EXPECT(xs::device_slot_overridden(127));
     EXPECT(release(device) == 0);
+
+    // A PC device whose ID3D12Device10 is another pointer than the device itself: the call goes to that one, and the
+    // reference the proxy took on it is given back. The base pointer is a trap that answers E_UNEXPECTED.
+    Mock* split_mock = nullptr;
+    void* split_device = make_device(split_mock, 10, true);
+    EXPECT(split_device);
+    Mock* alias = new_mock(Kind::device);
+    alias->device_level = 10;
+    alias->refs = 1;
+    split_mock->device10_alias = alias;
+    split_mock->create_result = E_UNEXPECTED;
+    resource = nullptr;
+    words[9] = word(&resource);
+    EXPECT(hr_of(raw10(split_device, 127, words)) == S_OK && resource);
+    EXPECT(g_committed3.device == alias);
+    EXPECT(alias->refs == 1);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(split_device) == 0);
 
     // A PC device that stops at ID3D12Device9 has no CreateCommittedResource3: E_NOTIMPL, a null object, no PC call.
     Mock* old_mock = nullptr;
