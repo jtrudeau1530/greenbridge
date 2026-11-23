@@ -369,7 +369,19 @@ void test_physical_pages(const PhysicalApi& api) {
         VirtualQuery(window, &info, sizeof(info));
         check(info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READWRITE,
               "a mapped page is a read-write view with the window's protection");
+        check(info.AllocationBase == window && info.RegionSize == kPages * kPage64k,
+              "consecutive pages of one allocation are mapped as one view");
     }
+
+    // A page unmapped or remapped inside that view splits it; its neighbours keep their pages.
+    void* const middle = window + kPage64k;
+    check(api.scatter(&middle, 1, nullptr) == TRUE && reserved_only(window + kPage64k),
+          "a page inside a view unmaps on its own");
+    check(page_holds(window, 0x1000u) && page_holds(window + 2 * kPage64k, 0x3000u) &&
+              page_holds(window + 3 * kPage64k, 0x4000u),
+          "the pages around it stay mapped with their contents");
+    check(api.map(middle, 1, &pages[1]) == middle && page_holds(window + kPage64k, 0x2000u),
+          "a page maps again into the gap");
 
     check(api.map(window, kPages, nullptr) == window, "XMemMapPhysicalPages with no page array unmaps");
     check(reserved_only(window) && reserved_only(window + 3 * kPage64k), "unmapped pages are reserved again");
