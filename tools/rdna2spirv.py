@@ -12933,8 +12933,10 @@ def fold_far_branches(insns):
 
 def reachable_code(insns):
     """Instructions reachable from the first one, following fall-through and branch targets. Fall-through stops
-    after s_endpgm, s_branch and s_setpc_b64. Raises Unsupported if a branch target isn't an instruction start."""
+    after s_endpgm, s_branch and s_setpc_b64. Raises Unsupported if a branch target isn't an instruction start, or if
+    an instruction falls through into words that are not an instruction (undecodable words before later code)."""
     by_pc = {i["pc"]: k for k, i in enumerate(insns)}
+    code_end = max((i["pc"] + len(i["enc"]) // 2 for i in insns), default=0)
     seen, work = set(), [0]
     while work:
         k = work.pop()
@@ -12955,8 +12957,10 @@ def reachable_code(insns):
             if op in ("s_endpgm", "s_setpc_b64"):
                 break
             k = by_pc.get(nxt)
-            if k is None and op not in ("s_endpgm",):
-                break
+            if k is None and nxt < code_end:
+                # The next words are ones llvm-mc could not decode (re-anchoring skipped them) and this instruction
+                # runs into them: ending the path here would drop every later store and export without a word.
+                raise Unsupported("fall-through into undecodable words")
     return [insns[k] for k in sorted(seen)]
 
 
