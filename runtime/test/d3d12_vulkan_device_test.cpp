@@ -6560,6 +6560,18 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateReservedResource(&xbox_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                             IID_PPV_ARGS(&xbox_tiled.p))));
             {
+                // 0x105, the volume form of 0x101, on a TEXTURE3D; an unrelated layout word is still refused.
+                Ref<ID3D12Resource> xbox_volume;
+                auto volume_desc = reserved_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 64, 64, 32, 1,
+                                                 DXGI_FORMAT_R8G8B8A8_UNORM);
+                volume_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+                EXPECT(SUCCEEDED(device->CreateReservedResource(&volume_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                IID_PPV_ARGS(&xbox_volume.p))));
+                if (xbox_volume.p) EXPECT(static_cast<UINT>(xbox_volume->GetDesc().Layout) == 0x105);
+                volume_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x103);
+                EXPECT(refuses(volume_desc));
+            }
+            {
                 Ref<ID3D12Device4> device4;
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
@@ -7362,6 +7374,27 @@ int main() {
         UINT xbox_tiles = 0;
         standalone->GetResourceTiling(xbox_tiled.p, &xbox_tiles, nullptr, nullptr, nullptr, 0, nullptr);
         EXPECT(xbox_tiles == 4);
+
+        // Layout word 0x105, the volume form of the Xbox tiled word 0x101: sized, placed and tiled like the same
+        // TEXTURE3D with 64KB_UNDEFINED_SWIZZLE, and the word is kept in the description.
+        {
+            D3D12_RESOURCE_DESC xbox_volume_desc = tiled_3d_desc;
+            xbox_volume_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+            const D3D12_RESOURCE_ALLOCATION_INFO want = standalone->GetResourceAllocationInfo(0, 1, &tiled_3d_desc);
+            const D3D12_RESOURCE_ALLOCATION_INFO got = standalone->GetResourceAllocationInfo(0, 1, &xbox_volume_desc);
+            EXPECT(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment);
+            Ref<ID3D12Resource> xbox_volume;
+            EXPECT(SUCCEEDED(standalone->CreatePlacedResource(tiled_heap.p, 1024 * 1024, &xbox_volume_desc,
+                                                              D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                              IID_PPV_ARGS(&xbox_volume.p))));
+            if (xbox_volume.p && tiled_3d.p) {
+                EXPECT(static_cast<UINT>(xbox_volume->GetDesc().Layout) == 0x105);
+                UINT want_tiles = 0, got_tiles = 0;
+                standalone->GetResourceTiling(tiled_3d.p, &want_tiles, nullptr, nullptr, nullptr, 0, nullptr);
+                standalone->GetResourceTiling(xbox_volume.p, &got_tiles, nullptr, nullptr, nullptr, 0, nullptr);
+                EXPECT(got_tiles > 0 && got_tiles == want_tiles);
+            }
+        }
 
         // Refusals matching host D3D12: 1D, 4 KiB alignment, 96-bit, two-plane DS, invalid MSAA, upload heap, past-end.
         D3D12_RESOURCE_DESC bad_1d = line_desc(256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM);

@@ -438,12 +438,21 @@ bool xr_bias_compatible(const D3D12_RESOURCE_DESC& desc) {
     return mips == 1;
 }
 
-// The Xbox tiled layout word (slot 76, docs/d3d12_vulkan.md section 4.2) is outside D3D12_TEXTURE_LAYOUT's
-// enumerators, so compare as an integer.
+// The Xbox tiled layout words (slot 76, docs/d3d12_vulkan.md section 4.2) are outside D3D12_TEXTURE_LAYOUT's
+// enumerators, so compare as integers. 0x105 is what the title writes into TEXTURE3D descriptions before slots 25
+// and 108: its layout words come in pairs that differ only in bit 2 (0x101/0x105, 0x1/0x5, ...), so 0x105 is read
+// as the volume form of 0x101 (a static reading of the executable, not a measured one). Both are taken as
+// 64KB_UNDEFINED_SWIZZLE.
 constexpr UINT kXboxTiledLayout = 0x101;
+constexpr UINT kXboxTiledVolumeLayout = 0x105;
+
+bool is_xbox_tiled_layout(D3D12_TEXTURE_LAYOUT layout) {
+    const UINT word = static_cast<UINT>(layout);
+    return word == kXboxTiledLayout || word == kXboxTiledVolumeLayout;
+}
 
 bool is_tiled_layout(D3D12_TEXTURE_LAYOUT layout) {
-    return layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE || static_cast<UINT>(layout) == kXboxTiledLayout;
+    return layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE || is_xbox_tiled_layout(layout);
 }
 
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
@@ -6730,8 +6739,8 @@ public:
     // Reserved buffers use sparse binding where available. Textures and fallback buffers are fully backed.
     // The description rules are D3D12's: buffers are ROW_MAJOR, textures 64KB_UNDEFINED_SWIZZLE with a tile shape
     // (64KB_STANDARD_SWIZZLE needs StandardSwizzle64KBSupported, which CheckFeatureSupport reports as FALSE). The
-    // Xbox tiled layout word 0x101 (slot 76, section 4.2) is accepted as 64KB_UNDEFINED_SWIZZLE; that the console
-    // uses it for reserved resources too is an assumption.
+    // Xbox tiled layout words 0x101 (slot 76, section 4.2) and 0x105 (its volume form) are accepted as
+    // 64KB_UNDEFINED_SWIZZLE; that the console uses them for reserved resources too is an assumption.
     HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                                                      const D3D12_CLEAR_VALUE* clear, REFIID riid,
                                                      void** out) override {
@@ -7177,7 +7186,7 @@ public:
                          int(desc->Dimension));
                 return d3d12_trace::result(method, E_INVALIDARG);
             }
-            if (tiled && static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+            if (tiled && is_xbox_tiled_layout(desc->Layout)) {
                 log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          int(desc->Dimension));
             }
@@ -8404,7 +8413,7 @@ private:
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return d3d12_trace::result(method, E_INVALIDARG);
         } else {
-            if (static_cast<UINT>(desc->Layout) == kXboxTiledLayout) {
+            if (is_xbox_tiled_layout(desc->Layout)) {
                 log_once("reserved resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          desc->Dimension);
             } else if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
