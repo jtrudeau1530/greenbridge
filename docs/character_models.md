@@ -12,9 +12,6 @@ No game data is reproduced here.
 - A `.#ft` fragment carries the shared 597-name humanoid skeleton and the character's bounds. The
   measured skeleton is in [character_skeleton.md](character_skeleton.md).
 
-The current exporter writes every fragment as a **25-vertex bounds cube** with `Embedded: null`
-(2,865 of 2,865). Fragment child drawables are not walked, so a part that exists only as a
-fragment child is not in the OBJ/GLB output even though its parent fragment is.
 The current exporter writes every fragment as a **flat 25-vertex / 32-triangle bounds grid** (a 5x5
 grid at z=0, `Min`/`Max` z = 0) with `Embedded: null` (2,865 of 2,865). Fragment child drawables
 are not walked, so a part that exists only as a fragment child is not in the OBJ/GLB output even

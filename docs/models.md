@@ -521,19 +521,6 @@ file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy,
 | Materials whose hash is the joaat of a carved effect name | 3,211 (96%), 8 of the 18 hashes |
 | Materials whose hash is the joaat of a native effect record's name (both SGD5 databases, below) | 3,340 (100%), 18 of the 18 hashes, one record each |
 
-So a material leads to its effect and that effect's ray-tracing resolve programs. It does **not** lead to the
-draw (VS/PS/MS) programs from the package alone:
-
-- None of the 23,619 graphics programs (VS/PS/MS) carries an effect name; they are named `<stage>_<technique or entry>_<8 hex>`.
-- `shaders.rpf` stores programs grouped by kind, not by effect (the 1,004 `RaytracingResolve` programs sit next
-  to each other), so position doesn't group an effect's programs either.
-- The graphics programs' 8-hex suffix groups them (1,226 suffixes over 23,016 programs, the largest shared by
-  1,775) but is not the joaat of the program name, and only 1 of the 896 suffixes on the effect-named CS programs
-  appears on any graphics program.
-
-The effect → technique → VS/PS table is therefore not in the carved programs' names, order or suffixes; it is
-presumably in the executable (RT-5). Until then, a real model is drawn with a chosen pair ([first_light.md](first_light.md)).
-
 So a material leads to its effect. Through the carved compute names it reaches only 8 of the 18 hashes; the
 effect records' own names reach all 18 (@jeremygold02, `tools/sgd5_effects.py` in #3036). The draw (VS/PS/MS)
 programs are not reachable through the carved programs' names, order or suffixes:
@@ -647,8 +634,7 @@ the drawable's local joint palette through the drawable and ped tables, and emit
 in [character_skeleton.md](character_skeleton.md#skinned-glb-export). On the 1.0.2.1 package, the
 head (8,983 v) and biker jacket (9,818 v) produce one skin with 596 ped joints (703 with the
 jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconstruction error is
-6e-8 m. `python -I tests/test_skinned_glb.py` runs 10 synthetic tests and needs no game files.
-6e-8 m. `python -I tests/test_skinned_glb.py` runs 15 synthetic tests and needs no game files.
+6e-8 m. `python -I tests/test_skinned_glb.py` runs 19 synthetic tests and needs no game files.
 
 ## What to do next
 
