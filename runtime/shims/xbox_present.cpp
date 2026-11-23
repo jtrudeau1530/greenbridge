@@ -104,6 +104,21 @@ HRESULT XboxPresentation::GetFrameStatisticsX(std::uint64_t token, UINT type_mas
 HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                    const XboxPresentParameters* params) {
     std::lock_guard serialise(present_mutex_);
+    const HRESULT hr = present_x(plane_count, planes, params);
+    // Logged at 1, 2, 4, ... calls and at the first of each failure: the first thing to check on a boot.
+    const std::uint64_t call = ++present_calls_;
+    const bool new_failure = FAILED(hr) && hr != last_failure_;
+    if (FAILED(hr)) last_failure_ = hr;
+    if ((call & (call - 1)) == 0 || new_failure)
+        std::fprintf(stderr,
+                     "[rt] xbox_present: PresentX call %llu (%u planes) returned 0x%08lx, %llu presented so far\n",
+                     static_cast<unsigned long long>(call), plane_count, static_cast<unsigned long>(hr),
+                     static_cast<unsigned long long>(presents_.load()));
+    return hr;
+}
+
+HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlaneParameters* planes,
+                                    const XboxPresentParameters* params) {
     if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
     if (pacer_.suspended()) return from_pacer(hr::invalid_state);
     // A zero, negative or NaN threshold never tears.
@@ -127,6 +142,15 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         return result;
     }
 
+    if (!logged_plane_words_) {  // the console layout is unmeasured: its first plane's words, once
+        logged_plane_words_ = true;
+        const auto* w = reinterpret_cast<const std::uint64_t*>(planes);
+        std::fprintf(stderr, "[rt] xbox_present: first plane words %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                     static_cast<unsigned long long>(w[0]), static_cast<unsigned long long>(w[1]),
+                     static_cast<unsigned long long>(w[2]), static_cast<unsigned long long>(w[3]),
+                     static_cast<unsigned long long>(w[4]), static_cast<unsigned long long>(w[5]),
+                     static_cast<unsigned long long>(w[6]), static_cast<unsigned long long>(w[7]));
+    }
     // All planes carry the token of one frame.
     const std::uint64_t token = planes[0].Token;
     for (UINT i = 0; i < plane_count; ++i) {

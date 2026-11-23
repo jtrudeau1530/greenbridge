@@ -1804,6 +1804,7 @@ public:
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
+        if (title_alias_) device_.context->remove_resource(id() | 1);
         if (host_import_) {
             // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
             // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
@@ -2078,6 +2079,14 @@ public:
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         return S_OK;
+    }
+
+    // A buffer the title placed on its own pages that the driver would not import: it is also found at that VA, so a
+    // draw or copy that names the title's address resolves. Its contents are the buffer's, not the title's pages.
+    bool alias_title_va(std::uint64_t va) {
+        if ((id() & 1) || !device_.context->alias_buffer(id(), id() | 1, va)) return false;
+        title_alias_ = true;
+        return true;
     }
 
     HRESULT create_sparse_buffer() {
@@ -2614,6 +2623,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
+    bool title_alias_ = false;  // also registered at the title's VA as id() | 1 (alias_title_va)
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -7104,11 +7114,17 @@ public:
             // `address` do not reach it.
             resource->Release();
             log_once("a title-placed buffer (device slot 133) could not import its pages, so it is an ordinary buffer "
-                     "the title's writes do not reach; HRESULT",
+                     "the title's writes do not reach, found at the title's VA too; HRESULT",
                      int(hr));
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
-            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
-                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
+            const HRESULT created = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out);
+            if (SUCCEEDED(created) && out && *out) {
+                Resource* placed = Resource::from<Resource>(static_cast<IUnknown*>(*out));
+                if (!placed || !placed->alias_title_va(reinterpret_cast<std::uintptr_t>(address)))
+                    log_once("a title-placed fallback buffer could not be registered at the title's VA", 0);
+            }
+            return d3d12_trace::result(method, created);
         }
         return d3d12_trace::result(method, hand_out(resource, riid, out));
     }

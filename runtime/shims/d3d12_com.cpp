@@ -1597,9 +1597,15 @@ public:
         }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
-        if (last_result_ != leonida::ReplayResult::success)
-            std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
-                         name(last_result_));
+        if (last_result_ != leonida::ReplayResult::success) {
+            // Logged at 1, 2, 4, ... failures: a title that resubmits every frame would fill the log otherwise.
+            static std::atomic<std::uint64_t> failures{0};
+            const std::uint64_t n = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted (%llu so far)\n",
+                             name(last_result_), static_cast<unsigned long long>(n));
+        }
     }
 
     // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.

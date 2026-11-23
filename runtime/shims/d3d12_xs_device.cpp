@@ -1423,10 +1423,19 @@ PresentState* present_state_for(DeviceProxy* device) {
     return state;
 }
 
+// The device's presentation once the first PresentX has built it (building it earlier, at SetFrameIntervalX, made the
+// retail title fault at boot); null before. The frame-event slots go to it from then on.
+rt::d3d12::XboxPresentation* device_presentation(DeviceProxy* device) {
+    auto* state = device ? static_cast<PresentState*>(device->present_state) : nullptr;
+    return state ? state->xbox.get() : nullptr;
+}
+
 std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes,
                               std::uint64_t params) {
     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
+    // The tokens the proxy handed out before the presentation existed are ones PresentX must accept.
+    state->xbox->adopt_frame_tokens(self->device->frame_next_token.load(std::memory_order_relaxed) - 1);
     return hr_to_u64(state->xbox->PresentX(
         static_cast<UINT>(plane_count),
         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
@@ -1436,6 +1445,13 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
 #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)
 
 void destroy_present_state(void*) {}
+
+struct NoPresentation {
+    HRESULT SetFrameIntervalX(IUnknown*, UINT, UINT, UINT) { return S_OK; }
+    HRESULT ScheduleFrameEventX(UINT, UINT, UINT) { return S_OK; }
+    HRESULT WaitFrameEventX(UINT, DWORD, UINT, std::uint64_t*) { return S_OK; }
+};
+NoPresentation* device_presentation(DeviceProxy*) { return nullptr; }
 
 std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::uint64_t) {
     return hr_to_u64(S_OK);
@@ -2344,20 +2360,21 @@ HRESULT proxy_create_command_queue_xbox(DeviceProxy* self, const std::uint32_t* 
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
 HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
                                    std::uint64_t latency, std::uint64_t flags) {
-    (void)output;
-    (void)flags;
     self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
     self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
+    if (auto* presentation = device_presentation(self))
+        return presentation->SetFrameIntervalX(reinterpret_cast<IUnknown*>(output), static_cast<UINT>(interval_us),
+                                               static_cast<UINT>(latency), static_cast<UINT>(flags));
     return S_OK;
 }
 
 // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
-    (void)event;
-    (void)offset_us;
-    (void)flags;
     self->frame_event_scheduled.store(true, std::memory_order_relaxed);
+    if (auto* presentation = device_presentation(self))
+        return presentation->ScheduleFrameEventX(static_cast<UINT>(event), static_cast<UINT>(offset_us),
+                                                 static_cast<UINT>(flags));
     return S_OK;
 }
 
@@ -2366,11 +2383,11 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
 // a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
 HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
                                  std::uint64_t flags, std::uint64_t token_word) {
-    (void)event;
-    (void)timeout_ms;
-    (void)flags;
     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
     if (!token) return E_POINTER;
+    if (auto* presentation = device_presentation(self))
+        return presentation->WaitFrameEventX(static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
+                                             static_cast<UINT>(flags), token);
     std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
     if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
     *token = value;

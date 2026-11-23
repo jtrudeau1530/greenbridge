@@ -253,6 +253,12 @@ public:
     // must not freeze. So the only refusal is a token that was never handed out (invalid_arg, which is a bug in the
     // caller); null, stale (older than the last presented) and repeated tokens return ok and say which kind they
     // were in `issue`, so the caller can log it. invalid_state while suspended.
+    // Tokens up to `token` were handed out by someone else on this pacer's behalf (the device proxy answers
+    // WaitFrameEventX before a presentation exists): they count as issued.
+    void adopt_issued(std::uint64_t token) {
+        std::lock_guard guard(mutex_);
+        if (token > issued_) issued_ = token;
+    }
     enum class TokenIssue { none, null_token, stale, repeated };
     std::int32_t check_present_token(std::uint64_t token, TokenIssue* issue = nullptr) {
         std::lock_guard guard(mutex_);

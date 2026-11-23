@@ -108,6 +108,8 @@ public:
     // (INFINITE waits for ever); `*token` is untouched then. E_INVALIDARG for a null token pointer or another event;
     // HRESULT_FROM_WIN32(ERROR_INVALID_STATE) when nothing is registered (not yet, or since SuspendX).
     HRESULT WaitFrameEventX(UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token);
+    // Frame tokens up to `token` were handed out before this presentation existed (the device proxy's).
+    void adopt_frame_tokens(std::uint64_t token) { pacer_.adopt_issued(token); }
     // See FramePacer::get_frame_statistics: S_FALSE and count 0 when nothing is available.
     HRESULT GetFrameStatisticsX(std::uint64_t token, UINT type_mask, UINT* count, leonida::FrameStatistic* out);
 
@@ -167,6 +169,11 @@ private:
     leonida::FramePacer pacer_;
     std::mutex present_mutex_;  // PresentX, SuspendX and ResumeX one at a time
     std::atomic<std::uint64_t> presents_{0};
+    std::uint64_t present_calls_ = 0;  // under present_mutex_
+    HRESULT last_failure_ = S_OK;      // under present_mutex_
+    bool logged_plane_words_ = false;  // under present_mutex_
+    // PresentX's body, called under present_mutex_.
+    HRESULT present_x(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
     bool logged_planes_ = false, logged_threshold_ = false, logged_display_ = false, logged_color_space_ = false,
          logged_extras_ = false, logged_resource_count_ = false;
     std::atomic<float> sdr_white_override_{0.0f};  // > 0: set_sdr_white_nits

@@ -2297,6 +2297,10 @@ public:
     // Set when any command writes to a host_readable (READBACK) buffer so VulkanQueue only flushes to HOST_BIT when needed.
     bool wrote_readback = false;
     VkPipelineStageFlags2 readback_src_stages = 0;
+    // The first command whose resource did not resolve: its index, its Command alternative and the id it named.
+    std::size_t unresolved_command = SIZE_MAX;
+    std::size_t unresolved_kind = 0;
+    ResourceId unresolved_id = 0;
 };
 
 inline ReplayResult plan_occlusion_segments(PreparedList& out) {
@@ -2578,6 +2582,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     bool overlaps = false, statistics_overlaps = false, statistics_active = false;
     out.wrote_readback = false;
     out.readback_src_stages = 0;
+    out.unresolved_command = SIZE_MAX;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -2585,6 +2590,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         const auto bind = [&](ResourceId id) {
             const ResourceBinding* binding = resolve(id);
             if (binding) p.binding = *binding;
+            else if (out.unresolved_command == SIZE_MAX) {
+                out.unresolved_command = i;
+                out.unresolved_kind = command.index();
+                out.unresolved_id = id;
+            }
             return binding != nullptr;
         };
         const auto rect_view = [&](std::span<const Rect> rects, const TargetView& target, VkImageAspectFlags view_aspects) {
@@ -3089,8 +3099,48 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
             p.draw = std::uint32_t(out.draw_count++);
-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
+            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success) {
+                if (r == ReplayResult::unresolved_resource && out.unresolved_command == SIZE_MAX) {
+                    // Which part did not resolve: kind 1000 is the pipeline, 1001 a colour target, 1002 the depth.
+                    const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw->pipeline);
+                    out.unresolved_command = i;
+                    out.unresolved_kind = 1000;
+                    out.unresolved_id = static_cast<ResourceId>(draw->pipeline);
+                    if (pipeline && pipeline->pipeline) {
+                        // 1001 a colour target, 1002 the depth target, 1003 a vertex buffer VA, 1004 the index VA.
+                        out.unresolved_kind = 1005;
+                        out.unresolved_id = 0;
+                        const auto miss = [&](std::size_t kind, ResourceId id) {
+                            if (out.unresolved_kind != 1005) return;
+                            out.unresolved_kind = kind;
+                            out.unresolved_id = id;
+                        };
+                        const std::uint32_t n = draw->views ? draw->views->render_target_count : 0;
+                        for (std::uint32_t t = 0; t < n; ++t) {
+                            const ResourceId id = draw->views->render_targets[t].resource;
+                            if (id && !resolve(id)) miss(1001, id);
+                        }
+                        if (draw->depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED &&
+                            !resolve(draw->depth.resource))
+                            miss(1002, draw->depth.resource);
+                        if (draw->views) {
+                            for (const VertexBufferView& v : draw->views->vertex_buffers) {
+                                VkBuffer buffer = VK_NULL_HANDLE;
+                                VkDeviceSize offset = 0;
+                                std::uint64_t size = v.size;
+                                if (v.va && !vk.buffer_at(v.va, size, buffer, offset)) miss(1003, v.va);
+                            }
+                        }
+                        if (draw->indexed && draw->index.va) {
+                            VkBuffer buffer = VK_NULL_HANDLE;
+                            VkDeviceSize offset = 0;
+                            std::uint64_t size = draw->index.size;
+                            if (!vk.buffer_at(draw->index.va, size, buffer, offset)) miss(1004, draw->index.va);
+                        }
+                    }
+                }
                 return r;
+            }
         }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
