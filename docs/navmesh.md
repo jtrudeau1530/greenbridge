@@ -534,6 +534,78 @@ are authoring/build-time inputs to that partition:
   JSON and optional numeric CSV metadata. It never writes payload bytes and never touches the TOC.
 - `tools/navmesh_links.py` (stdlib-only) decodes and verifies the 12-byte `+0x88` adjacent-polygon edges, the polygon
   `+0x20` special-link prefix-sum chain, and the 32-byte `+0xA8` special links and `+0xB0` index table.
+  Pass `--reciprocity` to include a `reciprocity` object. `tiles_counted` covers tiles with verified pool bounds
+  and contiguous polygon spans. Within each tile, `excess_directed` sums the positive differences between the
+  counts of A to B and B to A for each ordered polygon pair. Self edges contribute zero excess. The report counts
+  valid same-tile records, all-ones open targets and invalid targets separately. This measures polygon references
+  without testing geometric edge alignment.
+  Pass `--endpoint-agreement` to compare two ways to associate slot *j* of the adjacency span with its
+  polygon boundary. Under `outgoing` it runs from vertex *j* to the next vertex. Under `incoming` it runs
+  from the previous vertex to *j*. Both wrap within the polygon and compare all three stored u16 coordinates
+  at `+0x70` through the `+0x80` indices. The unit is a directed slot. With one occurrence on each polygon,
+  matching endpoints count as `reversed`, `same_direction`, or `degenerate` (identical endpoints).
+  If a return exists and either polygon repeats the same unordered endpoints for this neighbor, all affected
+  slots count as `repeated`. A slot with no return to its source at those exact coordinates counts as
+  `no_exact_return`. Open, invalid and self targets have separate totals.
+
+  Across all 27,644 Xbox 1.0.2.1 tiles, each convention accounts for 458,728,869 directed same-tile slots.
+  The endpoint agreement supports slot *j* describing the outgoing boundary edge. A unique return can run
+  in either direction. Another 34,295,319 slots were open. None had invalid or self targets.
+
+  | Boundary tested | Reversed | Same direction | Degenerate | Repeated | No exact return |
+  |---|---:|---:|---:|---:|---:|
+  | Outgoing | 449,013,586 | 9,676,624 | 42 | 94 | 38,523 |
+  | Incoming | 702 | 102,408 | 2 | 3 | 458,625,754 |
+
+  Pass `--relative-winding` to subdivide uniquely matched outgoing slots by the winding of the two
+  polygon rings. The first two words of each vertex at `+0x70` are its tile-space X and Y coordinates
+  (see [the lane-graph height check](#polygon-flags-under-the-lane-graph)). Translation and positive
+  per-axis scaling by the tile extents at `+0x60` preserve the sign of the shoelace area, so the test uses
+  exact integer arithmetic. Dynamic meshes use their local XY plane. Endpoint matching still uses XYZ.
+  Either ring makes the pair ambiguous if it has fewer than three projected vertices, zero signed area,
+  a repeated point, or a boundary that crosses, touches itself or doubles back. Nonpositive or nonfinite
+  horizontal extents also make the pair ambiguous.
+
+  | Unique outgoing match (directed slots) | Same winding | Opposite winding | Ambiguous |
+  |---|---:|---:|---:|
+  | Same direction | 61,128 | 592 | 9,614,904 |
+  | Reversed | 448,891,156 | 11,896 | 110,534 |
+
+  Across the whole archive, only 592 same-direction slots have demonstrably opposite XY winding. Of the
+  61,720 same-direction slots with classifiable rings, 61,128 have the same winding. The remaining
+  9,614,904 slots admit no conclusion from this projection. Reversed slots overwhelmingly join rings
+  of the same winding.
+
+  Pass `--coplanar-winding` to examine the 9,614,904 XY-ambiguous same-direction directed slots.
+  The three unsigned words per vertex at `+0x70` give tile-space XYZ. Positive per-axis scaling and
+  translation preserve coplanarity and the relative orientation of rings in a common plane. A zero
+  extent collapses that axis. The test requires finite, nonnegative extents. It finds a plane from
+  three noncollinear ring points and verifies all remaining points against it with integer arithmetic.
+  Dropping an axis with a nonzero normal component maps that plane one-to-one onto a coordinate plane,
+  where the existing simple-ring and signed-area tests apply. Two parallel planes containing the same
+  edge coincide, so both rings use the same projection. For different planes the relative sign can
+  depend on the viewing direction.
+
+  A private census over all 27,644 tiles classified each ring separately. For planar rings with
+  distinct vertices, the segment checks stop at the first boundary defect in vertex order. When the
+  two rings have different conditions, the first listed below takes precedence. Each reciprocal
+  pair contributes two directed slots.
+
+  | First applicable 3D condition | Directed slots |
+  |---|---:|
+  | Fewer than three vertices | 6,375,984 |
+  | Repeated XYZ vertex in a ring | 84 |
+  | All vertices collinear | 1,100,732 |
+  | Adjacent segments double back in a planar ring | 89,984 |
+  | Nonadjacent segments intersect or touch in a planar ring | 738,318 |
+  | Nonplanar ring | 596,656 |
+  | Both rings simple and planar | 713,146 |
+
+  Among the 713,146 slots with two simple planar rings, 713,102 join different planes. The coplanar
+  group contains 20 slots of equal winding, 20 of opposite winding and 4 with coincident boundaries.
+  The coincidence test ignores extra vertices along straight sides. The remaining 8,901,758 slots
+  have at least one undefined ring. These counts describe polygon geometry only.
+
 - `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
   ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
 
