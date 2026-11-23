@@ -787,8 +787,13 @@ The compute path, end to end:
   that set they are refused with a log.
 - **Command list**: `Set{Compute,Graphics}RootSignature` (a different signature clears the arguments, as D3D12
   leaves them undefined; setting the bound one again keeps them, as D3D12 does), `SetPipelineState`, the 32-bit
-  constant, root view and descriptor-table setters, `SetDescriptorHeaps` and `ClearState`. A wrong parameter type
-  or out-of-range constants makes `Close` return `E_INVALIDARG`.
+  constant, root view and descriptor-table setters, `SetDescriptorHeaps` and `ClearState`. A wrong parameter type,
+  out-of-range constants, or an invalid `SetDescriptorHeaps` call makes `Close` return `E_INVALIDARG`.
+  - `SetDescriptorHeaps` tracks the currently bound shader-visible `CBV_SRV_UAV` and `SAMPLER` heaps and their
+    arena GPU base VAs, holds references to them until `Reset` or list destruction, unbinds omitted types (clearing
+    both on `ClearState` and `Reset`), refuses `COPY` lists, > 2 heaps, null arrays/elements, non-shader-visible or
+    `RTV`/`DSV`/duplicate-type/foreign-device heaps, and enforces bundle matching against the parent list (`parent`'s
+    currently bound heap for each non-null heap the bundle specifies, `d3d12_set_descriptor_heaps`).
   - The list holds a reference to every root signature and pipeline state it is given, until `Reset` or its own
     release. D3D12 lets an application release them right after setting them, so the root layout the setters read
     and the pipeline `ExecuteCommandLists` looks up must outlive that. Keeping them alive while the GPU runs the
@@ -1572,7 +1577,10 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    graphics stages (question 3 in the table below) is what would confirm it. Which SGPR holds which heap varies
    with the stage and the root signature, so placing the bases belongs to the root-signature mapping, not to a new
    translator input. No stride is read at run time: static offsets of T# loads are multiples of 32 and of S# loads
-   multiples of 16, so the stride is compiled into the code.
+   multiples of 16, so the stride is compiled into the code. In the runtime shim, `CreateRootSignature` records the
+   `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and `SAMPLER_HEAP_DIRECTLY_INDEXED` root-signature flags and `SetDescriptorHeaps`
+   tracks the bound shader-visible heap GPU bases (`d3d12_set_descriptor_heaps`), while placing those bases into
+   per-stage user SGPRs remains open on question 3.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
