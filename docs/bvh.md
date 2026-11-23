@@ -330,6 +330,37 @@ counts and check results, never a key, value or payload byte. The chance table, 
 orders, the run lengths and the preamble count came from scratch scripts over the same parse and are not in the
 tool.
 
+#### The `0x40` key (ASSET-350, measured; what it hashes is **Open**)
+
+Measured over all 269,106 descriptors of `core_bvh4.rpf`, each paired with the `bvh4` stream that follows it; a
+BLAS is identified by that stream's crc32 (197,324 distinct).
+
+* **Two populations.** 144,471 keys are below 2^55 (the top 9 bits zero; about 244 would be by chance) and
+  124,635 use all 64 bits, with the top 9 bits spread evenly over the other 511 values. Inside each population
+  every bit is set about half the time, and splitting the key at any of 12 points (8 to 48 bits) gives as many
+  distinct high and low parts as uniform values would: no packed field, both read as hash output.
+* **The population follows the BLAS.** Only 28 of the 197,324 BLAS occur with keys of both kinds. The 55-bit keys
+  sit on smaller BLAS (median 191 elements against 2,802) and the two kinds come in runs in file order (44,156
+  runs; about 133,800 for a random interleave).
+* **Key to geometry.** A key always comes with one (BLAS, transform) pair, with the one exception already noted
+  in the ASSET-350 finding. The reverse does not hold: 11,209 of the 211,407 (crc32, transform) pairs carry more
+  than one key, up to 743.
+* **Not a name hash.** 0 of the 235,533 keys equal a hash of any of the 318,149 distinct drawable names of the 343,327
+  models `rpf9dump models` reads from `levels.rpf`, as is, lower-cased, with `.ydr` or with the `.#dr` suffix,
+  under Murmur3 x64-128 (either half), xxh64, FNV-1/FNV-1a 64, joaat64, CRC-64 (ECMA and ISO), djb2/sdbm 64 and
+  the first 8 bytes of MD5, SHA-1, SHA-256 and BLAKE2b (both byte orders), compared in full, masked to 55 bits
+  and shifted right by 9. 32-bit joaat, FNV-1a and CRC32 of the names match either key half at the chance rate.
+  The name set is close to complete: the same Murmur3 h1 reproduces 228,610 of the 228,681 distinct archetype keys
+  (`c8a7b90a`, [world_names.md](world_names.md)).
+* **Not an entity field.** 0 keys equal any entity id (`1b60404d`, 1,664,626 distinct) or archetype key
+  (`c8a7b90a`, 228,681 distinct) of the 1,670,435 entities a whole-archive `world_index.py` run reads, also
+  byte-swapped, with the halves swapped or masked to 55 bits.
+* **Not shared with the other descriptors.** 2 of the keys occur in the 24,832 other descriptor streams (both
+  256-byte records, at `+0x40`); those streams hold no entity id or archetype key at any 8-byte-aligned offset.
+
+Since the packs are baked offline, the key may be assigned at build time rather than derived from a name the
+package stores.
+
 ### 3.3 Fill and node occupancy
 
 The declared node area in `core_bvh4.rpf` is 1,896,784,254 nodes (121,394,192,256 bytes), 93.4% of all inflated
