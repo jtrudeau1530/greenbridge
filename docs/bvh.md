@@ -828,6 +828,28 @@ the header. Its root parent-table entry is `0xFFFFFFFF` in all eight samples ide
 `offsetToParents` read signed, plus `4 * ((root - offsetToElements) / 64)`), which is what the GPU builder writes
 for a root and what `tools/xdxr_bvh.py validate` requires since #2625.
 
+`tools/image_bvh_census.py` (standard library only) counts how the game's shaders call `image_bvh*_intersect_ray`:
+sites per form, the descriptor fields at each site, and how the four result words are read, as ratio (divided by word
+1), high_half (`sext(w1[31:16])` into `v_mul_i32_i24`), raw integer, raw float, raw other or select. It walks forward
+from each call with an EXEC lane rule (its docstring has the rule and the categories), and it prints counts,
+mnemonics and field values only. On the 1.0.2.1 disassembly: 716 sites in 64 CS (638 `image_bvh_intersect_ray`, 78
+`image_bvh64_intersect_ray`). The descriptor has box_grow 0, box_sort_en 1, size all ones, triangle_return_mode 1,
+llc_noalloc 0, big_page 1 and type 8 at all 716 sites. On every path from the call, 397 sites take `v_rcp_f32` of
+word 1 and multiply word 0 by it (`v_mul_f32` 244, `v_mul_legacy_f32` 153), 335 of them words 2 and 3 as well, and
+they read the high half of word 1. That high half's product is compared with `v_cmp_lt_i32` against -1 at 319 sites
+and `v_cmp_gt_i32` against 0 at 78. All 716 read the words as integers: 397 sites through `v_lshlrev_b32`,
+`v_and_or_b32`, `v_lshl_or_b32` and `v_or3_b32`, and 319 through `v_cmp_eq_u32` only. No site reads a word as an
+undivided float, a memory operand or a select on every path. These are static candidates, not traces. 633 sites also
+have reads on some paths only, where the register can also hold another value, and the census leaves them
+unclassified. Of the 548 sites with such a raw-float read, 506 have every one after a later call in program order and
+42 have one before the next call. The census does not follow the next pass of a loop around the call, or a value that
+goes through memory.
+
+```powershell
+python -I tools/image_bvh_census.py <work>/shaders/dxbc/disasm --out <temp>/image_bvh_census.json
+python -I tests/test_image_bvh_census.py
+```
+
 ## 7a. Building runtime BVHs: `tools/xdxr_bvh.py`
 
 The Vulkan layer has to write acceleration structures in this runtime layout, because the game's traversal shaders
