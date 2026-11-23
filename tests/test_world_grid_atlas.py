@@ -50,6 +50,8 @@ class PlainLogicTest(unittest.TestCase):
             wga.geometry({**DOC, "width": 4000})
         with self.assertRaises(ValueError):
             wga.geometry({**DOC, "tileSize": 0})
+        with self.assertRaises(ValueError):
+            wga.geometry({**DOC, "width": 4096.5})
 
     def test_row_zero_is_north(self):
         g = wga.geometry(DOC)
@@ -82,9 +84,46 @@ class PlainLogicTest(unittest.TestCase):
 
     def test_fill_by_order_drops_an_anchor_out_of_order(self):
         placed, dropped, _ = wga.fill_by_order(3, {0: 5, 1: 2, 2: 7}, list(range(10)))
+        # cells 5, 2, 7: (5, 7) and (2, 7) are equally long, so either may be kept; one anchor is dropped
         self.assertEqual(dropped, 1)
-        # tile 1 is then the one tile between cells 5 and 7, so archive order places it at 6
-        self.assertEqual(placed, {0: 5, 1: 6, 2: 7})
+        self.assertEqual(placed[2], 7)
+        cells = [placed[i] for i in sorted(placed)]
+        self.assertTrue(all(b > a for a, b in zip(cells, cells[1:])))
+
+    def test_fill_by_order_keeps_the_longest_consistent_anchors(self):
+        """One wrong early anchor must not drop the correct ones after it."""
+        placed, dropped, left = wga.fill_by_order(5, {0: 9, 1: 1, 2: 2, 3: 3, 4: 4}, list(range(10)))
+        self.assertEqual(dropped, 1)
+        self.assertEqual({i: placed[i] for i in (1, 2, 3, 4)}, {1: 1, 2: 2, 3: 3, 4: 4})
+        self.assertNotEqual(placed.get(0), 9)
+        # two anchors on one cell: only one is kept
+        placed, dropped, _ = wga.fill_by_order(2, {0: 3, 1: 3}, list(range(5)))
+        self.assertEqual(dropped, 1)
+
+    def test_longest_increasing_matches_brute_force(self):
+        rnd = random.Random(7)
+        for _ in range(300):
+            pos = [rnd.randrange(8) for _ in range(rnd.randint(0, 8))]
+            pairs = list(enumerate(pos))
+            got = wga.longest_increasing(pairs)
+            self.assertTrue(all(b[1] > a[1] and b[0] > a[0] for a, b in zip(got, got[1:])))
+            best = 0
+            for k in range(len(pos), 0, -1):
+                if any(all(b > a for a, b in zip(c, c[1:])) for c in itertools.combinations(pos, k)):
+                    best = k
+                    break
+            self.assertEqual(len(got), best)
+
+    def test_main_archive_and_counts(self):
+        recs = [{"archive": a} for a in ("levels", "levels", "minigame", "levels")]
+        self.assertEqual(wga.archive_counts(recs), {"levels": 3, "minigame": 1})
+        self.assertEqual(wga.main_archive(recs), "levels")
+        self.assertIsNone(wga.main_archive([]))
+
+    def test_inside_is_inclusive(self):
+        self.assertTrue(wga.inside(-1000.0, 1000.0, -1000.0, 1000.0))
+        self.assertFalse(wga.inside(-1000.5, 0.0, -1000.0, 1000.0))
+        self.assertFalse(wga.inside(0.0, 1000.5, -1000.0, 1000.0))
 
     def test_align_matches_brute_force(self):
         rnd = random.Random(340)
@@ -346,7 +385,16 @@ class ForwardCheckTest(unittest.TestCase):
         sg = grids["shorelinegrid1"]
         self.assertEqual(sg["unplaced"], 1)
         self.assertEqual(sg["featureless_tiles"], 1)
+        self.assertEqual(sg["unplaced_with_features"], 0)
+        self.assertEqual(sg["anchors_moved_by_alignment"], 0)
         self.assertEqual(sg["background"], [0, 128, 0, 128])
+        self.assertEqual(sg["anchors"], len(offs) - 3)      # the twins and the blank tile are not clear
+        for g in grids.values():
+            self.assertEqual((g["duplicate_records"], g["unshared_dictionaries"], g["tiles_in_other_archives"]),
+                             (0, 0, 0))
+        self.assertEqual(hg["tile_size"], [64, 64])
+        self.assertEqual(hg["fallback_format"], "R16_UNORM")
+        self.assertEqual(set(data["placements"]), {"watersystemheightmap", "fog", "fog2", "shore"})
 
     def test_water_fit_recovers_the_scale_and_north_up(self):
         self.build()
@@ -354,8 +402,8 @@ class ForwardCheckTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         hg = next(g for g in data["grids"] if g["name"] == "WaterSystemHeightMap")
         fit = hg["water_fit"][0]
-        self.assertAlmostEqual(fit["north_up"]["units_per_metre"], 40.96, delta=0.8)
-        self.assertAlmostEqual(fit["north_up"]["zero_metre_value"], 32768, delta=300)
+        self.assertAlmostEqual(fit["north_up"]["units_per_metre"], 40.96, delta=0.3)
+        self.assertAlmostEqual(fit["north_up"]["zero_metre_value"], 32768, delta=60)
         self.assertGreater(fit["north_up"]["r"], 0.95)
         self.assertLess(fit["south_up"]["r"], 0.5)
         self.assertEqual(data["z_check"], [{"z_box": [-1000.0, 1000.0], "heightmaps_inside": 1, "heightmaps": 1}])
@@ -378,9 +426,48 @@ class ForwardCheckTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", TOOL, self.work, "--carve", self.carve, "--json", manifest],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
-        self.assertIn("would overwrite", p.stderr)
+        self.assertIn("inside the exported assets", p.stderr)
         with open(manifest, "rb") as f:
             self.assertEqual(f.read(), before)
+
+    def test_refuses_json_over_a_tile_texture(self):
+        self.build()
+        tile = next(pth for pth in self.files if pth.endswith("_watersystemheightmap.dds"))
+        with open(tile, "rb") as f:
+            before = f.read()
+        p = subprocess.run([sys.executable, "-I", TOOL, self.work, "--carve", self.carve, "--json", tile],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        with open(tile, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_counts_duplicates_and_other_archives(self):
+        self.build()
+        first = next(it for it in self.items["levels"] if it["Textures"][0]["Name"] == "watersystemheightmap")
+        self.items["levels"].append(json.loads(json.dumps(first)))          # the same dictionary listed twice
+        other = next(pth for pth in self.files if pth.endswith("_watersystemheightmap.dds"))
+        with open(other, "rb") as f:
+            data = f.read()
+        self.add_dict("minigame", [("watersystemheightmap", "R16_UNORM", data, 64, 64)])
+        self.finish()
+        p, out = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        hg = next(g for g in out["grids"] if g["name"] == "WaterSystemHeightMap")
+        self.assertEqual((hg["duplicate_records"], hg["tiles_in_other_archives"]), (1, 1))
+        self.assertIn("1 duplicate tile records ignored", p.stdout)
+        self.assertIn("1 tiles in other archives not placed", p.stdout)
+
+    def test_says_when_there_is_no_heightmap(self):
+        self.build()
+        def magic(row):
+            with open(os.path.join(self.carve, f"{row['off']:012x}.bin"), "rb") as f:
+                return f.read(4)
+        self.rows = [r for r in self.rows if magic(r) != b"MHIU"]
+        self.finish()
+        p, data = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("no heightmap in the carve, not checked", p.stdout)
+        self.assertIn("no MHIU heightmap", p.stdout)
 
     def test_refuses_json_inside_the_carve(self):
         self.build()
@@ -388,7 +475,7 @@ class ForwardCheckTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", TOOL, self.work, "--carve", self.carve, "--json", out],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
-        self.assertIn("inside the carve", p.stderr)
+        self.assertIn("inside the carve folder", p.stderr)
         self.assertFalse(os.path.exists(out))
 
     def test_reports_bad_inputs_in_one_line(self):

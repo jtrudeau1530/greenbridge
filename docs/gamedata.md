@@ -259,9 +259,8 @@ in the earlier catalog search. `tools/world_grid_atlas.py` (below) finds them in
 
 ### What the four grids hold
 
-All four are water data. Counts are the tool's printed summary and its `--json` fields (`dictionaries`, `placed`,
-`unplaced`, `tile_archives`, `fallback_size`, `fallback_stats`); `levels` and `textures` are `levels.rpf` and
-`textures.rpf`.
+All four are water data. Every count below is in the tool's printed summary or is the named `--json` field;
+`levels` and `textures` are `levels.rpf` and `textures.rpf`.
 
 | Grid (`clientSystemName`) | Tile texture | Tile dictionaries | Fallback (pixels per tile) | Placed |
 |---|---|---:|---|---:|
@@ -274,7 +273,8 @@ All four are water data. Counts are the tool's printed summary and its `--json` 
   edge (largest y, see the fit below), and cell = row * 32 + column.
 - The two fog grids share their dictionaries: each of the 1,313 holds one `waterfog` and one `waterfog2`.
 - `shared_minigame000` holds the `mapswap_tblux` sector-override fallback of all four grids (`sector_fallbacks`)
-  and a few more tiles (`tile_archives`: 10 water height, 2 shoreline, 1 fog pair). They are counted, not placed.
+  and a few more tiles (`tiles_in_other_archives`: 10 water height, 2 shoreline, 1 fog pair). They are counted
+  and printed, not placed.
 - The water-height fallback has 1,134 constant cells of 2,112; its most common value, 20,480, covers 55.74% of the
   pixels, and the values run from 20,470 to 49,247.
 
@@ -290,9 +290,11 @@ A tile's cell is recovered by comparing it with its grid's fallback mosaic, then
 - Shoreline (`method: mask`): the fallback's most common colour, `(0, 128, 0, 128)`, is background. Tiles and cells
   are compared by intersection over union of their feature masks (pixels more than 32 from the background), 264
   fallback cells have features and 6 tiles have none. The tiles, in archive order, are aligned to cells in text
-  order (next point) by a dynamic programme that maximises the summed overlap. 262 tiles land on a cell they
-  overlap (median overlap 0.83); the 6 featureless tiles stay unplaced. 208 tiles match one cell clearly (best
-  overlap more than 0.2 above the runner-up) without the order and are the shoreline anchors.
+  order (next point) by a dynamic programme that maximises the summed overlap. A tile is placed when it overlaps
+  the cell it is aligned to: 262 are (median overlap 0.83, `overlap_median`), and the 6 unplaced ones are the 6
+  without features. 208 tiles match one cell clearly without the order (best overlap more than 0.2 above the
+  runner-up); these are the shoreline anchors, and the alignment moves none of them
+  (`anchors_moved_by_alignment` 0).
 - **Archive order:** the tile dictionaries are stored in the order of their cells sorted as text of the decimal
   cell index (`sorted(cells, key=str)`). Ascending steps of the anchors in archive order (`anchor_order`):
 
@@ -308,10 +310,11 @@ number order in each grid is there: in the `--json` placements the three-digit c
 are stored after the last four-digit cells, where text order puts them. The dictionary names most likely
 contain the decimal cell index; with one deciding step per grid this is a strong hint, not a read name.
 - Between two anchors, tiles are placed by archive order when their number equals the free cells between them
-  (`placed_by_order`): 31 fog tiles, none for water height. 721 fog dictionaries stay unplaced; most of them are
-  flat colour, which content cannot place.
-- Cross-check (`in_water_height_cells`, `anchors_in_water_height_cells`): all 262 placed shoreline tiles and all 561
-  fog anchors lie in a cell that also has a water-height tile. Of the 31 fog tiles placed by order, 16 do.
+  (`placed_by_order`): 31 fog tiles, none for water height. 721 fog dictionaries stay unplaced; 677 of them have
+  no detail in either texture (`unplaced_without_detail`), which content cannot place.
+- Cross-check (`in_water_height_cells`, `anchors_in_water_height_cells`, `placed_by_order_in_water_height_cells`):
+  all 262 placed shoreline tiles and all 561 fog anchors lie in a cell that also has a water-height tile; of the
+  31 fog tiles placed by order, 16 do.
 
 ### Water-height values and `zInflation`
 
@@ -326,8 +329,8 @@ The water-height values follow the ground. Over the fallback pixels above 36,000
 Reading row 0 as the south edge destroys the fit, which is why row 0 is north. Under the better fit, the
 fallback's 20,470 to 49,247 is -301.3 to 401.1 m (`water_metres`), close to the `PAMH` Z box of -302 to 404 m. The
 fit is consistent with a `R16_UNORM` value spread over -800 to 800 m (65,536 / 1,600 = 40.96 units per metre, 0 m
-at 32,768). Under that reading the dominant 20,480 is -300 m, below the whole world, which would make it a "no
-water" value. Both readings are hypotheses: the scale comes from a fit, not from a field.
+at 32,768). Under that reading the dominant 20,480 is -300 m, at the floor of the `PAMH` Z box (-302 m) and below
+all ground in `MHIU` (-50 m), which would make it a "no water" value. Both readings are hypotheses: the scale comes from a fit, not from a field.
 
 `zInflation` was not observed at runtime. All four documents have origin z = 0 and `zInflation` 1,000, so if the
 runtime turns each 2D tile into a box from origin z - 1,000 to origin z + 1,000 for its stream test, that box

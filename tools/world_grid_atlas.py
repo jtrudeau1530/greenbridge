@@ -49,6 +49,7 @@ DX10_HEADER = 148
 DXGI_R16_UNORM = 56
 MASK_THRESHOLD = 32          # max channel distance from the background colour that still counts as background
 MASK_BLOCK_SHARE = 0.25      # share of feature pixels in a tile block for the block to count as feature
+CLEAR_MARGIN = 0.2           # a shoreline tile is an anchor when its best overlap beats the runner-up by more
 DETAIL_STD = 0.5             # a texture with a smaller standard deviation is flat
 ANCHOR_RATIO = 2.0           # runner-up distance / best distance for an anchor
 ANCHOR_GAP = 0.5             # and runner-up minus best at least this
@@ -67,8 +68,10 @@ ORDER_KEYS = {
 
 def geometry(doc: dict) -> dict:
     """Columns, rows and world box of a grid document; origin is the grid centre (docs/gamedata.md)."""
-    tile = int(doc["tileSize"])
-    width, height = int(doc["width"]), int(doc["height"])
+    tile, width, height = (doc[k] for k in ("tileSize", "width", "height"))
+    if any(not float(v).is_integer() for v in (tile, width, height)):
+        raise ValueError(f"grid size {width}x{height} or tile {tile} is not a whole number")
+    tile, width, height = int(tile), int(width), int(height)
     if tile <= 0 or width % tile or height % tile:
         raise ValueError(f"grid {width}x{height} is not a whole number of {tile}-unit tiles")
     ox, oy, oz = (float(v) for v in doc["origin"])
@@ -105,22 +108,37 @@ def ascending_steps(cells_in_archive_order: list, columns: int) -> dict:
     return out
 
 
+def longest_increasing(pairs: list) -> list:
+    """Longest subsequence of (tile, position) pairs, in tile order, whose positions strictly increase."""
+    import bisect
+    tails, tail_at, back = [], [], [-1] * len(pairs)
+    for n, (_, p) in enumerate(pairs):
+        k = bisect.bisect_left(tails, p)
+        back[n] = tail_at[k - 1] if k else -1
+        if k == len(tails):
+            tails.append(p)
+            tail_at.append(n)
+        else:
+            tails[k] = p
+            tail_at[k] = n
+    out, n = [], tail_at[-1] if tail_at else -1
+    while n >= 0:
+        out.append(pairs[n])
+        n = back[n]
+    return out[::-1]
+
+
 def fill_by_order(n_tiles: int, anchors: dict, order: list) -> tuple:
     """Place tiles between anchors (tile index -> cell) by archive order.
 
-    ``order`` lists the cells in storage order. Anchors that break the order are dropped (the later one of each
-    break). Between two kept anchors, k tiles fill the k cells between them only when there are exactly k free
-    cells. Returns (placement dict tile -> cell, dropped anchors, tiles left unplaced).
+    ``order`` lists the cells in storage order. The anchors kept are a longest subsequence whose cells strictly
+    increase in that order; the others are dropped and counted. Between two kept anchors, k tiles fill the k cells
+    between them only when there are exactly k free cells. Returns (placement dict tile -> cell, dropped anchors,
+    tiles left unplaced).
     """
     pos = {c: i for i, c in enumerate(order)}
-    kept, dropped, last = [], 0, -1
-    for i in sorted(anchors):
-        p = pos[anchors[i]]
-        if p > last:
-            kept.append((i, p))
-            last = p
-        else:
-            dropped += 1
+    kept = longest_increasing([(i, pos[anchors[i]]) for i in sorted(anchors)])
+    dropped = len(anchors) - len(kept)
     placed = {i: order[p] for i, p in kept}
     left = 0
     bounds = [(-1, -1)] + kept + [(n_tiles, len(order))]
@@ -272,14 +290,24 @@ def split_cells(fallback, geom: dict):
 
 
 def point_sample(tile, p: int):
-    step = tile.shape[0] // p
+    step = tile_step(tile, p)
     return tile[step // 2::step, step // 2::step][:p, :p]
+
+
+def tile_step(tile, p: int) -> int:
+    """Tile pixels per fallback pixel; the tile must be square and a whole multiple of the fallback cell."""
+    h, w = tile.shape[:2]
+    if h != w or w < p or w % p:
+        raise ValueError(f"a {w}x{h} tile does not fit a fallback cell of {p}x{p} pixels")
+    return w // p
 
 
 def match_content(tiles: list, fallbacks: list, geom: dict) -> dict:
     """tiles: per dictionary, a list of images (one per grid); fallbacks: the matching mosaics."""
     import numpy as np
     cells = [split_cells(f, geom) for f in fallbacks]
+    if cells[0].shape[0] < 2:
+        raise ValueError("a grid needs at least two cells to rank a match")
     p = cells[0].shape[1]
     best, runner, detail = [], [], []
     for images in tiles:
@@ -294,7 +322,7 @@ def match_content(tiles: list, fallbacks: list, geom: dict) -> dict:
     anchors = {i: best[i][0] for i in range(len(tiles))
                if detail[i] and runner[i] >= ANCHOR_RATIO * max(best[i][1], 1e-9)
                and runner[i] - best[i][1] >= ANCHOR_GAP}
-    return {"anchors": anchors, "detail": sum(detail), "best": best}
+    return {"anchors": anchors, "detail": detail}
 
 
 def match_mask(tiles: list, fallback, geom: dict) -> dict:
@@ -308,7 +336,7 @@ def match_mask(tiles: list, fallback, geom: dict) -> dict:
     cm = (np.abs(cells - bg).max(-1) > MASK_THRESHOLD).astype(np.int32)
     tm = []
     for img in tiles:
-        b = img.shape[0] // p
+        b = tile_step(img, p)
         m = (np.abs(img - bg).max(-1) > MASK_THRESHOLD).reshape(p, b, p, b).mean((1, 3)) > MASK_BLOCK_SHARE
         tm.append(m)
     tm = np.array(tm, dtype=np.int32)
@@ -316,15 +344,18 @@ def match_mask(tiles: list, fallback, geom: dict) -> dict:
     union = tm.sum((1, 2))[:, None] + cm.sum((1, 2))[None, :] - inter
     iou = np.where(union > 0, inter / np.maximum(union, 1), 0.0)
     top = np.sort(iou, 1)[:, ::-1]
-    clear = {i: int(iou[i].argmax()) for i in range(len(tiles)) if top[i, 0] - top[i, 1] > 0.2}
+    clear = {i: int(iou[i].argmax()) for i in range(len(tiles)) if top[i, 0] - top[i, 1] > CLEAR_MARGIN}
     order = text_order(len(cells))
     path = align(iou[:, order].tolist())
     placed = {i: order[j] for i, j in enumerate(path) if iou[i, order[j]] > 0}
-    scores = [float(iou[i, c]) for i, c in placed.items()]
+    scores = sorted(float(iou[i, c]) for i, c in placed.items())
+    featureless = tm.sum((1, 2)) == 0
     return {"background": [int(v) for v in bg], "clear": clear, "placed": placed,
-            "featureless_tiles": int((tm.sum((1, 2)) == 0).sum()),
+            "featureless_tiles": int(featureless.sum()),
+            "unplaced_with_features": sum(1 for i in range(len(tiles)) if i not in placed and not featureless[i]),
+            "anchors_moved_by_alignment": sum(1 for i, c in clear.items() if placed.get(i) != c),
             "feature_cells": int((cm.sum((1, 2)) > 0).sum()),
-            "iou_median": sorted(scores)[len(scores) // 2] if scores else None}
+            "overlap_median": scores[len(scores) // 2] if scores else None}
 
 
 def fallback_stats(fallback, geom: dict) -> dict:
@@ -339,14 +370,17 @@ def fallback_stats(fallback, geom: dict) -> dict:
     return out
 
 
-def water_fit(fallback, geom: dict, payloads: list) -> list:
-    """Fit water-height fallback values against each MHIU terrain grid, north-up and (for contrast) south-up."""
+def water_fit(fallback, geom: dict, payloads: list) -> tuple:
+    """Fit water-height fallback values against each MHIU terrain grid, north-up and (for contrast) south-up.
+
+    Returns (one row per MHIU payload, the fallback's value range in metres under the best north-up fit or None).
+    """
     import numpy as np
     rows, cols = fallback.shape
     px = (geom["x_max"] - geom["x_min"]) / cols
     r, c = np.mgrid[0:rows, 0:cols]
     x = geom["x_min"] + (c + 0.5) * px
-    out = []
+    out, fits = [], []
     for pl in payloads:
         if pl.get("type") != "MHIU":
             continue
@@ -359,23 +393,33 @@ def water_fit(fallback, geom: dict, payloads: list) -> list:
             i = np.floor((x - b["min"][0]) / (b["max"][0] - b["min"][0]) * w).astype(int)
             j = np.floor((y - b["min"][1]) / (b["max"][1] - b["min"][1]) * h).astype(int)
             ok = (i >= 0) & (i < w) & (j >= 0) & (j < h) & (fallback > FIT_MIN_VALUE)
+            row[label] = None
             if ok.sum() < 2:
-                row[label] = None
                 continue
-            fit = linear_fit(fallback[ok].tolist(), z[j[ok], i[ok]].tolist())
+            try:
+                fit = linear_fit(fallback[ok].tolist(), z[j[ok], i[ok]].tolist())
+            except ValueError:
+                continue
+            if label == "north_up":
+                fits.append(fit)
             row[label] = {"n": fit["n"], "r": round(fit["r"], 4),
                           "units_per_metre": round(1 / fit["slope"], 3) if fit["slope"] else None,
-                          "zero_metre_value": round(-fit["intercept"] / fit["slope"], 1) if fit["slope"] else None,
-                          "_fit": fit}
+                          "zero_metre_value": round(-fit["intercept"] / fit["slope"], 1) if fit["slope"] else None}
         out.append(row)
-    return out
+    metres = None
+    good = [f for f in fits if f["slope"]]
+    if good:
+        fit = max(good, key=lambda f: f["r"])
+        lo, hi = float(fallback.min()), float(fallback.max())
+        metres = {"min": round(fit["slope"] * lo + fit["intercept"], 1),
+                  "max": round(fit["slope"] * hi + fit["intercept"], 1), "r": round(fit["r"], 4)}
+    return out, metres
 
 
 # ---- driver ----------------------------------------------------------------------------------------------------
 
-def run(work: str, carve: str) -> dict:
+def run(textures: list, carve: str) -> dict:
     import gamedata_maps as gm
-    textures = load_manifests(work)
     by_name = {}
     for t in textures:
         by_name.setdefault(t["name"], []).append(t)
@@ -386,9 +430,9 @@ def run(work: str, carve: str) -> dict:
     # group grids whose tiles live in the same dictionaries (matched jointly)
     keys = {}
     for doc in grids:
-        recs = [t for t in by_name.get(doc["tileTextureNameSuffix"], []) if t["archive"] == _main_archive(
-            by_name.get(doc["tileTextureNameSuffix"], []))]
-        keys.setdefault(frozenset((t["archive"], t["offset"]) for t in recs), []).append(doc)
+        recs = by_name.get(doc["tileTextureNameSuffix"], [])
+        main = main_archive(recs)
+        keys.setdefault(frozenset((t["archive"], t["offset"]) for t in recs if t["archive"] == main), []).append(doc)
 
     summary = {"grids": [], "texture_grids": [], "heightmaps": [], "placements": {}}
     height_cells = None
@@ -398,155 +442,183 @@ def run(work: str, carve: str) -> dict:
         for d in docset[1:]:
             if geometry(d) != geom:
                 raise ValueError("grids that share tile dictionaries have different geometry")
-        main = _main_archive(by_name.get(docset[0]["tileTextureNameSuffix"], []))
-        per_doc = []
+        main = main_archive(by_name.get(docset[0]["tileTextureNameSuffix"], []))
+        per_doc, duplicates = [], 0
         for doc in docset:
             recs = [t for t in by_name.get(doc["tileTextureNameSuffix"], []) if t["archive"] == main]
-            per_doc.append({(t["offset"], t["dir"]): t for t in recs})
+            keyed = {(t["offset"], t["dir"]): t for t in recs}
+            duplicates += len(recs) - len(keyed)
+            per_doc.append(keyed)
         dicts = sorted(set.intersection(*(set(p) for p in per_doc)))
+        counts = {"duplicate_records": duplicates,
+                  "unshared_dictionaries": sum(len(p) for p in per_doc) - len(per_doc) * len(dicts)}
         if not dicts:
-            raise ValueError(f"no tile dictionaries for {', '.join(d['tileTextureNameSuffix'] for d in docset)}")
-        fmt = per_doc[0][dicts[0]]["format"]
+            for doc in docset:
+                summary["grids"].append({"name": doc.get("clientSystemName"), "tile_name": doc["tileTextureNameSuffix"],
+                                         "dictionaries": 0, **counts})
+            continue
+        first = per_doc[0][dicts[0]]
+        fmt = first["format"]
         method = METHODS.get(fmt)
-        fallbacks = []
+        if method is None:
+            raise ValueError(f"no matching method for tile format {fmt}")
+        fallbacks, fallback_recs = [], []
         for doc in docset:
             fb = by_name.get(doc["globalFallbackTextureName"], [])
             if len(fb) != 1:
                 raise ValueError(f"expected one {doc['globalFallbackTextureName']}, found {len(fb)}")
             fallbacks.append(read_image(fb[0]))
-        result = {"method": method, "dictionaries": len(dicts), "tile_format": fmt}
+            fallback_recs.append(fb[0])
+        result = {"method": method, "dictionaries": len(dicts), "tile_format": fmt,
+                  "tile_size": [first["width"], first["height"]], **counts}
         if method == "content":
             tiles = [[read_image(p[k]) for p in per_doc] for k in dicts]
             m = match_content(tiles, fallbacks, geom)
             anchors = m["anchors"]
-            result["tiles_with_detail"] = m["detail"]
             placed, dropped, left = fill_by_order(len(dicts), anchors, text_order(geom["rows"] * geom["columns"]))
-            result.update({"anchors": len(anchors), "anchor_order": ascending_steps(
-                [anchors[i] for i in sorted(anchors)], geom["columns"]), "anchors_dropped": dropped,
-                "placed_by_order": len(placed) - (len(anchors) - dropped), "unplaced": left})
-        elif method == "mask":
+            by_order = {i: c for i, c in placed.items() if i not in anchors}
+            result.update({"tiles_with_detail": sum(m["detail"]), "anchors": len(anchors),
+                           "anchor_order": ascending_steps([anchors[i] for i in sorted(anchors)], geom["columns"]),
+                           "anchors_dropped": dropped, "placed_by_order": len(by_order), "unplaced": left,
+                           "unplaced_without_detail": sum(1 for i in range(len(dicts))
+                                                          if i not in placed and not m["detail"][i])})
+            anchor_cells = [c for i, c in anchors.items() if placed.get(i) == c]
+        else:
             tiles = [read_image(per_doc[0][k]) for k in dicts]
             m = match_mask(tiles, fallbacks[0], geom)
             placed = m.pop("placed")
             clear = m.pop("clear")
+            by_order = {}
             result.update(m)
             result.update({"anchors": len(clear), "anchor_order": ascending_steps(
                 [clear[i] for i in sorted(clear)], geom["columns"]), "unplaced": len(dicts) - len(placed)})
-        else:
-            raise ValueError(f"no matching method for tile format {fmt}")
+            anchor_cells = list(clear.values())
         result["placed"] = len(placed)
         result["distinct_cells"] = len(set(placed.values()))
         if is_height:
             height_cells = set(placed.values())
         elif height_cells is not None:
             result["in_water_height_cells"] = sum(1 for c in set(placed.values()) if c in height_cells)
-            anchor_cells = list((anchors if method == "content" else clear).values())
             result["anchors_in_water_height_cells"] = sum(1 for c in anchor_cells if c in height_cells)
-        for doc, fb in zip(docset, fallbacks):
-            g = {"name": doc.get("clientSystemName"), "tile_name": doc["tileTextureNameSuffix"],
-                 "tile_archives": _archive_counts(by_name.get(doc["tileTextureNameSuffix"], [])),
+            result["placed_by_order_in_water_height_cells"] = sum(1 for c in by_order.values() if c in height_cells)
+        for doc, fb, fb_rec in zip(docset, fallbacks, fallback_recs):
+            tile_archives = archive_counts(by_name.get(doc["tileTextureNameSuffix"], []))
+            g = {"name": doc.get("clientSystemName"), "tile_name": doc["tileTextureNameSuffix"], **result,
+                 "tile_archives": tile_archives,
+                 "tiles_in_other_archives": sum(n for a, n in tile_archives.items() if a != main),
                  "fallback": doc["globalFallbackTextureName"], "fallback_size": list(fb.shape[1::-1]),
-                 "fallback_stats": fallback_stats(fb, geom), "geometry": geom,
+                 "fallback_format": fb_rec["format"], "fallback_stats": fallback_stats(fb, geom), "geometry": geom,
                  "z_inflation": float(doc.get("zInflation", 0.0)),
                  "sector_fallbacks": {o.get("sectorOverrideGlobalFallbackName"):
-                                      _archive_counts(by_name.get(o.get("sectorOverrideGlobalFallbackName"), []))
-                                      for o in doc.get("sectorOverrides") or []},
-                 **result}
+                                      archive_counts(by_name.get(o.get("sectorOverrideGlobalFallbackName"), []))
+                                      for o in doc.get("sectorOverrides") or []}}
             if is_height and fmt == "R16_UNORM":
-                fits = water_fit(fb, geom, payloads)
-                g["water_fit"] = [{k: v for k, v in f.items()} for f in fits]
-                g["water_metres"] = _water_metres(fb, fits)
-                for f in g["water_fit"]:
-                    for label in ("north_up", "south_up"):
-                        if f.get(label):
-                            f[label] = {k: v for k, v in f[label].items() if not k.startswith("_")}
+                g["water_fit"], g["water_metres"] = water_fit(fb, geom, payloads)
             summary["grids"].append(g)
-        summary["placements"][docset[0]["tileTextureNameSuffix"]] = [
-            {"archive": main, "offset": dicts[i][0], "dir": dicts[i][1], "cell": c,
-             "row": c // geom["columns"], "column": c % geom["columns"]} for i, c in sorted(placed.items())]
+            summary["placements"][doc["tileTextureNameSuffix"]] = [
+                {"archive": main, "offset": dicts[i][0], "dir": dicts[i][1], "cell": c,
+                 "row": c // geom["columns"], "column": c % geom["columns"]} for i, c in sorted(placed.items())]
 
     for doc in docs["TextureGridInfo"]:
-        geom = geometry(doc)
         summary["texture_grids"].append({
-            "geometry": geom, "z_inflation": float(doc.get("zInflation", 0.0)),
-            "fallbacks": {k: {"name": doc.get(k), "archives": _archive_counts(by_name.get(doc.get(k), []))}
-                for k in ("lowDetailFallBack", "highDetailFallBack")}})
+            "geometry": geometry(doc), "z_inflation": float(doc.get("zInflation", 0.0)),
+            "fallbacks": {k: {"name": doc.get(k), "archives": archive_counts(by_name.get(doc.get(k), []))}
+                          for k in ("lowDetailFallBack", "highDetailFallBack")}})
 
     for pl in payloads:
         b = pl["header"]["bounds"]
         summary["heightmaps"].append({"type": pl["type"], "offset": pl.get("offset_hex"),
                                       "z_min": b["min"][2], "z_max": b["max"][2]})
-    zboxes = {(g["geometry"]["z_min"], g["geometry"]["z_max"]) for g in summary["grids"]}
+    zboxes = {(g["geometry"]["z_min"], g["geometry"]["z_max"]) for g in summary["grids"] if "geometry" in g}
     summary["z_check"] = [{"z_box": list(z), "heightmaps_inside": sum(
         inside(h["z_min"], h["z_max"], *z) for h in summary["heightmaps"]), "heightmaps": len(summary["heightmaps"])}
         for z in sorted(zboxes)]
     return summary
 
 
-def _main_archive(recs: list):
-    counts = _archive_counts(recs)
+def main_archive(recs: list):
+    """The archive holding most of these records (ties: the later name)."""
+    counts = archive_counts(recs)
     return max(counts, key=lambda a: (counts[a], a)) if counts else None
 
 
-def _archive_counts(recs: list) -> dict:
+def archive_counts(recs: list) -> dict:
     out = {}
     for t in recs:
         out[t["archive"]] = out.get(t["archive"], 0) + 1
     return out
 
 
-def _tile_format(doc: dict, by_name: dict):
-    recs = by_name.get(doc["tileTextureNameSuffix"], [])
-    return recs[0]["format"] if recs else None
-
-
-def _water_metres(fallback, fits: list):
-    """Fallback value range in metres under the best (highest r) north-up fit."""
-    good = [f["north_up"]["_fit"] for f in fits if f.get("north_up")]
-    if not good:
-        return None
-    fit = max(good, key=lambda f: f["r"])
-    lo, hi = float(fallback.min()), float(fallback.max())
-    return {"min": round(fit["slope"] * lo + fit["intercept"], 1),
-            "max": round(fit["slope"] * hi + fit["intercept"], 1)}
-
-
-def check_out_path(out: str, carve: str, textures: list) -> None:
-    """Refuse a --json path inside the carve folder or equal to a manifest the tool reads."""
-    for path in sorted({t["manifest"] for t in textures}):
-        if report_paths.same_report_path(out, path):
-            raise ValueError(f"--json {out} would overwrite the input {path}")
+def _within(path: str, folder: str) -> bool:
+    """True when path is folder or lies under it, after resolving links (case-folded where the volume is)."""
+    a, b = os.path.realpath(path), os.path.realpath(folder)
     try:
-        common = os.path.commonpath([os.path.abspath(out), os.path.abspath(carve)])
+        common = os.path.commonpath([a, b])
     except ValueError:              # different drives on Windows
-        return
-    if report_paths.path_key(common) == report_paths.path_key(os.path.abspath(carve)):
-        raise ValueError(f"--json {out} is inside the carve folder {carve}")
+        return False
+    return report_paths.path_key(common) == report_paths.path_key(b)
+
+
+def check_out_path(out: str, work: str, carve: str) -> None:
+    """Refuse a --json path in the exported assets (manifests, textures) or in the carve folder."""
+    for folder, what in ((os.path.join(work, "assets"), "the exported assets"), (carve, "the carve folder")):
+        if _within(out, folder):
+            raise ValueError(f"--json {out} is inside {what} ({folder}), which the tool reads")
 
 
 def report_lines(summary: dict) -> list:
     out = []
     for g in summary["grids"]:
-        order = g.get("anchor_order", {})
-        text = order.get("text", [0, 0])
-        num = order.get("numeric", [0, 0])
-        line = (f"{g['name']}: {g['dictionaries']} tile dictionaries of {g['tile_name']} ({g['tile_format']}), "
-                f"{g['method']}: {g['anchors']} anchors (text order {text[0]}/{text[1]} ascending, numeric "
-                f"{num[0]}/{num[1]}), {g['placed']} placed in {g['distinct_cells']} cells, {g['unplaced']} unplaced")
-        if "in_water_height_cells" in g:
-            line += (f"; cells with a water-height tile: {g['in_water_height_cells']} of placed, "
-                     f"{g['anchors_in_water_height_cells']} of {g['anchors']} anchors")
+        if not g["dictionaries"]:
+            out.append(f"{g['name']}: no tile dictionaries of {g['tile_name']} found")
+            continue
+        order = g["anchor_order"]
+        text, num = order["text"], order["numeric"]
+        line = (f"{g['name']}: {g['dictionaries']} tile dictionaries of {g['tile_name']} "
+                f"({g['tile_size'][0]}x{g['tile_size'][1]} {g['tile_format']}), fallback {g['fallback_size'][0]}x"
+                f"{g['fallback_size'][1]} {g['fallback_format']}; {g['method']}: {g['anchors']} anchors "
+                f"(text order {text[0]}/{text[1]} ascending, numeric {num[0]}/{num[1]}")
+        if "anchors_dropped" in g:
+            line += f", {g['anchors_dropped']} dropped), {g['placed_by_order']} placed by order"
+        else:
+            line += f", {g['anchors_moved_by_alignment']} moved by the alignment)"
+        line += f"; {g['placed']} placed in {g['distinct_cells']} cells, {g['unplaced']} unplaced"
+        if "unplaced_without_detail" in g:
+            line += f" ({g['unplaced_without_detail']} without detail)"
+        if "featureless_tiles" in g:
+            line += f" ({g['featureless_tiles']} without features)"
         out.append(line)
-        if g.get("water_metres"):
+        notes = []
+        if g["tiles_in_other_archives"]:
+            notes.append(f"{g['tiles_in_other_archives']} tiles in other archives not placed "
+                         f"({', '.join(f'{a} {n}' for a, n in sorted(g['tile_archives'].items()))})")
+        if g["duplicate_records"]:
+            notes.append(f"{g['duplicate_records']} duplicate tile records ignored")
+        if g["unshared_dictionaries"]:
+            notes.append(f"{g['unshared_dictionaries']} dictionaries hold only some textures of the group, ignored")
+        if "in_water_height_cells" in g:
+            notes.append(f"cells with a water-height tile: {g['in_water_height_cells']} of {g['placed']} placed, "
+                         f"{g['anchors_in_water_height_cells']} of {g['anchors']} anchors, "
+                         f"{g['placed_by_order_in_water_height_cells']} of {g.get('placed_by_order', 0)} "
+                         f"placed by order")
+        if "water_fit" in g:
             fits = "; ".join(
-                f"{f['heightmap']}: {f['north_up']['units_per_metre']} units/m, 0 m at {f['north_up']['zero_metre_value']}, "
-                f"r {f['north_up']['r']} (south-up r {f['south_up']['r'] if f.get('south_up') else None})"
+                f"{f['heightmap']}: {f['north_up']['units_per_metre']} units/m, 0 m at "
+                f"{f['north_up']['zero_metre_value']}, r {f['north_up']['r']} "
+                f"(south-up r {f['south_up']['r'] if f.get('south_up') else None})"
                 for f in g["water_fit"] if f.get("north_up"))
-            out.append(f"  water height vs terrain (values > {FIT_MIN_VALUE}): {fits}; fallback range "
-                       f"{g['water_metres']['min']} to {g['water_metres']['max']} m")
+            if g["water_metres"]:
+                notes.append(f"water height vs terrain (values > {FIT_MIN_VALUE}): {fits}; fallback range "
+                             f"{g['water_metres']['min']} to {g['water_metres']['max']} m")
+            else:
+                notes.append("no MHIU heightmap to fit the water heights against")
+        out.extend("  " + n for n in notes)
     for z in summary["z_check"]:
-        out.append(f"z box {z['z_box'][0]:g} to {z['z_box'][1]:g}: {z['heightmaps_inside']} of {z['heightmaps']} "
-                   f"heightmap Z bounds inside")
+        if not z["heightmaps"]:
+            out.append(f"z box {z['z_box'][0]:g} to {z['z_box'][1]:g}: no heightmap in the carve, not checked")
+        else:
+            out.append(f"z box {z['z_box'][0]:g} to {z['z_box'][1]:g}: {z['heightmaps_inside']} of "
+                       f"{z['heightmaps']} heightmap Z ranges inside")
     return out
 
 
@@ -559,25 +631,30 @@ def main(argv=None) -> int:
     try:
         if not os.path.isdir(a.carve):
             raise ValueError(f"--carve {a.carve} is not a folder")
-        textures = load_manifests(a.work)
         if a.json:
             if os.path.isdir(a.json):
                 raise ValueError(f"--json {a.json} is a folder")
-            check_out_path(a.json, a.carve, textures)
-        summary = run(a.work, a.carve)
-    except (OSError, ValueError, KeyError) as e:
+            check_out_path(a.json, a.work, a.carve)
+        summary = run(load_manifests(a.work), a.carve)
+    except KeyError as e:
+        print(f"world_grid_atlas: missing field {e} in an input", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as e:
         print(f"world_grid_atlas: {e}", file=sys.stderr)
         return 2
     except ImportError as e:
-        print(f"world_grid_atlas: needs numpy and Pillow ({e})", file=sys.stderr)
+        need = " (this tool needs numpy and Pillow)" if e.name in ("numpy", "PIL") else ""
+        print(f"world_grid_atlas: {e}{need}", file=sys.stderr)
         return 2
     for line in report_lines(summary):
         print(line)
     if a.json:
+        tmp = a.json + ".tmp"
         try:
             os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(summary, f, indent=1)
+            os.replace(tmp, a.json)
         except OSError as e:
             print(f"world_grid_atlas: cannot write {a.json}: {e}", file=sys.stderr)
             return 2
