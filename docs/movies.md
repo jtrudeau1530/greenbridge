@@ -216,6 +216,10 @@ ffmpeg -f rawvideo -pix_fmt bgra -s 1280x720 -i frame.raw -frames:v 1 frame.png
 
 The raw buffer and PNG stay in temp. FFmpeg is only the raw-to-PNG step here; it never sees the `.bk2`.
 
+The loader-side runs behind these numbers are recorded in [`runtime/test/bink_decode_test.md`](../runtime/test/bink_decode_test.md),
+[`runtime/test/bink_audio_test.md`](../runtime/test/bink_audio_test.md) and
+[`runtime/test/bink_play.md`](../runtime/test/bink_play.md).
+
 ## 5. What is still unknown
 
 - **Roles.** The RPF9 table of contents is encrypted, but `tools/bink_names.py` recovers each stream's path from

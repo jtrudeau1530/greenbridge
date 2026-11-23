@@ -53,8 +53,8 @@ All decoded WAVs are 48 kHz, stereo, `pcm_s16le`. The sampled `0x3000`-only trac
 `0x7000` track in the mixed two-track file has normal signal. This does not establish what each track is used for.
 
 The 1280x720 row is an independent run on a second machine (Windows 11, Ryzen 7 7800X3D, own 1.0.2.1 package):
-181 frames yield exactly 181 x 6,400 PCM bytes with `calls=181` and no pre-roll on that stream, matching the API
-shape above (a byte count per frame, not a fixed packet size).
+every one of the 181 calls returned 6,400 bytes (no 7,680 or 0 calls, so no pre-roll on this stream), and the
+total matches the API shape above (a byte count per call).
 
 ## FFmpeg
 
