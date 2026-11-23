@@ -510,7 +510,8 @@ def find_dumps(containers: list | None = None) -> list:
             if v:
                 found[real] = (d, v)
                 return
-        if depth == 0:
+        # At the last level, inspect packaged files there without visiting any subfolders.
+        if depth == 0 and containers is None:
             return
         try:
             with os.scandir(d) as it:
@@ -520,7 +521,7 @@ def find_dumps(containers: list | None = None) -> list:
         subs = []
         for e in entries:
             try:
-                if e.is_dir(follow_symlinks=False):
+                if depth > 0 and e.is_dir(follow_symlinks=False):
                     if e.name.lower() not in skip and not e.name.startswith((".", "$")):
                         subs.append(e.path)
                 elif containers is not None and e.name.lower().endswith(CONTAINER_SUFFIXES) \
