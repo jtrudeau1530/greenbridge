@@ -343,13 +343,13 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     wave64: it was run with --require-wave64, so exit 77 is a skip and the 64-wide confirmation must be printed.
     partial: a group smaller than a wave, run at subgroup size 64 without full subgroups; skipped when the device
     reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size."""
-    no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
-    if (wave64 and rc == 77) or (no64 and rc == 0):
-        return None, "SKIP (no 64-wide compute subgroup on this device)"
-    if rc == 77:   # the program refused the module: "unsupported: <why>" is a skip, as for every other missing feature
+    if rc == 77:   # the program refused the module and said why ("unsupported: <why>"): a skip with that reason, in every mode
         why = next((ln for ln in msg.splitlines() if ln.startswith("unsupported:")), None)
         if why:
             return None, "SKIP (" + why[len("unsupported:"):].strip() + ")"
+    no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
+    if (wave64 and rc == 77) or (no64 and rc == 0):
+        return None, "SKIP (no 64-wide compute subgroup on this device)"
     if rc == 0 and wave64 and "compute subgroup size: 64" not in msg.splitlines():
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
     words = dump_words(msg)

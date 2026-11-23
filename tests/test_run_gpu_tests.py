@@ -198,6 +198,15 @@ class WholeWaveDump(unittest.TestCase):
         self.assertIs(ok, None)
         self.assertTrue(detail.startswith("SKIP"))
 
+    def test_a_77_with_an_unsupported_reason_keeps_that_reason(self):
+        """A 64-wide device, a module that needs OpFmaKHR the device lacks: the skip names OpFmaKHR, not the subgroup."""
+        msg = ("unsupported: cs_x.spv needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device lacks it; "
+               "translate with --fma glsl\n")
+        ok, detail = self.judge(77, DEVICE_64 + msg)
+        self.assertIs(ok, None)
+        self.assertTrue(detail.startswith("SKIP (cs_x.spv needs OpFmaKHR"), detail)
+        self.assertNotIn("64-wide", detail)
+
     def test_right_words_without_the_confirmation_fail(self):    # a vk_compute_test that ignores the flag
         ok, detail = self.judge(0, DEVICE_64 + dump(WANT))
         self.assertIs(ok, False)
