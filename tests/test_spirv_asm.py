@@ -104,6 +104,7 @@ class SpirvAsmUnitTests(unittest.TestCase):
             "%ld = OpLoad %uint %var Aligned|Nontemporal 4\n"
             "%absf = OpExtInst %float %glsl FAbs %fneg0\n"
             "%sumf = OpFAdd %float %absf %fhex\n"
+            "%sum64 = OpIAdd %ulong %c64 %c64\n"
             "OpSelectionMerge %merge None\n"
             "OpSwitch %ld %def 0 %case0 1 %case1\n"
             "%case0 = OpLabel\n"
@@ -125,6 +126,12 @@ class SpirvAsmUnitTests(unittest.TestCase):
         self.assertIn(0x11223344, words)
         self.assertIn(0x80000000, words)
         self.assertIn(0x3FC00000, words)  # 0x1.8p+0 = 1.5f
+        # A selector produced by a pure-ID instruction still needs its 64-bit result type.
+        asm64 = asm.replace("OpSwitch %ld %def 0 %case0 1 %case1",
+                            "OpSwitch %sum64 %def 0 %case0 0x100000001 %case1")
+        spv64 = spirv_asm.assemble(asm64, target_env="vulkan1.2")
+        self.assertEqual(len(spv64), len(spv) + 8)  # one extra word per case literal
+        _validate(spv64)
 
     def test_hex_float_inf_nan_and_string_escapes_match_spirv_as(self):
         # Regression tests for PR #2251 review (@FreddyxS):
