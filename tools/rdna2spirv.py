@@ -9466,13 +9466,13 @@ class Gen:
             # gives a signed zero (exponent 0) and exponent 31 (infinity, NaN) passes through. f16 denormals are kept,
             # as in the MODE inferred for the game (denorm_mode_16_64 = 3): a denormal operand is normalized, and
             # v_ldexp_f16 rounds a result below the normal range to nearest even. Measured natively on gfx1036 over
-            # every f16 input (docs/design.md). VOP3 clamp clamps to [0.0, 1.0]; output multipliers are rejected.
-            if op == "v_frexp_exp_i16_f16":
-                if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
-                    raise Unsupported(op + " output modifier")
-            else:
-                if any(m.startswith(("mul:", "div:")) for m in mods):
-                    raise Unsupported(op + " output modifier")
+            # every f16 input (docs/design.md). Under console MODE (0x1c0: IEEE=0, DX10_CLAMP=1, denorm16_64=3),
+            # VOP3 mul:2/mul:4/div:2 are hardware no-ops on v_frexp_mant_f16 and v_ldexp_f16 while clamp clamps to
+            # [0.0, 1.0] alone and combined with mul:*/div:*; on v_frexp_exp_i16_f16 (integer result), clamp and
+            # mul:2/mul:4/div:2 are all hardware no-ops across every MODE (0x1c0, 0x100, 0x3c0).
+            bad = [m for m in mods if m not in ("clamp", "mul:2", "mul:4", "div:2") and not m.startswith("op_sel:")]
+            if bad:
+                raise Unsupported(op + " output modifier")
             nsrc = 2 if op == "v_ldexp_f16" else 1
             sel, dhi = self.opsel_bits(mods, nsrc)
             u = self.src_h(a[1])
