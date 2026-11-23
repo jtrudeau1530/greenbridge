@@ -48,6 +48,10 @@ std::vector<char*> g_argv;
 std::vector<wchar_t*> g_wargv;
 std::string g_cmdline;
 std::wstring g_wcmdline;
+// The UCRT's _acmdln and _wcmdln, which __p__acmdln and __p__wcmdln return the address of: ordinary variables a title
+// may store to, so only set_command_line (a new run) points them back at the game's command line.
+char* g_acmdln = g_cmdline.data();
+wchar_t* g_wcmdln = g_wcmdline.data();
 int g_argc = 0;
 char** g_argv_ptr = nullptr;
 wchar_t** g_wargv_ptr = nullptr;
@@ -272,16 +276,8 @@ int __cdecl game_configure_wide_argv(int mode) {
 
 LPSTR __stdcall game_get_command_line_a() { return g_cmdline.data(); }
 LPWSTR __stdcall game_get_command_line_w() { return g_wcmdline.data(); }
-char** __cdecl game_p_acmdln_storage() {
-    static char* p = nullptr;
-    p = g_cmdline.data();
-    return &p;
-}
-wchar_t** __cdecl game_p_wcmdln_storage() {
-    static wchar_t* p = nullptr;
-    p = g_wcmdline.data();
-    return &p;
-}
+char** __cdecl game_p_acmdln_storage() { return &g_acmdln; }
+wchar_t** __cdecl game_p_wcmdln_storage() { return &g_wcmdln; }
 
 // What the UCRT's _get_narrow/_get_wide_winmain_command_line return, and the CRT's WinMain startup passes as
 // lpCmdLine: the command line after the program name and the blanks that follow it. The program name ends at the
@@ -366,6 +362,8 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
         g_wcmdline += quote(a);
     }
     g_cmdline = narrow(g_wcmdline);
+    g_acmdln = g_cmdline.data();
+    g_wcmdln = g_wcmdline.data();
     // GetCommandLine is available before TLS/DllMain, but CRT argv starts unconfigured on every run.
     g_args.clear();
     g_wargs.clear();

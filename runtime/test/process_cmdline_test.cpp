@@ -156,6 +156,42 @@ void check_winmain(const std::wstring& program, const std::vector<std::wstring>&
     }
 }
 
+// __p__acmdln / __p__wcmdln return the address of the UCRT's _acmdln / _wcmdln, which are ordinary variables: they
+// start as the game's command line on each run, and a value the game stores through the pointer stays there.
+void check_cmdln_storage() {
+    using Narrow = char**(__cdecl*)();
+    using Wide = wchar_t**(__cdecl*)();
+    const auto narrow_fn = reinterpret_cast<Narrow>(rt::shims::find("ucrtbase.dll", "__p__acmdln"));
+    const auto wide_fn = reinterpret_cast<Wide>(rt::shims::find("ucrtbase.dll", "__p__wcmdln"));
+    if (!narrow_fn || !wide_fn) {
+        std::fprintf(stderr, "FAIL ucrtbase.dll!__p__acmdln/__p__wcmdln are not shimmed\n");
+        ++failures;
+        return;
+    }
+    using LineA = LPSTR(WINAPI*)();
+    using LineW = LPWSTR(WINAPI*)();
+    const auto line_a = reinterpret_cast<LineA>(rt::shims::find("kernel32.dll", "GetCommandLineA"));
+    const auto line_w = reinterpret_cast<LineW>(rt::shims::find("kernel32.dll", "GetCommandLineW"));
+    rt::process::set_command_line(L"game.exe", {L"-cmdln"});
+    if (*narrow_fn() != line_a() || *wide_fn() != line_w()) {
+        std::fprintf(stderr, "FAIL __p__acmdln/__p__wcmdln do not start as the game's command line\n");
+        ++failures;
+    }
+    static char narrow_text[] = "stored";
+    static wchar_t wide_text[] = L"stored";
+    *narrow_fn() = narrow_text;
+    *wide_fn() = wide_text;
+    if (*narrow_fn() != narrow_text || *wide_fn() != wide_text) {
+        std::fprintf(stderr, "FAIL a value stored through __p__acmdln/__p__wcmdln is lost on the next call\n");
+        ++failures;
+    }
+    rt::process::set_command_line(L"game.exe", {L"-next"});
+    if (*narrow_fn() != line_a() || *wide_fn() != line_w()) {
+        std::fprintf(stderr, "FAIL __p__acmdln/__p__wcmdln are not the new run's command line\n");
+        ++failures;
+    }
+}
+
 // msvcrt.dll's __getmainargs/__wgetmainargs (what a MinGW or old-MSVC CRT startup calls) hand out the game's argv and
 // the process environment. The wide environment (_wenviron) does not exist until a wide environment function has run,
 // and the narrow table is reallocated by _putenv, so both must be read at the call, not remembered by
@@ -231,6 +267,7 @@ int main() {
     check_import_names();
     check_argv_reset();
     check_getmainargs_environment();
+    check_cmdln_storage();
     check_winmain(L"game.exe", {L"-foo", L"with space"}, L"-foo \"with space\"", "arguments after a plain name");
     check_winmain(L"C:\\My Games\\game.exe", {L"-x"}, L"-x", "a quoted program name with a space");
     check_winmain(L"game.exe", {}, L"", "no arguments");
