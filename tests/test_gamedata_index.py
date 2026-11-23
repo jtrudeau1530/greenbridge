@@ -170,6 +170,18 @@ class GamedataIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["root"], "RootA")
         self.assertEqual(rows[0]["type"], "xml")
 
+    def test_sps1_magic_is_classified_as_other_sps1(self):
+        # +0x04 is u32 entry_count; 90 (0x5a = 'Z') reproduces the 5th byte that used to read "SPS1Z".
+        sps = bytearray(b"SPS1" + struct.pack("<I", 90) + b"\x05a.sps\x00\x02a\x00\x00" * 90)
+        self.add(bytes(sps))
+        self.finish()
+        out = os.path.join(self.root, "sps1_index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            row = json.load(f)["rows"][0]
+        self.assertEqual((row["type"], row["detail"], row["chunks"]), ("other", "SPS1", 1))
+
     def test_printable_page_directory_stream_is_not_xml(self):
         # A resource stream with the "0DRP" page marker at +16 whose first 4 KiB are over 95% printable and hold a
         # "<": data.rpf's 337 such streams were reported as incomplete XML with no root.
