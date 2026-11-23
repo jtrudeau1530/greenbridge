@@ -171,6 +171,9 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
 .cat-header.collapsed .arrow { transform: rotate(-90deg); }
 .cat-content { padding-left: 6px; margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
 .cat-header.collapsed + .cat-content { display: none; }
+.model-page { display: flex; flex-direction: column; gap: 3px; }
+.model-pagination { display: flex; align-items: center; justify-content: space-between; gap: 4px; font-size: 11px; }
+.model-pagination button:disabled { opacity: 0.5; cursor: default; }
 
 .model-item {
   padding: 8px 10px;
@@ -477,6 +480,8 @@ const I18N = {
     texCountSuffix: "текстур найдено",
     texNotFound: "Текстуры не найдены",
     modelsNotFound: "Ничего не найдено",
+    previousModelPage: "Назад",
+    nextModelPage: "Далее",
     modalTitle: "Просмотр текстуры",
     catNames: {
       "Оружие (Weapons)": "Оружие",
@@ -510,6 +515,8 @@ const I18N = {
     texCountSuffix: "textures found",
     texNotFound: "No textures found",
     modelsNotFound: "No models found",
+    previousModelPage: "Previous",
+    nextModelPage: "Next",
     modalTitle: "Texture Preview",
     catNames: {
       "Оружие (Weapons)": "Weapons",
@@ -550,6 +557,8 @@ function applyTranslations() {
 }
 
 let allModels = [];
+let selectedModel = null;
+const modelPages = new Map();
 let allTextures = [];
 let activeCategory = 'ALL';
 let modelSearchQuery = '';
@@ -779,13 +788,15 @@ async function loadModels() {
     const res = await fetch('/api/models');
     const data = await res.json();
     allModels = data.models || [];
+    selectedModel = allModels[0] || null;
+    modelPages.clear();
     document.getElementById('badge-models').innerText = allModels.length;
 
     renderCategoryChips(data.categories || {});
     renderAccordionList();
 
-    if (allModels.length > 0) {
-      const first = allModels[0];
+    if (selectedModel) {
+      const first = selectedModel;
       loadModel(first.url, first.name, first.category, first.size);
     }
   } catch (e) {
@@ -813,6 +824,7 @@ function renderCategoryChips(categories) {
 }
 
 function selectCategory(cat, chipElem) {
+  if (activeCategory !== cat) modelPages.clear();
   activeCategory = cat;
   document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
   chipElem.classList.add('active');
@@ -820,7 +832,10 @@ function selectCategory(cat, chipElem) {
 }
 
 function onModelSearch() {
-  modelSearchQuery = document.getElementById('model-search').value.toLowerCase().trim();
+  const query = document.getElementById('model-search').value.toLowerCase().trim();
+  if (query === modelSearchQuery) return;
+  modelSearchQuery = query;
+  modelPages.clear();
   renderAccordionList();
 }
 
@@ -865,14 +880,18 @@ function renderAccordionList() {
     const content = document.createElement('div');
     content.className = 'cat-content';
 
-    // Show up to 100 items per category with pagination to keep DOM ultra fast
-    const limit = 100;
-    const initialList = list.slice(0, limit);
+    const pageSize = 100;
+    const pageRows = document.createElement('div');
+    pageRows.className = 'model-page';
+    let page = modelPages.get(cat) ?? 0;
 
-    function appendItems(items) {
-      items.forEach(m => {
+    function renderPage() {
+      const start = page * pageSize;
+      const end = Math.min(start + pageSize, list.length);
+      pageRows.replaceChildren(...list.slice(start, end).map(m => {
         const item = document.createElement('div');
         item.className = 'model-item';
+        if (m === selectedModel) item.classList.add('active');
         item.innerHTML = `
           <div class="m-name">${escapeHtml(m.name)}</div>
           <div class="m-meta">
@@ -882,26 +901,47 @@ function renderAccordionList() {
         `;
         item.onclick = () => {
           document.querySelectorAll('.model-item').forEach(el => el.classList.remove('active'));
+          selectedModel = m;
           item.classList.add('active');
           loadModel(m.url, m.name, m.category, m.size);
         };
-        content.appendChild(item);
-      });
+        return item;
+      }));
+      if (range) {
+        previous.disabled = page === 0;
+        next.disabled = end === list.length;
+        range.innerText = `${start + 1}–${end} / ${list.length}`;
+      }
     }
 
-    appendItems(initialList);
-
-    if (list.length > limit) {
-      const moreBtn = document.createElement('button');
-      moreBtn.className = 'tool-btn';
-      moreBtn.style.marginTop = '6px';
-      moreBtn.innerText = `Показать ещё ${list.length - limit}...`;
-      moreBtn.onclick = () => {
-        moreBtn.remove();
-        appendItems(list.slice(limit));
-      };
-      content.appendChild(moreBtn);
+    let previous, next, range;
+    if (list.length > pageSize) {
+      const pager = document.createElement('nav');
+      previous = document.createElement('button');
+      next = document.createElement('button');
+      range = document.createElement('span');
+      pager.className = 'model-pagination';
+      pager.setAttribute('aria-label', cat);
+      range.setAttribute('aria-live', 'polite');
+      const labels = I18N[currentLang] || I18N.ru;
+      for (const [button, label, step] of [[previous, labels.previousModelPage, -1], [next, labels.nextModelPage, 1]]) {
+        button.type = 'button';
+        button.className = 'tool-btn';
+        button.innerText = label;
+        button.onclick = () => {
+          page += step;
+          modelPages.set(cat, page);
+          renderPage();
+          if (button.disabled) (step < 0 ? next : previous).focus();
+        };
+      }
+      pager.appendChild(previous);
+      pager.appendChild(range);
+      pager.appendChild(next);
+      content.appendChild(pager);
     }
+    content.appendChild(pageRows);
+    renderPage();
 
     header.onclick = () => {
       header.classList.toggle('collapsed');
