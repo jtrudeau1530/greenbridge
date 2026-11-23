@@ -885,8 +885,9 @@ def check_build(directory, rays=300, seed=1):
                 raise CaseError(f"{js}: {b!r} is a {cases[b][0]['kind']}, not a blas")
         for i, inst in enumerate(desc["instances"]):
             index = inst["blas"]
-            if not isinstance(index, int) or not 0 <= index < len(desc["blas"]):
-                raise CaseError(f"{js}: instance {i} names BLAS index {index!r}, not 0..{len(desc['blas']) - 1}")
+            # -1 is an instance with no BLAS (vk_xdxr_build_test's "no BLAS" case), which the model skips
+            if not isinstance(index, int) or not -1 <= index < len(desc["blas"]):
+                raise CaseError(f"{js}: instance {i} names BLAS index {index!r}, not -1..{len(desc['blas']) - 1}")
     rng = random.Random(seed)
     for n, (desc, data) in cases.items():
         # An in-place update leaves two dumps at one address (before and after): the case being checked comes first,
