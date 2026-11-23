@@ -1223,6 +1223,7 @@ private:
         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
         const std::uint32_t first = first_dword(state, *p);
+        if (first == UINT32_MAX) return;  // past the user SGPRs: no place
         for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
     }
 
@@ -1241,9 +1242,10 @@ private:
         else if (va && p->table_descriptors && (tables_.empty() || tables_.back().first != va))
             tables_.push_back({va, p->table_descriptors});
         const std::uint32_t first = first_dword(state, *p);
+        if (first == UINT32_MAX) return;  // past the user SGPRs: no place
         write(state, first, std::uint32_t(va));
-        // A descriptor table is one dword at both bind points, the 32-bit VA of its first descriptor (the heaps live
-        // below 4 GiB); a root view keeps both halves.
+        // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
+        // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
         if (type != rt::rootsig::ParamType::Table) write(state, first + 1, std::uint32_t(va >> 32));
     }
 

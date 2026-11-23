@@ -27,6 +27,7 @@
 #include "startup_trace.h"
 #include <algorithm>
 #include <mutex>
+#include <deque>
 #include <vector>
 #include <intrin.h>
 #include "d3d12_trace.h"
@@ -1455,6 +1456,7 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
     // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
     // Each list proxy (#2490) is replaced by its real list, as the generic slot-10 path does.
     if (self->device) rt::title_textures::refresh(self->device->real);
+    refresh_title_gpu_memory();
     sync_title_heaps();
     UnwrappedArray unwrapped;
     if (!unwrapped.fill(lists_word, count_word)) return 0;
@@ -2064,6 +2066,75 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
     return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
 }
 
+// ---- Title memory as GPU memory (boot stand-in) ----
+// The console's memory is unified: the title gives the GPU its own CPU addresses. Leonida's GPU addresses are offsets in
+// an arena of at most 4 GiB, so an address at or above 4 GiB is a CPU pointer. Its bytes are copied into an upload ring
+// when the command is recorded and the ring's address is used. GPU writes do not come back; later CPU writes are missed.
+struct LateCopy {
+    std::uint64_t va, size;
+    std::uint8_t* to;
+    std::uint64_t submission;
+};
+std::mutex g_late_mutex;
+std::deque<LateCopy> g_late;
+std::uint64_t g_late_submission = 0;
+D3D12_GPU_VIRTUAL_ADDRESS title_gpu_va(ID3D12Device* device, std::uint64_t va, std::uint64_t want) {
+    if (va < (1ull << 32)) return va;
+    static ID3D12Resource* ring = nullptr;
+    static std::uint8_t* mapped = nullptr;
+    static std::uint64_t base = 0, cursor = 0;
+    constexpr std::uint64_t kRing = 96ull << 20;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(va), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        static std::atomic<int> bad{0};
+        if (bad.fetch_add(1) < 8)
+            std::fprintf(stderr, "[rt] title va 0x%llx is not readable memory\n", static_cast<unsigned long long>(va));
+        return 0;
+    }
+    const std::uint64_t room = reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize - va;
+    const std::uint64_t n = want < room ? want : room;
+    if (!n || n > kRing) return 0;
+    const std::lock_guard lock(g_late_mutex);
+    if (!ring) {
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        d.Width = kRing; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1; d.SampleDesc.Count = 1;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d,
+                                                           D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&ring));
+        if (SUCCEEDED(hr)) ring->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+        std::fprintf(stderr, "[rt] title memory: upload ring -> 0x%08lx\n", static_cast<unsigned long>(hr));
+        if (FAILED(hr) || !mapped) return 0;
+        base = ring->GetGPUVirtualAddress();
+    }
+    if (cursor + n > kRing) cursor = 0;
+    const std::uint64_t at = cursor;
+    cursor = (cursor + n + 255) & ~std::uint64_t{255};
+    std::memcpy(mapped + at, reinterpret_cast<const void*>(va), static_cast<std::size_t>(n));
+    g_late.push_back({va, n, mapped + at, g_late_submission});
+    return base + at;
+}
+
+bool late_copy(void* to, const void* from, std::size_t n) {
+    __try {
+        std::memcpy(to, from, n);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+// Before ExecuteCommandLists: the title fills constant buffers after it made their views, so the copies of the last
+// submissions are made again.
+void refresh_title_gpu_memory() {
+    const std::lock_guard lock(g_late_mutex);
+    ++g_late_submission;
+    while (!g_late.empty() && g_late.front().submission + 3 < g_late_submission) g_late.pop_front();
+    for (const LateCopy& c : g_late) late_copy(c.to, reinterpret_cast<const void*>(c.va), static_cast<std::size_t>(c.size));
+}
+
 // An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
 // real resource VA the title already holds — passes through.
 std::uint64_t upload_translate(DeviceProxy* device, std::uint64_t va) {
@@ -2076,6 +2147,12 @@ std::uint64_t upload_translate(DeviceProxy* device, std::uint64_t va) {
         if (va >= base && va < base + chunk->size) return chunk->gpu_base + (va - base);
     }
     return va;
+}
+
+// upload_translate, then a title CPU address left over goes through the upload ring (title_gpu_va).
+std::uint64_t title_translate(DeviceProxy* device, std::uint64_t va, std::uint64_t want) {
+    va = upload_translate(device, va);
+    return device ? title_gpu_va(device->real, va, want) : va;
 }
 
 void destroy_upload_state(void* upload_state) {
@@ -2312,13 +2389,13 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // The six root descriptor setters (index, GPU VA): an upload-arena CPU pointer becomes the
                 // chunk's device address (d3d12_xs_console_abi.md §5.3 measures slots 41/43/45 for the compute
                 // side; the graphics setters interleave on even slots).
-                a2 = upload_translate(self->device, a2);
+                a2 = title_translate(self->device, a2, Slot <= 42 ? (64u << 10) : (256u << 10));
             } else if constexpr (Slot == 47) {
                 // IASetIndexBuffer(pView): the view's BufferLocation is a GPU VA; translate in a copy so the
                 // title's struct is not written.
                 if (a1) {
                     auto view = *reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(a1);
-                    view.BufferLocation = upload_translate(self->device, view.BufferLocation);
+                    view.BufferLocation = title_translate(self->device, view.BufferLocation, view.SizeInBytes);
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
                         self->real, reinterpret_cast<std::uint64_t>(&view), a2, a3, a4, a5, a6, a7, a8, a9,
                         a10, a11, a12, a13, a14);
@@ -2330,7 +2407,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     const auto* in = reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(a3);
                     self->vb_scratch.assign(in, in + static_cast<std::uint32_t>(a2));  // a UINT count
                     for (auto& view : self->vb_scratch)
-                        view.BufferLocation = upload_translate(self->device, view.BufferLocation);
+                        view.BufferLocation = title_translate(self->device, view.BufferLocation, view.SizeInBytes);
                     return reinterpret_cast<ForwardFn>(real_vtable[pc])(
                         self->real, a1, a2, reinterpret_cast<std::uint64_t>(self->vb_scratch.data()), a4, a5,
                         a6, a7, a8, a9, a10, a11, a12, a13, a14);
@@ -2948,10 +3025,14 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     // Only words that describe exactly this heap: a PC-size description on the stack is followed by whatever is there.
     const std::uint64_t exact =
         std::uint64_t(desc->NumDescriptors) * self->real->GetDescriptorHandleIncrementSize(desc->Type);
-    const bool title_heap = title_address && title_size == exact &&
-                            VirtualQuery(reinterpret_cast<void*>(title_address), &mbi, sizeof(mbi)) &&
-                            mbi.State == MEM_COMMIT &&
-                            reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize >= title_address + title_size;
+    const auto committed = [&] {  // the range may span several regions
+        for (std::uint64_t at = title_address; at < title_address + title_size;) {
+            if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+            at = reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+        }
+        return true;
+    };
+    const bool title_heap = title_address && title_size == exact && committed();
     SIZE_T custom_cpu_start = 0;
     SIZE_T custom_byte_size = 0;
     SIZE_T real_cpu_start = 0;
@@ -3013,6 +3094,13 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+    if (desc) {  // a CPU address of the title's is copied (title_gpu_va)
+        cbv = *desc;
+        cbv.BufferLocation = title_gpu_va(self->real, cbv.BufferLocation, cbv.SizeInBytes);
+        if (!cbv.BufferLocation) cbv.SizeInBytes = 0;
+        desc = &cbv;
+    }
     self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
 }
 

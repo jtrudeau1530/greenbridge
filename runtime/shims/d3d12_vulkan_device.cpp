@@ -3896,7 +3896,12 @@ public:
     static constexpr GUID kTag{0x8d2f6c14, 0xb0e7, 0x4a93, {0x9c, 0x58, 0x1f, 0x4a, 0x7e, 0x3b, 0x6d, 0x20}};
     explicit PipelineState(DeviceState& device) : device_(device) {}
     // Built on first use (LEONIDA_LAZY_PSO=1); every path that asks for the Vulkan pipeline calls build_lazy first.
-    void defer(const PipelineStream& stream) { lazy_ = std::make_unique<LazyStream>(stream); }
+    void defer(const PipelineStream& stream) {
+        lazy_ = std::make_unique<LazyStream>(stream);
+        static const bool opaque = std::getenv("LEONIDA_PROBE_NOBLEND") != nullptr;
+        if (opaque)
+            for (auto& t : lazy_->stream.graphics.BlendState.RenderTarget) t.BlendEnable = FALSE;
+    }
     void build_lazy() {
         if (!lazy_) return;
         std::call_once(lazy_once_, [this] {
@@ -4419,6 +4424,7 @@ public:
                                                                : VK_CULL_MODE_NONE;
         if (!probe_vs.empty()) raster.cullMode = VK_CULL_MODE_NONE;  // the probe's winding is not the title's
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
+        if (rect_list) raster.cullMode = VK_CULL_MODE_NONE;  // the console draws a rectangle list whatever its winding
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
         // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
         // rasterizer's bias stays off and zero, so its clamp needs no depthBiasClamp feature either.
@@ -7208,11 +7214,11 @@ public:
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
         buffer.address = desc->BufferLocation;
-        buffer.stride = 0;
-        buffer.num_records = desc->SizeInBytes;
+        // Records of 16 bytes: console shaders also read a constant buffer with buffer_load ... idxen (its row).
+        buffer.stride = 16;
+        buffer.num_records = desc->SizeInBytes / 16;
         buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-        buffer.oob_select = leonida::gfx10::OobSelect::raw;
-        buffer.address = vsharp_address(buffer.address, desc->SizeInBytes);
+        buffer.oob_select = leonida::gfx10::OobSelect::structured;
         const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
