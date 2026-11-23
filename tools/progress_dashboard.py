@@ -1006,6 +1006,8 @@ def main(argv=None):
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"GitHub repository (default {DEFAULT_REPO})")
     ap.add_argument("--login", help="with --github, show this account's claims and pull requests")
     args = ap.parse_args(argv)
+    if args.login is not None and not args.github:
+        ap.error("--login requires --github")
     if args.jobs < 1:
         ap.error("--jobs must be a positive integer")
     if args.test_timeout < 1:
