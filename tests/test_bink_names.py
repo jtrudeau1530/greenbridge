@@ -11,6 +11,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -423,6 +424,42 @@ class TestCli(unittest.TestCase):
                 self.assertEqual(fh.read(), stream_bytes)
             with open(xml_file, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), xml_text)
+
+    def test_overwrite_check_fails_on_an_unlistable_sub_folder(self):
+        # os.walk skips a folder it cannot list unless onerror stops it, so the --out check used to pass over
+        # it and a report file inside it could be overwritten. Forcing os.scandir to raise for one folder gives
+        # the PermissionError os.walk hits for real, also on Windows where chmod cannot lock a folder.
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = os.path.join(tmp, "streams")
+            locked = os.path.join(src_dir, "locked")
+            os.makedirs(locked)
+            with open(os.path.join(src_dir, "one.bk2"), "wb") as fh:
+                fh.write(make_stream(1280, 720, 40))
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+            out = os.path.join(tmp, "names.csv")
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write("previous report\n")
+            real_scandir = os.scandir
+            target = os.path.normcase(os.path.abspath(locked))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(os.fspath(path))) == target:
+                    raise PermissionError(13, "Access is denied", os.fspath(path))
+                return real_scandir(path, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch.object(names_mod.os, "scandir", scandir):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as cm:
+                        names_mod.main([src_dir, "--mount", xml, "--out", out])
+            self.assertEqual(cm.exception.code, 2, err.getvalue())
+            self.assertIn("cannot list", err.getvalue())
+            self.assertIn(locked, err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "previous report\n")
 
 
 class TestReportErrors(unittest.TestCase):

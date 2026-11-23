@@ -370,12 +370,18 @@ def main(argv=None):
     if a.out and os.path.isdir(a.out):
         ap.error(f"--out is a folder, not a report file: {a.out}")
     if a.out:
+        def unlistable(error):
+            # os.walk skips a folder it cannot list unless onerror stops it, and then an --out that is a file in
+            # that folder would pass this check and be overwritten. Refuse rather than guess.
+            ap.error(f"--out cannot be checked against the inputs: cannot list {error.filename or folder}: "
+                     f"{error.strerror or error}")
+
         for folder in [p for p in [a.source, *a.mount] if os.path.isdir(p)]:
             manifest = os.path.join(folder, "index.json")
             if os.path.isfile(manifest) and bink_index.same_output_path(a.out, manifest):
                 ap.error(f"--out would overwrite the carve manifest: {a.out}")
             if os.path.isfile(a.out):
-                for root, _dirs, names in os.walk(folder):
+                for root, _dirs, names in os.walk(folder, onerror=unlistable):
                     for name in names:
                         if name.lower().endswith((".json", ".csv")):
                             continue
