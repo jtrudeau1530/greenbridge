@@ -2,8 +2,9 @@
 
 Covers the 7 remaining RDNA2 dot-product instructions:
   - v_dot2c_i32_i16, v_dot2c_u32_u16, v_dot4c_u32_u8, v_dot8c_i32_i4, v_dot8c_u32_u4 (VOP2 accumulating)
-  - v_dot2_f32_f16 (VOP3P half-to-float dot product with op_sel, op_sel_hi, neg_lo, neg_hi, clamp)
-  - v_dot2c_f32_f16 (VOP2 accumulating half-to-float dot product with optional clamp)
+  - v_dot2_f32_f16 (VOP3P half-to-float dot product with op_sel, op_sel_hi, neg_lo, neg_hi; clamp is accepted
+    and, as on the hardware, has no effect)
+  - v_dot2c_f32_f16 (VOP2 accumulating half-to-float dot product, no modifiers)
 
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 """
@@ -110,7 +111,6 @@ def ref_dot2_f32_f16(
     selhi=(1, 1, 1),
     nlo=(0, 0, 0),
     nhi=(0, 0, 0),
-    clamp: bool = False,
 ) -> int:
     a0 = bits_f16((s0 >> (16 * sel[0])) & 0xFFFF)
     a1 = bits_f16((s0 >> (16 * selhi[0])) & 0xFFFF)
@@ -131,8 +131,6 @@ def ref_dot2_f32_f16(
     p1 = f32(a1 * b1)
     s = f32(p0 + p1)
     r = f32(s + acc)
-    if clamp:
-        r = max(0.0, min(1.0, r))
     return f32_bits(r)
 
 
@@ -236,18 +234,18 @@ class HalfDotF32Tests(unittest.TestCase):
         self.assertEqual(got[0], want)
         self.assertEqual(got[3], want)
 
-    def test_v_dot2_f32_f16_opsel_neg_and_clamp(self):
+    def test_v_dot2_f32_f16_opsel_neg_and_ignored_clamp(self):
         s0 = pack_f16x2(1.5, -2.0)
         s1 = pack_f16x2(4.0, 0.5)
         acc = f32_bits(0.75)
         cases = [
-            ("op_sel:[1,0,0] op_sel_hi:[0,1,1]", (1, 0, 0), (0, 1, 1), (0, 0, 0), (0, 0, 0), False),
-            ("neg_lo:[1,0,0] neg_hi:[0,1,0]", (0, 0, 0), (1, 1, 1), (1, 0, 0), (0, 1, 0), False),
-            ("neg_lo:[0,0,1]", (0, 0, 0), (1, 1, 1), (0, 0, 1), (0, 0, 0), False),
-            ("clamp", (0, 0, 0), (1, 1, 1), (0, 0, 0), (0, 0, 0), True),
-            ("neg_lo:[1,1,1] clamp", (0, 0, 0), (1, 1, 1), (1, 1, 1), (0, 0, 0), True),
+            ("op_sel:[1,0,0] op_sel_hi:[0,1,1]", (1, 0, 0), (0, 1, 1), (0, 0, 0), (0, 0, 0)),
+            ("neg_lo:[1,0,0] neg_hi:[0,1,0]", (0, 0, 0), (1, 1, 1), (1, 0, 0), (0, 1, 0)),
+            ("neg_lo:[0,0,1]", (0, 0, 0), (1, 1, 1), (0, 0, 1), (0, 0, 0)),
+            ("clamp", (0, 0, 0), (1, 1, 1), (0, 0, 0), (0, 0, 0)),
+            ("neg_lo:[1,1,1] clamp", (0, 0, 0), (1, 1, 1), (1, 1, 1), (0, 0, 0)),
         ]
-        for mods, sel, selhi, nlo, nhi, clamp in cases:
+        for mods, sel, selhi, nlo, nhi in cases:
             with self.subTest(mods=mods):
                 got = run_ps([
                     f"v_mov_b32 v1, {s0:#x}",
@@ -255,17 +253,7 @@ class HalfDotF32Tests(unittest.TestCase):
                     f"v_mov_b32 v3, {acc:#x}",
                     f"v_dot2_f32_f16 v0, v1, v2, v3 {mods}",
                 ])[0]
-                self.assertEqual(got, ref_dot2_f32_f16(s0, s1, acc, sel, selhi, nlo, nhi, clamp=clamp))
-
-        # v_dot2c_f32_f16 clamp
-        got_c = run_ps([
-            f"v_mov_b32 v0, {f32_bits(0.5):#x}",
-            f"v_mov_b32 v1, {pack_f16x2(2.0, 1.0):#x}",
-            f"v_mov_b32 v2, {pack_f16x2(1.0, 1.0):#x}",
-            "v_mov_b32 v3, 0",
-            "v_dot2c_f32_f16_e64 v0, v1, v2 clamp",
-        ])[0]
-        self.assertEqual(got_c, f32_bits(1.0))
+                self.assertEqual(got, ref_dot2_f32_f16(s0, s1, acc, sel, selhi, nlo, nhi))
 
     def test_subnormals_inf_and_nan(self):
         # f16 subnormal input (2^-24) * 2.0 + 0.0 -> 2^-23 (exact normal f32, kept)
@@ -336,6 +324,7 @@ class HalfDotF32Tests(unittest.TestCase):
             "v_dot2c_f32_f16 v0, v1, v2 neg_lo:[1,0,0]",
             "v_dot2c_f32_f16_sdwa v0, v1, v2 dst_sel:DWORD",
             "v_dot2c_f32_f16_e64 v0, |v1|, v2",
+            "v_dot2c_f32_f16_e64 v0, v1, v2 clamp",
             "v_dot2c_f32_f16 s0, v1, v2",
         ]
         for line in bad_lines:

@@ -7200,7 +7200,9 @@ class Gen:
                     self.emit(f"{t} = OpFNegate %float {acc}")
                     acc = t
             else:
-                if any(m != "clamp" for m in mods):
+                # The VOP2 form has no clamp bit, and gfx103x has no VOP3 form (llvm-mc rejects
+                # v_dot2c_f32_f16_e64 and calls the bytes an invalid encoding), so a clamp here is unmeasurable.
+                if mods:
                     raise Unsupported(op + " modifiers")
                 a0 = self.f16_in(a[1], 0)
                 a1 = self.f16_in(a[1], 1)
@@ -7212,7 +7214,8 @@ class Gen:
             self.emit(f"{p1} = OpFMul %float {a1} {b1}")
             self.emit(f"{s} = OpFAdd %float {p0} {p1}")
             self.emit(f"{r} = OpFAdd %float {s} {acc}")
-            r = self.clamp_mods(r, ["clamp"] if "clamp" in mods else [])
+            # v_dot2_f32_f16 `clamp` is encoded but the hardware ignores it (measured on gfx1031, docs/design.md
+            # "v_dot2_f32_f16 clamp"), so it is accepted and not applied.
             self.dst(a[0], self.tou(r))
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
