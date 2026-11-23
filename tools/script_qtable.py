@@ -40,6 +40,10 @@ ARRAY_FLAG_POINTERS = 0x10000
 MAX_RECORDS = 1_000_000
 
 
+class UsageError(ValueError):
+    """CLI argument or output-path error reported with exit code 2."""
+
+
 def _align16(value: int) -> int:
     return (value + 15) & ~15
 
@@ -60,30 +64,51 @@ def is_qtable_prefix(blob: bytes) -> bool:
 
 
 def _parse_hex_u32(text: str) -> int:
-    value = int(text, 16)
+    try:
+        value = int(text, 16)
+    except ValueError as e:
+        raise UsageError(f"invalid hex u32: {text}") from e
     if not (0 <= value <= 0xFFFFFFFF):
-        raise ValueError(f"hash out of u32 range: {text}")
+        raise UsageError(f"hash out of u32 range: {text}")
     return value
 
 
 def _classify_record(idx: int, rec: bytes, ptrs: list[tuple[int, int, int | None]]) -> dict:
     w2, w3 = struct.unpack_from("<2I", rec, 8)
-    if len(rec) >= ARRAY_HEADER_BYTES and w2 == ARRAY_MARKER and w3 == 0:
-        cnt, cap, stride, aflags, w8, w9, elem_hash, w11 = struct.unpack_from("<8I", rec, 16)
-        if cnt == cap:
-            expected_len = _align16(ARRAY_HEADER_BYTES + cnt * stride)
+    if w2 == ARRAY_MARKER and w3 == 0:
+        if len(rec) < ARRAY_HEADER_BYTES:
             return {
                 "index": idx,
                 "kind": "array",
                 "bytes": len(rec),
-                "count": cnt,
-                "stride": stride,
-                "array_flags": aflags,
-                "element_type_hash": elem_hash,
-                "size_exact": expected_len == len(rec),
-                "extra_words_zero": (w8 == 0 and w9 == 0 and w11 == 0),
-                "zero_element_hash": elem_hash == 0,
+                "count": 0,
+                "capacity": 0,
+                "stride": 0,
+                "array_flags": 0,
+                "element_type_hash": 0,
+                "header_complete": False,
+                "count_eq_capacity": False,
+                "size_exact": False,
+                "extra_words_zero": False,
+                "zero_element_hash": True,
             }
+        cnt, cap, stride, aflags, w8, w9, elem_hash, w11 = struct.unpack_from("<8I", rec, 16)
+        expected_len = _align16(ARRAY_HEADER_BYTES + cnt * stride)
+        return {
+            "index": idx,
+            "kind": "array",
+            "bytes": len(rec),
+            "count": cnt,
+            "capacity": cap,
+            "stride": stride,
+            "array_flags": aflags,
+            "element_type_hash": elem_hash,
+            "header_complete": True,
+            "count_eq_capacity": cnt == cap,
+            "size_exact": expected_len == len(rec),
+            "extra_words_zero": (w8 == 0 and w9 == 0 and w11 == 0),
+            "zero_element_hash": elem_hash == 0,
+        }
 
     is_wrapper = (
         len(rec) == 32
@@ -109,16 +134,20 @@ def _collect_subtree(root_idx: int, adj: list[list[int]], records: list[dict],
     stack = [(root_idx, 0)]
     seen: set[int] = set()
     arrays = structs = max_depth = total_bytes = cross_edges = 0
+    expected_next = root_idx
+    dfs_preorder = True
     stride_counts: Counter[int] = Counter()
     struct_sizes: Counter[int] = Counter()
 
     while stack:
         node, depth = stack.pop()
         if node in seen:
+            dfs_preorder = False
             continue
         seen.add(node)
-        if not (root_idx <= node < limit_hi):
-            cross_edges += 1
+        if node != expected_next:
+            dfs_preorder = False
+        expected_next += 1
         if depth > max_depth:
             max_depth = depth
         rec_end = offsets[node + 1] if node + 1 < len(offsets) else end_off
@@ -130,8 +159,15 @@ def _collect_subtree(root_idx: int, adj: list[list[int]], records: list[dict],
         else:
             structs += 1
             struct_sizes[info["bytes"]] += 1
-        for child in adj[node]:
-            stack.append((child, depth + 1))
+        for child in reversed(adj[node]):
+            if root_idx <= child < limit_hi:
+                stack.append((child, depth + 1))
+            else:
+                cross_edges += 1
+                dfs_preorder = False
+
+    if expected_next != limit_hi:
+        dfs_preorder = False
 
     return {
         "nodes": len(seen),
@@ -140,6 +176,7 @@ def _collect_subtree(root_idx: int, adj: list[list[int]], records: list[dict],
         "arrays": arrays,
         "structs": structs,
         "cross_tree_edges": cross_edges,
+        "dfs_preorder": dfs_preorder,
         "array_strides": {str(k): stride_counts[k] for k in sorted(stride_counts)},
         "struct_sizes": {str(k): struct_sizes[k] for k in sorted(struct_sizes)},
     }
@@ -154,6 +191,10 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
 
     n = struct.unpack_from("<I", blob, 0x14)[0]
     table_end = HEADER_BYTES + n * 8
+    if len(blob) < table_end:
+        raise ValueError(
+            f"payload length {len(blob)} is shorter than {n}-record offset table ({table_end} bytes)"
+        )
     offsets = list(struct.unpack_from(f"<{n}Q", blob, HEADER_BYTES))
 
     for i, off in enumerate(offsets):
@@ -186,6 +227,7 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
     element_hashes: set[int] = set()
     struct_hashes: set[int] = set()
     wrapper_count = struct_w3_nonzero = 0
+    array_header_complete = array_count_eq_capacity = 0
     array_exact = array_extra_zero = array_zero_elem_hash = 0
     array_ptr_stride8 = array_ptr_count = 0
 
@@ -226,6 +268,10 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
             array_stride_hist[info["stride"]] += 1
             array_flags_hist[info["array_flags"]] += 1
             element_hashes.add(info["element_type_hash"])
+            if info["header_complete"]:
+                array_header_complete += 1
+            if info["count_eq_capacity"]:
+                array_count_eq_capacity += 1
             if info["size_exact"]:
                 array_exact += 1
             if info["extra_words_zero"]:
@@ -256,6 +302,7 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
     tree_depths: list[int] = []
     cross_tree_edges = 0
     tree_owner: list[int] = [-1] * n
+    all_dfs_preorder = bool(root_indices) and root_indices[0] == 0
     for pos, r_idx in enumerate(root_indices):
         hi = root_indices[pos + 1] if pos + 1 < len(root_indices) else n
         for member in range(r_idx, hi):
@@ -264,9 +311,15 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
         tree_sizes.append(stats["nodes"])
         tree_depths.append(stats["max_depth"])
         cross_tree_edges += stats["cross_tree_edges"]
+        if not stats["dfs_preorder"]:
+            all_dfs_preorder = False
 
     trees_partition_records = sum(tree_sizes) == n and cross_tree_edges == 0
-    contiguous_preorder = trees_partition_records and forward_edges == resolved_pointers
+    contiguous_preorder = (
+        trees_partition_records
+        and forward_edges == resolved_pointers
+        and all_dfs_preorder
+    )
 
     array_count = sum(1 for r in records if r["kind"] == "array")
     struct_count = n - array_count
@@ -275,6 +328,8 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
         unresolved_pointers == 0
         and root_bijection_holds
         and contiguous_preorder
+        and array_header_complete == array_count
+        and array_count_eq_capacity == array_count
         and array_exact == array_count
     )
 
@@ -301,6 +356,8 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
         "nonroot_prefix_flags_nonzero": nonroot_flags_nonzero,
         "root_prefix_flags": {f"{k:#x}": root_flags_hist[k] for k in sorted(root_flags_hist)},
         "array_records": array_count,
+        "array_header_complete": array_header_complete,
+        "array_count_eq_capacity": array_count_eq_capacity,
         "array_size_exact": array_exact,
         "array_extra_words_zero": array_extra_zero,
         "array_zero_element_hashes": array_zero_elem_hash,
@@ -355,6 +412,23 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
     return result
 
 
+def _is_complete_qtable(blob: bytes) -> bool:
+    """True when `blob` already holds a complete, structurally valid qtable payload."""
+    if not is_qtable_prefix(blob) or len(blob) % 16 != 0:
+        return False
+    n = struct.unpack_from("<I", blob, 0x14)[0]
+    table_end = HEADER_BYTES + n * 8
+    if len(blob) < table_end + 16:
+        return False
+    last_off = struct.unpack_from("<Q", blob, HEADER_BYTES + (n - 1) * 8)[0]
+    if last_off < table_end or last_off + 16 > len(blob):
+        return False
+    try:
+        return bool(parse_qtable(blob)["valid"])
+    except ValueError:
+        return False
+
+
 def _join_qtable_from_source(source) -> tuple[bytes, dict]:
     rows = source.rows
     n = len(rows)
@@ -367,6 +441,8 @@ def _join_qtable_from_source(source) -> tuple[bytes, dict]:
         j = i + 1
         prev_len = len(data)
         while j < n and prev_len > 0 and prev_len % 65536 == 0:
+            if _is_complete_qtable(b"".join(parts)):
+                break
             nxt = source.read(rows[j])
             nk = gi.stream_kind(nxt, rows[j])
             if nk in ("decl", "bink2", "rbf0", "psin", "other") or gi.standalone_xml(nxt):
@@ -377,7 +453,7 @@ def _join_qtable_from_source(source) -> tuple[bytes, dict]:
             j += 1
         blob = b"".join(parts)
         meta = {
-            "source_type": "directory" if isinstance(source, gi.DirectorySource) else "archive",
+            "source_type": "directory" if isinstance(source, (gi.DirectorySource, _BinFolderSource)) else "archive",
             "offset": rows[i]["off"],
             "offset_hex": f"{rows[i]['off']:#x}",
             "chunks": j - i,
@@ -446,18 +522,21 @@ def load_qtable_payload(target: str) -> tuple[bytes, dict]:
 def check_report_path(out_path: str, target: str, rows: list[dict] | None = None) -> None:
     """Refuse a --json destination that is a directory or collides with any input."""
     if os.path.isdir(out_path):
-        raise ValueError(f"--json is a directory: {out_path}")
+        raise UsageError(f"--json is a directory: {out_path}")
     if os.path.isdir(target):
         if os.path.isfile(os.path.join(target, "index.json")):
-            gm.check_report_path(out_path, target, rows=rows)
+            try:
+                gm.check_report_path(out_path, target, rows=rows)
+            except ValueError as e:
+                raise UsageError(str(e)) from e
         elif same_report_path(out_path, target):
-            raise ValueError(f"--json would overwrite the input {target}")
+            raise UsageError(f"--json would overwrite the input {target}")
         else:
             for name in os.listdir(target):
                 if name.lower().endswith(".bin") and same_report_path(out_path, os.path.join(target, name)):
-                    raise ValueError(f"--json would overwrite the input {name}")
+                    raise UsageError(f"--json would overwrite the input {name}")
     elif same_report_path(out_path, target):
-        raise ValueError(f"--json would overwrite the input {target}")
+        raise UsageError(f"--json would overwrite the input {target}")
 
 
 def _print_summary(report: dict) -> None:
@@ -514,7 +593,7 @@ def main(argv=None) -> int:
         report = parse_qtable(blob, root_hash=root_h, type_hash=type_h)
     except (OSError, ValueError, KeyError, TypeError, struct.error, RuntimeError) as e:
         print("error:", e, file=sys.stderr)
-        return 2 if isinstance(e, ValueError) and "--json" in str(e) else 1
+        return 2 if isinstance(e, UsageError) else 1
 
     out = {"location": meta, **report}
     _print_summary(out)

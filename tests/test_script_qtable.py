@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,9 +43,9 @@ def build_synthetic_qtable(*, pad_to_bytes: int = 0) -> bytes:
     #     [6] 32B leaf struct (type 0xAAAA0005)
     sizes = [32, 64, 48, 64, 48, 96, 32]
     if pad_to_bytes:
-        # Enlarge last leaf value array? Better: add padding elements to record [5] so align16 stays exact.
-        extra_elems = max(0, (pad_to_bytes - 0x200) // 12)
-        cnt5 = 3 + extra_elems
+        # Enlarge leaf value array [5] so align16 stays exact.
+        other_bytes = 40 + len(sizes) * 8 + sum(sizes) - sizes[5]
+        cnt5 = max(3, (pad_to_bytes - other_bytes - 48) // 12)
         sizes[5] = ((48 + cnt5 * 12) + 15) & ~15
     else:
         cnt5 = 3
@@ -176,6 +177,128 @@ class ScriptQtableTests(unittest.TestCase):
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
             )
             self.assertEqual(p2.returncode, 1)
+
+            p3 = subprocess.run(
+                [sys.executable, "-I", TOOL, bin_path, "--root-hash", "nothex"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(p3.returncode, 2)
+            self.assertIn("invalid hex", p3.stderr)
+
+    def test_exact_64k_qtable_does_not_absorb_trailing_opaque_row(self):
+        exact = build_synthetic_qtable(pad_to_bytes=65536)
+        self.assertEqual(len(exact), 65536)
+        opaque = b"\x01\x02\x03\x04" * 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            rows = [
+                {"off": 0x2000, "stored": 9000, "size": len(exact), "head": exact[:16].hex()},
+                {"off": 0x8000, "stored": 16, "size": len(opaque), "head": opaque[:16].hex()},
+            ]
+            with open(os.path.join(carve, f"{rows[0]['off']:012x}.bin"), "wb") as f:
+                f.write(exact)
+            with open(os.path.join(carve, f"{rows[1]['off']:012x}.bin"), "wb") as f:
+                f.write(opaque)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": {"archive": "synthetic", "files": len(rows)}, "files": rows}, f)
+
+            blob, meta = script_qtable.load_qtable_payload(carve)
+            self.assertEqual(meta["chunks"], 1)
+            self.assertEqual(meta["inflated"], 65536)
+            self.assertEqual(meta["source_type"], "directory")
+            self.assertTrue(script_qtable.parse_qtable(blob)["valid"])
+
+            raw_dir = os.path.join(tmp, "raw_bins")
+            os.makedirs(raw_dir)
+            with open(os.path.join(raw_dir, "000000002000.bin"), "wb") as f:
+                f.write(exact)
+            with open(os.path.join(raw_dir, "000000008000.bin"), "wb") as f:
+                f.write(opaque)
+            blob2, meta2 = script_qtable.load_qtable_payload(raw_dir)
+            self.assertEqual(meta2["source_type"], "directory")
+            self.assertEqual(meta2["chunks"], 1)
+            self.assertEqual(len(blob2), 65536)
+
+    def test_array_marker_mismatched_capacity_and_truncated_header_fail_validation(self):
+        # Record [1] is the 64B array at offsets[1]; bump capacity from 2 to 3.
+        bad_cap = bytearray(build_synthetic_qtable())
+        rec1_off = struct.unpack_from("<Q", bad_cap, 40 + 8)[0]
+        struct.pack_into("<I", bad_cap, rec1_off + 20, 3)
+        rep = script_qtable.parse_qtable(bytes(bad_cap))
+        self.assertEqual(rep["array_records"], 2)
+        self.assertEqual(rep["array_count_eq_capacity"], 1)
+        self.assertFalse(rep["valid"])
+
+        # Set w2=0x14, w3=0 on 32B struct record [6] (shorter than 48B array header).
+        short_arr = bytearray(build_synthetic_qtable())
+        rec6_off = struct.unpack_from("<Q", short_arr, 40 + 6 * 8)[0]
+        struct.pack_into("<2I", short_arr, rec6_off + 8, script_qtable.ARRAY_MARKER, 0)
+        rep2 = script_qtable.parse_qtable(bytes(short_arr))
+        self.assertEqual(rep2["array_records"], 3)
+        self.assertEqual(rep2["array_header_complete"], 2)
+        self.assertFalse(rep2["valid"])
+
+    def test_contiguous_preorder_requires_strict_dfs_and_rejects_short_offset_table(self):
+        def build_4rec(r0_ptrs: list[int], r1_ptrs: list[int]) -> bytes:
+            table_end = 40 + 4 * 8  # 72; align16(72) == 80
+            first_off = 80
+            offsets = [first_off + i * 32 for i in range(4)]
+
+            def pack_rec(rkey: int, thash: int, ptrs: list[int]) -> bytes:
+                w = [0, 0]
+                for idx, tgt in enumerate(ptrs):
+                    w[idx] = Q_PTR_HIGH | (offsets[tgt] + 8)
+                return struct.pack("<4I2Q", rkey, 0, thash, 0, w[0], w[1])
+
+            recs = b"".join([
+                pack_rec(0x11111111, 0xAAAA0001, r0_ptrs),
+                pack_rec(0, 0xAAAA0002, r1_ptrs),
+                pack_rec(0, 0xAAAA0003, []),
+                pack_rec(0, 0xAAAA0004, []),
+            ])
+            header = struct.pack("<10I", 0, 0, 0, 0, 0, 4, 0, 0, 0, 0)
+            return header + struct.pack("<4Q", *offsets) + bytes(first_off - table_end) + recs
+
+        ok_rep = script_qtable.parse_qtable(build_4rec([1, 3], [2]))
+        self.assertTrue(ok_rep["contiguous_preorder"])
+        self.assertTrue(ok_rep["valid"])
+
+        bad_interleaved = script_qtable.parse_qtable(build_4rec([1, 2], [3]))
+        self.assertFalse(bad_interleaved["contiguous_preorder"])
+        self.assertFalse(bad_interleaved["valid"])
+
+        bad_sibling_order = script_qtable.parse_qtable(build_4rec([3, 1], [2]))
+        self.assertFalse(bad_sibling_order["contiguous_preorder"])
+        self.assertFalse(bad_sibling_order["valid"])
+
+        # Header claiming 11 records in 64B payload must raise ValueError, not struct.error.
+        trunc = bytearray(64)
+        struct.pack_into("<I", trunc, 0x14, 11)
+        struct.pack_into("<Q", trunc, 40, 128)
+        with self.assertRaisesRegex(ValueError, "shorter than"):
+            script_qtable.parse_qtable(bytes(trunc))
+
+    def test_all_root_forward_chain_runs_linear_time(self):
+        n = 2000
+        table_end = 40 + n * 8
+        first_off = (table_end + 15) & ~15
+        offsets = [first_off + i * 16 for i in range(n)]
+        header = struct.pack("<10I", 0, 0, 0, 0, 0, n, 0, 0, 0, 0)
+        offset_table = struct.pack(f"<{n}Q", *offsets)
+        recs = bytearray()
+        for i in range(n):
+            word = (Q_PTR_HIGH | (offsets[i + 1] + 8)) if i + 1 < n else 0
+            recs += struct.pack("<2IQ", i + 1, 0, word)
+        blob = header + offset_table + bytes(first_off - table_end) + bytes(recs)
+
+        t0 = time.monotonic()
+        rep = script_qtable.parse_qtable(blob)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.0)
+        self.assertFalse(rep["valid"])
+        self.assertEqual(rep["cross_tree_edges"], n - 1)
 
 
 if __name__ == "__main__":

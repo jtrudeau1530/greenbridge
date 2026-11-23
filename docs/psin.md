@@ -514,8 +514,9 @@ pointer whose low 32 bits equal `offsets[target] + 8` (the start of record `targ
 - **Exact root bijection:** the **483** records with `root_key_hash != 0` are the exact **483** records with
   in-degree `0`; all **30,200** records with `root_key_hash == 0` have in-degree `1`.
 - **Contiguous preorder forest:** all **30,200** edges point strictly forward (`target > source`, `0` back-edges or
-  cycles) and remain inside their root's contiguous index slice `[root_k, root_{k+1})` (`0` cross-tree edges). Tree sizes
-  range from `1` to `1,131` nodes (median `53`, depths `0..9`).
+  cycles), remain inside their root's contiguous index slice `[root_k, root_{k+1})` (`0` cross-tree edges), and match
+  strict depth-first preorder in stored pointer-field sibling order across all **30,683** positions. Tree sizes range
+  from `1` to `1,131` nodes (median `53`, depths `0..9`).
 
 ### Array and struct records
 
