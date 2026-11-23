@@ -799,8 +799,7 @@ the drawable's local joint palette through the drawable and ped tables, and emit
 in [character_skeleton.md](character_skeleton.md#skinned-glb-export). On the 1.0.2.1 package, the
 head (8,983 v) and biker jacket (9,818 v) produce one skin with 596 ped joints (703 with the
 jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconstruction error is
-6e-8 m. `python -I tests/test_skinned_glb.py` runs 10 synthetic tests and needs no game files.
-6e-8 m. `python -I tests/test_skinned_glb.py` runs 15 synthetic tests and needs no game files.
+6e-8 m. `python -I tests/test_skinned_glb.py` runs 19 synthetic tests and needs no game files.
 
 ## What to do next
 

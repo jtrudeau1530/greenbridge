@@ -3289,8 +3289,6 @@ own names use the `XDXR` prefix for Xbox's raytracing path:
 **The builder's own shaders are console FSSM, not Xbox DXIL.** Each of the 52 containers carries an LLVM
 bitcode blob and an `XDAT`/`XBCH` record; the PC experiment below compiled the bitcode, but the console runtime
 executes the `XBCH` record. Measured from that record: 52/52 unpack to `FSSM`, 51 translate and all 51 pass
-`spirv-val` with the same translator the game's 26,503 shaders use; the one left, `Box16Rehydration`, needs
-`buffer_store_short` ([embedded_shaders.md](embedded_shaders.md)). The
 `spirv-val` with the same translator the game's 26,503 shaders use; the one left (`Box16Rehydration`) needs
 `buffer_store_short` (#1864) ([embedded_shaders.md](embedded_shaders.md)). The
 raw 64-bit addresses are the corpus's existing raw-address path, not a separate lowering. Open: whether the game
@@ -3303,7 +3301,6 @@ Vulkan AS would be invisible to them. Two paths:
 1. If `XboxBvhBuilder` does the build with its own compute dispatches (the likely case, given it ships as a DLL
    with a device and command lists), the layer must translate and run its compute shaders. The console programs
    are `FSSM` and 51 of the 52 already pass `spirv-val`; only `Box16Rehydration` still needs `buffer_store_short` (#1864). Buffers,
-   are `FSSM` and 51 of the 52 already pass `spirv-val`; the one left still needs `buffer_store_short`. Buffers,
    UAVs, descriptors, barriers and indirect dispatch are necessary but not sufficient. The standard
    `BuildRaytracingAccelerationStructure` calls may never reach our command list.
 2. If the game calls `ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure`, the layer must implement
@@ -3809,7 +3806,6 @@ nothing is copied from their trees.
   unknown. If the game assumes console tiling or compression metadata, the layer needs a detile/repack step.
 - **BVH builder shaders.** The container's DXIL bitcode is Xbox DXIL that PC drivers reject; its console `XBCH`
   record is `FSSM`, and 51 of the 52 programs already pass `spirv-val` through the same translator as the game
-  ([embedded_shaders.md](embedded_shaders.md)). The one left needs `buffer_store_short`. Translation is not execution:
   ([embedded_shaders.md](embedded_shaders.md)). The one left needs `buffer_store_short` (#1864). Translation is not execution:
   there is no GPU reference for any of the 52 yet.
 - **Ray tracing.** The game's RT work includes 64 compute shaders that traverse AMD-format BVH nodes, and it ships

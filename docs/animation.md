@@ -1064,7 +1064,6 @@ The bytes support **new RAGE resource pages**, not the GTA V `YCD`/`RSC7` family
 6. **Keep the compression boundary explicit.** Outer RPF9 zlib is understood. Do not add a zlib pass inside a
    page without evidence; the sampled pages had no valid nested stream.
 7. **Re-run the model cross-check with the full export.** The current 1,350-model data.rpf manifest has bone
-   bindings but no bone names or hashes. The full 350,251-model export plus the `RBF0` rig table is needed to
    bindings but no bone names or hashes. The full 382,781-model export plus the `RBF0` rig table is needed to
    match skeletons to models.
 
