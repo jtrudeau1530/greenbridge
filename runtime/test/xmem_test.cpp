@@ -459,7 +459,19 @@ void test_physical_pages(const PhysicalApi& api) {
     // The windows were split into one placeholder per page; the process exit releases them.
 }
 
+// True when a read fault raised for `address` reaches this handler rather than being retried by the split handler.
+bool read_fault_reaches_caller(const void* address) {
+    const ULONG_PTR info[2] = {0, reinterpret_cast<ULONG_PTR>(address)};
+    __try {
+        RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 2, info);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
+    }
+    return false;
+}
+
 // Splitting a view briefly unmaps the view's other pages; a thread reading one of them meanwhile must not fault.
+// Unmapping page k of the view [k, end) splits it every time, and the last page of each view is the one being read.
 void test_split_under_reader(const PhysicalApi& api) {
     constexpr uint64_t kPages = 2048;  // two capped views
     auto* const window = static_cast<uint8_t*>(
@@ -470,24 +482,30 @@ void test_split_under_reader(const PhysicalApi& api) {
               api.map(window, kPages, pages.data()) == window,
           "a 2,048-page run maps for the split test");
     if (!window || count != kPages) return;
-    fill_page(window + 11 * kPage64k, 0x11000u);
+    uint8_t* const read_pages[2] = {window + 1023 * kPage64k, window + 2047 * kPage64k};
+    fill_page(read_pages[0], 0x11000u);
+    fill_page(read_pages[1], 0x11000u);
     std::atomic<bool> done{false};
     std::atomic<uint64_t> reads{0}, wrong{0};
     std::thread reader([&] {
-        while (!done.load(std::memory_order_relaxed)) {
-            wrong += read_u32(window + 11 * kPage64k, 0) != 0x11000u;
+        for (uint64_t i = 0; !done.load(std::memory_order_relaxed); ++i) {
+            wrong += read_u32(read_pages[i & 1], 0) != 0x11000u;
             ++reads;
         }
     });
-    void* const page = window + 10 * kPage64k;
-    bool remapped = true;
-    for (int i = 0; i < 2000; ++i) {
-        remapped &= api.scatter(&page, 1, nullptr) == TRUE && api.scatter(&page, 1, &pages[10]) == TRUE;
+    bool unmapped = true;
+    for (uint64_t k = 0; k < kPages - 1; ++k) {
+        if (k == 1023) continue;
+        void* const page = window + k * kPage64k;
+        unmapped &= api.scatter(&page, 1, nullptr) == TRUE;
     }
     done = true;
     reader.join();
-    check(remapped, "a page next to a reader unmaps and maps again 2,000 times");
-    check(reads.load() > 0 && wrong.load() == 0, "the reader of the neighbouring page never faults or misreads");
+    check(unmapped, "2,046 pages unmap one at a time, each splitting the view a reader is in");
+    check(reads.load() > 0 && wrong.load() == 0, "the reader of the views' last pages never faults or misreads");
+    // The last split was of [2046, 2048): a fault there is retried, one on another mapped page is not.
+    check(!read_fault_reaches_caller(read_pages[1]), "a read fault inside the last split span is retried");
+    check(read_fault_reaches_caller(read_pages[0]), "a read fault on a mapped page outside it reaches the caller");
     api.map(window, kPages, nullptr);
     api.free_pages(kPages, pages.data());
 }
@@ -531,6 +549,19 @@ void test_long_run(const PhysicalApi& api) {
           "the whole run unmaps");
     check(api.free_pages(kPages, pages.data()) == TRUE, "the long run's pages are freed");
     check(api.map(window, 1, pages.data()) == nullptr && reserved_only(window), "a freed page does not map again");
+    // Pages freed while still mapped keep their memory, and splitting their view later still maps the rest again.
+    count = 4;
+    check(api.allocate(0x280, &count, pages.data()) == TRUE && count == 4 && api.map(window, 4, pages.data()) == window,
+          "four pages map as one view");
+    if (count != 4) return;
+    for (uint64_t i = 0; i < 4; ++i) fill_page(window + i * kPage64k, static_cast<uint32_t>(i + 1));
+    check(api.free_pages(4, pages.data()) == TRUE, "they are freed while mapped");
+    void* const second = window + kPage64k;
+    check(api.scatter(&second, 1, nullptr) == TRUE && !reserved_only(window) &&
+              !reserved_only(window + 2 * kPage64k) && page_holds(window, 1u) &&
+              page_holds(window + 2 * kPage64k, 3u) && page_holds(window + 3 * kPage64k, 4u),
+          "unmapping one of them afterwards keeps the others' memory");
+    api.map(window, 4, nullptr);
 }
 
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.

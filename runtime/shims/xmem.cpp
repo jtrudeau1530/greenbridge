@@ -276,9 +276,14 @@ std::map<uintptr_t, View> g_views;  // view base -> view
 // Splitting a view (unmap_range) unmaps it whole and maps its remainders again, so for that moment pages the caller
 // did not name are unmapped. On the console they stay mapped, and another thread may be reading them. The span being
 // split is published here, and a vectored handler makes a thread that faults inside it wait for the remap, then
-// retries the access.
+// retries the access. The last finished split stays published too, for a fault the handler sees only after the split
+// is done; any other access violation goes on to the next handler.
+// Only the last finished span is kept, so a fault delivered after two later splits is not retried.
 std::atomic<uintptr_t> g_split_begin{0};
 std::atomic<uintptr_t> g_split_end{0};
+std::atomic<uintptr_t> g_last_split_begin{0};
+std::atomic<uintptr_t> g_last_split_end{0};
+std::atomic<uint64_t> g_splits{0};  // splits started
 bool g_split_handler = false;  // with g_phys_mutex held
 
 LONG CALLBACK wait_for_split(EXCEPTION_POINTERS* info) {
@@ -290,19 +295,31 @@ LONG CALLBACK wait_for_split(EXCEPTION_POINTERS* info) {
     const uintptr_t address = record.ExceptionInformation[1];
     if (access != 0 && access != 1) return EXCEPTION_CONTINUE_SEARCH;
     for (;;) {
-        const uintptr_t begin = g_split_begin.load(std::memory_order_acquire);
-        if (!begin || address < begin || address >= g_split_end.load(std::memory_order_acquire)) break;
-        SwitchToThread();
+        const uint64_t splits = g_splits.load(std::memory_order_acquire);
+        bool in_split = false;
+        for (;;) {
+            const uintptr_t begin = g_split_begin.load(std::memory_order_acquire);
+            if (!begin || address < begin || address >= g_split_end.load(std::memory_order_acquire)) break;
+            in_split = true;
+            SwitchToThread();
+        }
+        if (!in_split) {
+            const uintptr_t last = g_last_split_begin.load(std::memory_order_acquire);
+            in_split = last && address >= last && address < g_last_split_end.load(std::memory_order_acquire);
+        }
+        if (!in_split) return EXCEPTION_CONTINUE_SEARCH;
+        // Retry only an access the page now allows: the fault may have come in during a split that has since finished.
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+            mbi.Type == MEM_MAPPED) {
+            const DWORD protect = mbi.Protect & 0xff;
+            const bool allowed =
+                access == 1 ? protect == PAGE_READWRITE : protect == PAGE_READWRITE || protect == PAGE_READONLY;
+            return allowed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+        }
+        // Not mapped. A split that started since the wait ended may have unmapped it again: wait for that one too.
+        if (g_splits.load(std::memory_order_acquire) == splits) return EXCEPTION_CONTINUE_SEARCH;
     }
-    // Retry only an access the page now allows: the fault may have come in during a split that has since finished.
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
-        mbi.Type != MEM_MAPPED) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    const DWORD protect = mbi.Protect & 0xff;
-    const bool allowed = access == 1 ? protect == PAGE_READWRITE : protect == PAGE_READWRITE || protect == PAGE_READONLY;
-    return allowed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 // With g_phys_mutex held: publishes [begin, end) as being split until it goes out of scope.
@@ -311,8 +328,14 @@ struct SplitGuard {
         if (!g_split_handler) g_split_handler = AddVectoredExceptionHandler(1, &wait_for_split) != nullptr;
         g_split_end.store(end, std::memory_order_release);
         g_split_begin.store(begin, std::memory_order_release);
+        g_splits.fetch_add(1, std::memory_order_release);
     }
-    ~SplitGuard() { g_split_begin.store(0, std::memory_order_release); }
+    ~SplitGuard() {
+        g_last_split_begin.store(0, std::memory_order_release);
+        g_last_split_end.store(g_split_end.load(std::memory_order_relaxed), std::memory_order_release);
+        g_last_split_begin.store(g_split_begin.load(std::memory_order_relaxed), std::memory_order_release);
+        g_split_begin.store(0, std::memory_order_release);
+    }
     SplitGuard(const SplitGuard&) = delete;
     SplitGuard& operator=(const SplitGuard&) = delete;
 };
