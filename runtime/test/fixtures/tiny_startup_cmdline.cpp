@@ -1,5 +1,6 @@
 // Synthetic startup fixture: process-attach callbacks see the command line before CRT argv is configured.
 #include <windows.h>
+#include <winternl.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,8 @@ struct Snapshot {
     wchar_t wargv[8][256];
     char line[2048];
     wchar_t wline[2048];
+    // Set by main for the native run under Wine only; the DLL gets it with the entry snapshot.
+    bool wine_native;
 };
 
 Snapshot g_startup{};
@@ -45,7 +48,8 @@ bool capture(Snapshot& s) {
 
 bool matches(const Snapshot& a, const Snapshot& b) {
     // Native UCRT has not configured either argv width at process attach. GetCommandLine is already complete.
-    return a.argc == 0 && !a.has_argv && !a.has_wargv &&
+    const bool unconfigured = a.argc == 0 && !a.has_argv && !a.has_wargv;
+    return (unconfigured || (b.wine_native && a.argc == b.argc)) &&
            std::strcmp(a.line, b.line) == 0 && std::wcscmp(a.wline, b.wline) == 0;
 }
 
@@ -70,6 +74,23 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
 extern "C" __declspec(dllimport) bool __cdecl startup_cmdline_matches(const Snapshot* entry);
 
 namespace {
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+// This image is the process image (run directly), not one gta6rt mapped into its own process. PEB first, because
+// under the loader GetModuleHandleW(nullptr) answers for the guest.
+bool run_directly() {
+    return NtCurrentTeb()->ProcessEnvironmentBlock->Reserved3[1] == static_cast<void*>(&__ImageBase);
+}
+
+// Wine's ucrtbase configures argc and both argv widths when it loads, before any DLL attach, where Microsoft's
+// configures neither until the startup code asks. So the native reference cannot show the console-like state
+// there; it keeps comparing the command lines. The gta6rt run is never relaxed: the loader has to provide it.
+bool wine_native_run() {
+    if (!run_directly()) return false;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+}
+
 void NTAPI startup_callback(PVOID, DWORD reason, PVOID) {
     if (reason == DLL_PROCESS_ATTACH) g_captured = capture(g_startup);
 }
@@ -82,8 +103,10 @@ extern "C" __declspec(allocate(".CRT$XLB")) PIMAGE_TLS_CALLBACK g_startup_callba
 
 int main(int argc, char** argv) {
     Snapshot entry{};
+    entry.wine_native = wine_native_run();
     bool ok = capture(entry) && g_captured && matches(g_startup, entry) && startup_cmdline_matches(&entry);
-    ok = ok && argc == entry.argc && entry.has_argv && !entry.has_wargv;
+    // The wide width stays unconfigured for a narrow main, except under Wine (see wine_native_run).
+    ok = ok && argc == entry.argc && entry.has_argv && (entry.wine_native || !entry.has_wargv);
     for (int i = 0; ok && i < argc; ++i) ok = std::strcmp(argv[i], entry.argv[i]) == 0;
     std::printf("tiny_startup_cmdline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

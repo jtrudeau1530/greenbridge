@@ -23,6 +23,7 @@
 #include <exception>
 #include <filesystem>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -204,14 +205,17 @@ int wmain(int argc, wchar_t** argv) {
                              r.error);
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
-        std::exception_ptr init_failure;
+        // The message is copied, not an exception_ptr: Wine's ucrtbase can free the stored exception before a rethrow.
+        bool init_failed = false;
+        std::string init_failure;
         if (init || run) {
             try {
                 loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
                 std::printf("%zu module(s) initialised\n", loader.modules().size());
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
                 // Keep the mapped modules available for the binding report on an attach failure.
-                init_failure = std::current_exception();
+                init_failed = true;
+                init_failure = e.what();
             }
         }
         int unimplemented = 0, unimplemented_hresult = 0;
@@ -236,9 +240,9 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("%zu module(s) mapped, %d unimplemented import(s)\n", loader.modules().size(), unimplemented);
         std::printf("unimplemented by return policy: hresult=%d other=%d\n", unimplemented_hresult,
                     unimplemented - unimplemented_hresult);
-        if (init_failure) {
+        if (init_failed) {
             std::fflush(stdout);
-            std::rethrow_exception(init_failure);
+            throw std::runtime_error(init_failure);
         }
         if (!run) {
             rt::startup_trace::event("exit", "\"code\":0");
