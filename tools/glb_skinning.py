@@ -197,6 +197,8 @@ def parse_glb(data):
     try:
         text = json_chunk.decode("utf-8")
         gltf = json.loads(text, parse_constant=_reject_json_constant)
+    except RecursionError as exc:
+        raise GlbSkinError("invalid GLB JSON chunk: nesting is too deep") from exc
     except (UnicodeDecodeError, ValueError) as exc:
         raise GlbSkinError(f"invalid GLB JSON chunk: {exc}") from exc
     if not isinstance(gltf, dict):
