@@ -6786,7 +6786,8 @@ public:
     // (docs/d3d12_vulkan.md section 3.5). So each gets a sampler in set 0 and a key in the hash table here, as
     // CreateSampler gives a heap slot's S#; without them the shader's lookup misses and it samples through the
     // fallback sampler. A static sampler is a D3D12_SAMPLER_DESC2 whose border colour is one of five named ones
-    // (D3D12_STATIC_BORDER_COLOR; the two UINT ones can be in a blob of any version, the flags only in 1.2).
+    // (D3D12_STATIC_BORDER_COLOR; the two UINT ones can be in a blob of any version, the flags only in 1.2), or
+    // transparent black with the UINT flag.
     void register_static_samplers(const rt::rootsig::RootSignature& signature) {
         for (const rt::rootsig::StaticSampler& s : signature.static_samplers) {
             D3D12_SAMPLER_DESC2 desc{};
@@ -6807,9 +6808,14 @@ public:
                 desc.Flags |= D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
                 desc.UintBorderColor[0] = desc.UintBorderColor[1] = desc.UintBorderColor[2] = white ? 1u : 0u;
                 desc.UintBorderColor[3] = 1;
+            } else if (s.border_color == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK &&
+                       (desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) {
+                // The integer border the enum has no value for: the 1.2 flag on transparent black is UINT (0,0,0,0),
+                // which D3D12 serializes and creates. UintBorderColor is already zero.
             } else if (s.border_color > D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT ||
                        (desc.Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR)) {
-                // A value past the enum, or the UINT flag with a float border: not a sampler D3D12 defines.
+                // A value past the enum, or the UINT flag with the float opaque black or white (D3D12 refuses to
+                // serialize that pair): not a sampler D3D12 defines.
                 log_once("static sampler not registered: border colour and flags do not go together; border colour",
                          int(s.border_color));
                 continue;
