@@ -229,6 +229,49 @@ def test_out_inside_corpus_is_a_usage_error():
     assert failures == 0, f"{failures} --out guard check(s) failed"
 
 
+def test_out_via_directory_alias_into_corpus_is_a_usage_error():
+    tool = os.path.join(TOOLS, "feature_scan.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        sh, _ = build(tmp)
+        corpus = os.path.join(sh, "dxbc")
+        alias = os.path.join(tmp, "corpus-alias")
+        if os.name == "nt":
+            # A junction works even when the Windows runner lacks symlink privileges.
+            subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", os.path.basename(alias),
+                            os.path.relpath(corpus, tmp)], cwd=tmp, check=True)
+        else:
+            os.symlink(corpus, alias, target_is_directory=True)
+        index_path = os.path.join(corpus, "index.json")
+        with open(index_path, "rb") as f:
+            before = f.read()
+        for name in ("report.json", "index.json"):
+            output = os.path.join(alias, name)
+            r = subprocess.run([sys.executable, "-I", tool, sh, "--out", output],
+                               capture_output=True, text=True)
+            assert r.returncode == 2, (output, r.returncode, r.stdout, r.stderr)
+            assert "inside the scanned corpus" in r.stderr, r.stderr
+        assert not os.path.exists(os.path.join(corpus, "report.json"))
+        with open(index_path, "rb") as f:
+            assert f.read() == before
+
+
+def test_out_hard_link_to_carved_index_is_a_usage_error():
+    tool = os.path.join(TOOLS, "feature_scan.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        sh, _ = build(tmp)
+        index_path = os.path.join(sh, "dxbc", "index.json")
+        report = os.path.join(tmp, "report.json")
+        os.link(index_path, report)
+        with open(index_path, "rb") as f:
+            before = f.read()
+        r = subprocess.run([sys.executable, "-I", tool, sh, "--out", report],
+                           capture_output=True, text=True)
+        assert r.returncode == 2, (r.returncode, r.stderr)
+        assert index_path in r.stderr, r.stderr
+        with open(index_path, "rb") as f:
+            assert f.read() == before
+
+
 def test_duplicate_shader_names_keep_file_stages():
     with tempfile.TemporaryDirectory() as tmp:
         dx = os.path.join(tmp, "dxbc")

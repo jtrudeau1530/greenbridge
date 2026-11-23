@@ -536,10 +536,13 @@ def same_path(first: str, second: str) -> bool:
 
 
 def inside_dir(path: str, folder: str) -> bool:
-    """True when path is folder itself or anything under it."""
-    root = os.path.normcase(os.path.abspath(folder))
-    target = os.path.normcase(os.path.abspath(path))
-    return target == root or target.startswith(root + os.sep)
+    """True when the path itself or its symlink target is in the folder."""
+    for resolve in (os.path.abspath, os.path.realpath):
+        root = os.path.normcase(resolve(folder))
+        target = os.path.normcase(resolve(path))
+        if target == root or target.startswith(os.path.join(root, "")):
+            return True
+    return False
 
 
 def main() -> int:
@@ -560,10 +563,11 @@ def main() -> int:
             print(f"ERROR: --out {a.out} is inside the scanned corpus {dxbc_dir}. Writing the report there would "
                   "replace index.json or a .dxbc the scan reads. Give a report path outside it.", file=sys.stderr)
             return 2
-        if same_path(a.out, spirv_index):
-            print(f"ERROR: --out {a.out} is {spirv_index}, which the scan reads. Give another report path.",
-                  file=sys.stderr)
-            return 2
+        for input_index in (index_path, spirv_index):
+            if same_path(a.out, input_index):
+                print(f"ERROR: --out {a.out} is {input_index}, which the scan reads. Give another report path.",
+                      file=sys.stderr)
+                return 2
     if not os.path.isfile(index_path):
         print(f"ERROR: {index_path} is missing. Run the shaders stage of make_game.py first.", file=sys.stderr)
         return 2
