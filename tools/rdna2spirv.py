@@ -2481,6 +2481,10 @@ class Gen:
         from %fmt_size_tab. Typed loads used to select it through a chain over all of FORMATS per load (about 150
         instructions); ScreenProbes_ActivateProbes has 3,281 such loads and its module was 2.5 M ids."""
         self.uses_fmt_size = True
+        # The table's length and entries are constants: register them here, while the constant section can still
+        # take them, not at assembly (an OpTypeArray naming a constant declared after it fails spirv-val).
+        for v in {128, 0, *(f[0] for f in self.FORMATS.values())}:
+            self.cu(v)
         ptr, size = self.tmp(), self.tmp()
         self.emit(f"{ptr} = OpAccessChain %_ptr_Private_uint %fmt_size_tab {fmt}")
         self.emit(f"{size} = OpLoad %uint {ptr}")

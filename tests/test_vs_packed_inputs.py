@@ -86,5 +86,5 @@ def test_distinct_integer_registers_keep_their_component_types(make_shader):
 def test_packed_register_with_conflicting_types_is_rejected(make_shader):
     shader = make_shader(VS_PACKED, "vs_conflicting_input",
                          dxbc=make_dxbc([isg1([(0, 0, 0x3, 1), (0, 0, 0xC, 3)])]))
-    with pytest.raises(rdna2spirv.Unsupported, match="conflicting component type"):
+    with pytest.raises(rdna2spirv.Unsupported, match="mixed component types"):
         shader.translate()
