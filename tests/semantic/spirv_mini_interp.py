@@ -1001,7 +1001,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             else:
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
-            values[res] = f32(-val(a[1]))
+            negated = -val(a[1])
+            values[res] = negated if types.t[a[0]] == ("float", 64) else f32(negated)
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16
@@ -1083,7 +1084,8 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name in ("Sin", "Cos"):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
-                values[res] = f32(abs(args[0]))
+                magnitude = abs(args[0])
+                values[res] = magnitude if types.t[a[0]] == ("float", 64) else f32(magnitude)
             elif name == "FSign":
                 # GLSL.std.450: 1.0 if x > 0, 0.0 if x = 0 (keeping the zero's sign), -1.0 if x < 0
                 x = args[0]

@@ -80,6 +80,55 @@ class InterpreterTests(unittest.TestCase):
                                   "%x = OpCompositeExtract %float %u 1\n"
                                   "%res = OpBitcast %uint %x\n"), 0x40000000)                   # 2.0f
 
+    def test_float_sign_operations_use_result_width(self):
+        # The low word in 1 + 2**-30 and the finite magnitude 2**130 both need binary64.
+        text = """\
+OpCapability Shader
+OpCapability Float64
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %out %f32_control
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %out Location 0
+OpDecorate %f32_control Location 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%double = OpTypeFloat 64
+%u2 = OpTypeVector %uint 2
+%u4 = OpTypeVector %uint 4
+%precise64 = OpConstant %double 1.000000000931322574615478515625
+%large_negative64 = OpConstant %double -1361129467683753853853498429727072845824
+%zero32 = OpConstant %float 0
+%negative32 = OpConstant %float -1.25
+%ptr_out_words = OpTypePointer Output %u4
+%ptr_out_pair = OpTypePointer Output %u2
+%out = OpVariable %ptr_out_words Output
+%f32_control = OpVariable %ptr_out_pair Output
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%neg64 = OpFNegate %double %precise64
+%abs64 = OpExtInst %double %glsl FAbs %large_negative64
+%neg_words = OpBitcast %u2 %neg64
+%abs_words = OpBitcast %u2 %abs64
+%neg_lo = OpCompositeExtract %uint %neg_words 0
+%neg_hi = OpCompositeExtract %uint %neg_words 1
+%abs_lo = OpCompositeExtract %uint %abs_words 0
+%abs_hi = OpCompositeExtract %uint %abs_words 1
+%words = OpCompositeConstruct %u4 %neg_lo %neg_hi %abs_lo %abs_hi
+OpStore %out %words
+%neg32 = OpFNegate %float %zero32
+%abs32 = OpExtInst %float %glsl FAbs %negative32
+%neg32_bits = OpBitcast %uint %neg32
+%abs32_bits = OpBitcast %uint %abs32
+%control = OpCompositeConstruct %u2 %neg32_bits %abs32_bits
+OpStore %f32_control %control
+"""
+        outputs = si.run_fragment(text + FOOTER)
+        self.assertEqual(outputs["%f32_control"], (0x80000000, 0x3FA00000))
+        self.assertEqual(outputs["%out"], (0x00400000, 0xBFF00000, 0, 0x48100000))
+
     def test_fma_select_bitcast(self):
         self.assertEqual(run_word("%x = OpExtInst %float %glsl Fma %f2 %f3 %f1\n%res = OpBitcast %uint %x\n"),
                          0x40E00000)                                                              # 7.0f
