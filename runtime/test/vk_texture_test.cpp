@@ -26,6 +26,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "spirv_capability.h"
 
 #include <algorithm>
 #include <cmath>
@@ -211,7 +212,6 @@ int main(int argc, char** argv) {
     f12.pNext = &f11;
     f12.bufferDeviceAddress = VK_TRUE; f12.runtimeDescriptorArray = VK_TRUE; f12.descriptorIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext = &f12;
-    f2.features.shaderInt64 = VK_TRUE;
     // Texel offsets: the limits the shader's Offset operands must stay inside, and the two optional features.
     LI(vkEnumerateDeviceExtensionProperties); LI(vkGetPhysicalDeviceFeatures);
     VkPhysicalDeviceProperties pdp; vkGetPhysicalDeviceProperties(pd, &pdp);
@@ -230,6 +230,14 @@ int main(int argc, char** argv) {
     f2.features.shaderSampledImageArrayDynamicIndexing = dynamic_sampled;
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
     f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
+    // shaderInt64 only when a stage has 64-bit integers: SHADER-423's address pairs need none (TEST-468).
+    const bool int64 = leonida::vk_test::needs_shader_int64(read_spv(vs_path.c_str())) ||
+                       leonida::vk_test::needs_shader_int64(fragment_code);
+    if (int64 && !have.shaderInt64) {
+        std::printf("unsupported: shaderInt64 (a stage declares Int64)\n");
+        return 77;
+    }
+    f2.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
     if (spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4, 42) &&
         !have.shaderResourceMinLod) {   // 42 = MinLod
         std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");

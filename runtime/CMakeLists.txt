@@ -1124,6 +1124,13 @@ if(LEONIDA_D3D12_SHIM_TESTS)
 endif()
 endif()
 
+# CPU-only: which SPIR-V capabilities make the standalone GPU tools ask for shaderInt64 (TEST-468). It includes no
+# Vulkan header, so it builds and runs without them, unlike the tools below that use it.
+add_executable(spirv_capability_test test/spirv_capability_test.cpp)
+if(BUILD_TESTING)
+  add_test(NAME spirv_capability COMMAND spirv_capability_test)
+endif()
+
 # GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
 # Nothing is downloaded unless asked: set VULKAN_SDK, install the Vulkan headers, pass
 # -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time

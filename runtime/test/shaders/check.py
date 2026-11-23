@@ -649,6 +649,14 @@ def run_readback(path, launch, *args, **kwargs):
     return code, output
 
 
+def compute_unsupported(code, output):
+    """A Skip quoting vk_compute_test's "unsupported: ..." line when it exited UNSUPPORTED because the module needs a
+    feature the device lacks (Int64, Float64, OpFmaKHR), in any run mode; None otherwise. Its --require-wave64
+    refusal prints no such line and keeps the callers' own handling, and a 77 without a reason stays a failure."""
+    m = re.search(r"^unsupported: .*", output, re.MULTILINE) if code == UNSUPPORTED else None
+    return Skip(f"SKIP ({m.group(0)})") if m else None
+
+
 def failure(code, output, lines):
     details = "\n".join(output.strip().splitlines()[-lines:])
     return f"exit {code}: {details or 'no test output'}"
@@ -663,6 +671,8 @@ def dump_test(tools, spirv, name, want, words, env=None):
         child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS=str(words))
         code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"),
                         "1", "dump", env=child)
+        if skip := compute_unsupported(code, out):
+            return skip
         if code:
             return failure(code, out, 3)
         if not dump.is_file():
@@ -890,7 +900,7 @@ def words_match(got, want):
 def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expected_words=None, needs_32_lanes=False,
                  env=None):
     """Return an empty string for a pass, None for unsupported wave64, a Skip for a wave32 lane-mask test on a device
-    narrower than 32 lanes (needs_32_lanes), or a failure diagnostic. `env` adds variables for vk_compute_test
+    narrower than 32 lanes (needs_32_lanes) or a module the device lacks a feature for, or a failure diagnostic. `env` adds variables for vk_compute_test
     (VKC_SGPRS)."""
     shader = os.path.join(spirv, name + ".spv")
     args = []
@@ -907,6 +917,8 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         env = {**(env or {}), "VKC_SUBGROUP_SIZE": str(sg)}
     extra = {"env": dict(os.environ, **env)} if env else {}
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, groups, mode, *args, **extra)
+    if skip := compute_unsupported(code, out):
+        return skip
     if require_wave64 and code == 77:  # vk_compute_test: the device cannot run a 64-wide compute subgroup
         return None
     if needs_32_lanes:

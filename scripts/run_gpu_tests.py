@@ -27,6 +27,7 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
                    fmt_xy_xyz_test, tbuffer_store_test)
+from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
@@ -255,6 +256,21 @@ def verdict_line(rc: int, msg: str) -> str:
     return failure(rc, msg, 1) if rc else msg.splitlines()[-1] if msg else ""
 
 
+def helper_result(rc: int, msg: str) -> tuple[bool | None, str]:
+    """(ok, detail) for a helper that judges its own output (vk_store_test): 77 is a SKIP that names the missing
+    feature, not a failure (TEST-469); otherwise the exit code decides and verdict_line gives the detail."""
+    if rc == UNSUPPORTED:
+        return None, unsupported_skip(msg)
+    return rc == 0, verdict_line(rc, msg)
+
+
+def compute_result(rc: int, msg: str, ok: bool, detail: str) -> tuple[bool | None, str]:
+    """(ok, detail) for a vk_compute_test run the caller judges itself, unless the module needs a feature the device
+    lacks (check.compute_unsupported: exit 77 with an "unsupported: ..." line), which is a SKIP quoting it."""
+    skip = compute_unsupported(rc, msg)
+    return (None, skip) if skip else (ok, detail)
+
+
 def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
             cwd: str | None = None) -> tuple[int, str]:
     # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
@@ -321,6 +337,8 @@ def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) 
     --wave64-emulate and runs on any subgroup size, so it asks for none."""
     cmd = [vk_compute, spv, "1", "wavemask"] + ([] if emulated else ["--require-wave64"])
     rc, msg = run_cmd(cmd, env=env)
+    if skip := compute_unsupported(rc, msg):
+        return None, skip
     if not emulated and rc == 77:
         return None, "SKIP (no 64-wide compute subgroup on this device)"
     if not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
@@ -876,16 +894,17 @@ def run_suite(a, work: str) -> int:
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
-            results.append((name, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches" in msg.splitlines(), msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
+                                                    in msg.splitlines(), msg))
         elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name in ("cs_bvh", "cs_bvh32"):   # the 64-bit and the 32-bit node pointer: one scene, the same words
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name in STORE_WORDS:
             # TEST-184: image atomics (cs_imgatomic, cs_imgatomic3d) and image_get_resinfo (cs_resinfo). vk_store_test
             # binds the images and prints the r32 ones after the dispatch; the expected words are check.py's.
@@ -935,8 +954,8 @@ def run_suite(a, work: str) -> int:
             }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
-            results.append((name, rc == 0 and vals == want,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == want,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_fmt_1010102":
             problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
@@ -973,36 +992,41 @@ def run_suite(a, work: str) -> int:
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **heap_init_env()))
             words = dump_words(msg)
             vals = words[:len(HEAP_INIT_EXPECTED)] if words else []
-            results.append((name, rc == 0 and vals == HEAP_INIT_EXPECTED,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == HEAP_INIT_EXPECTED,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_user_sgprs":
             # vk_compute_test seeds s4..s7 from VKC_SGPRS; the shader stores them back.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **USER_SGPRS_ENV))
             words = dump_words(msg)
             vals = words[:len(USER_SGPRS_WORDS)] if words else []
-            results.append((name, rc == 0 and vals == USER_SGPRS_WORDS,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == USER_SGPRS_WORDS,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_f64_add":
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
-            if rc == 77:
-                results.append((name, None, "SKIP (no shaderFloat64 on this device)"))
+            if rc == 77:   # Float64, or Int64 where the module declares both: quote whichever it names
+                results.append((name, None, compute_unsupported(rc, msg) or "SKIP (no shaderFloat64 on this device)"))
             else:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
                 results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
-            wrong = []
+            wrong, skip = [], None
             for bits, unsigned, signed in CVT_F32_SAT_CASES:
                 rc, msg = run_cmd([vk_compute, spv, "1", "dump"],
                                   env=dict(cs_env or os.environ, VKC_SGPRS=f"{bits:#010x}"))
+                if skip := compute_unsupported(rc, msg):   # the module, not this input: no other input can run either
+                    break
                 words = dump_words(msg)
                 if rc != 0 or not words or words[:2] != [unsigned, signed]:
                     got = " ".join(hex(x) for x in words[:2]) if words else msg.splitlines()[-1] if msg else "no output"
                     wrong.append(f"{bits:#010x} gave {got}, want {unsigned:#x} {signed:#x}")
             n = len(CVT_F32_SAT_CASES)
-            results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
-                            else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
+            if skip:
+                results.append((name, None, skip))
+            else:
+                results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
+                                else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
         elif name == "cs_fma_fused":
             # Single-rounded f32 FMA (+ f16 round-to-odd): strict under LEONIDA_FMA=khr (OpFmaKHR, exit 77 if
             # unsupported), fused-or-split f32 allowed under default --fma glsl (e.g. Mesa RADV splits 5/7).
@@ -1184,10 +1208,10 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name, *helper_result(rc, msg)))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name, *helper_result(rc, msg)))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
@@ -1494,6 +1518,7 @@ def run_suite(a, work: str) -> int:
     print("\n=== GPU TEST RESULTS ===")
     passed = skipped = 0
     for name, ok, detail in results:
+        ok = None if isinstance(detail, Skip) else ok   # a check.py helper's "this device can't run it" (cs_fmt_*)
         tag = "SKIP" if ok is None else "PASS" if ok else "FAIL"
         passed += ok is True
         skipped += ok is None
