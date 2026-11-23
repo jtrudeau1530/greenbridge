@@ -2117,6 +2117,18 @@ def build_pipeline_check(jobs: int) -> None:
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
             *, work: str | None = None) -> None:
+    destinations = [*RUNTIME_FILES, "game_path.txt"]
+    if work is not None:
+        destinations.append("shader_path.txt")
+    if os.name != "nt":
+        destinations.append("gta6rt.sh")
+    # Check the complete set before compiling or copying, so a later conflict leaves the old runtime usable.
+    for name in destinations:
+        destination = os.path.join(out, name)
+        if os.path.isdir(destination):
+            fail(f"runtime: {destination} is a directory and the runtime needs it as a file. "
+                 "Use another --out folder or move the directory before retrying.")
+
     if runtime_build:
         log(f"runtime: using the build in {runtime_build}")
         build = runtime_build
