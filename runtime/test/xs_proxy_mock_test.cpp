@@ -406,6 +406,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         if (a1) reinterpret_cast<D3D12_GPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapGpuStart;
         return kMockHeapGpuStart;
     }
+    if (m->kind == Kind::queue && slot == 10) copy_array(m, 10, a2, a1);  // ExecuteCommandLists(count, lists)
     if (m->kind == Kind::queue && slot == 16 && a1) {
         // GetTimestampFrequency writes a fixed value — unless a1 is a mock object, which on this slot is a
         // newer-layout Signal's fence, not an out pointer.
@@ -1800,12 +1801,16 @@ int check_xbox_queue_slots() {
     EXPECT(xs::queue_slot_overridden(35) && xs::queue_slot_overridden(14) && xs::queue_slot_overridden(15));
     EXPECT(!xs::queue_slot_overridden(10) && !xs::queue_slot_overridden(34) && !xs::queue_slot_overridden(36));
 
-    void* fake_lists[2] = {reinterpret_cast<void*>(0x12340000), reinterpret_cast<void*>(0x56780000)};
-    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 2ull, word(fake_lists)) == 0);
+    // Two readable non-proxy objects: slot 35 unwraps list proxies as slot 10 does, so each entry's vtable is read.
+    void* not_a_proxy_vtable[1] = {};
+    void* objects[2][1] = {{not_a_proxy_vtable}, {not_a_proxy_vtable}};
+    void* lists[2] = {objects[0], objects[1]};
+    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 2ull, word(lists)) == 0);
     EXPECT(xs::queue_slot_hits(35) == 1 && xs::queue_slot_first_call_seen(35));
     EXPECT(xs::queue_slot_hits(10) == 0);
     EXPECT(queue_mock->calls[35] == 0 && queue_mock->calls[10] == 1);
-    EXPECT(queue_mock->args[10][0] == 2 && queue_mock->args[10][1] == word(fake_lists));
+    EXPECT(queue_mock->args[10][0] == 2 && queue_mock->array[10][0] == word(lists[0]) &&
+           queue_mock->array[10][1] == word(lists[1]));  // passed on unchanged, in an unwrapped copy
 
     EXPECT(raw(queue, 35, 0, 0) == 0);
     EXPECT(xs::queue_slot_hits(35) == 2 && queue_mock->calls[35] == 0 && queue_mock->calls[10] == 2);
