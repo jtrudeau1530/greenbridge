@@ -64,6 +64,19 @@ The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetComm
 
 The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
+The UCRT argv configuration imports honor the executable's startup mode. Each run starts with `argc == 0` and
+null narrow/wide argument tables, while `GetCommandLineA/W` is already available to TLS and process-attach
+callbacks. Default startup publishes unexpanded arguments for its chosen width. `setargv.obj` / `wsetargv.obj`
+startup expands wildcard arguments against the host working directory, including quoted patterns; an unmatched
+pattern stays literal. Narrow expansion searches the ACP-converted pattern and converts matching names back to
+ACP, so its matches can differ from wide startup. The two widths retain independent tables, and the most recently
+configured width sets the shared `argc`. `noarg.obj` leaves the initial tables null; later no-argument
+configuration is a no-op that preserves existing pointers and counts. These are guest-owned tables, without
+changing the host CRT's argument globals. This does not add console-path wildcard routing or change the legacy
+`msvcrt!__getmainargs` wildcard policy. `run_argv_modes` compares the same six linker-selected MSVC fixtures
+natively and through the loader; `run_startup_cmdline` also checks native preconfiguration and command-line
+identity through attach and entry.
+
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
 
@@ -89,6 +102,27 @@ bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))`
 2 MiB, to move budget from the title's memory partition to the system's. A PC has no such partition, so the shim
 returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
 and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
+
+Seven more `xmem.dll` imports follow argument shapes measured locally at a title's call sites (the comments in
+`runtime/shims/xmem.cpp` give each shape):
+
+- `XMemAllocDefault` and `XMemFreeDefault` take `XMemAlloc`'s and `XMemFree`'s arguments and share their heap.
+- `XMemAllocatePhysicalPages(attributes, UINT64* count, UINT64* pages)` returns a `BOOL` and the count it allocated.
+  Each call is one pagefile-backed section of `count` 64 KiB pages. A page number is a 4 KiB frame number: a
+  non-zero multiple of 16 below 2^25, which is what the measured title assumes when it packs them. `0` means "unmap".
+- `XMemMapPhysicalPages(address, UINT64 count, pages)` returns the address. A null page array unmaps.
+  `XMemMapPhysicalPagesScatter(addresses, UINT32 count, pages)` returns a `BOOL`, and a `0` entry unmaps.
+  `XMemFreePhysicalPages(UINT64 count, pages)` returns a `BOOL`. Every page is its own view, mapped with
+  `MapViewOfFile3` into a 64 KiB placeholder, so a page keeps its contents across remaps and can be mapped twice.
+- The windows are reserve-only 64 KiB-page `XMemVirtualAlloc` regions. The shim reserves them as placeholders and
+  keeps their protection, which mapped pages get (AWE's rule). The measured title also reserves a placeholder with
+  `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both
+  through. **ASSUMPTION:** nothing commits into a window with `kernel32!VirtualAlloc`, which a placeholder refuses.
+- `XMemVirtualAlloc` used to refuse 2 MiB pages, and five of the 23 measured calls commit them. They are now
+  committed 2 MiB-aligned through `VirtualAlloc2`. The attribute word is recorded (`xmem_attributes`) and the
+  console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
+- `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
+  on an out-of-memory path, after an allocation has already failed.
 
 ## The retail executable (RT-5)
 
@@ -130,6 +164,8 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
 `xapu.dll`, `AcpHal.dll`) with no shim at all.
+
+The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and

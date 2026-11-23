@@ -294,6 +294,8 @@ class Gen:
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
+        self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
+        self.uses_fma_khr64 = False    # ... on f64 (feature shaderFmaFloat64)
         self.uses_clock = set()
         self.uses_bvh = False
         self.lconsts = {}              # 64-bit constants: value -> id
@@ -512,6 +514,16 @@ class Gen:
             self.emit(f"{g} = OpBitwiseXor %uint {u} {self.cu(0x80000000)}")
             u = g
         return u
+
+    def src_f_sign_mods(self, a):
+        """Read a float source with VOP3 abs/neg applied as raw sign-bit moves.
+
+        Min/max-family instructions preserve NaN payload and signaling state
+        when their source modifiers are applied. OpFNegate/OpFAbs can quiet a
+        signaling NaN before the min/max operation sees it, so these operations
+        must bitcast the integer sign-bit result instead.
+        """
+        return self.tof(self.src_u_sign_mods(a))
 
     def modify(self, v, a):
         if a.get("abs") or a.get("neg"):
@@ -1140,12 +1152,23 @@ class Gen:
         driver may round twice. With --fma khr it is OpFmaKHR instead: "correctly rounded" (SPV_KHR_fma), which needs
         VK_KHR_shader_fma + shaderFmaFloat32 and is recorded in the index as capability FMAKHR."""
         if FMA_KHR:
-            self.uses_fma_khr = True
+            self.uses_fma_khr = self.uses_fma_khr32 = True
             self.emit(f"{r} = OpFmaKHR %float {x} {y} {z}")
         elif FMA_EXACT:
             self.fma_exact(r, x, y, z)
         else:
             self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
+
+    def emit_fma64(self, r, x, y, z):
+        """r = x * y + z on doubles with ONE rounding, as RDNA2's f64 multiply-adds do. GLSL.std.450 Fma may round
+        twice here as for f32, and NVIDIA's driver does (RTX 4090, 621.24: the fma(a, a, c) cancellation probe with
+        a = 1 + 2^-30 gives 0, not 2^-60). With --fma khr it is OpFmaKHR on doubles, which needs VK_KHR_shader_fma +
+        shaderFmaFloat64 (feature shaderFmaFloat64 in the index). --fma exact has no f64 form and keeps Fma."""
+        if FMA_KHR:
+            self.uses_fma_khr = self.uses_fma_khr64 = True
+            self.emit(f"{r} = OpFmaKHR %double {x} {y} {z}")
+        else:
+            self.emit(f"{r} = OpExtInst %double %glsl Fma {x} {y} {z}")
 
     def fma_exact(self, r, x, y, z):
         """r = x * y + z rounded once to f32, built from single-rounded NoContraction f32 operations (--fma exact,
@@ -4496,9 +4519,12 @@ class Gen:
         return v
 
     def lds_load(self, addr, byte_off, bound=None):
+        # Volatile: another lane's ds_write may come between two accesses of this lane, and the Vulkan memory model
+        # orders nothing between invocations without a barrier, so a driver may otherwise move this read ahead of
+        # the wave's earlier writes or merge it with another read (docs/design.md, "LDS access order within a wave").
         def f(p):
             v = self.tmp()
-            self.emit(f"{v} = OpLoad %uint {p}")
+            self.emit(f"{v} = OpLoad %uint {p} Volatile")
             return v
         return self.lds_access(addr, byte_off, f, bound)
 
@@ -4510,7 +4536,7 @@ class Gen:
         return min(self.lds_declared, self.lds_dwords) if self.lds_declared else self.lds_dwords
 
     def lds_store(self, addr, byte_off, val):
-        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val}"))
+        self.lds_access(addr, byte_off, lambda p: self.emit(f"OpStore {p} {val} Volatile"))   # as lds_load
 
     def lds_next_in_bounds(self, addr, byte_off):
         """Bool: the dword after the one at (addr + byte_off) is inside the allocation (lds_cross_bound)."""
@@ -4585,10 +4611,10 @@ class Gen:
             ptr = self.lds_ptr(addr, off)
             if op == "ds_read_addtid_b32":
                 value = self.tmp()
-                self.emit(f"{value} = OpLoad %uint {ptr}")
+                self.emit(f"{value} = OpLoad %uint {ptr} Volatile")       # as lds_load
                 self.dst(a[0], value)
             else:
-                self.emit(f"OpStore {ptr} {self.src_u(a[0])}")
+                self.emit(f"OpStore {ptr} {self.src_u(a[0])} Volatile")
         elif op in ("ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128"):
             addr = self.src_u(a[1])
             for k in range(sizes[op.rsplit("_", 1)[1]]):
@@ -6764,7 +6790,7 @@ class Gen:
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
-            x, y, z = (self.src_f(t) for t in a[1:4])
+            x, y, z = (self.src_f_sign_mods(t) for t in a[1:4])
             f = "NMax" if "max" in op else "NMin"      # RDNA2: f(f(s0, s1), s2) keeping S0 on all-NaN
             m = self.nminmax_f32(f, x, y, y_src=a[2])
             r = self.nminmax_f32(f, m, z, y_src=a[3])
@@ -6937,7 +6963,7 @@ class Gen:
                     "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
                     "image_sample_c_b_cl",
                     "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
-                    "image_gather4_lz_o", "image_gather4_l_o"):
+                    "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             u = self.src_h(a[1])
@@ -9689,7 +9715,7 @@ class Gen:
                 self.emit(f"{ax} = OpExtInst %double %glsl FAbs {x}")
                 self.emit(f"{ay} = OpExtInst %double %glsl FAbs {y}")
                 self.emit(f"{az} = OpExtInst %double %glsl FAbs {z}")
-                self.emit(f"{f_plain} = OpExtInst %double %glsl Fma {x} {y} {z}")
+                self.emit_fma64(f_plain, x, y, z)
                 self.emit(f"{scale_up} = OpFOrdGreaterThanEqual %bool {az} {self.dconst(2.0)}")
                 self.emit(f"{f_up} = OpFMul %double {f_plain} {self.dconst(2.0 ** 128)}")
                 gx128, gy1, bx, gy128, gx1, by, gx64, gy64, bxy, b1, big = (self.tmp() for _ in range(11))
@@ -9732,7 +9758,7 @@ class Gen:
                 self.emit(f"{z_sc} = OpFMul %double {z} {self.dconst(2.0 ** -128)}")
                 self.emit(f"{zs} = OpSelect %double {ztiny} {zst} {z_sc}")
                 f_pre = self.tmp()
-                self.emit(f"{f_pre} = OpExtInst %double %glsl Fma {xs} {ys} {zs}")
+                self.emit_fma64(f_pre, xs, ys, zs)
                 # Subnormal-output single-rounding tie adjustment when |f_plain| in [2^-947, 2^-894).
                 pv2, plo, phi, pe_shift, pe_exp, e_ge, e_le, in_rng = (self.tmp() for _ in range(8))
                 self.emit(f"{pv2} = OpBitcast %v2uint_d {f_plain}")
@@ -9777,7 +9803,7 @@ class Gen:
                 pmul, np, pe_raw, p_z, x_nz, y_nz, xy_nz, p_uf = (self.tmp() for _ in range(8))
                 self.emit(f"{pmul} = OpFMul %double {x} {y}")
                 self.emit(f"{np} = OpFNegate %double {pmul}")
-                self.emit(f"{pe_raw} = OpExtInst %double %glsl Fma {x} {y} {np}")
+                self.emit_fma64(pe_raw, x, y, np)
                 self.emit(f"{p_z} = OpFOrdEqual %bool {pmul} {d0}")
                 self.emit(f"{x_nz} = OpFOrdNotEqual %bool {x} {d0}")
                 self.emit(f"{y_nz} = OpFOrdNotEqual %bool {y} {d0}")
@@ -10716,7 +10742,8 @@ class Gen:
             self.emit(f"{r} = OpFDiv %float %f1 {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
-            x, y = self.src_f(a[1]), self.src_f(a[2])
+            read_source = self.src_f_sign_mods if F2[op] in ("max", "min") else self.src_f
+            x, y = read_source(a[1]), read_source(a[2])
             r = self.tmp()
             if F2[op] in ("max", "min"):
                 r = self.nminmax_f32("NMax" if F2[op] == "max" else "NMin", x, y, y_src=a[2])
@@ -10737,7 +10764,7 @@ class Gen:
             elif op == "v_fmac_f32":
                 x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
             else:
-                r = self.med3_f([self.src_f(t) for t in a[1:4]], a[1:4])
+                r = self.med3_f([self.src_f_sign_mods(t) for t in a[1:4]], a[1:4])
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
             r = self.tmp()
@@ -11906,10 +11933,20 @@ class Gen:
         for i, word in enumerate(words):
             self.dst({"k": "vgpr", "r": first_vgpr + i, "n": 1}, word)
 
+    GATHER4_LOD_OPS = (
+        "image_gather4_c_l", "image_gather4_c_l_o",
+        "image_gather4_cl", "image_gather4_cl_o",
+        "image_gather4_c_cl", "image_gather4_c_cl_o",
+        "image_gather4_b", "image_gather4_b_o",
+        "image_gather4_b_cl", "image_gather4_b_cl_o",
+        "image_gather4_c_b", "image_gather4_c_b_o",
+        "image_gather4_c_b_cl", "image_gather4_c_b_cl_o",
+    )
+
     # SQ_IMG_SAMP_WORD0 address modes (Mesa src/amd/registers/gfx10-rsrc.json: CLAMP_X = bits [2:0], CLAMP_Y = [5:3];
     # values: SQ_TEX_* in Mesa's gfx6.json, as RADV's radv_tex_wrap maps VkSamplerAddressMode onto them): 0 wrap, 1 mirror, 2 clamp last texel, 3 mirror once last texel,
     # 4 clamp half border, 5 mirror once half border, 6 clamp border, 7 mirror once border.
-    def gather_addr_modes(self, s_op):
+    def gather_addr_modes(self, s_op, unorm: bool = False):
         """(x, y) address modes of an S# for the gather emulation, each either a Python int (the S# word 0 is a
         literal an s_mov_b32 wrote earlier in this basic block) or the id of a uint computed from the S# at run time.
 
@@ -11922,7 +11959,7 @@ class Gen:
             raise Unsupported("descriptor operand")
         lit = self.sgpr_imm.get(s_op["r"])
         if lit is not None:
-            if lit & 0x8000:
+            if not unorm and (lit & 0x8000):
                 raise Unsupported("image_gather4_l with FORCE_UNNORMALIZED")
             m = (lit & 7, lit >> 3 & 7)
             for mode in m:
@@ -12065,6 +12102,278 @@ class Gen:
         self.emit(f"{out} = OpLogicalOr %bool {b6} {b7}")
         return r7, out
 
+    # SQ_IMG_SAMP_WORD0 DEPTH_COMPARE_FUNC [14:12] (SQ_TEX_DEPTH_COMPARE, same numbering as VkCompareOp):
+    # 0 NEVER, 1 LESS, 2 EQUAL, 3 LESS_EQUAL, 4 GREATER, 5 NOT_EQUAL, 6 GREATER_EQUAL, 7 ALWAYS.
+    _DEPTH_CMP_OPS = {
+        1: "OpFOrdLessThan",
+        2: "OpFOrdEqual",
+        3: "OpFOrdLessThanEqual",
+        4: "OpFOrdGreaterThan",
+        5: "OpFUnordNotEqual",
+        6: "OpFOrdGreaterThanEqual",
+    }
+
+    def gather_depth_compare_prep(self, s_op):
+        """Decode S# word 0 DEPTH_COMPARE_FUNC [14:12] once per depth-compare gather4.
+        Returns ('const', func) for a literal S#, or ('dyn', b0, b1, b2, b02) for a run-time S#."""
+        lit = self.sgpr_imm.get(s_op["r"]) if s_op["k"] == "sgpr" else None
+        if lit is not None:
+            return ("const", (lit >> 12) & 7)
+        w0 = self.sgpr_word(s_op, 0)
+        fn = self.tmp()
+        self.emit(f"{fn} = OpBitFieldUExtract %uint {w0} {self.cu(12)} {self.cu(3)}")
+        bits = []
+        for mask in (1, 2, 4):
+            bu, bb = self.tmp(), self.tmp()
+            self.emit(f"{bu} = OpBitwiseAnd %uint {fn} {self.cu(mask)}")
+            self.emit(f"{bb} = OpINotEqual %bool {bu} {self.cu(0)}")
+            bits.append(bb)
+        b02 = self.tmp()
+        self.emit(f"{b02} = OpLogicalAnd %bool {bits[0]} {bits[2]}")
+        return ("dyn", bits[0], bits[1], bits[2], b02)
+
+    def gather_depth_compare(self, cmp_state, ref: str, texel: str) -> str:
+        """Compare ref <DEPTH_COMPARE_FUNC> texel and return %float (%f1 if pass, else %f0)."""
+        if cmp_state[0] == "const":
+            func = cmp_state[1]
+            if func == 0:
+                return "%f0"
+            if func == 7:
+                return "%f1"
+            c, res = self.tmp(), self.tmp()
+            self.emit(f"{c} = {self._DEPTH_CMP_OPS[func]} %bool {ref} {texel}")
+            self.emit(f"{res} = OpSelect %float {c} %f1 %f0")
+            return res
+        _, b0, b1, b2, b02 = cmp_state
+        lt, eq, gt = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lt} = OpFOrdLessThan %bool {ref} {texel}")
+        self.emit(f"{eq} = OpFOrdEqual %bool {ref} {texel}")
+        self.emit(f"{gt} = OpFOrdGreaterThan %bool {ref} {texel}")
+        lt_m, eq_m, gt_m = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lt_m} = OpLogicalAnd %bool {b0} {lt}")
+        self.emit(f"{eq_m} = OpLogicalAnd %bool {b1} {eq}")
+        self.emit(f"{gt_m} = OpLogicalAnd %bool {b2} {gt}")
+        ord1, any_ord, unord, unord_m = (self.tmp() for _ in range(4))
+        self.emit(f"{ord1} = OpLogicalOr %bool {lt} {eq}")
+        self.emit(f"{any_ord} = OpLogicalOr %bool {ord1} {gt}")
+        self.emit(f"{unord} = OpLogicalNot %bool {any_ord}")
+        self.emit(f"{unord_m} = OpLogicalAnd %bool {b02} {unord}")
+        m1, m2, passed, res = (self.tmp() for _ in range(4))
+        self.emit(f"{m1} = OpLogicalOr %bool {lt_m} {eq_m}")
+        self.emit(f"{m2} = OpLogicalOr %bool {gt_m} {unord_m}")
+        self.emit(f"{passed} = OpLogicalOr %bool {m1} {m2}")
+        self.emit(f"{res} = OpSelect %float {passed} %f1 %f0")
+        return res
+
+    def emit_gather4_lod(self, op, a, mods, dim, img, img_idx, si, coords, f, ncoord, is3d, dmask, vdata, a16, d16):
+        """Translate image_gather4_{c_l,cl,c_cl,b,b_cl,c_b,c_b_cl}[_o] via 2x2 OpImageFetch footprint.
+        Address order: [offset (_o)], [bias (_b)], [z_compare (_c)], s, t, [slice (2D_ARRAY)], [lod (_l) | clamp (_cl)]."""
+        kind = op[len("image_gather4"):]
+        goff = None
+        if kind.endswith("_o"):
+            if a16 and ("tfe" in mods or "lwe" in mods):
+                raise Unsupported(op + " a16 status")
+            parts = []
+            for k in range(2):
+                u, i = self.tmp(), self.tmp()
+                self.emit(f"{u} = OpBitFieldSExtract %uint {coords[0]} {self.cu(8 * k)} {self.cu(6)}")
+                self.emit(f"{i} = OpBitcast %int {u}")
+                parts.append(i)
+            goff = self.tmp()
+            self.emit(f"{goff} = OpCompositeConstruct %v2int {parts[0]} {parts[1]}")
+            f = f[1:]
+            kind = kind[:-2]
+        has_clamp = kind.endswith("_cl")
+        if has_clamp:
+            kind = kind[:-3]
+        has_l = kind.endswith("_l")
+        if has_l:
+            kind = kind[:-2]
+        has_b = kind.endswith("_b")
+        if has_b:
+            kind = kind[:-2]
+        has_c = kind == "_c"
+        if not has_c and kind != "":
+            raise Unsupported(op)
+        if bin(dmask).count("1") != 1 or dim not in ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D_ARRAY") or is3d:
+            raise Unsupported(op + " form")
+        if has_b and self.stage != "ps":
+            raise Unsupported(op)
+        bias = None
+        if has_b:
+            if not f:
+                raise Unsupported(op + " coords")
+            bias, f = f[0], f[1:]
+        ref = None
+        if has_c:
+            if not f:
+                raise Unsupported(op + " coords")
+            ref, f = f[0], f[1:]
+        need = ncoord + (1 if (has_l or has_clamp) else 0)
+        if len(f) < need:
+            raise Unsupported(op + " coords")
+        raw_lod_arg = f[ncoord] if has_l else None
+        minlod = f[ncoord] if has_clamp else None
+
+        unorm = "unorm" in mods
+        modes = self.gather_addr_modes(a[3], unorm=unorm)
+        self.uses_query = True
+        self.uses_fhalf = True
+        ch = 0 if has_c else (dmask.bit_length() - 1)
+        uvf = self.tmp()
+        self.emit(f"{uvf} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+        qtype = "%v3int" if ncoord == 3 else "%v2int"
+
+        if has_l:
+            raw_lod = raw_lod_arg
+        else:
+            if self.stage == "ps":
+                uv_q = uvf
+                if unorm:
+                    sz0 = self.tmp()
+                    self.emit(f"{sz0} = OpImageQuerySizeLod {qtype} {img} {self.as_int(self.cu(0))}")
+                    if ncoord == 3:
+                        sz0_2 = self.tmp()
+                        self.emit(f"{sz0_2} = OpVectorShuffle %v2int {sz0} {sz0} 0 1")
+                        sz0 = sz0_2
+                    sz0f, uv_q = self.tmp(), self.tmp()
+                    self.emit(f"{sz0f} = OpConvertSToF %v2float {sz0}")
+                    self.emit(f"{uv_q} = OpFDiv %v2float {uvf} {sz0f}")
+                q, qy = self.tmp(), self.tmp()
+                self.emit(f"{q} = OpImageQueryLod %v2float {si} {uv_q}")
+                self.emit(f"{qy} = OpCompositeExtract %float {q} 1")
+                raw_lod = qy
+            else:
+                raw_lod = "%f0"
+            if bias is not None:
+                lb = self.tmp()
+                self.emit(f"{lb} = OpFAdd %float {raw_lod} {bias}")
+                raw_lod = lb
+            if minlod is not None:
+                lc = self.tmp()
+                self.emit(f"{lc} = OpExtInst %float %glsl FMax {raw_lod} {minlod}")
+                raw_lod = lc
+
+        lv, lvm, mi, mc, mz = (self.tmp() for _ in range(5))
+        self.emit(f"{lv} = OpImageQueryLevels %int {img}")
+        self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
+        lod = self.clamp_gather_lod(raw_lod, a[3]["r"] + 1)
+        # Share #4321's RDNA2 8-fraction-bit LOD rounding so ordinary and depth-compare gathers agree at
+        # mip boundaries such as 0x3eff0000 (127.5/256) and 0x3eff0001: mip = (RoundEven(lod * 256) + 128) >> 8.
+        sc, q, qi, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{sc} = OpFMul %float {lod} {self.fconst(256.0)}")
+        self.emit(f"{q} = OpExtInst %float %glsl RoundEven {sc}")
+        self.emit(f"{qi} = OpConvertFToS %int {q}")
+        self.emit(f"{b} = OpIAdd %int {qi} {self.as_int(self.cu(128))}")
+        self.emit(f"{mi} = OpShiftRightArithmetic %int {b} {self.cu(8)}")
+        self.emit(f"{mz} = OpExtInst %int %glsl SMax {mi} {self.as_int(self.cu(0))}")
+        self.emit(f"{mc} = OpExtInst %int %glsl SMin {mz} {lvm}")
+
+        sz = self.tmp()
+        self.emit(f"{sz} = OpImageQuerySizeLod {qtype} {img} {mc}")
+        layer = None
+        if ncoord == 3:
+            sz2, szl, lmax, rlayer, ilayer, layer = (self.tmp() for _ in range(6))
+            self.emit(f"{sz2} = OpVectorShuffle %v2int {sz} {sz} 0 1")
+            self.emit(f"{szl} = OpCompositeExtract %int {sz} 2")
+            self.emit(f"{lmax} = OpISub %int {szl} {self.as_int(self.cu(1))}")
+            self.emit(f"{rlayer} = OpExtInst %float %glsl RoundEven {f[2]}")
+            self.emit(f"{ilayer} = OpConvertFToS %int {rlayer}")
+            self.emit(f"{layer} = OpExtInst %int %glsl SClamp {ilayer} {self.as_int(self.cu(0))} {lmax}")
+        else:
+            sz2 = sz
+
+        if unorm:
+            st = uvf
+        else:
+            szf, st = self.tmp(), self.tmp()
+            self.emit(f"{szf} = OpConvertSToF %v2float {sz2}")
+            self.emit(f"{st} = OpFMul %v2float {uvf} {szf}")
+        half, sub, flo, i0, one2, i1 = (self.tmp() for _ in range(6))
+        self.emit(f"{half} = OpCompositeConstruct %v2float %fhalf_g %fhalf_g")
+        self.emit(f"{sub} = OpFSub %v2float {st} {half}")
+        self.emit(f"{flo} = OpExtInst %v2float %glsl Floor {sub}")
+        self.emit(f"{i0} = OpConvertFToS %v2int {flo}")
+        if goff is not None:
+            i0o = self.tmp()
+            self.emit(f"{i0o} = OpIAdd %v2int {i0} {goff}")
+            i0 = i0o
+        c1 = self.as_int(self.cu(1))
+        self.emit(f"{one2} = OpCompositeConstruct %v2int {c1} {c1}")
+        self.emit(f"{i1} = OpIAdd %v2int {i0} {one2}")
+        x0, y0, x1, y1, szx, szy = (self.tmp() for _ in range(6))
+        self.emit(f"{x0} = OpCompositeExtract %int {i0} 0")
+        self.emit(f"{y0} = OpCompositeExtract %int {i0} 1")
+        self.emit(f"{x1} = OpCompositeExtract %int {i1} 0")
+        self.emit(f"{y1} = OpCompositeExtract %int {i1} 1")
+        self.emit(f"{szx} = OpCompositeExtract %int {sz2} 0")
+        self.emit(f"{szy} = OpCompositeExtract %int {sz2} 1")
+        ax = [self.gather_addr(c, szx, modes[0]) for c in (x0, x1)]
+        ay = [self.gather_addr(c, szy, modes[1]) for c in (y0, y1)]
+        texels, outs = [], []
+        for (xx, ox), (yy, oy) in ((ax[0], ay[1]), (ax[1], ay[1]), (ax[1], ay[0]), (ax[0], ay[0])):
+            cc = self.tmp()
+            if ncoord == 3:
+                self.emit(f"{cc} = OpCompositeConstruct %v3int {xx} {yy} {layer}")
+            else:
+                self.emit(f"{cc} = OpCompositeConstruct %v2int {xx} {yy}")
+            texels.append(cc)
+            if ox is not None and oy is not None:
+                both = self.tmp()
+                self.emit(f"{both} = OpLogicalOr %bool {ox} {oy}")
+                outs.append(both)
+            else:
+                outs.append(ox if ox is not None else oy)
+        border_one = self.gather_border_one(a[3], ch) if any(o is not None for o in outs) else None
+
+        if has_c:
+            cmp_state = self.gather_depth_compare_prep(a[3])
+            if border_one is not None:
+                if isinstance(border_one, bool):
+                    border_v = "%f1" if border_one else "%f0"
+                else:
+                    border_v = self.tmp()
+                    self.emit(f"{border_v} = OpSelect %float {border_one} %f1 %f0")
+            taps = []
+            for cc, out in zip(texels, outs):
+                tx, comp = self.tmp(), self.tmp()
+                self.emit(f"{tx} = OpImageFetch %v4float {img} {cc} Lod {mc}")
+                self.emit(f"{comp} = OpCompositeExtract %float {tx} 0")
+                if out is not None:
+                    sel = self.tmp()
+                    self.emit(f"{sel} = OpSelect %float {out} {border_v} {comp}")
+                    comp = sel
+                taps.append(self.gather_depth_compare(cmp_state, ref, comp))
+            self.store_gather_taps(vdata["r"], taps, d16)
+            return
+
+        def gather_mip(image: str, cls: int, ty: str) -> str:
+            scalar = ("%float", "%uint", "%int")[cls]
+            if border_one is not None:
+                zero_v, one_v = (self.fconst(0.0), self.fconst(1.0)) if cls == 0 else \
+                    (self.cu(0), self.cu(1)) if cls == 1 else (self.as_int(self.cu(0)), self.as_int(self.cu(1)))
+                if isinstance(border_one, bool):
+                    border_v = one_v if border_one else zero_v
+                else:
+                    border_v = self.tmp()
+                    self.emit(f"{border_v} = OpSelect {scalar} {border_one} {one_v} {zero_v}")
+            taps = []
+            for cc, out in zip(texels, outs):
+                tx, comp = self.tmp(), self.tmp()
+                self.emit(f"{tx} = OpImageFetch {ty} {image} {cc} Lod {mc}")
+                self.emit(f"{comp} = OpCompositeExtract {scalar} {tx} {ch}")
+                if out is not None:
+                    sel = self.tmp()
+                    self.emit(f"{sel} = OpSelect {scalar} {out} {border_v} {comp}")
+                    comp = sel
+                taps.append(comp)
+            result = self.tmp()
+            self.emit(f"{result} = OpCompositeConstruct {ty} {' '.join(taps)}")
+            return result
+
+        self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
+                              0xf, vdata, d16, gather_mip)
+
     def desc_lookup_sgpr(self, a, n):
         """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
 
@@ -12199,7 +12508,12 @@ class Gen:
             # v[0:2] for a 2D image_sample_c_b ... a16). A bias is an f16 in the low half of its VGPR, a z-compare
             # an f32. Until 2026-11-21 those were unpacked as pairs too, and the coordinates after them were read a
             # half early. A texel offset comes first and keeps its full dword under a16.
-            extras = op[len("image_sample"):] if op.startswith("image_sample") else ""
+            if op.startswith("image_sample"):
+                extras = op[len("image_sample"):]
+            elif op.startswith("image_gather4"):
+                extras = op[len("image_gather4"):]
+            else:
+                extras = ""
             w_off = 1 if op.endswith("_o") else 0
             extras = extras[:-2] if w_off else extras
             extras = extras[:-3] if extras.endswith("_cl") else extras      # the clamp is packed with the coordinates
@@ -12250,9 +12564,17 @@ class Gen:
                 self.emit(f"{sampled} = OpSampledImage %{sampler_type} {image} {smp}")
                 return sampled
 
-            if not typed_sample and op not in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o"):
+            no_sampled_img = op in ("image_gather4_lz", "image_gather4_lz_o", "image_gather4_l", "image_gather4_l_o",
+                                    "image_gather4_c_l", "image_gather4_c_l_o") or (
+                op in ("image_gather4_cl", "image_gather4_cl_o", "image_gather4_c_cl", "image_gather4_c_cl_o")
+                and self.stage != "ps"
+            )
+            if not typed_sample and not no_sampled_img:
                 self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
             f = [self.tof(c) for c in coords]
+            if op in self.GATHER4_LOD_OPS:
+                self.emit_gather4_lod(op, a, mods, dim, img, img_idx, si, coords, f, ncoord, is3d, dmask, vdata, a16, d16)
+                return
             goff = None
             if op in ("image_gather4_lz_o", "image_gather4_l_o"):
                 # first address dword: signed 6-bit texel offsets x [5:0], y [13:8]
@@ -17249,7 +17571,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
              "DrawParameters": "shaderDrawParameters",
-             "FMAKHR": "shaderFmaFloat32"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
+             }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
          # but --fma exact has no capability to distinguish it from the default GLSL Fma (TEST-1147).
@@ -17257,7 +17579,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))} |
                             {{"subgroup": "shaderSubgroupClock", "device": "shaderDeviceClock"}[k]
-                             for k in getattr(g, "uses_clock", ())}),
+                             for k in getattr(g, "uses_clock", ())} |
+                            {f for f, used in (("shaderFmaFloat32", getattr(g, "uses_fma_khr32", False)),
+                                               ("shaderFmaFloat64", getattr(g, "uses_fma_khr64", False))) if used}),
          "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 16,
          "subgroup_size": 64 if g.wave64 else 32,
          # Which stages can ask for a 64-wide subgroup is the driver's requiredSubgroupSizeStages, not a fixed rule:
@@ -17675,8 +17999,8 @@ def main():
     ap.add_argument("--fma", choices=("glsl", "khr", "exact"), default="glsl",
                     help="how fused multiply-adds (v_fma_f32, v_fmac_f32, v_fmaak/fmamk_f32, v_fma_mix*) are emitted: "
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
-                         "(guaranteed single rounding; needs VK_KHR_shader_fma + shaderFmaFloat32, listed in the "
-                         "shader's metadata as capability FMAKHR / feature shaderFmaFloat32), exact = a single "
+                         "(guaranteed single rounding, f32 and f64; needs VK_KHR_shader_fma + shaderFmaFloat32/64, listed in the "
+                         "shader's metadata as capability FMAKHR / feature shaderFmaFloat32/64), exact = a single "
                          "rounding built from NoContraction f32 ops, for a device that splits Fma and has no "
                          "VK_KHR_shader_fma (about 110 instructions, 31 NoContraction decorations and 13 constants per multiply-add; no extension needed)")
     ap.add_argument("--f16-interp-fallback", action="store_true",

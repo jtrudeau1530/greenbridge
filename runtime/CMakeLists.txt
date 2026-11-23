@@ -622,6 +622,31 @@ if(BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       )
     endforeach()
+    # These linker-selected startup modes are specific to the MSVC CRT.
+    if(MSVC)
+      foreach(width a w)
+        foreach(mode default expand noargs)
+          set(target tiny_argv_${mode}_${width})
+          add_executable(${target} test/fixtures/tiny_argv_modes.cpp)
+          target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+          target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+          if(width STREQUAL "w")
+            target_compile_definitions(${target} PRIVATE APP_WIDE)
+          endif()
+          if(mode STREQUAL "expand")
+            if(width STREQUAL "w")
+              target_link_options(${target} PRIVATE wsetargv.obj)
+            else()
+              target_link_options(${target} PRIVATE setargv.obj)
+            endif()
+          elseif(mode STREQUAL "noargs")
+            target_link_options(${target} PRIVATE noarg.obj)
+          endif()
+          set_target_properties(${target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
+        endforeach()
+      endforeach()
+    endif()
     add_executable(tiny_atexit test/fixtures/tiny_atexit.cpp)
     target_compile_definitions(tiny_atexit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8)
@@ -1059,6 +1084,16 @@ if(BUILD_TESTING)
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    if(TARGET tiny_argv_default_a AND NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME run_argv_modes COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_argv_modes.py"
+          --loader "$<TARGET_FILE:gta6rt>" --fixtures "$<TARGET_FILE_DIR:tiny_argv_default_a>"
+          --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+        set_tests_properties(run_argv_modes PROPERTIES TIMEOUT 90)
+      endif()
+    endif()
     add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
@@ -1187,6 +1222,10 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # OpFmaKHR width gate of vk_shader_fma.h (shaderFmaFloat32 / shaderFmaFloat64): no Vulkan instance, no GPU.
+  add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
+  target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
+  add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
   if(MSVC)
     # Keep the checker and its worker threads on the toolchain's C++ runtime under Wine.
     set_property(TARGET vk_pipeline_check PROPERTY
@@ -2714,6 +2753,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_clear_formats_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_clear_formats COMMAND d3d12_clear_formats_test)
     set_tests_properties(d3d12_clear_formats PROPERTIES SKIP_RETURN_CODE 77)
+
+    # SetDescriptorHeaps validation, Reset/ClearState/bundle parity, lifetime pinning, direct-index flags.
+    add_executable(d3d12_set_descriptor_heaps_test test/d3d12_set_descriptor_heaps_test.cpp)
+    target_link_libraries(d3d12_set_descriptor_heaps_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_set_descriptor_heaps_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_set_descriptor_heaps COMMAND d3d12_set_descriptor_heaps_test)
+    set_tests_properties(d3d12_set_descriptor_heaps PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)

@@ -1690,6 +1690,9 @@ public:
         return {in_arena_ ? UINT64(arena_offset_) : 0};
     }
 
+    const D3D12_DESCRIPTOR_HEAP_DESC& raw_desc() const { return desc_; }
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_base() const { return in_arena_ ? UINT64(arena_offset_) : 0; }
+
 private:
     DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
@@ -5602,8 +5605,8 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
                                                  D3D12_COMMAND_LIST_FLAGS, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device4::CreateCommandList1";
-        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE, then a null
-        // output is E_UNEXPECTED.
+        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE (non-zero
+        // D3D12_COMMAND_LIST_FLAGS are ignored by the host runtime), then a null output is E_UNEXPECTED.
         if (out) *out = nullptr;
         if ((node_mask & ~1u) || UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE))
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -5884,6 +5887,7 @@ public:
         if (!compute.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
+        layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
@@ -8601,6 +8605,17 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
+}
+
+IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,
+                               D3D12_GPU_VIRTUAL_ADDRESS& gpu_base) {
+    if (!heap) return nullptr;
+    if (ID3D12DescriptorHeap* real = rt::d3d12_xs::heap_proxy_real_heap(heap)) heap = real;
+    const DescriptorHeap* d = DescriptorHeap::from<DescriptorHeap>(heap);
+    if (!d) return nullptr;
+    desc = d->raw_desc();
+    gpu_base = d->gpu_base();
+    return d->attached_device();
 }
 
 VkImage vulkan_image(ID3D12Resource* resource) {

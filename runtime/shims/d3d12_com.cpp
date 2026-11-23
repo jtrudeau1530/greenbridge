@@ -202,12 +202,15 @@ public:
     const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
+    D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base() const { return cbv_srv_uav_base_; }
+    D3D12_GPU_VIRTUAL_ADDRESS sampler_base() const { return sampler_base_; }
 
     D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override {
         d3d12_trace::record("ID3D12CommandList::GetType");
         return type_;
     }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
+    bool invalid() const { return invalid_; }
 
     // E_INVALIDARG when a call during recording was invalid, or a query was begun and not ended, as D3D12's Close
     // reports it.
@@ -248,6 +251,7 @@ public:
 
     void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* command_list) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ExecuteBundle");
+        if (list_.closed()) return;
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         GraphicsCommandList* bundle = from(command_list);
         if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ ||
@@ -279,13 +283,47 @@ public:
 
     void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.set_pipeline(state); })) return hold(state);
         set_pipeline(state);
     }
 
-    // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
-    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {
-        d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps", "ignored");
+    // Validates shader-visible descriptor heaps and tracks bound heap identities/bases (docs/d3d12_vulkan.md §3.2/§3.4).
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT num, ID3D12DescriptorHeap* const* heaps) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
+        if (num > 2 || (num && !heaps)) return check(false);
+
+        ID3D12DescriptorHeap* cbv = nullptr;
+        ID3D12DescriptorHeap* smp = nullptr;
+        D3D12_GPU_VIRTUAL_ADDRESS cbv_base = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS smp_base = 0;
+        IUnknown* const owner = this->attached_device();
+        for (UINT i = 0; i < num; ++i) {
+            ID3D12DescriptorHeap* raw = heaps[i];
+            if (!raw) return check(false);
+            if (ID3D12DescriptorHeap* real = d3d12_xs::heap_proxy_real_heap(raw)) raw = real;
+            D3D12_DESCRIPTOR_HEAP_DESC desc{};
+            D3D12_GPU_VIRTUAL_ADDRESS base = 0;
+            IUnknown* const heap_owner = descriptor_heap_info(raw, desc, base);
+            if (!heap_owner || (owner && heap_owner != owner)) return check(false);
+            if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return check(false);
+            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                if (cbv) return check(false);
+                cbv = raw;
+                cbv_base = base;
+            } else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+                if (smp) return check(false);
+                smp = raw;
+                smp_base = base;
+            } else {
+                return check(false);
+            }
+        }
+        hold(cbv);
+        hold(smp);
+        if (defer([=](GraphicsCommandList& l) { l.verify_bundle_descriptor_heaps(cbv, smp); })) return;
+        set_descriptor_heaps(cbv, cbv_base, smp, smp_base);
     }
 
     void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) override {
@@ -334,12 +372,14 @@ public:
 
     // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
     void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
+        if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         reset_state(state);
     }
 
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.topology_ = u(topology); })) return;
         topology_ = u(topology);
     }
@@ -358,6 +398,7 @@ public:
     }
 
     void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
+        if (list_.closed()) return;
         const std::optional<D3D12_INDEX_BUFFER_VIEW> copy = view ? std::optional(*view) : std::nullopt;
         if (defer([=](GraphicsCommandList& l) { l.set_index_buffer(copy ? &*copy : nullptr); })) return;
         set_index_buffer(view);
@@ -405,6 +446,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
+        if (list_.closed()) return;
         const std::array<float, 4> value = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
                                                   : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
         if (defer([=](GraphicsCommandList& l) { l.blend_factor_ = value; })) return;
@@ -412,6 +454,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.front_stencil_ref_ = l.back_stencil_ref_ = reference; })) return;
         front_stencil_ref_ = back_stencil_ref_ = reference;
     }
@@ -1141,6 +1184,10 @@ private:
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
     std::uintptr_t graphics_pipeline_ = 0;
+    ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
+    ID3D12DescriptorHeap* sampler_heap_ = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
@@ -1205,10 +1252,44 @@ private:
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
     }
 
+    void set_descriptor_heaps(ID3D12DescriptorHeap* cbv, D3D12_GPU_VIRTUAL_ADDRESS cbv_base,
+                              ID3D12DescriptorHeap* smp, D3D12_GPU_VIRTUAL_ADDRESS smp_base) {
+        cbv_srv_uav_heap_ = cbv;
+        cbv_srv_uav_base_ = cbv_base;
+        sampler_heap_ = smp;
+        sampler_base_ = smp_base;
+    }
+
+    // D3D12 bundle rule: every non-null heap bound by a bundle's SetDescriptorHeaps must match the parent list's
+    // currently bound heap of that type, without clearing any omitted heap slot on the parent.
+    void verify_bundle_descriptor_heaps(ID3D12DescriptorHeap* cbv, ID3D12DescriptorHeap* smp) {
+        if ((cbv && cbv != cbv_srv_uav_heap_) || (smp && smp != sampler_heap_)) check(false);
+    }
+
+    void note_direct_heap_indexing(const RootArgumentLayout* layout) const {
+        if (!layout) return;
+        if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
+            if (!cbv_srv_uav_heap_)
+                note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
+            else
+                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+        }
+        if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
+            if (!sampler_heap_)
+                note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
+            else
+                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+        }
+    }
+
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
         compute_ = {};
         graphics_ = {};
+        cbv_srv_uav_heap_ = nullptr;
+        sampler_heap_ = nullptr;
+        cbv_srv_uav_base_ = 0;
+        sampler_base_ = 0;
         topology_ = 0;
         vertex_buffers_ = {};
         index_ = {};
@@ -1237,6 +1318,7 @@ private:
 
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
+        note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
 
@@ -1256,6 +1338,7 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
@@ -1438,6 +1521,12 @@ public:
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
         std::lock_guard lock(mutex_);
+        if (count > 0 && !lists) {
+            note_once("ExecuteCommandLists: null command list array with non-zero count");
+            last_result_ = leonida::ReplayResult::unsupported;
+            d3d12_trace::record(method, "failed");
+            return;
+        }
         std::vector<const leonida::CommandList*> recorded;
         std::vector<const GraphicsCommandList*> graphics;
         for (UINT i = 0; i < count; ++i) {
@@ -1454,6 +1543,13 @@ public:
             if (list->type() != desc_.Type) {
                 std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u has type %d, the queue type %d\n", i,
                              int(list->type()), int(desc_.Type));
+                last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
+            // A list whose recording failed (Close returned E_INVALIDARG) must not replay its earlier commands.
+            if (list->invalid()) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is invalid; refusing batch\n", i);
                 last_result_ = leonida::ReplayResult::unsupported;
                 d3d12_trace::record(method, "failed");
                 return;
@@ -1889,6 +1985,15 @@ bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Com
     if (!l) return false;
     const auto recorded = l->commands().commands();
     commands.assign(recorded.begin(), recorded.end());
+    return true;
+}
+
+bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS& cbv_srv_uav,
+                                 D3D12_GPU_VIRTUAL_ADDRESS& sampler) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    cbv_srv_uav = l->cbv_srv_uav_base();
+    sampler = l->sampler_base();
     return true;
 }
 

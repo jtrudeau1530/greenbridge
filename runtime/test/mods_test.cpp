@@ -1,5 +1,6 @@
 // mods.h: mod.json manifests and archetype swaps (docs/modding.md). No game files.
 #include "../src/mods.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -133,8 +134,8 @@ int main() {
     set_active_camera(camera_of({}));
     check(override_view_mode(3, 0) == 3, "with no camera mod the game's view mode passes through");
 
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_mods_test";
-    std::filesystem::remove_all(dir);
+    const testfiles::ScratchDir scratch("leonida_mods_test");
+    const auto& dir = scratch.path();
     write(dir / "a_mandy" / "mod.json",
           R"({"name":"Mandy","archetype_swaps":[{"from":"player_story000_00","to":"cs_mandy","when":"always"}]})");
     write(dir / "b_off" / "mod.json",
@@ -156,7 +157,6 @@ int main() {
     check(mandy_only.remap(0xE472B687u) == 0xD7C0CDFFu, "the Mandy mod swaps Lucia's player model for cs_mandy");
 
     check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
-    std::filesystem::remove_all(dir);
 
     std::printf("mods_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

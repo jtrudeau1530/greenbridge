@@ -3,10 +3,11 @@
     python -I scripts/merge_check.py [--main REF] [--json] [--min-length N] PR=REF [PR=REF ...]
 
 PR is the pull request number and REF its head (a branch, a fetched `refs/pull/PR/head`, a commit). For each one,
-against `--main` (default `origin/main`):
+against `--main` (default `origin/main`), using one history scan for the whole batch:
 
-- `merges`: merge commits on main whose subject is "Merge pull request #PR", newest first. A number that is already
-  there is the case the repeated merges come from: a rebased copy merged again keeps both copies of what it added.
+- `merges`: first-parent commits on main whose subject is "Merge pull request #PR" or ends with " (#PR)" (squash
+  merges; "Revert ..." subjects are ignored), newest first. A number that is already there is the case the repeated
+  merges come from: a rebased copy merged again keeps both copies of what it added.
 - `commits`: the PR's commits (merge base..REF) and how many `git cherry` finds on main already (same patch).
 - `duplicates`: runs of three or more consecutive lines the merge would add (each at least `--min-length`
   characters once stripped) that already stand in the same order in the same file on main. This is what a second
@@ -15,7 +16,8 @@ against `--main` (default `origin/main`):
   .rst) make the verdict `duplicates`; a block in code is listed, since equal lines in two functions are ordinary.
 - `conflict`: whether `git merge-tree` reports a conflict (the duplicate check is then on the conflicted tree).
 
-Verdict per PR: `already-merged` (a merge exists and every commit is on main), `duplicates`, `conflict` or `clean`.
+Verdict per PR: `already-merged` (a prior merge exists and either every commit is on main or the conflict-free merged
+tree matches main, as after a multi-commit squash merge), `duplicates`, `conflict` or `clean`.
 Exit 0 when every PR is clean, 1 when any is not, 2 on a usage or git error. Read-only: `merge-tree --write-tree`
 writes only objects, no refs. Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`.
 """
@@ -28,6 +30,8 @@ import sys
 from collections import Counter
 
 MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+)\b")
+SQUASH_SUBJECT = re.compile(r"(?:^|\s)\(#(\d+)\)\s*$")
+REVERT_SUBJECT = re.compile(r"^Revert\b", re.IGNORECASE)
 # Where a doubled block is the repeated-merge damage. In code, three equal lines in two functions are ordinary, so a
 # block there is listed but does not change the verdict.
 TEXT_SUFFIXES = (".md", ".txt", ".rst")
@@ -47,14 +51,24 @@ def git(repo, *args, check=True):
     return r
 
 
-def prior_merges(repo, main, number, depth):
-    out = git(repo, "log", main, "--merges", "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
-    hits = []
+def _merged_pr_number(subject):
+    m = MERGE_SUBJECT.match(subject)
+    if m:
+        return int(m.group(1))
+    if REVERT_SUBJECT.match(subject):
+        return None
+    m = SQUASH_SUBJECT.search(subject)
+    return int(m.group(1)) if m else None
+
+
+def prior_merges(repo, main, numbers, depth):
+    out = git(repo, "log", main, "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
+    hits = {number: [] for number in numbers}
     for line in out.splitlines():
         sha, _, subject = line.partition("\t")
-        m = MERGE_SUBJECT.match(subject)
-        if m and int(m.group(1)) == number:
-            hits.append(sha[:12])
+        number = _merged_pr_number(subject)
+        if number in hits:
+            hits[number].append(sha[:12])
     return hits
 
 
@@ -62,6 +76,10 @@ def cherry(repo, main, ref):
     """(commits on the PR side, those whose patch is already on main)."""
     lines = [l for l in git(repo, "cherry", main, ref).stdout.splitlines() if l.strip()]
     return len(lines), sum(1 for l in lines if l.startswith("-"))
+
+
+def rev_tree(repo, rev):
+    return git(repo, "rev-parse", f"{rev}^{{tree}}").stdout.strip()
 
 
 def merged_tree(repo, main, ref):
@@ -128,13 +146,13 @@ def duplicates(repo, main, tree, min_length, block=3):
     return found
 
 
-def check(repo, main, number, ref, min_length, depth):
-    merges = prior_merges(repo, main, number, depth)
+def check(repo, main, number, ref, min_length, merges):
     total, on_main = cherry(repo, main, ref)
     tree, conflict = merged_tree(repo, main, ref)
-    dups = duplicates(repo, main, tree, min_length)
+    unchanged = not conflict and tree == rev_tree(repo, main)
+    dups = {} if unchanged else duplicates(repo, main, tree, min_length)
     text_dups = {p: v for p, v in dups.items() if p.lower().endswith(TEXT_SUFFIXES)}
-    if merges and total == on_main:
+    if merges and (total == on_main or unchanged):
         verdict = "already-merged"
     elif text_dups:
         verdict = "duplicates"
@@ -161,11 +179,12 @@ def main(argv=None):
     ap.add_argument("--main", default="origin/main", help="the branch the round merges into (default origin/main)")
     ap.add_argument("--repo", default=".", help="repository folder (default: the current one)")
     ap.add_argument("--min-length", type=int, default=40, help="shortest stripped line counted as a duplicate (40)")
-    ap.add_argument("--depth", type=int, default=5000, help="first-parent merges searched for earlier merges (5000)")
+    ap.add_argument("--depth", type=int, default=5000, help="first-parent commits searched for earlier merges (5000)")
     ap.add_argument("--json", action="store_true", help="one JSON report instead of text")
     args = ap.parse_args(argv)
     try:
-        results = [check(args.repo, args.main, n, ref, args.min_length, args.depth) for n, ref in args.pairs]
+        history = prior_merges(args.repo, args.main, (n for n, _ in args.pairs), args.depth)
+        results = [check(args.repo, args.main, n, ref, args.min_length, history[n]) for n, ref in args.pairs]
     except GitError as e:
         print(f"merge_check: {e}", file=sys.stderr)
         return 2
@@ -175,6 +194,8 @@ def main(argv=None):
         for r in results:
             c = r["commits"]
             print(f"#{r['pr']} {r['verdict']}: {c['on_main']}/{c['total']} commit(s) already on main"
+                  + (", merged tree matches main"
+                     if r["verdict"] == "already-merged" and c["on_main"] != c["total"] else "")
                   + (f", merged before at {', '.join(r['merges'])}" if r["merges"] else "")
                   + (", conflicts" if r["conflict"] else ""))
             for path, n in sorted(r["duplicates"].items()):

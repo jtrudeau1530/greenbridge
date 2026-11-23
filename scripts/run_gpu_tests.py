@@ -304,10 +304,15 @@ def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
 
 
 def bary_fallback() -> bool:
-    """LEONIDA_BARY_FALLBACK=1: pixel shaders that read raw barycentrics are translated with --bary-fallback and drawn
-    through their pass-through geometry shader (tools/bary_fallback_gs.py), so they run on a device without
-    VK_KHR_fragment_shader_barycentric (NVIDIA Pascal, for one)."""
-    return (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower() in ("1", "true", "yes", "on")
+    """LEONIDA_BARY_FALLBACK=1 (or 0): translate raw barycentrics to an ordinary vec3 input and draw it through
+    tools/bary_fallback_gs.py. Unset, it is on where tools/vk_subgroup_info.py reports a driver with a known
+    BaryCoordKHR bug: Mesa ANV (SHADER-925) and AMD's Windows driver on gfx90c iGPUs (#5933)."""
+    v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_barycentric_fallback() is True
 
 
 def f16_interp_fallback() -> bool:
@@ -323,6 +328,7 @@ def f16_interp_fallback() -> bool:
 
 
 _PER_VERTEX = []
+_BARYCENTRIC_FALLBACK = []
 
 
 def _device_per_vertex():
@@ -337,6 +343,21 @@ def _device_per_vertex():
             pass
         _PER_VERTEX.append(answer)
     return _PER_VERTEX[0]
+
+
+def _device_barycentric_fallback():
+    """barycentric_fallback from tools/vk_subgroup_info.py (Mesa ANV, SHADER-925; AMD Windows on gfx90c, #5933),
+    cached per suite."""
+    if not _BARYCENTRIC_FALLBACK:
+        answer = None
+        try:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
+                               capture_output=True, text=True, timeout=60)
+            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("barycentric_fallback")
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+        _BARYCENTRIC_FALLBACK.append(answer)
+    return _BARYCENTRIC_FALLBACK[0]
 
 
 def w64_emulated() -> bool:
@@ -860,7 +881,11 @@ def run_suite(a, work: str) -> int:
         fname = shader_source(name) + ".asm"
         disasm_path = os.path.join(disasm_dir, f"{name}.s")
         if disasm_src is not None:
-            shutil.copyfile(os.path.join(disasm_src, f"{name}.s"), disasm_path)
+            try:
+                shutil.copyfile(os.path.join(disasm_src, f"{name}.s"), disasm_path)
+            except shutil.SameFileError:
+                # A replay can use the work folder's existing listings as its source.
+                pass
         else:
             assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
         disasm_files.append(disasm_path)
@@ -1064,6 +1089,21 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
+                results.append((name, ok, detail))
+        elif name == "cs_div_fmas_f64":
+            # One-rounding binary64 FMA: strict where the translator emitted OpFmaKHR on doubles (shaderFmaFloat64,
+            # --fma khr); under the default GLSL Fma the split result (0) is allowed, as cs_fma_fused allows it.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            if rc == UNSUPPORTED:      # no shaderFloat64, or (--fma khr) no shaderFmaFloat64
+                results.append((name, None, unsupported_skip(msg)))
+            else:
+                words = (dump_words(msg) or [])[:2] if rc == 0 else []
+                strict = "shaderFmaFloat64" in ((index.get(name) or {}).get("features") or ())
+                fused, split = [0, 0x3c300000], [0, 0]
+                ok = rc == 0 and (words == fused or (not strict and words == split))
+                detail = " ".join(hex(x) for x in words) if words else msg
+                if ok and words == split:
+                    detail += " (split: the driver rounds GLSL Fma on doubles twice; --fma khr fixes it)"
                 results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
