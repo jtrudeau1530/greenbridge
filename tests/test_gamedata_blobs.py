@@ -141,17 +141,46 @@ class GamedataBlobsTest(unittest.TestCase):
                          ("vfx_settings_dat", 3, 1, 1, 1, 1, 1, 3))
 
         tbl = gamedata_blobs.parse_fixed_table_1296(fixed_table_1296_blob(3))
-        self.assertEqual((tbl["kind"], tbl["record_count"], tbl["duplicated_header_pairs"], tbl["distinct_header_pairs"]),
-                         ("fixed_table_1296", 3, 3, 3))
+        self.assertEqual(
+            (tbl["kind"], tbl["record_count"], tbl["record_header_bytes"], tbl["record_body_bytes"],
+             tbl["duplicated_header_pairs"], tbl["distinct_header_pairs"]),
+            ("fixed_table_1296", 3, 16, 1280, 3, 3),
+        )
         with self.assertRaisesRegex(ValueError, "1296"):
             gamedata_blobs.parse_fixed_table_1296(fixed_table_1296_blob(2) + b"\x00")
 
-        grid = gamedata_blobs.parse_spatial_grid_blob(spatial_grid_blob(cells=8))
+        blob = spatial_grid_blob(cells=8)
+        grid = gamedata_blobs.parse_spatial_grid_blob(blob)
         self.assertEqual((grid["kind"], grid["grid_cells"], grid["empty_cells"], grid["populated_cells"],
                           grid["region2_records"], grid["region3_words"]),
                          ("spatial_grid_table", 8, 1, 7, 3, 5))
         self.assertEqual(grid["region2_record_words_hist"], {"3": 1, "6": 1, "11": 1})
-        self.assertTrue(grid["all_cells_in_region3"] and grid["all_region3_in_region2"])
+        self.assertEqual(
+            (grid["cells_in_region3"], grid["region3_words_in_region2"], grid["region3_end_inclusive"],
+             grid["region3_spans"], grid["region3_span_words_min"], grid["region3_span_words_max"]),
+            (7, 5, len(blob) - 1, 3, 1, 2),
+        )
+
+        # Negative spatial-grid checks: cell offset out of bounds, lowest cell offset skipping Region 3 start,
+        # and Region 3 pointer targeting Region 3 itself.
+        bad_cell = bytearray(blob)
+        struct.pack_into("<I", bad_cell, 4, 0)
+        with self.assertRaisesRegex(ValueError, "Region 3 bounds"):
+            gamedata_blobs.parse_spatial_grid_blob(bytes(bad_cell))
+
+        skip_start = bytearray(blob)
+        r3_second_off = grid["region3_offset"] + 4
+        for cell_idx in range(1, 8):
+            word = struct.unpack_from("<I", skip_start, cell_idx * 4)[0]
+            if (word & gamedata_blobs.CELL_OFFSET_MASK) == grid["region3_offset"]:
+                struct.pack_into("<I", skip_start, cell_idx * 4, (word & ~gamedata_blobs.CELL_OFFSET_MASK) | r3_second_off)
+        with self.assertRaisesRegex(ValueError, "lowest cell offset"):
+            gamedata_blobs.parse_spatial_grid_blob(bytes(skip_start))
+
+        bad_r3 = bytearray(blob)
+        struct.pack_into("<I", bad_r3, len(bad_r3) - 4, grid["region3_offset"])
+        with self.assertRaisesRegex(ValueError, "Region 2 bounds"):
+            gamedata_blobs.parse_spatial_grid_blob(bytes(bad_r3))
 
     def test_reads_carve_cross_references_sgd5_and_protects_paths(self):
         # Pad text/XML cleanly so printable() > 0.95 distinguishes text from binary in small fixtures
@@ -184,6 +213,8 @@ class GamedataBlobsTest(unittest.TestCase):
             self.assertTrue(xref["preload_lists"][0]["exact_order_db0"])
             self.assertTrue(xref["preload_lists"][1]["exact_order_db1"])
             self.assertEqual(xref["vfx_settings"][0]["prefixes_in_db0"], 1)
+            self.assertEqual(xref["vfx_settings"][0]["data_lines"], 80)
+            self.assertEqual(xref["vfx_settings"][0]["data_lines_in_db0"], 40)
 
         out_json = os.path.join(self.root, "reports", "blobs.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.carve, "--json", out_json],

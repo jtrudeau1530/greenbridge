@@ -116,6 +116,7 @@ def parse_vfx_settings_dat(text: str) -> dict:
         "distinct_prefixes": len(set(prefixes)),
         "token_counts": {str(k): token_hist[k] for k in sorted(token_hist)},
         "_prefixes": sorted(set(prefixes)),
+        "_prefix_counts": dict(Counter(prefixes)),
     }
 
 
@@ -139,8 +140,8 @@ def parse_fixed_table_1296(blob: bytes) -> dict:
         "kind": "fixed_table_1296",
         "record_count": count,
         "record_bytes": 1296,
-        "subrecords_per_record": 64,
-        "subrecord_bytes": 20,
+        "record_header_bytes": 16,
+        "record_body_bytes": 1280,
         "duplicated_header_pairs": duplicated_pairs,
         "distinct_header_pairs": len(distinct_pairs),
     }
@@ -182,20 +183,31 @@ def parse_spatial_grid_blob(blob: bytes) -> dict:
     r2_bounds = r2_targets + [region3_start]
     r2_word_hist = Counter((r2_bounds[i + 1] - r2_bounds[i]) // 4 for i in range(len(r2_targets)))
 
+    r3_targets = sorted(set(cell_offs))
+    if r3_targets[0] != region3_start:
+        raise ValueError(f"Region 3 start {region3_start:#x} does not match lowest cell offset {r3_targets[0]:#x}")
+    r3_bounds = r3_targets + [len(blob)]
+    r3_span_lens = [(r3_bounds[i + 1] - r3_bounds[i]) // 4 for i in range(len(r3_targets))]
+
     return {
         "kind": "spatial_grid_table",
         "grid_cells": len(grid),
         "empty_cells": empty_cells,
         "populated_cells": len(populated),
-        "distinct_cell_offsets": len(set(cell_offs)),
+        "distinct_cell_offsets": len(r3_targets),
+        "cells_in_region3": len(populated),
         "region2_offset": region2_start,
         "region2_bytes": region3_start - region2_start,
         "region2_records": len(r2_targets),
         "region2_record_words_hist": {str(sz): r2_word_hist[sz] for sz in sorted(r2_word_hist)},
         "region3_offset": region3_start,
+        "region3_bytes": len(blob) - region3_start,
+        "region3_end_inclusive": len(blob) - 1,
         "region3_words": len(region3),
-        "all_cells_in_region3": True,
-        "all_region3_in_region2": True,
+        "region3_words_in_region2": len(region3),
+        "region3_spans": len(r3_targets),
+        "region3_span_words_min": min(r3_span_lens),
+        "region3_span_words_max": max(r3_span_lens),
     }
 
 
@@ -281,11 +293,15 @@ def cross_reference_sgd5(payloads: list[dict], shaders_rpf: str) -> dict:
             })
         elif p["kind"] == "vfx_settings_dat":
             prefixes = set(p["_prefixes"])
+            pfx_counts = p["_prefix_counts"]
             vfx_prefix_matches.append({
                 "offset_hex": p["offset_hex"],
+                "data_lines": p["data_lines"],
                 "distinct_prefixes": p["distinct_prefixes"],
                 "prefixes_in_db0": len(prefixes & db0_set),
                 "prefixes_in_db1": len(prefixes & db1_set),
+                "data_lines_in_db0": sum(c for k, c in pfx_counts.items() if k in db0_set),
+                "data_lines_in_db1": sum(c for k, c in pfx_counts.items() if k in db1_set),
             })
 
     return {
@@ -353,7 +369,10 @@ def main(argv=None) -> int:
             print(f'SGD5 xref {row["offset_hex"]}: in_db0={row["in_db0"]} (order={row["exact_order_db0"]}), '
                   f'in_db1={row["in_db1"]} (order={row["exact_order_db1"]}), unshipped={row["unshipped"]}')
         for row in xref["vfx_settings"]:
-            print(f'VFX xref {row["offset_hex"]}: {row["prefixes_in_db0"]}/{row["distinct_prefixes"]} prefixes in DB0')
+            print(
+                f'VFX xref {row["offset_hex"]}: {row["prefixes_in_db0"]}/{row["distinct_prefixes"]} prefixes '
+                f'({row["data_lines_in_db0"]}/{row["data_lines"]} data lines) in DB0'
+            )
 
     if a.json:
         out: dict = {"payloads": [_public(p) for p in payloads]}
