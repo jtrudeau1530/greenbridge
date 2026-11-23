@@ -186,6 +186,9 @@ def main():
     a = ap.parse_args()
     if a.out and same_report_path(a.out, a.archive):
         ap.error("--out would overwrite the archive")
+    if not os.path.exists(a.archive):
+        print(f"ERROR: cannot read {a.archive}: no such file or folder", file=sys.stderr)
+        return 2
     hashes, docs = None, None
     if a.common:
         cells, names = vehicle_documents(a.common)
