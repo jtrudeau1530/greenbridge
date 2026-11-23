@@ -2784,7 +2784,21 @@ void attach_xmem_backing(DeviceProxy* self, void* resource, const D3D12_RESOURCE
         info.SizeInBytes > (std::numeric_limits<std::size_t>::max)())
         return;
 
+    {
+        const DWORD last_error = GetLastError();
+        std::fprintf(stderr, "[rt] d3d12_xs: lease-diag before alloc: %llu bytes, attributes 0x%llx\n",
+                     static_cast<unsigned long long>(info.SizeInBytes),
+                     static_cast<unsigned long long>(kXmemCommittedResourceAttributes));
+        std::fflush(stderr);
+        SetLastError(last_error);
+    }
     void* const memory = alloc_fn(static_cast<std::size_t>(info.SizeInBytes), kXmemCommittedResourceAttributes);
+    {
+        const DWORD last_error = GetLastError();
+        std::fprintf(stderr, "[rt] d3d12_xs: lease-diag after alloc: %s\n", memory ? "allocated" : "refused");
+        std::fflush(stderr);
+        SetLastError(last_error);
+    }
     static std::atomic<bool> logged{false};
     if (first_call(logged))
         std::fprintf(stderr, "[rt] d3d12_xs: slot 127 resource memory through the title's XMem hook: %llu bytes, %s\n",
