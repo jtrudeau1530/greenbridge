@@ -5,6 +5,10 @@ padding only when every byte in it is zero. Slicing an mmap copies the slice, so
 whole gap at once. On a large archive a gap can run to gigabytes (story000.rpf, about 20 GB, cannot be indexed on
 a 16 GB machine that way), so the gap is compared against zeros one window at a time instead, and the first
 non-zero window ends the check.
+
+The range is normalized with Python's own slice rules, so the counts and verdicts match `buf[start:end]` for
+negative and out-of-range endpoints. That is the right contract here because callers address the buffer through
+slices rather than raw file offsets.
 """
 
 WINDOW = 1 << 22                 # 4 MiB: the most a check allocates, besides the shared zero block
