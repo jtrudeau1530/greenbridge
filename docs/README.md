@@ -66,6 +66,7 @@ method, scope and caveats. No game data is included.
 | [xdxr.md](xdxr.md) | `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) from `XboxBvhBuilder.dll`'s reads; stream records' offsets and defaults; offline statistics not in the package. |
 | [d3d12_command_objects.md](d3d12_command_objects.md) | Measured command queue/list/fence/`PresentX` surface; verified vs prior art vs open. |
 | [d3d12_xs_console_abi.md](d3d12_xs_console_abi.md) | The D3D12.X console ABI the `d3d12_xs` shim must reproduce: device/queue/list vtable slots, command-list object fields and record encodings, root-argument SGPR rules, unified memory; sibling-layer measurements marked unverified here. |
+| [xbox_d3d12_xs.md](xbox_d3d12_xs.md) | The `d3d12_xs` graphics ABI quoted from Microsoft's public GDK reference: root signatures, state objects, DXIL libraries, hit groups, shader cache sessions; which pages are missing or NDA-gated. |
 | [runtime_imports.md](runtime_imports.md) | The 16 shipped modules' measured imports and shim/host/unimplemented split. |
 | [console_libraries.md](console_libraries.md) | The console-DLL surface a title can import (`d3d12_xs`, `xgameruntime`, `xmem`, `gameinput`, `xaudio2_9`, `dstorage_xs`, `xg_xs`, `AcpHal`, `chad`/`xapu`/`xcrdapi`): which are shimmed, classified or unbound. |
 | [import_routing.md](import_routing.md) | The bind order (shim → bundled → host → unimplemented), `owns_dll` and the pseudo-handle path, per-DLL outcome. |
