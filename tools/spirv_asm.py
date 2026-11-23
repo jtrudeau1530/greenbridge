@@ -273,6 +273,8 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
     defined_types: set[str] = set()
     type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
+    # Only OpSwitch needs a value's result type, to choose the case literal width.
+    track_switch_types = "OpSwitch" in text
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
 
     def get_id(tok: str, lineno: int) -> int:
@@ -451,7 +453,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if has_res:
                 rid = get_id(res_tok, lineno)
                 out.append(rid)
-                if rt_id is not None:
+                if track_switch_types and rt_id is not None:
                     id_to_type[rid] = rt_id
             for k in range(arg_idx, len(toks)):
                 out.append(get_id(toks[k], lineno))
@@ -483,7 +485,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 raise SpirvAsmError(f"line {lineno}: {opname} requires '%id =' result")
             res_id = get_id(res_tok, lineno)
             out.append(res_id)
-            if res_type_id is not None:
+            if track_switch_types and res_type_id is not None:
                 id_to_type[res_id] = res_type_id
         elif res_tok is not None:
             raise SpirvAsmError(f"line {lineno}: {opname} does not produce a result id")
