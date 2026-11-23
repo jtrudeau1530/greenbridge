@@ -34,10 +34,19 @@ _ATTR = re.compile(r"attr(\d+)\.([xyzw])")
 _TARGET = re.compile(r"(pos|param|mrt|mrtz|null|prim)(\d*)")
 _INT = re.compile(r"-?(0x[0-9a-fA-F]+|\d+)")
 _FLOAT = re.compile(r"-?\d+\.\d+(e[+-]?\d+)?")
+# LLVM 23 prints a literal it could also show as an inline constant as lit(V), e.g. a v_fma_mix* f32 source
+# `lit(0x42200000)`, where LLVM 21 printed the inline constant of the low half (0) and dropped the literal.
+# Only a numeric constant is unwrapped: lit(v2) is no literal and stays raw (Unsupported), as before.
+_LIT = re.compile(r"lit\((-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+(?:e[+-]?\d+)?)?))\)")
 
 
 def operand(tok):
     t = tok.strip()
+    if "lit(" in t:
+        # lit(V) is the constant V. A leading '-' on it is the VOP3 neg modifier, as neg(V) (not integer negation).
+        t = _LIT.sub(r"\1", t)
+        if t.startswith("-"):
+            t = "neg(" + t[1:] + ")"
     neg = t.startswith("-")
     core = t[1:] if neg else t
     absm = len(core) > 2 and core.startswith("|") and core.endswith("|")
@@ -207,8 +216,11 @@ def parse_line(line):
             return ""
         rest = MODWORDS.sub(_take_mod, rest)
     parts = [a for a in split_args(rest) if a.strip()]
-    # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
-    if parts and len(parts[0].split()) == 2:
+    if op in ("s_waitcnt", "s_waitcnt_depctr"):
+        # LLVM separates named wait counters with spaces.
+        parts = [token for part in parts for token in part.split()]
+    elif parts and len(parts[0].split()) == 2:
+        # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
