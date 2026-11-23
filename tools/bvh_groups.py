@@ -299,11 +299,15 @@ def main(argv=None):
     for k, v in summary["bvh_preceded_by"].items():
         print("%8d  bvh stream preceded by %s" % (v, k))
     if a.json:
-        with open(a.json, "w", encoding="utf-8") as f:
+        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"source": a.archive, "summary": summary, "rows": rows}, f, indent=1)
             f.write("\n")
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())
