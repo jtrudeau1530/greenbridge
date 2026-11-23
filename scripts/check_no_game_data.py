@@ -251,13 +251,20 @@ def tracked_files(root):
     return [os.path.join(root, p) for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
-def check(paths):
-    """[(path, format)] for every regular file in `paths` that starts like game data."""
+def check(paths, unreadable=None):
+    """[(path, format)] for every regular file in `paths` that starts like game data.
+
+    A file that exists but cannot be opened or read is appended to `unreadable` (when given) as (path, error)."""
     found = []
     for path in paths:
         if os.path.islink(path) or not os.path.isfile(path):
             continue  # submodules, symlinks, files deleted in the working tree
-        name = classify_file(path)
+        try:
+            name = classify_file(path)
+        except OSError as e:
+            if unreadable is not None:
+                unreadable.append((path, e))
+            continue
         if name:
             found.append((path, name))
     return found
@@ -273,13 +280,16 @@ def display(path):
 
 def main(argv):
     paths = argv or tracked_files(os.getcwd())
-    found = check(paths)
+    unreadable = []
+    found = check(paths, unreadable)
     for path, name in found:
         print(f"{display(path)}: {name}")
+    for path, e in unreadable:
+        print(f"check_no_game_data: cannot read {display(path)}: {e.strerror or e}", file=sys.stderr)
     if found:
         print(f"{len(found)} file(s) start like game data. Remove them; see CONTRIBUTING.md.", file=sys.stderr)
         return 1
-    return 0
+    return 2 if unreadable else 0  # 2: some files could not be checked and none of the others matched
 
 
 if __name__ == "__main__":
