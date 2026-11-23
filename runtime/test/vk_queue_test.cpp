@@ -9,6 +9,7 @@
 #include "../src/vulkan_backend.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -30,6 +31,20 @@ VKAPI_ATTR VkResult VKAPI_CALL counting_allocate_command_buffers(VkDevice device
                                                                  VkCommandBuffer* buffers) {
     allocated_command_buffers += info->commandBufferCount;
     return real_allocate_command_buffers(device, info, buffers);
+}
+
+// Makes the queue's first kStalls waits for room time out at once, as on a GPU that stopped making progress.
+constexpr std::uint32_t kStalls = 3;
+PFN_vkWaitSemaphores real_wait_semaphores = nullptr;
+std::atomic<std::uint32_t> injected_stalls{0};
+
+VKAPI_ATTR VkResult VKAPI_CALL stalling_wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo* info,
+                                                        std::uint64_t timeout) {
+    if (timeout == VulkanQueue::kQueuedWaitNs && injected_stalls.load() < kStalls) {
+        ++injected_stalls;
+        return VK_TIMEOUT;
+    }
+    return real_wait_semaphores(device, info, timeout);
 }
 
 const char* flags_text(VkQueueFlags f) {
@@ -211,7 +226,8 @@ int main() {
     std::printf("copy and compute queues refuse a render-target clear\n");
 
     // 5. A caller that submits faster than the GPU finishes must not grow the queue's command buffers without bound:
-    // at the cap it waits for the oldest one. Big host-visible copies keep the GPU behind the submitting loop.
+    // at the cap it waits for the oldest one. Big host-visible copies keep the GPU behind the submitting loop. The first
+    // waits time out (injected), as on a stalled GPU: the cap must hold through a timeout too.
     {
         constexpr VkDeviceSize kBig = 16u << 20;
         constexpr std::uint32_t kSubmits = 4 * VulkanQueue::kMaxQueuedCommandBuffers;
@@ -228,14 +244,18 @@ int main() {
         const CommandList* big_lists[] = {&big_copy};
 
         real_allocate_command_buffers = context.vk.vkAllocateCommandBuffers;
+        real_wait_semaphores = context.vk.vkWaitSemaphores;
         context.vk.vkAllocateCommandBuffers = counting_allocate_command_buffers;
+        context.vk.vkWaitSemaphores = stalling_wait_semaphores;
         allocated_command_buffers = 0;
         for (std::uint32_t i = 0; i < kSubmits; ++i) EXPECT(direct.execute(big_lists) == ReplayResult::success);
         context.vk.vkAllocateCommandBuffers = real_allocate_command_buffers;
+        context.vk.vkWaitSemaphores = real_wait_semaphores;
         EXPECT(direct.signal(fence.semaphore(), 5));
         EXPECT(fence.wait(5, 20'000'000'000ull));
-        std::printf("backlog: %u submits, %u command buffers allocated (cap %zu)\n", kSubmits, allocated_command_buffers,
-                    VulkanQueue::kMaxQueuedCommandBuffers);
+        std::printf("backlog: %u submits, %u command buffers allocated (cap %zu), %u waits timed out\n", kSubmits,
+                    allocated_command_buffers, VulkanQueue::kMaxQueuedCommandBuffers, injected_stalls.load());
+        EXPECT(injected_stalls.load() == kStalls);  // the queue did reach the cap and wait
         EXPECT(allocated_command_buffers <= VulkanQueue::kMaxQueuedCommandBuffers);
         EXPECT(static_cast<std::uint8_t*>(dst_map)[kBig - 1] == 0x5A);
     }
