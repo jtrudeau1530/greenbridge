@@ -240,5 +240,32 @@ class CliTest(unittest.TestCase):
             self.assertNotIn("Traceback", r.stderr)
 
 
+    def test_index_saved_with_bom_is_read(self):
+        # PowerShell 5.1 Set-Content and some editors save JSON with a UTF-8 BOM; the index is still JSON.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "index.json")
+            with open(path, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps(NO_SPILL).encode("utf-8"))
+            result = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("cs: 2 shaders; base s4", result.stdout)
+
+
+    def test_carve_index_saved_with_bom_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump(NO_SPILL, f)
+            carve = os.path.join(tmp, "carve.json")
+            with open(carve, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps([{"name": "x", "parts": {"RTS0": 1}}]).encode("utf-8"))
+            result = subprocess.run([sys.executable, "-I", TOOL, index, "--carve", carve],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("containers: 1, with an RTS0 part: 1", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
