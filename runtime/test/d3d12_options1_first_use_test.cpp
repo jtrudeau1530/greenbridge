@@ -6,8 +6,9 @@
 #include "../shims/d3d12_com.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
-#include <cstring>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -18,10 +19,18 @@ int fail(const char* what) {
     return 1;
 }
 
+// The fields by name, so that padding or a field a later SDK adds cannot change the result.
+bool same_answer(const D3D12_FEATURE_DATA_D3D12_OPTIONS1& a, const D3D12_FEATURE_DATA_D3D12_OPTIONS1& b) {
+    return a.WaveOps == b.WaveOps && a.WaveLaneCountMin == b.WaveLaneCountMin &&
+           a.WaveLaneCountMax == b.WaveLaneCountMax && a.TotalLaneCount == b.TotalLaneCount &&
+           a.ExpandedComputeResourceStates == b.ExpandedComputeResourceStates &&
+           a.Int64ShaderOps == b.Int64ShaderOps;
+}
+
 }  // namespace
 
 int main() {
-    // The threads spin between rounds, so there are never more of them than cores left beside the main thread.
+    // The threads poll between rounds, so there are never more of them than cores left beside the main thread.
     const unsigned cores = std::thread::hardware_concurrency();
     const int kThreads = cores >= 9 ? 8 : cores >= 3 ? int(cores) - 1 : 2;
     constexpr int kRounds = 500;
@@ -52,8 +61,8 @@ int main() {
     if (expected.WaveLaneCountMin < 1 || expected.WaveLaneCountMax < expected.WaveLaneCountMin)
         return fail("the single-thread answer has no lane range");
 
-    // The threads live for the whole test and spin between rounds, so that they all enter the call inside the few
-    // microseconds the first read takes.
+    // The threads live for the whole test and poll between rounds (with a yield, so an idle thread gives its core
+    // away), so that they all enter the call inside the few microseconds the first read takes.
     std::atomic<ID3D12Device*> shared{nullptr};
     std::atomic<int> round{0}, finished{0};
     std::atomic<long long> wrong{0}, errors{0};
@@ -63,12 +72,15 @@ int main() {
         threads.emplace_back([&] {
             int seen = 0;
             while (!stop.load(std::memory_order_acquire)) {
-                if (round.load(std::memory_order_acquire) == seen) continue;
+                if (round.load(std::memory_order_acquire) == seen) {
+                    std::this_thread::yield();
+                    continue;
+                }
                 ++seen;
                 D3D12_FEATURE_DATA_D3D12_OPTIONS1 got{};
                 if (FAILED(shared.load()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &got, sizeof(got))))
                     ++errors;
-                else if (std::memcmp(&got, &expected, sizeof(got)) != 0)
+                else if (!same_answer(got, expected))
                     ++wrong;
                 ++finished;
             }
@@ -82,7 +94,17 @@ int main() {
         shared.store(device);
         finished.store(0);
         round.fetch_add(1, std::memory_order_release);
-        while (finished.load() != kThreads) std::this_thread::yield();
+        // A thread that does not come back cannot be joined: stop the process with the reason, not a hang.
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (finished.load() != kThreads) {
+            if (std::chrono::steady_clock::now() > give_up) {
+                std::fprintf(stderr, "d3d12_options1_first_use_test: round %d: %d of %d threads did not return from "
+                                     "CheckFeatureSupport(OPTIONS1) in 60 s\n", r, kThreads - finished.load(), kThreads);
+                std::fflush(stderr);
+                std::_Exit(1);
+            }
+            std::this_thread::yield();
+        }
         device->Release();
     }
     stop.store(true, std::memory_order_release);
