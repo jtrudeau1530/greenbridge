@@ -15,6 +15,7 @@
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -559,7 +560,187 @@ int main(int argc, char** argv) {
         check(hook_state.free_count == 1 && hook_state.freed_ptr == hook_state.backing &&
                   hook_state.freed_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
               "releasing the hooked heap frees its backing through __XMemAllocationHooks__");
-        rt::shims::remove_xmem_allocation_hooks(&title_hooks);
+
+        // End-to-end console command list clear + readback with title-backed RTV and DSV heaps:
+        // verifies CPU handle translation on console slots 50/51/52 and FLOAT Depth (XMM3) on slot 51.
+        {
+            struct DualHeapState {
+                alignas(64) std::uint8_t rtv_backing[1024]{};
+                alignas(64) std::uint8_t dsv_backing[1024]{};
+                int next_slice = 0;
+            };
+            static DualHeapState dual_state;
+            dual_state = {};
+            struct DualHooks {
+                static void* __stdcall alloc(std::size_t size, std::uint64_t attr) {
+                    if ((attr & 0x3FFFull) != 4 || size > 1024) return nullptr;
+                    return dual_state.next_slice++ == 0 ? dual_state.rtv_backing : dual_state.dsv_backing;
+                }
+                static void __stdcall free(void*, std::uint64_t) {}
+            };
+            const rt::shims::XMemAllocationHooks dual_hooks{&DualHooks::alloc, &DualHooks::free};
+            rt::shims::remove_xmem_allocation_hooks(&title_hooks);
+            rt::shims::add_xmem_allocation_hooks(&dual_hooks, &dual_hooks);
+
+            D3D12_DESCRIPTOR_HEAP_DESC rtv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            D3D12_DESCRIPTOR_HEAP_DESC dsv_hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            ComPtr<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
+            hr = device->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(rtv_heap.GetAddressOf()));
+            HRESULT hr_dsv = device->CreateDescriptorHeap(&dsv_hd, IID_PPV_ARGS(dsv_heap.GetAddressOf()));
+            check(SUCCEEDED(hr) && SUCCEEDED(hr_dsv) && rtv_heap && dsv_heap,
+                  "hooked RTV and DSV heaps create through slot 14");
+
+            const D3D12_HEAP_PROPERTIES default_hp = default_heap();
+            D3D12_HEAP_PROPERTIES readback_hp = default_heap();
+            readback_hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rt_desc{};
+            rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rt_desc.Width = 4;
+            rt_desc.Height = 4;
+            rt_desc.DepthOrArraySize = 1;
+            rt_desc.MipLevels = 1;
+            rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            rt_desc.SampleDesc = {1, 0};
+            rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+            D3D12_RESOURCE_DESC ds_desc = rt_desc;
+            ds_desc.Format = DXGI_FORMAT_D32_FLOAT;
+            ds_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+            D3D12_RESOURCE_DESC rb_desc = buffer_desc();
+            rb_desc.Width = 4096;
+            rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            ComPtr<ID3D12Resource> rt_tex, ds_tex, rb_buf;
+            hr = device->CreateCommittedResource(&default_hp, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                 IID_PPV_ARGS(rt_tex.GetAddressOf()));
+            HRESULT hr2 = device->CreateCommittedResource(&default_hp, D3D12_HEAP_FLAG_NONE, &ds_desc,
+                                                          D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                                                          IID_PPV_ARGS(ds_tex.GetAddressOf()));
+            HRESULT hr3 = device->CreateCommittedResource(&readback_hp, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                          IID_PPV_ARGS(rb_buf.GetAddressOf()));
+            check(SUCCEEDED(hr) && SUCCEEDED(hr2) && SUCCEEDED(hr3),
+                  "RT, DS and readback resources create for console list clear test");
+
+            if (rtv_heap && dsv_heap && rt_tex && ds_tex && rb_buf) {
+                const auto rtv_cpu = reinterpret_cast<GetCpuHandleFn>(
+                    (*reinterpret_cast<void***>(rtv_heap.Get()))[9])(rtv_heap.Get());
+                const auto dsv_cpu = reinterpret_cast<GetCpuHandleFn>(
+                    (*reinterpret_cast<void***>(dsv_heap.Get()))[9])(dsv_heap.Get());
+                const UINT rtv_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                const UINT dsv_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+                const D3D12_CPU_DESCRIPTOR_HANDLE rtv_h{rtv_cpu.ptr + rtv_inc};
+                const D3D12_CPU_DESCRIPTOR_HANDLE dsv_h{dsv_cpu.ptr + dsv_inc};
+                check(rtv_cpu.ptr == reinterpret_cast<SIZE_T>(dual_state.rtv_backing) &&
+                          dsv_cpu.ptr == reinterpret_cast<SIZE_T>(dual_state.dsv_backing),
+                      "RTV and DSV heaps report their title-backed CPU descriptor bases");
+
+                device->CreateRenderTargetView(rt_tex.Get(), nullptr, rtv_h);
+                device->CreateDepthStencilView(ds_tex.Get(), nullptr, dsv_h);
+
+                using CreateQueueXFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
+                using CreateListXFn = HRESULT(WINAPI*)(void*, const void*, ID3D12CommandAllocator*,
+                                                       ID3D12PipelineState*, const IID*, void**);
+                using CloseFn = HRESULT(WINAPI*)(void*);
+                using BarrierFn = void(WINAPI*)(void*, UINT, const D3D12_RESOURCE_BARRIER*);
+                using CopyTexFn = void(WINAPI*)(void*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT,
+                                                const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
+                using OmSetRtFn = void(WINAPI*)(void*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
+                                                const D3D12_CPU_DESCRIPTOR_HANDLE*);
+                using ClearDsvFn = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8,
+                                                 UINT, const D3D12_RECT*);
+                using ClearRtvFn = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT[4], UINT,
+                                                 const D3D12_RECT*);
+
+                const D3D12_COMMAND_QUEUE_DESC qd{};
+                const IID iid_q = __uuidof(ID3D12CommandQueue);
+                const IID iid_l = __uuidof(ID3D12GraphicsCommandList);
+                ComPtr<ID3D12CommandQueue> clear_q;
+                ComPtr<ID3D12CommandAllocator> clear_alloc;
+                ComPtr<ID3D12GraphicsCommandList> clear_list;
+                ComPtr<ID3D12Fence> clear_fence;
+                hr = reinterpret_cast<CreateQueueXFn>(proxy_vtbl[48])(
+                    device.Get(), &qd, &iid_q, reinterpret_cast<void**>(clear_q.GetAddressOf()));
+                HRESULT hra = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                             IID_PPV_ARGS(clear_alloc.GetAddressOf()));
+                struct {
+                    UINT Type;
+                    UINT NodeMask;
+                } ld{D3D12_COMMAND_LIST_TYPE_DIRECT, 0};
+                HRESULT hrl = SUCCEEDED(hra) ? reinterpret_cast<CreateListXFn>(proxy_vtbl[73])(
+                                                   device.Get(), &ld, clear_alloc.Get(), nullptr, &iid_l,
+                                                   reinterpret_cast<void**>(clear_list.GetAddressOf()))
+                                             : hra;
+                HRESULT hrf = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(clear_fence.GetAddressOf()));
+                check(SUCCEEDED(hr) && SUCCEEDED(hra) && SUCCEEDED(hrl) && SUCCEEDED(hrf) &&
+                          rt::d3d12_xs::is_list_proxy(clear_list.Get()),
+                      "console list proxy created for hooked RTV/DSV clear");
+
+                if (clear_q && clear_list && clear_fence) {
+                    void** lv = *reinterpret_cast<void***>(clear_list.Get());
+                    const FLOAT rgba[4] = {1.0f, 0.0f, 0.5f, 1.0f};
+                    reinterpret_cast<OmSetRtFn>(lv[50])(clear_list.Get(), 1, &rtv_h, FALSE, &dsv_h);
+                    reinterpret_cast<ClearRtvFn>(lv[52])(clear_list.Get(), rtv_h, rgba, 0, nullptr);
+                    reinterpret_cast<ClearDsvFn>(lv[51])(clear_list.Get(), dsv_h, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0,
+                                                         nullptr);
+
+                    D3D12_RESOURCE_BARRIER b[2]{};
+                    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b[0].Transition = {rt_tex.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                       D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+                    b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b[1].Transition = {ds_tex.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                       D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE};
+                    reinterpret_cast<BarrierFn>(lv[26])(clear_list.Get(), 2, b);
+
+                    D3D12_TEXTURE_COPY_LOCATION dst_rt{}, src_rt{}, dst_ds{}, src_ds{};
+                    dst_rt.pResource = rb_buf.Get();
+                    dst_rt.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    dst_rt.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 256}};
+                    src_rt.pResource = rt_tex.Get();
+                    src_rt.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    dst_ds.pResource = rb_buf.Get();
+                    dst_ds.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    dst_ds.PlacedFootprint = {1536, {DXGI_FORMAT_R32_TYPELESS, 4, 4, 1, 256}};
+                    src_ds.pResource = ds_tex.Get();
+                    src_ds.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    reinterpret_cast<CopyTexFn>(lv[16])(clear_list.Get(), &dst_rt, 0, 0, 0, &src_rt, nullptr);
+                    reinterpret_cast<CopyTexFn>(lv[16])(clear_list.Get(), &dst_ds, 0, 0, 0, &src_ds, nullptr);
+
+                    const HRESULT hr_close = reinterpret_cast<CloseFn>(lv[9])(clear_list.Get());
+                    check(hr_close == S_OK, "console list Close succeeds after title-backed RTV/DSV clears");
+
+                    ID3D12CommandList* lists[] = {clear_list.Get()};
+                    clear_q->ExecuteCommandLists(1, lists);
+                    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    const bool done = ev && SUCCEEDED(clear_q->Signal(clear_fence.Get(), 1)) &&
+                                      SUCCEEDED(clear_fence->SetEventOnCompletion(1, ev)) &&
+                                      WaitForSingleObject(ev, 5000) == 0;
+                    if (ev) CloseHandle(ev);
+                    check(done, "console list clear commands complete on the GPU");
+
+                    void* mapped = nullptr;
+                    const D3D12_RANGE range{0, 4096};
+                    if (done && SUCCEEDED(rb_buf->Map(0, &range, &mapped)) && mapped) {
+                        const auto* bytes = static_cast<const std::uint8_t*>(mapped);
+                        const bool rt_ok = bytes[0] == 255 && bytes[1] == 0 && (bytes[2] == 127 || bytes[2] == 128) &&
+                                           bytes[3] == 255;
+                        float depth_got = -1.0f;
+                        std::memcpy(&depth_got, bytes + 1536, sizeof(depth_got));
+                        const bool ds_ok = std::fabs(depth_got - 0.25f) < 1e-6f;
+                        check(rt_ok, "console slot 52 ClearRenderTargetView writes expected RGBA texel via hooked heap");
+                        check(ds_ok, "console slot 51 ClearDepthStencilView preserves FLOAT depth 0.25 via XMM3");
+                        const D3D12_RANGE empty{0, 0};
+                        rb_buf->Unmap(0, &empty);
+                    }
+                }
+            }
+            rtv_heap.Reset();
+            dsv_heap.Reset();
+            rt::shims::remove_xmem_allocation_hooks(&dual_hooks);
+        }
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
