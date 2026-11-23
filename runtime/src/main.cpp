@@ -29,6 +29,7 @@
 
 #include "base_reservation.h"
 #include "code_hooks.h"
+#include "host_cpu.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
@@ -101,6 +102,12 @@ int wmain(int argc, wchar_t** argv) {
     if (image.empty()) return usage();
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
     if (dry_run + init + run != 1) return usage();
+    // The game runs AVX code from its TLS callbacks on; without AVX that is a bare 0xC000001D (src/host_cpu.h).
+    if ((init || run) && !rt::host_cpu::check_skipped())
+        if (const auto missing = rt::host_cpu::missing_host_features(); !missing.empty()) {
+            std::fprintf(stderr, "%s\n", rt::host_cpu::message(missing).c_str());
+            return rt::host_cpu::kExitCode;
+        }
     // The console folders are fixed once, as absolute paths. A bare image name (`gta6rt --run game.exe` from the
     // game folder) has an empty parent path, which left GAME: with no root; and a relative --game-dir or --overlay
     // would follow the title's later SetCurrentDirectory. If absolute() fails the path stays as given.

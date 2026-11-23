@@ -72,6 +72,9 @@ Useful switches:
   printing the caller's `module+RVA` and the argument registers (with a debugger attached it breaks instead). Start
   with `log`, then use `stop` to pin the first blocker and `fail` to see how the game's own failure path reacts.
   This switch covers imports only; it does not affect the D3D12 outcomes.
+* `LEONIDA_SKIP_CPU_CHECK=1` skips the AVX preflight of `--init` and `--run`, which otherwise exits 4 with one line
+  naming the missing feature on a host without AVX (a QEMU `qemu64` guest; under Rosetta, set
+  `ROSETTA_ADVERTISE_AVX=1` instead). The game itself still needs AVX, so this is for the #UD emulation work.
 * `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
