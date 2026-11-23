@@ -7411,7 +7411,7 @@ class Gen:
                 word = self.wave32_ballot_word(ballot)
                 self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
                 self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
-                self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+                self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.wave32_first_running_lane()}")
                 self.g_shuffle(r, v, first)
                 self.dst(a[0], r)
                 return
