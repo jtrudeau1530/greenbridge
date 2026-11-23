@@ -378,8 +378,13 @@ class TestCli(unittest.TestCase):
             self.assertFalse(os.path.exists(out), "no report may be written before the check")
 
     def test_missing_input(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(T.main(["/nonexistent"]), 2)
+        # "/nonexistent" is a drive-root path on Windows (C:\nonexistent), which really exists on some hosts.
+        # Use a path inside a fresh temp directory so the input is guaranteed to be missing on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing-input")
+            self.assertFalse(os.path.exists(missing))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(T.main([missing]), 2)
 
     def test_missing_parent_and_hardlinked_outputs_rejected_upfront(self):
         with tempfile.TemporaryDirectory() as tmp:
