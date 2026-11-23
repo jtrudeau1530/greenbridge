@@ -270,9 +270,54 @@ Before this the 2,531 were tied to their buffers only as "followed by". The cens
 by other streams; this walk, with `bvh_index.classify`, finds all 2,531 followed by a `bvh4`, and all 271,637 BVH
 streams preceded by an instance descriptor (269,106 + 2,531). The 3 are not reproduced. What is new is what such a
 buffer holds: N BLAS, not one. 4,170 of the 6,701 BLAS sit past the first header of their stream, where an index
-that reads only the first `0x140` bytes of each stream does not see them. The matrices pair with the slots by
-position; that each is the geometry transform of the BLAS in its slot, as §4a measured for N = 1, is a
-**hypothesis** for N > 1 that needs the source geometry to test.
+that reads only the first `0x140` bytes of each stream does not see them. The descriptor stores one matrix per
+slot. ASSET-520 tests whether each matrix is the geometry transform of the BLAS at that position, as section 4a
+measured for N = 1.
+
+**Multi-slot geometry comparison.** Generate a local stream index with
+`python -I tools/rpf9_carve.py <core_bvh4.rpf> <index-dir> --index-only`. Supply that index and the manifests
+from one or more primary-LOD `rpf9dump models` exports, with each manifest beside its OBJs.
+
+```text
+python -I tools/bvh_slot_check.py <core_bvh4.rpf> <index-dir>/index.json <models>/manifest.json [...]
+```
+
+For incremental scans, pass `--save-evidence <private-file>` when checking a window. Add another
+manifest with `--prior <private-file>`, or combine independent saved scans by repeating `--prior`
+without any manifests. Either form can save the combined evidence. Keep these files local.
+Each run still checks the core archive and carve index. Evidence is tied to the index bytes, the
+multi-slot descriptor and BLAS contents, and the evidence-format version. A SHA-256 digest over the
+ordered, length-prefixed candidate buffers identifies repeats across scans. Two distinct candidates
+leave the slot ambiguous even if their matrix verdicts agree. `manifest_items` counts entries read
+across the input histories, including overlaps. The CLI prints an aggregate report to stdout.
+
+The tool splits each descriptor's following buffer by the low entry sizes, preserving empty slot indices.
+For descriptors with distinct matrices it searches the supplied drawables for an ordered sequence of geometries
+within one model. Triangle counts must agree per geometry, and the BLAS must have at least 30 paired leaves.
+In every pair, the two indexed triangles must share exactly two indices and the corner selected by the stored
+vertex-order byte must be the unshared vertex of the second triangle. A source is eligible only if this leaves
+one distinct sequence of float32 vertex and uint32 index buffers across the supplied exports. Additional exports
+can reveal a second source with the same topology. No transform, bounds or internal area enters this choice.
+
+For an eligible source the tool calls `bvh_geometry_check.check` with each distinct matrix in the descriptor,
+keeping the vertex and index buffers fixed. An `own_only` result requires the slot matrix to pass, every
+different matrix to fail and the passing matrix to occur in just one slot. Identical matrices or several passing
+slot choices that include the proposed one are non-discriminating. The output counts competing-only passes and
+cases where no matrix passes separately. A missing or ambiguous source leaves the slot unknown.
+
+On Xbox 1.0.2.1 the full core scan covered 2,531 descriptors, 6,701 occupied slots and 19 empty slots.
+Four primary-LOD export windows supplied 7,513 drawable manifest entries. Ten occupied slots across five
+descriptors passed with their own matrix and failed with the other distinct matrix. Zero passed only with an
+alternative. This supports positional pairing for those ten slots. In 2,679 slots all descriptor matrices were
+identical, 308 slots lacked sufficient topology, 3,694 had no topology match in these exports, and 10 had
+multiple distinct source buffers. Pairing remains unknown for those 6,691 slots.
+
+Two additional 1 GiB primary-LOD windows brought the total to 15,064 manifest entries. In the
+six-window scan, 43 slots in 25 descriptors passed only their own matrix, each rejecting one
+distinct alternative. Zero passed only an alternative. Of the remaining 6,658 occupied slots,
+2,679 had identical matrices, 308 lacked sufficient topology, 3,659 had no source match, 11 had
+multiple source buffers and one passed multiple matrix choices. Source uniqueness is relative
+to these exports.
 
 **Table template** (22,301 streams in core, 81 in the shared pack). Two arrays, each a pointer followed by a
 `u16 count, u16 capacity` pair:
