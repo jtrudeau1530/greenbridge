@@ -595,8 +595,12 @@ def check(lines, backends=("translator",), hw=None):
             skips.append(e)
     if "hw" in backends:
         got = hw(lines) if callable(hw) else hw
+        if got is None:
+            raise RuntimeError("no result from the hardware runner")
         if isinstance(got, str):
             skips.append(Skip(f"hardware: {got}"))
+        elif len(got) < 4:
+            raise RuntimeError(f"the hardware runner returned {len(got)} words (expected 4)")
         else:
             problems.append(_diff(lines, want, got, "hardware"))
     if skips and len(skips) == len(backends):
@@ -672,7 +676,12 @@ def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=Non
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
-    hw = oracle.run([hw_kernel(p, wave) for p in progs]) if "hw" in backends else [None] * programs
+    if "hw" in backends:
+        hw = oracle.run([hw_kernel(p, wave) for p in progs])
+        if len(hw) != len(progs):
+            raise RuntimeError(f"the hardware runner returned {len(hw)} results for {len(progs)} programs")
+    else:
+        hw = [None] * programs
     vk_failures = []
     if "vk" in backends:
         import vk_fuzz_run
@@ -814,7 +823,12 @@ def main(argv=None):
         backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)])[0]) if oracle else None)
+            def run_hw_one(l):
+                res = oracle.run([hw_kernel(l, a.wave)])
+                if not res:
+                    raise RuntimeError("the hardware runner returned no result for shrunk program")
+                return res[0]
+            return check(lines, backends, run_hw_one if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
             print(f"MISMATCH program {i}: {check_fn(small) or problem}")
