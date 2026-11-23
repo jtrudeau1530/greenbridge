@@ -6,6 +6,11 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <array>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -28,6 +33,25 @@ void write(const std::filesystem::path& p, const std::string& text) {
 
 int main() {
     using namespace leonida::mods;
+
+    std::array<const ArchetypeSwaps*, 8> swaps_slots{};
+    std::array<const CameraView*, 8> camera_slots{};
+    std::array<std::thread, 8> threads;
+    for (size_t i = 0; i < threads.size(); ++i)
+        threads[i] = std::thread([&, i] { swaps_slots[i] = &active(); camera_slots[i] = &camera_slot(); });
+    for (auto& thread : threads) thread.join();
+    for (size_t i = 0; i < threads.size(); ++i)
+        check(swaps_slots[i] == &active() && camera_slots[i] == &camera_slot(), "threads share both slots");
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info{};
+    check(VirtualQuery(&active(), &info, sizeof(info)) && info.Type == MEM_PRIVATE, "active slot is heap allocated");
+    check(VirtualQuery(&camera_slot(), &info, sizeof(info)) && info.Type == MEM_PRIVATE, "camera slot is heap allocated");
+#endif
+    Mod slot_mod;
+    slot_mod.archetype_swaps.push_back({1, 2});
+    set_active(ArchetypeSwaps({slot_mod}));
+    check(active().remap(1) == 2 && active().remap(3) == 3, "active slot retains the installed swaps");
+    set_active(ArchetypeSwaps({}));
 
     // The model ids docs/character_skeleton.md measured in the packs tables are the joaat of their names.
     static_assert(joaat("player_story000_00") == 0xE472B687u, "Lucia's player model id");

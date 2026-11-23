@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -255,9 +256,18 @@ private:
 };
 
 // The process's swaps: set once at start (main.cpp), before any game code runs; read by the archetype hook.
+// Publish immortal heap objects without CRT local-static guards: the mapped title owns TLS slot 0.
 inline ArchetypeSwaps& active_slot() {
-    static ArchetypeSwaps swaps{std::vector<Mod>{}};
-    return swaps;
+    static std::atomic<ArchetypeSwaps*> slot{nullptr};
+    auto* swaps = slot.load(std::memory_order_acquire);
+    if (!swaps) {
+        auto* candidate = new ArchetypeSwaps(std::vector<Mod>{});
+        if (slot.compare_exchange_strong(swaps, candidate, std::memory_order_acq_rel))
+            swaps = candidate;
+        else
+            delete candidate;
+    }
+    return *swaps;
 }
 inline void set_active(ArchetypeSwaps swaps) { active_slot() = std::move(swaps); }
 inline const ArchetypeSwaps& active() { return active_slot(); }
@@ -271,8 +281,16 @@ inline CameraView camera_of(const std::vector<Mod>& mods) {
 }
 
 inline CameraView& camera_slot() {
-    static CameraView view;
-    return view;
+    static std::atomic<CameraView*> slot{nullptr};
+    auto* view = slot.load(std::memory_order_acquire);
+    if (!view) {
+        auto* candidate = new CameraView;
+        if (slot.compare_exchange_strong(view, candidate, std::memory_order_acq_rel))
+            view = candidate;
+        else
+            delete candidate;
+    }
+    return *view;
 }
 inline void set_active_camera(CameraView view) { camera_slot() = std::move(view); }
 
