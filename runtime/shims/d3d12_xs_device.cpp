@@ -108,23 +108,29 @@ struct DescriptorRange {
     const HeapProxy* heap;
 };
 
-// Immortal: late COM Release calls during process teardown may still unregister a heap or check the table.
-std::mutex& descriptor_range_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+// Constant-initialized and immortal: no function-local static guard on a title thread (#7957), and late COM Release
+// calls during process teardown may still unregister a heap or check the table.
+struct SrwMutex {
+    SRWLOCK srw = SRWLOCK_INIT;
+    void lock() { AcquireSRWLockExclusive(&srw); }
+    void unlock() { ReleaseSRWLockExclusive(&srw); }
+};
 
+SrwMutex g_descriptor_range_mutex;
+std::vector<DescriptorRange>* g_descriptor_ranges = nullptr;  // made on first use, under g_descriptor_range_mutex
+
+SrwMutex& descriptor_range_mutex() { return g_descriptor_range_mutex; }
+
+// Callers hold descriptor_range_mutex().
 std::vector<DescriptorRange>& descriptor_ranges() {
-    static auto* v = new std::vector<DescriptorRange>;
-    return *v;
+    if (!g_descriptor_ranges) g_descriptor_ranges = new std::vector<DescriptorRange>;
+    return *g_descriptor_ranges;
 }
 
 std::atomic<std::size_t> g_custom_range_count{0};
 
-std::mutex& heap_alloc_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+SrwMutex g_heap_alloc_mutex;
+SrwMutex& heap_alloc_mutex() { return g_heap_alloc_mutex; }
 
 DescriptorHeapBackingAlloc g_heap_alloc = nullptr;
 DescriptorHeapBackingFree g_heap_free = nullptr;
@@ -2249,13 +2255,17 @@ void tie_xmem(void* resource, void* memory, const XmemHooks& hooks) {
 
 // LEONIDA_XMEM_RESOURCE_BACKING=0 keeps every committed resource on the PC device's own memory and the hook memory as
 // bookkeeping only, as before (to compare a run, or when GPU reads of host memory are too slow on a machine).
+std::atomic<int> g_xmem_buffer_backing{-1};  // -1 until read; no function-local static guard (#7957)
+
 bool xmem_buffer_backing_enabled() {
-    static const bool enabled = [] {
+    int enabled = g_xmem_buffer_backing.load(std::memory_order_relaxed);
+    if (enabled < 0) {
         char value[8]{};
         const DWORD n = GetEnvironmentVariableA("LEONIDA_XMEM_RESOURCE_BACKING", value, sizeof(value));
-        return !(n == 1 && value[0] == '0');
-    }();
-    return enabled;
+        enabled = !(n == 1 && value[0] == '0') ? 1 : 0;
+        g_xmem_buffer_backing.store(enabled, std::memory_order_relaxed);
+    }
+    return enabled != 0;
 }
 
 // Heap flags a buffer on the title's memory cannot honour: memory shared with another device or process. Such a

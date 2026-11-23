@@ -257,7 +257,7 @@ bool shim_enabled() {
 struct Registration {
     Registration() {
         if (!shim_enabled()) return;
-        static rt::shims::Table table(kEntries, sizeof(kEntries) / sizeof(kEntries[0]));
+        new rt::shims::Table(kEntries, sizeof(kEntries) / sizeof(kEntries[0]));  // immortal, no static guard
     }
 } g_registration;
 
