@@ -1,0 +1,11 @@
+{
+  "piece": "Out-of-bounds typed buffer loads and `DST_SEL=1`",
+  "status": "gpu_verified",
+  "rank": 193,
+  "sentences": [
+    "When a MUBUF `buffer_load_format_{x,xy,xyz,xyzw}` or `buffer_load_format_d16_{x,xy,xyz,xyzw}` is out of bounds (`OOB_SELECT` 0–3, `num_records == 0`, partial-element spill, or swizzled OOB), memory is not accessed and raw data channels (`DST_SEL` 4..7) read 0, while the V# `DST_SEL` swizzle still runs: `DST_SEL=0` returns 0 and `DST_SEL=1` returns `1.0f` (`0x3F800000`, `d16` `0x3C00`) iff V# `FORMAT[6:0]` is a valid float, normalized or scaled buffer format (`1..77` ending in `_UNORM`, `_SNORM`, `_USCALED`, `_SSCALED`, or `_FLOAT`), and integer `1` (`0x00000001`, `d16` `0x0001`) for `UINT`/`SINT`, `INVALID` (`0`), and reserved codes (`78..127`).",
+    "`d16_x` and `d16_xyz` preserve the unaddressed upper 16 bits of the final destination VGPR, and MTBUF `tbuffer_load_format_*` ignores V# `DST_SEL` on both out-of-bounds and `FORMAT=0` loads (returning 0 in addressed channels).",
+    "Until 2026-11-22 `Gen.buffer_load_format` clamped the post-swizzle result to 0 when `in_b` was false (`SHADER-429`), dropping `DST_SEL=1` on out-of-bounds loads and returning `1.0f` instead of `1` for `DST_SEL=1` with `FORMAT=0`.",
+    "**Hardware-verified on RDNA2** (`gfx1036`, Windows 11, driver `32.0.21042.62`, wave32 and wave64, 746 kernels via `tools/hw_oracle`: all 41 `Gen.FORMATS` across `xyzw`/`d16_xyzw`/`d16_xyz`/`d16_x`, all 128 7-bit `FORMAT` codes `0..127` for both `f32` and `d16`, `OOB_SELECT` 0–3, partial spill, swizzled OOB, MTBUF controls, and inactive EXEC lanes), Vulkan GPU-checked across all 128 7-bit `FORMAT` codes (`xyzw`, `d16_xyzw`, `d16_xyz`, `d16_x`) and the `cs_fmt_*`/`cs_oob_*`/`cs_bounds`/`cs_buf_*` fixtures on NVIDIA GeForce RTX 5090 (driver `32.0.16.1088`) and AMD Radeon Graphics (`gfx1036`, driver `32.0.21042.62`), and CPU/`spirv-val`-checked by `tests/semantic/test_buffer_oob_dst_sel.py`."
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "piece": "`v_pack_b32_f16` input `neg`",
+  "status": "cpu_only",
+  "rank": 32,
+  "sentences": [
+    "A VOP3 `neg` on an operand of this instruction flips the sign bit of **the 16-bit half that operand contributes**, not of the whole 32-bit source, and only that half: measured on gfx1036 (RDNA2 iGPU, AMD Windows driver 32.0.21044.64) with 192 raw kernels, `0x7c01` gives `0xfc01` under IEEE mode 0 and `0xfe01` under mode 1, in either half and with `op_sel`.",
+    "The translator moved the bits unchanged and refused every modifier; it now XORs `0x8000` into the selected half.",
+    "`abs` is still refused, because its rule on this instruction is unmeasured (SHADER-260), and the mode-1 quieting of a signalling-NaN half is not modelled while SHADER-190 is open; under mode 0, where the bits move unchanged, the translation is exact.",
+    "Checked on the CPU by `tests/test_values.py` and `tests/semantic/test_vop3_const_mods.py`; the gfx1036 measurement above is @Sanonymous01's, not repeated here."
+  ]
+}

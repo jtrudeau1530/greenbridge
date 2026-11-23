@@ -1,0 +1,14 @@
+{
+  "piece": "`v_trunc_f64`, `v_ceil_f64`, `v_rndne_f64`, `v_floor_f64`",
+  "status": "cpu_only",
+  "rank": 87,
+  "sentences": [
+    "Round binary64 toward zero, positive infinity, nearest-even, or negative infinity respectively; the result stays binary64.",
+    "The translator maps these to GLSL.std.450 `Trunc`, `Ceil`, `RoundEven`, and `Floor` with `shaderFloat64` (no intermediate f32).",
+    "Register pairs are low word first, literal dwords fill bits 63:32 with a zero low word, and inactive lanes keep both destination words.",
+    "VOP3 applies source modifiers before rounding and the existing f64 scale/clamp path afterwards.",
+    "Sources: AMD [RDNA 2 ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf) §6.2.1 and §12.8 (VOP1 opcodes 23–26), and LLVM's [GFX10 assembler tests](https://github.com/llvm/llvm-project/blob/1a7ece827ab3543387ee1adf1eb4c8878905b577/llvm/test/MC/AMDGPU/gfx10_asm_vop1.s).",
+    "Value and SPIR-V checks: `tests/semantic/test_f64_round.py`.",
+    "Hardware-confirmed natively on RDNA2 (`gfx1036` iGPU, Windows driver 32.0.21042.62, `tools/hw_oracle`, wave32 and wave64 identical on every case) by @timelery: exact IEEE-754 rounding that keeps signed zeros and binary64 subnormals (`ceil(+sub)` = +1.0, `ceil(-sub)` = -0.0, `floor(+sub)` = +0.0, `floor(-sub)` = -1.0, `trunc(±sub)` = ±0.0, `rndne(±0.5)` = ±0.0, `rndne(±1.5)` = ±2.0, `rndne(±2.5)` = ±2.0, ±inf stays ±inf, and ±qNaN/±sNaN pass through unchanged under IEEE=0), where `sub` is the smallest binary64 subnormal; the hex literal dword populates bits 63:32 with a zero low word (`v_floor_f64 v[4:5], 0x3ff80000` -> `0x3ff0000000000000`); and the VOP3 output modifiers behave as for `v_add_f64`/`v_sqrt_f64`: applied on hardware under `denorm16_64=0` and ignored under `denorm16_64=3` (IEEE=0), while the translator applies them through `clamp_mods_f64` as those rows do."
+  ]
+}

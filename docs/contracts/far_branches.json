@@ -1,0 +1,9 @@
+{
+  "piece": "Far branches",
+  "status": "spec_only",
+  "rank": 58,
+  "sentences": [
+    "`s_getpc_b64; s_add_u32 K; s_addc_u32 0/−1; s_setpc_b64` on the same pair is a branch beyond `s_branch`'s ±32K-dword range.",
+    "It's folded into one branch to (address after `s_getpc`) + K before CFG construction."
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "piece": "Typed image stores",
+  "status": "gpu_verified",
+  "rank": 121,
+  "sentences": [
+    "`image_store` (2D, 2D array, 3D) writes the dmask components (missing ones = 0).",
+    "The image's numeric type lives in the T# (word 1 FORMAT [28:20], 512 GFX10 formats), so it is decided at run time.",
+    "A 512-bit table built from `tools/gfx10_formats.json` (30 UINT and 15 SINT formats) picks a **sint**, **uint** or **float** view (bindings 8 + 3·dim + class; dim 0 = 2D, 1 = 2D array, 2 = 3D; class 0 float, 1 uint, 2 sint).",
+    "Views have Unknown format (`shaderStorageImageWriteWithoutFormat`).",
+    "**The runtime binds every storage image into all three arrays of its dimension, or at least the one matching its format.** The earlier path wrote only component 0 as `r32ui`, which was wrong for every other format.",
+    "GPU-checked with `runtime/test/shaders/cs_imgstore.asm` through `runtime/test/vk_store_test.cpp`: rgba8 unorm, r32 uint and r32 sint images, every texel correct."
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "piece": "Constant lane masks (`Gen.mask_src` immediates)",
+  "status": "gpu_verified",
+  "rank": 144,
+  "sentences": [
+    "A constant read as a lane mask is one bit per lane: lane L takes bit L.",
+    "The 64-bit forms (`s_and/or/andn2_saveexec_b64`, `s_andn2_wrexec_b64`, `s_mov_b64`/`s_not_b64` into EXEC or VCC, `s_and/or/xor/andn2/orn2_b64` and `s_cselect_b64` on the lane-mask path) read the 64-bit value, an inline constant sign-extended (`-16` = lanes 4-63) and a literal with a zero high word, as `src64_data` reads 64-bit constants; the b32 forms (`s_*_saveexec_b32`, `s_andn2_wrexec_b32`) read the 32-bit value at bit L mod 32. 0 and -1 still give no lane and every lane, with no per-lane code.",
+    "`s_bcnt0/1_i32_b64` of a constant counts the constant's 64 bits (scalar data, like `s_ff0/1_i32_b64`).",
+    "**Before this fix every lane took bit 0 of the constant**: `s_and_saveexec_b32 s7, 0xff00` with all 32 lanes on left none on, `5` left all 32 on, and `s_bcnt1_i32_b64 s0, 0xff00ff` gave 32. llvm-mc rejects a constant as the mask operand of `v_cndmask_b32_e64` / `v_add_co_ci_u32_e64` and decodes one as \"Invalid immediate\", so those VALU callers never see a constant.",
+    "**A constant held in an SGPR** (`s_mov_b32 s20, 0x3ffffc00`) is read the same way when it reaches a mask consumer: `mask_src` takes bit L of an SGPR that `holds_lane_mask` doesn't flag (a pair in a wave64 64-bit context: the high SGPR for lanes 32-63).",
+    "In a wave32 program a 32-bit bitwise SOP2 (`s_and/or/xor/andn2/orn2/nand/nor/xnor_b32`, `s_cselect_b32`) that writes EXEC/VCC reads both operands through `mask_src` (`Gen.sop2_b32_srcs`); into a plain SGPR it stays a data read, because `lane_masks.py` classifies that SGPR as data when the other operand is a constant (`s_and_b32 s20, exec_lo, 1` then `s_bcnt1` must count the wave's bits: found by @Pierre-Kookis on #1792, GPU-reproduced), and `s_mov_b32 exec_lo/exec_hi, sN` takes each lane's bit.",
+    "A real mask is unchanged: it holds 0 or ~0 per lane, and bit L of that is the same 0 or 1.",
+    "Until 2026-11-22 these took the value whole, so `s_and_saveexec_b32 s6, s20` with that constant, or `s_and_b32 exec_lo, exec_lo, 0xff00`, left every lane on (found writing `cs_w32_saveexec_ext`, #1771; CPU-checked by `tests/semantic/test_mask_src_sgpr_const.py`, and `tools/cf_diff.py` / `tools/salu_diff.py` still pass).",
+    "Not covered here: Not covered: a b32 op on one half of a wave64 mask, masks read as data (#293), and a literal with bit 31 set in a 64-bit position (zero- vs sign-extension not measured).",
+    "GPU-checked with `runtime/test/shaders/cs_w32_mask_imm.asm` and `cs_w64_mask_imm.asm` on an NVIDIA GeForce RTX 5080 (driver 616.92; wave64 with `LEONIDA_W64_EMULATE=1`) and an AMD Radeon RDNA2 iGPU (driver 26.10.1, native 64-wide subgroup): both failed before on both GPUs.",
+    "Run across every lane in `tests/semantic/test_value_semantics.py` (`LaneMaskConstants`)."
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "piece": "Workgroup barriers",
+  "status": "spec_only",
+  "rank": 108,
+  "sentences": [
+    "`s_barrier` (cs/ms) is one `OpControlBarrier` (workgroup scope, workgroup memory).",
+    "On RDNA every `s_barrier` counts against the same workgroup barrier and a wave that has ended no longer counts, while Vulkan requires a barrier to be reached by every invocation in uniform control flow.",
+    "Under `--wave64-emulate` the round loop keeps a single barrier at the top level, so this holds.",
+    "**Native wave32 compute shaders run in barrier rounds** when an `s_barrier` sits anywhere but a top-level block of the structured tree (one every invocation runs): under a guard, in a loop, or in the dispatch loop (`needs_barrier_rounds`, `bar_scheduler`).",
+    "That is the emulated loop without its cross-lane part: `s_barrier` ends a segment, each invocation runs its blocks until its next `s_barrier` or the end, then the whole workgroup meets at one `OpControlBarrier` (the same workgroup/acquire-release/workgroup-memory semantics) at the end of the round.",
+    "A wave that is done no longer holds the others, and a per-round count of the invocations not done (three `Workgroup` words, by round mod 3) ends the loop.",
+    "Cross-lane operations stay subgroup operations, as in the dispatch loop, since a wave's lanes run the same segment.",
+    "A barrier in a top-level block keeps the single `OpControlBarrier` in place.",
+    "In the 1.0.2.1 corpus 43 of the 55 wave32 cs shaders with `s_barrier` have one nested (SHADER-91's count), so those 43 now run in rounds.",
+    "Why: an Intel GPU does not survive the nested form.",
+    "`cs_barrier_divergent.asm` (two barrier sites in different branches), `cs_barrier_early_end.asm` (the other waves end without a barrier) and `cs_barrier_loop.asm` (a barrier in a loop whose trip count differs per wave) each lose the device (`vkQueueWaitIdle` → `VK_ERROR_DEVICE_LOST`) on an Intel Arrow Lake Xe-LPG iGPU (Windows 32.0.101.8132), and `cs_barrier_divergent` hangs or writes nothing on a UHD 770 (101.6129, #634).",
+    "With barrier rounds all three pass there and on an RTX 5070 Ti Laptop (617.42).",
+    "NVIDIA passed them before too (RTX 4070 Ti on 610.88 and 621.24, RTX 5090 on Linux 595.99, RTX 5070 Ti).",
+    "**Still not proven on the native wave64 path** (wave64 cs and every ms, run natively only on AMD's 64-wide subgroups): there the barrier stays where `s_barrier` is, inside a selection or loop construct in every ms and most wave64 cs shaders of the corpus.",
+    "Branches are scalar, so whole waves take the same path, and RDNA's own barrier counts the way the shader expects."
+  ]
+}

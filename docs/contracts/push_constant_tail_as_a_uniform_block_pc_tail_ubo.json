@@ -1,0 +1,16 @@
+{
+  "piece": "Push-constant tail as a uniform block (`--pc-tail-ubo`)",
+  "status": "cpu_only",
+  "rank": 50,
+  "sentences": [
+    "For devices whose `maxPushConstantsSize` is 128, Vulkan's minimum, which can't take the 144-byte block (152 with `--mesh-compute`): AMD's Windows driver on RDNA2 iGPUs (Radeon 680M on 22.40.84.06, 610M on 24.10.16.14, the Ryzen 5 7600's iGPU on 24.10.24) and some Intel Arc drivers (D3D-14, `push_constants_need_fallback` in `d3d12_vulkan_device.cpp`).",
+    "The push-constant block keeps dwords 0–31 (s0–s31, 128 bytes).",
+    "The tail that follows them by default, the heap base and code base and, with `--mesh-compute`, the output address, becomes `%pc_tail`: a uniform block at **set 1, binding 0** with the same members in the same order at offsets 0, 4, … (16 bytes, 24 with `--mesh-compute`).",
+    "Set 1 is otherwise unused, so set 0's update-after-bind table doesn't change.",
+    "The block is declared, and listed in the entry point's interface, only when the shader reads the tail (a memory access through the heap base, `s_getpc_b64`, or the `--mesh-compute` epilogue); the index then records `\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}`, and `\"push_constant_bytes\"` is 128 for every module.",
+    "`\"bindings\"` still lists set 0 only.",
+    "Without the flag nothing changes.",
+    "**Checked:** `tests/test_pc_tail_ubo.py`; all 185 hand-written GPU test shaders pass `spirv-val` with the flag (109 of them read the tail) with set-0 bindings unchanged.",
+    "The GPU harnesses and the D3D12 layer that bind the block are the follow-ups."
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "piece": "2D `image_sample_lz`",
+  "status": "spec_only",
+  "rank": 41,
+  "sentences": [
+    "The T# FORMAT selects the float, UINT or SINT sampled view at LOD zero.",
+    "With nearest sampling, native gfx1036 returned the original 32-bit integer components.",
+    "RTX 5080 and gfx1036 Vulkan readbacks matched all four channels on RGBA8 UINT, SINT and UNORM for full-width and D16 results.",
+    "The R32 UINT/SINT saturation-boundary fixture also matched all 64 sampled sums on both adapters."
+  ]
+}

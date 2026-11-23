@@ -1,0 +1,12 @@
+{
+  "piece": "`v_div_fixup_f16`, `v_div_fixup_f64`",
+  "status": "cpu_only",
+  "rank": 152,
+  "sentences": [
+    "Final IEEE-754 special-case fixup for division (VOP3, `S0` quotient, `S1` denominator, `S2` numerator): `sign_out = sign(S1) ^ sign(S2)`; `NaN(S2)` → quieted `S2`; `NaN(S1)` → quieted `S1`; `(0/0)` or `(±inf/±inf)` → canonical negative qNaN (`0xFE00` for f16, `0xFFF80000_00000000` for f64); `(x/±inf)`, `(±0/y)`, or guaranteed exponent underflow (`exp(S2) - exp(S1) <= -25` for f16, `<= -1075` for f64) → `±0` with `sign_out`; `(x/±0)`, `(±inf/y)`, or guaranteed exponent overflow (`exp(S2) - exp(S1) >= 16` for f16, `>= 1024` for f64) → `±inf` with `sign_out`; otherwise `copysign(S0, sign_out)` (including `NaN(S0)` keeping its payload with `sign_out`).",
+    "Computed bit-exactly on integer words (no `OpCapability Float64` for plain `v_div_fixup_f64`); VOP3 input modifiers (`abs`/`neg`, plus `op_sel:[s0,s1,s2,dst]` on f16 with the unwritten half preserved) and output modifiers (`mul:2`/`mul:4`/`div:2`/`clamp`, enabling `Float64` on f64) apply.",
+    "Source: AMD [RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) (`V_DIV_FIXUP_F16`, `V_DIV_FIXUP_F64`).",
+    "**Not measured on RDNA2 hardware** (translated GPU output checked on RTX 5070 by @duudiis).",
+    "Checked bit-for-bit on the CPU (`spirv_mini_interp`) and with `spirv-val` by `tests/semantic/test_alu_div_fixup.py`; not run on the shader corpus."
+  ]
+}

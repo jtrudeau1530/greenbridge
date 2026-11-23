@@ -1,0 +1,25 @@
+{
+  "piece": "Image atomics, size and LOD queries",
+  "status": "gpu_verified",
+  "rank": 127,
+  "sentences": [
+    "`image_atomic_add/sub/and/or/xor/smin/smax/umin/umax` are `OpAtomicIAdd/ISub/And/Or/Xor/SMin/SMax/UMin/UMax` on the texel (`OpImageTexelPointer`) of an r32ui storage image, binding 4 for 2D and 7 for 3D, at the T#'s index (the view `StorageViews::r32ui` of `runtime/src/vulkan_bindless.h`).",
+    "The data VGPR is the operand; with `glc` it receives the texel's previous value, without it it is not written (RDNA2 ISA, MIMG: the previous value is returned if glc is 1).",
+    "`image_atomic_cmpswap` takes two data VGPRs, the new value and then the comparand (`OpAtomicCompareExchange`).",
+    "A lane that EXEC turns off leaves memory alone: cmpswap is skipped, the others run with the operand that changes nothing.",
+    "`image_get_resinfo` (2D, no sampler) gives, for the mip level in its address VGPR, width, height, depth (0 for 2D; a 2D array's layers minified from BASE_LEVEL, T# word 3 [15:12]) and the level count in VGPRs 0..3, with width, height and depth 0 past the last level (the size isn't queried there) (ISA: {num_mip_levels, depth, height, width} in VGPRs 3..0; `image_get_resinfo` (2D, no sampler) gives, for the mip level in its address VGPR, width, height, depth (1) and the level count in VGPRs 0..3 (ISA: {num_mip_levels, depth, height, width} in VGPRs 3..0; `OpImageQuerySizeLod`, `OpImageQueryLevels`).",
+    "`image_get_lod` (pixel shaders; 2D and 2D array, the slice ignored) gives the clamped LOD and the calculated LOD in VGPRs 0..1 (ISA: {rawLOD, clampedLOD} in VGPRs 1..0; `OpImageQueryLod`).",
+    "In both, dmask keeps components and packs them into consecutive VGPRs.",
+    "GPU-checked (TEST-184) on an RX 7900 XTX and a Ryzen 9 7950X3D integrated GPU (RADV, Mesa 26.3.1) and on Mesa llvmpipe, with the expected words derived by hand in each `.asm` header: `cs_imgatomic.asm` (every op on a 2D image: 0xfffffff0 tells the signed min/max from the unsigned ones, each with a case that goes the other way; cmpswap hit and miss; an op without `glc`; 63 lanes off; 64 threads adding to one texel) and `cs_imgatomic3d.asm` (six cases on a 4x4x4 volume, the three coordinates all different), through `vk_store_test words`; `cs_resinfo.asm` (a 16x4 image with five levels: levels 0, 1 and 3 in full, then dmask 0x3, 0xa and 0x8); `ps_get_lod.asm` and `ps_get_lod_array.asm` through `vk_texture_test` (calculated LOD 1 and 3 on the two-mip texture, the clamped LOD held at the last level, and at 0 by a sampler MAX_LOD of 0.25; 2 and -3 on the one-level array).",
+    "Measured natively on RDNA2 (gfx1036, SHADER-388: `tools/image_query_probe.py`, 614 results in wave32 and wave64, all as follows). resinfo's depth word is 0 for a 2D image whatever T# WORD4 DEPTH holds; for a 2D array it is the layer count minified like a 3D depth, max(1, layers >> (BASE_LEVEL + level)).",
+    "Past the last level, width, height and depth are 0.",
+    "The level count is LAST_LEVEL - BASE_LEVEL + 1 and sizes count from BASE_LEVEL.",
+    "The translator follows all three (`Gen.resinfo_words`; `cs_resinfo.asm` checks the 2D depth word and level 5 of five on RTX 5080 and Radeon Graphics, `tests/test_translate.py` the array rule).",
+    "The translator still differs in the first three: it writes 1 for the 2D depth word and the full layer count for a 2D array, and `OpImageQuerySizeLod` past the last level is undefined.",
+    "`image_get_lod`'s raw LOD includes the S#'s LOD_BIAS.",
+    "Its clamped LOD is min(max(min(raw, MAX_LOD), MIN_LOD), levels - 1) under a linear mip filter (MIN_LOD wins when it is above MAX_LOD), that value rounded half up (the level read) under a point mip filter, and 0 with MIP_FILTER none: `OpImageQueryLod`'s definition. u is scaled by the width and v by the height (a 64x4 image).",
+    "Unverified: resinfo's depth word on hardware (1 is what the T#'s DEPTH field says for a 2D image), the clamped LOD under a linear mip filter (the test's sampler is point-filtered, where 0.25 selects level 0), and the order of u and v in the LOD query (the test textures are square, where it makes no difference).",
+    "`image_get_resinfo` on other dimensions is `Unsupported`.",
+    "A host quirk the LOD test steps around: Mesa llvmpipe 26.3.1 does not apply a sampler's LOD range to `OpImageQueryLod` when its minimum and maximum are equal (0..0 gave level 1), so the second draw uses 0..0.25."
+  ]
+}

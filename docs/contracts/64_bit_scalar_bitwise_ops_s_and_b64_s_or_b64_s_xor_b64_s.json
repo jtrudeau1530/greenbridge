@@ -1,0 +1,18 @@
+{
+  "piece": "64-bit scalar bitwise ops (`s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64`, `s_orn2_b64`, `s_nand_b64`, `s_nor_b64`, `s_xnor_b64`, `s_not_b64`)",
+  "status": "gpu_verified",
+  "rank": 142,
+  "sentences": [
+    "Dispatched like `s_cselect_b64`: when destination is `exec`/`vcc` or any source is a lane mask (`holds_lane_mask` or `exec`/`vcc`), uses the per-lane mask path (`mask_src`/`mask_dst` including `null` dst) and votes SCC across the wave (`scc_from_mask`).",
+    "Otherwise operates on both 32-bit dwords of non-mask 64-bit scalar data (SGPR pairs, sign-extended inline/literal immediates, `null` = 0), reads all source dwords before storing (preserving destination aliasing), accepts `null` destination, and sets `SCC = ((D.lo \\ | D.hi) != 0)`.",
+    "Until 2026-11-22 these ops always took the lane-mask path, duplicating D.lo into D.hi and voting SCC on D.lo alone.",
+    "`s_nand/nor/xnor_b64` compute `~(S0 op S1)` on both paths (a lane's mask value is 0 or ~0, so the NOT is per lane); until 2026-11-22 they were rejected as unsupported.",
+    "Source: RDNA2 ISA SOP1/SOP2.",
+    "CPU-checked by `tests/semantic/test_salu64_bitwise_data.py` (all 9 ops, 4-corner SCC, immediates, aliasing, stale mask overwrite, wave32/wave64 lane-mask regression, and `--wave64-emulate`); **Hardware-verified** on the same part through `tools/hw_oracle` for the plain-data path: `s_and_b64(0xFFFFFFFF_00000000, 0x0F0F0F0F_0F0F0F0F)` = 0x0F0F0000_00000000, `s_xnor_b64(0xFFFF0000_00000000, 0_FFFFFFFF)` = 0x0000FFFF_00000000, `s_nand_b64(0xFFFF0000_0, 0)` = 0xFFFFFFFF_FFFFFFFF, `s_not_b64(0x0000FFFF_0)` = 0xFFFF0000_FFFFFFFF and `s_andn2_b64(0xFFFF0000_0, 0)` = 0xFFFF0000_0, all with SCC 1, while `s_or_b64(0, 0)` = 0 with SCC 0: SCC = ((D.lo ≠ 0) or (D.hi ≠ 0)).",
+    "The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way.",
+    "**hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way; on RDNA3 the same plain-data path is **hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo | The measured plain-data words: `s_and_b64(0xFFFFFFFF_00000000, 0x0F0F0F0F_0F0F0F0F)` = 0x0F0F0000_00000000, `s_xnor_b64(0xFFFF0000_00000000, 0_FFFFFFFF)` = 0x0000FFFF_00000000, `s_nand_b64(0xFFFF0000_0, 0)` = 0xFFFFFFFF_FFFFFFFF, `s_not_b64(0x0000FFFF_0)` = 0xFFFF0000_FFFFFFFF and `s_andn2_b64(0xFFFF0000_0, 0)` = 0xFFFF0000_0, all with SCC 1, while `s_or_b64(0, 0)` = 0 with SCC 0.",
+    "The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way.",
+    "The lane-mask dispatch (`exec`/`vcc` destinations) was not re-measured.",
+    "D.hi) != 0`, the `andn2`/`orn2` pairs separate negation of the second source from negation of the first, `s_not_b64` inverts both dwords and clears SCC on a zero result, and `s_nand_b64`/`s_nor_b64`/`s_xnor_b64` invert the per-dword result (`and`/`or` of all ones gives `0` with SCC 0, `xnor` of equal pairs gives all ones with SCC 1); the lane-mask dispatch (`exec`/`vcc` destinations) was not re-measured."
+  ]
+}

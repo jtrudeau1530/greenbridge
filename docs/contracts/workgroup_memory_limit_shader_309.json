@@ -1,0 +1,23 @@
+{
+  "piece": "Workgroup memory limit (SHADER-309)",
+  "status": "cpu_only",
+  "rank": 101,
+  "sentences": [
+    "A compute shader's Workgroup variables, the LDS array plus `%x_buf` (the wave64 exchange, 2·L + 6·W + 7 dwords, or the 3 barrier-round counts), must fit in the device's `maxComputeSharedMemorySize`.",
+    "`spirv-val` does not check device limits, and RADV (Mesa 27.0.0-devel, RX 7600) dies with SIGFPE in `vkCreateComputePipelines` on a module 4 bytes over 64 KiB (#1721, hand-built repro by YaBulochka).",
+    "The limit differs per device: 65536 on RADV and NVIDIA, 32768 on the AMD Windows driver (RX 9070 XT, 32.0.32029.2010) and Intel (UHD 770, 101.7092), measured by towade in #1745; the Vulkan minimum is 16384.",
+    "The translator runs offline, so it has two parts. (1) `rdna2spirv.py` keeps every module under a hard cap, `MAX_SHARED_BYTES` (`--max-shared-memory`, default 65536): the LDS array is the program's need (RSRC2 LDS_SIZE, or the end of the furthest constant-offset access, counted exactly from the offset and the access width: a b32 at offset 65,532 ends at 16,384 dwords) rounded up to a power of two; when that plus `%x_buf` is over the cap but the need still fits, the array shrinks to the RSRC2 allocation and its accesses are bounds-checked (below); when the need itself does not fit (a 64 KiB LDS under `--wave64-emulate`) the shader is refused (`Unsupported`, with the byte counts).",
+    "The array is clipped to 16,384 dwords, but an RSRC2 allocation over the cap (LDS_SIZE above 128 units, so 66,048 B or more) is counted at its full size and refused, native or emulated, instead of being cut.",
+    "LDS bounds: RDNA2 LDS does not wrap, and an access outside the workgroup's allocation reads 0 and its write is dropped (RDNA2 ISA sections 3.6.1 and 3.6.6).",
+    "The wrapped power-of-two array aliases such an access onto a valid word, so when a program's constant offsets reach past its RSRC2 allocation, or the array was shrunk, the array is the allocation and `Gen.lds_access` checks every dword (`index < allocation`, else a read or an atomic's old value is 0 and the write or atomic is skipped): `ds_read*`/`ds_write*` of every width (b64/b96/b128 and read2/write2 per dword), the sub-dword reads and writes, every LDS atomic, `ds_cmpst`, `ds_mskor`, `ds_wrxchg*`.",
+    "`ds_swizzle`/`ds_bpermute`/`ds_permute` do not use `%lds`; `ds_append`/`ds_consume` were already refused.",
+    "Every other shader keeps the wrapped array and emits no check, as before.",
+    "Hypothesis, not yet counted over the corpus: the 16 of 486 LDS-using CS that index past LDS_SIZE with constant offsets (the Compute shaders row) now read 0 there, as the ISA says, where they used to read the wrapped word.",
+    "Counted over a 1.0.2.1 corpus by towade (#1882, counts only): with the exact need (offset + access width) none of the 485 LDS-using CS reaches past its RSRC2 allocation with a constant offset, so none gets a bounds check (no `OpULessThan` added, native or emulated); the \"16 of 486\" in the Compute shaders row came from the older offset + 4-dword estimate.",
+    "`%x_buf` is already sized to the workgroup's waves, so it has nothing to give back.",
+    "`lds_bytes` in `index.json` is the module's whole Workgroup total (LDS, `%x_buf`, a mesh shader's `%ms_counts`). (2) The D3D12 shim's `create_compute` compares `lds_bytes` with the device's `maxComputeSharedMemorySize` and refuses the pipeline with a log line (`E_NOTIMPL`) instead of creating an invalid one.",
+    "Pinned by `tests/semantic/test_cs_shared_memory_limit.py` (Workgroup bytes counted from the emitted SPIR-V: under the cap unchanged, shrunk to the 51,200 B allocation and bounds-checked, the exact-cap boundary, an access ending at 64 KiB counted exactly, a 64 KiB LDS refused when emulated and accepted natively, a native 66,048 B allocation refused, run through `spirv_mini_interp`: an out-of-range write dropped with the word it would wrap to intact, out-of-range reads (b32, u16) giving 0, a b64 write straddling the allocation's end, out-of-range atomics returning 0 and changing nothing, and an in-range shader with no check; `lds_bytes` equal to the SPIR-V total) and `shader_library_test` (`lds_bytes` read from the index).",
+    "Confirmed by those CPU tests only; GPU runs (RADV; AMD Windows and Intel at 32 KiB) are pending.",
+    "Not covered: mesh shaders against `maxMeshSharedMemorySize`."
+  ]
+}

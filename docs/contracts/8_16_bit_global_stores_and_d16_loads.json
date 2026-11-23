@@ -1,0 +1,18 @@
+{
+  "piece": "8/16-bit global stores and d16 loads",
+  "status": "cpu_only",
+  "rank": 13,
+  "sentences": [
+    "`global_store_byte`/`short` write the low 8/16 bits of the data VGPR (the `_d16_hi` forms its high half).",
+    "`global_load_{u,s}byte_d16` and `global_load_short_d16` write the low 16 bits of `vdst` (the `_hi` forms the high 16) and keep the other half; `ubyte` zero-extends and `sbyte` sign-extends the byte to 16 bits.",
+    "The address is the `global_load/store` one (`Gen.global_address`).",
+    "The access goes one byte at a time, so a 16-bit access that crosses a dword (at byte 3) is exact too.",
+    "A store merges each byte into its dword with atomic and/or, which keeps neighbouring bytes even when another lane writes them, as buffer byte stores do.",
+    "A load reads each byte.",
+    "Inactive lanes neither store nor load.",
+    "The first-read analysis counts a d16 load's `vdst` as read, for the half it keeps.",
+    "`global_load/store_dword_addtid` (lane-id and M0 addressing) raise `Unsupported`; until 2026-11-22 they crashed with `IndexError`, and the ten sub-dword ops raised `Unsupported`.",
+    "CPU-checked by `tests/semantic/test_global_sub_dword.py` (every byte offset 0 to 7 for each op, an inactive lane, rejected forms, the first-read analysis).",
+    "**Not GPU-verified.**"
+  ]
+}

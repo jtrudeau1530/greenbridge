@@ -1,0 +1,22 @@
+{
+  "piece": "LDS",
+  "status": "gpu_verified",
+  "rank": 109,
+  "sentences": [
+    "A `Workgroup` uint array sized from LDS_SIZE, rounded up to a power of two that also covers every constant offset (15 of 486 shaders index past LDS_SIZE).",
+    "Covers `ds_read/write_b32..b128`, `read2/write2` (+`st64`), `u16`/`i16`/`u8`/`i8` reads (also `ds_read_u16_d16`/`_d16_hi` and, since SHADER-85, `ds_read_u8_d16`/`_d16_hi` and `ds_read_i8_d16`/`_d16_hi`: the byte is zero- or sign-extended 8→16 into one half of the destination VGPR and the other half is kept, per the RDNA2 ISA DS opcode descriptions (opcodes 162–165) and as for the u16 d16 reads; GPU-checked with `cs_w32_lds_u8_d16.asm`, byte values 0x80/0xFF/0x7F with a non-zero `offset:`), `b16`/`b8` writes (atomic and/or, so neighbouring lanes don't race), the add/sub/min/max/and/or/xor atomics with and without return, `wrxchg`, `cmpst` (`OpAtomicCompareExchange` with DATA as comparator and DATA2 as value), and `ds_bpermute_b32` as a subgroup shuffle.",
+    "`ds_permute_b32`, its forward (scatter) form, has no Vulkan equivalent: each source lane that is on in EXEC publishes `((vAddr + offset) >> 2) mod 32` and each destination lane scans the 32 sources of its half and keeps the last one that targets it (a shuffle of target and data per source lane; under `--wave64-emulate` two buffer rounds and a Function variable instead).",
+    "Per the ISA pseudocode (`tmp[0..63] = 0`; `next if !EXEC[i]` on the source; `VGPR[VDST][i] = tmp[i]` only `if EXEC[i]`): a destination lane nobody targets gets 0, an off source sends nothing, an off destination keeps its VDST, and the half rule above applies as for `ds_bpermute_b32`.",
+    "When several sources target one lane the ISA leaves the winner unpredictable (\"the value from one of the writers\"; its pseudocode says the highest-numbered); the translator takes the highest, and nothing may depend on it.",
+    "Confirmed by the GPU tests `cs_w32_permute.asm` and, per half of a wave64, `cs_w64x_permute.asm` (SHADER-90: rotation, offset, unwritten lane = 0, off destination keeps its value, off source does not win) and `tests/semantic/test_ds_permute.py`.",
+    "**Hardware-verified on RDNA2 (`gfx1036`, AMD Ryzen 7 9800X3D iGPU, Linux AMDGPU DRM via `tools/hw_oracle`, wave32 and wave64, SHADER-133)** with `tools/ds_permute_probe.py` (9/9 cases exact in both wave sizes): unaddressed active lanes get 0, off destinations keep VDST, off sources send nothing, 2-/4-/32-way collisions deterministically take the highest-numbered active lane in the 32-lane half (matching the translator), `vAddr + offset` carries from the low 2 bits before `>> 2` mod 32, wave64 runs as two independent 32-lane halves (`+32` wraps within each half), and missing lanes of a partial wave (20 threads in wave32, 40 in wave64) send nothing.",
+    "A source lane that is off in EXEC reads 0 and an off destination lane keeps its value (RDNA ISA §10.4.4), in wave32 as in wave64.",
+    "In wave64 the permute also runs as two wave32s: each half reads lanes of its own half.",
+    "Until 2026-11-21 lanes 32–63 of a 64-wide subgroup read the low half and inactive sources kept their value (`cs_w64x_bpermute`, AMD Radeon 880M); the wave32 path shuffled the raw value until the same day (`cs_bpermute32`: wave32, EXEC without lanes 8–15, so lane 6 reads 0; GPU-checked on RTX 5070 and Radeon 880M).",
+    "A source lane that doesn't exist, in the missing lanes of a partial wave, also reads 0: the shuffle result is kept only where a ballot of the running invocations has the source lane, since SPIR-V leaves a shuffle from an invocation that isn't running undefined.",
+    "Before this, RADV returned stale register values that changed between runs (`cs_w64x_partial`, a 40-thread group, native wave64 on AMD RX 6700 XT, RADV Mesa 26.3.1).",
+    "Writes and atomics run only in active lanes.",
+    "Indices wrap at the array size, where hardware would return 0 for out-of-range reads.",
+    "`s_barrier` = `OpControlBarrier` Workgroup/Workgroup, AcquireRelease + WorkgroupMemory."
+  ]
+}

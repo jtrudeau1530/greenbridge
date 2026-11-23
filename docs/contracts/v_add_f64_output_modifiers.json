@@ -1,0 +1,11 @@
+{
+  "piece": "`v_add_f64` output modifiers",
+  "status": "cpu_only",
+  "rank": 85,
+  "sentences": [
+    "The double sum is scaled by `mul:2`, `mul:4` or `div:2` if present, then clamped to [0, 1] if `clamp` is set, as for f32 (`clamp_mods_f64`, GLSL.std.450 `FClamp` on the double, so a NaN result and the sign of a -0 result are left to the driver, also as for f32).",
+    "**Until 2026-11-22 both were ignored.** Source: LLVM AMDGPU defines it as `VOP3Inst<\"v_add_f64\", VOP3_Profile<VOP_F64_F64_F64>>` (VOP3Instructions.td), and `VOPProfile` sets `HasClamp` (f64 is a modifier type) and `HasOMod` (floating-point destination) (SIInstrInfo.td).",
+    "It is the only f64 arithmetic the translator handles; `v_cvt_f32_f64` has the row above.",
+    "`tests/test_f64_output_modifiers.py` checks the SPIR-V data flow; `runtime/test/shaders/ps_f64_mods.asm` is the GPU test (needs `shaderFloat64`, which `vk_harness` now enables when the fragment shader declares `Float64`), passed on an NVIDIA RTX 6000 Ada (driver 615.71.09, Linux; 4096/4096 pixels exact, and the `main` translator gives the predicted old words)."
+  ]
+}

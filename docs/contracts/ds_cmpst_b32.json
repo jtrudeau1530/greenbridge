@@ -1,0 +1,11 @@
+{
+  "piece": "`ds_cmpst_b32`",
+  "status": "gpu_verified",
+  "rank": 110,
+  "sentences": [
+    "The non-returning compare-and-store: `M = (M == data0) ? data1 : M`, the same `OpAtomicCompareExchange` as `ds_cmpst_rtn_b32` with the old value dropped (operands vaddr, data0, data1).",
+    "Source: RDNA2 ISA DS_CMPST_B32.",
+    "CPU-checked by `tests/semantic/test_lds_atomics_values.py`; GPU-checked by `runtime/test/shaders/cs_lds_b64_cmpst.asm` (hit and miss on an RTX 3070, driver 621.01, Windows 11), and measured on native gfx1100 through `tools/hw_oracle` (hit, miss and hit-to-zero), where GFX11 spells it `ds_cmpstore_b32` with the store value before the compare value.",
+    "GPU-checked by `runtime/test/shaders/cs_lds_b64_cmpst.asm` (hit and miss on an RTX 3070, driver 621.01, Windows 11)."
+  ]
+}

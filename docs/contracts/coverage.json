@@ -1,0 +1,9 @@
+{
+  "piece": "Coverage",
+  "status": "spec_only",
+  "rank": 68,
+  "sentences": [
+    "Every shader in the corpus translates.",
+    "The remaining fidelity gap is wave64 cross-half code on 32-wide subgroups in VS/PS/GS (tier C of the *Wave64 graphics* row; tiers A and B are exact); compute and mesh shaders are exact there with `--wave64-emulate` (see the wave-size and wave64 rows)."
+  ]
+}

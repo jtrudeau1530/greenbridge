@@ -1,0 +1,17 @@
+{
+  "piece": "Multiply-add and output modifiers",
+  "status": "gpu_verified",
+  "rank": 92,
+  "sentences": [
+    "`v_mac_f32` is the VOP2 form of `v_mad_f32`, **not** of `v_fma_f32`: the product is rounded before the add (`OpFMul` + `OpFAdd`, both `NoContraction`).",
+    "It used to emit `Fma`, one ULP off on some inputs.",
+    "Source: LLVM `SIInstrInfo.cpp` `getNewFMAInst` (`V_MAC_F32` -> `V_MAD_F32_e64`, `V_FMAC_F32` -> `V_FMA_F32_e64`).",
+    "VOP3 `clamp` and `mul:2`/`mul:4`/`div:2` now apply to `v_cvt_f32_i32`/`u32`/`ubyte0..3`, `v_cvt_f32_f16` and `v_rcp_iflag_f32` (they were dropped).",
+    "Source: LLVM `VOPProfileI2F` (`Ins64 = $src0, $clamp, $omod`) and the float-source profiles.",
+    "Found by `tools/f32_fuzz.py` (FUZZ-3: an exact-arithmetic model against the translated SPIR-V; 0 mismatches over 10,000 seeded programs after the fix) and pinned by `runtime/test/shaders/ps_f32_mods.asm` (`tests/semantic/test_f32_valu.py`); **GPU-checked** (TEST-298): `ps_f32_mods` gives the expected four words (`0xc0256a01 0x3f800000 0x41e00000 0x3fc00000`, so the `v_mac_f32` product is not fused and the `clamp`, `mul:4` and `div:2` on `v_cvt_f32_ubyte1`/`u32`/`f16` and `v_rcp_iflag_f32` apply) on an NVIDIA GeForce RTX 2060 SUPER (Linux, driver 615.78.08); `mul:2` on the conversions is not in that fixture.",
+    "**not yet GPU-verified**.",
+    "Still open: on some inputs the ISA defines a result but the emitted SPIR-V is undefined: `v_rcp_f32(±0)` (`OpFDiv` by zero), `v_rsq_f32`/`v_log_f32` of ±0 or a negative, `v_sqrt_f32` of a negative.",
+    "`v_cvt_pk_u8_f32(NaN)` now selects +0 before `FClamp` (see \"Float-to-byte pack\").",
+    "`v_rcp_f32(±0)` (`OpFDiv` by zero), `v_rsq_f32`/`v_log_f32` of ±0 or a negative, `v_sqrt_f32` of a negative (`v_cvt_pk_u8_f32(NaN)` now selects +0 before `FClamp`, see \"Float-to-byte pack\")."
+  ]
+}

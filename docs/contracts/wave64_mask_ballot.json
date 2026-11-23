@@ -1,0 +1,17 @@
+{
+  "piece": "Wave64 mask ballot",
+  "status": "gpu_verified",
+  "rank": 186,
+  "sentences": [
+    "`tools/lane_masks.py` tracks per-lane masks (including 32-bit `MASK_LO`/`MASK_HI` halves, `vcc_lo`/`vcc_hi`, `s_bfm_b64` bitfields, `_b64` copies of immediates into `vcc`, and `_b64` bitwise/select ops combining a lane mask or `vcc` destination with immediates; 32-bit mask + non-0/-1 immediate into an SGPR stays plain data, #1792).",
+    "Split wave64 SGPR pairs whose two dwords hold separately written half-masks or a half-mask paired with a 0/-1 `EITHER` constant (`include_either=True`) are recognized by `holds_lane_mask` and read `s[r]` for lanes 0–31 and `s[r+1]` for lanes 32–63 in `mask_src`, and `--wave64-emulate`'s `x_mcache` keys `wave_mask` on every dword of an SGPR operand so rewriting `s[r+1]` invalidates a cached 64-bit exchange.",
+    "`s_bcnt1_i32_b64`/`b32`, `s_bcnt0_i32_b64`/`b32`, `s_ff1_i32_b64`/`b32`, `s_ff0_i32_b64`/`b32`, `s_bitcmp0/1_b32/b64`, and `v_mbcnt_lo/hi_u32_b32` reconstruct the 64-bit wave mask via `OpGroupNonUniformBitwiseOr` (`GroupNonUniformArithmetic`), restricting 32-bit half ops (including `v_mbcnt_lo/hi_u32_b32` on `vcc_hi`/`vcc_lo`/`exec_lo` via `mask_half`) and `s_cmp_eq/lg_u32` (`wave_equal`) to the known 32-bit half in wave64.",
+    "`tools/lane_masks.py` tracks per-lane masks (including 32-bit `MASK_LO`/`MASK_HI` halves, `vcc_lo`/`vcc_hi`, and `s_bfm_b64` bitfields).",
+    "`s_bcnt1_i32_b64`/`b32`, `s_bcnt0_i32_b64`/`b32`, `s_ff1_i32_b64`/`b32`, `s_ff0_i32_b64`/`b32`, and `s_bitcmp0/1_b32/b64` reconstruct the 64-bit wave mask via `OpGroupNonUniformBitwiseOr` (`GroupNonUniformArithmetic`), restricting 32-bit half ops and `s_cmp_eq/lg_u32` (`wave_equal`) to the known 32-bit half in wave64.",
+    "Opposite-half `s_cmp_*_u32/i32` comparisons (lo vs hi), ordering comparisons on mask halves, and `s_cmp_*_u32/i32/u64` comparing a lane mask against an arbitrary scalar or immediate reconstruct the exact 32/64-bit mask words via `wave_mask`.",
+    "A compare with 0 keeps the vote, but a compare with -1 (all ones) does not: lanes that were never launched (a group smaller than the wave) don't vote, while their bits are 0 in the real mask, so until 2026-11-22 `s_cmp_eq_u32 vcc_hi, -1` read 1 in a 40-thread wave64 for `vcc_hi` = 0xff.",
+    "GPU-checked with `cs_w64x_partial_scmp.asm` (40-thread wave64, native and `--wave64-emulate`) and `cs_w32_partial_scmp.asm` (20-thread wave32) on an AMD Radeon RX 7800 XT (RADV, Mesa 26.2.6): all 8 words as the headers derive, and 4 of 8 wrong in each with the old translator.",
+    "GPU-checked with `runtime/test/shaders/cs_wave64_ballot.asm` and `cs_wm_*.asm` on AMD Radeon RX 9070 XT (64-wide subgroup); semantic test coverage in `tests/semantic/test_scalar_bitcmp.py`, `tests/semantic/test_scalar_alu_shifts.py`, `tests/semantic/test_loop_ballot_barrier.py`, and `tests/test_lane_masks.py` (split SGPR pairs, dual-dword `x_mcache`, `_b64` mask+imm, and `v_mbcnt` half selection CPU-checked, not yet GPU-verified).",
+    "GPU-checked with `runtime/test/shaders/cs_wave64_ballot.asm` and `cs_wm_*.asm` on AMD Radeon RX 9070 XT (64-wide subgroup); semantic test coverage in `tests/semantic/test_scalar_bitcmp.py` and `tests/semantic/test_scalar_alu_shifts.py`."
+  ]
+}

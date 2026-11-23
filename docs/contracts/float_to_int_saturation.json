@@ -1,0 +1,11 @@
+{
+  "piece": "Float-to-int saturation",
+  "status": "cpu_only",
+  "rank": 153,
+  "sentences": [
+    "`v_cvt_u32_f32` and `v_cvt_i32_f32` truncate toward zero, saturate out-of-range values (including infinities) to the destination bounds, and return zero for NaN.",
+    "The conversion operand is kept in range before emitting SPIR-V `OpConvertFToU`/`OpConvertFToS`.",
+    "Source: AMD [RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf), §12.8, VOP1 opcodes 7 and 8.",
+    "The synthetic `cs_cvt_f32_sat.asm` fixture is checked bit-for-bit by `tests/semantic/test_float_to_int.py`."
+  ]
+}

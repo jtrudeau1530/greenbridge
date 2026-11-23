@@ -1,0 +1,15 @@
+{
+  "piece": "`s_quadmask_b32`/`_b64`, `s_bitreplicate_b64_b32`",
+  "status": "gpu_verified",
+  "rank": 141,
+  "sentences": [
+    "On scalar data (RDNA2 ISA SOP1): `s_quadmask_b32` sets D[i] to the OR of S0[4i+3:4i] for the 8 quads, `s_quadmask_b64` does the same for the 16 quads of the 64-bit S0 (D[63:16] = 0), and both set SCC = D != 0.",
+    "`s_bitreplicate_b64_b32` copies each bit S0[i] to D[2i] and D[2i+1] and leaves SCC.",
+    "Built from fixed shift/mask steps, with no loop.",
+    "A lane-mask source (EXEC, VCC or an SGPR that `holds_lane_mask`) or an EXEC/VCC destination raises `Unsupported`: each invocation holds only its own lane's bit, and these ops read the other lanes of a quad or move bits between lanes.",
+    "Until 2026-11-22 all three were rejected.",
+    "CPU-checked by `tests/semantic/test_salu_quadmask_bitreplicate.py` (fixed and seeded values, SCC written or kept, immediates, aliasing, lane masks rejected).",
+    "**Hardware-verified** on an AMD Radeon RX 7900 XTX (gfx1100, Windows 11, driver 26.10.1) through `tools/hw_oracle`, one raw wave32 kernel per op: `s_quadmask_b32(0xF)` = 1 with SCC 1, `(0xF0000000)` = 0x80, `(0x0F0F0F0F)` = 0x55 (the set quads are 0, 2, 4 and 6), `(0)` = 0 with SCC 0; `s_quadmask_b64` of 0xF = 1 and of 0xF0000000_00000000 (quad 15, bits 60..63) = 0x8000 in the low word with D[63:16] = 0; `s_bitreplicate_b64_b32` of 5 = 0x33 and of 0x80000000 = 0xC0000000_00000000, with SCC left as it was.",
+    "**GPU-checked** by `runtime/test/shaders/cs_w32_new_ops.asm` (`s_quadmask_b32(0x01020408)` = 0x55, `s_quadmask_b64(0x80000000_00000001)` low word 0x8001, `s_bitreplicate_b64_b32(0x80000001)` high word 0xC0000000, with the expected words from the ISA pseudocode), exact on the Radeon iGPU of a Ryzen 9 9950X3D (RDNA2, `gfx1036`, driver 26.10.1) and an RTX 5080 (driver 616.92)."
+  ]
+}

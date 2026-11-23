@@ -1,0 +1,16 @@
+{
+  "piece": "`v_cvt_f16_f32` output modifiers",
+  "status": "cpu_only",
+  "rank": 171,
+  "sentences": [
+    "VOP3 `clamp` and `mul:2`/`mul:4`/`div:2` apply to the f16 result (Mesa ACO declares the op `dst(F16)`), in the order an RX 6800 (`gfx1030`) and Radeon Graphics (`gfx1036`) apply them: the value is rounded to f16 first, then scaled, then clamped, so in RNE `65520 div:2` is inf, not 32768.",
+    "The scaling works on the f16 bits (`Gen.f16_omod`): a zero or denormal f16, before or after it, gives +0, inf and NaN pass through, and a finite overflow gives inf (±65504 under MODE toward zero, unmeasured).",
+    "The scaling works on the f16 bits (`Gen.f16_omod`): a pre-omod zero or denormal f16 (`e == 0`) gives `+0`, `div:2` underflowing an exponent-1 normal (`e == 1`) gives signed zero (`h & 0x8000`, so negative inputs give `-0.0`, which a trailing `clamp` still turns into `+0`), `inf` and `NaN` pass through, and finite `mul:2`/`mul:4` overflow gives `±inf` in RNE or `±65504` under `MODE` toward zero (`FP_ROUND = 3`), where `±65520` / `±FLT_MAX` with `div:2` also round to `±65504` before halving to `±32752`.",
+    "Until 2026-11-22 both modifiers were dropped; `Gen.f16_omod` also flushed `e == 1 div:2` to `+0` until the `gfx1036` measurement.",
+    "Sources: [@shelbykb2's RX 6800 words](https://github.com/ItsNotRexed/Leonida/pull/718#issuecomment-7074230544) (gfx1030, not the console's gfx1013): [@shelbykb2's RX 6800 words](https://github.com/ItsNotRexed/Leonida/pull/718#issuecomment-7074230544) (gfx1030, not the console's gfx1013) and `tools/cvt_f16_omod_probe.py` on `gfx1036` (Radeon(TM) Graphics, Windows 11 driver `32.0.21045.29003`, wave32 & wave64, 2,880 evaluations, 0 diffs across static/dynamic `MODE`): `clamp` applies in every float mode, the omod only with IEEE off and f16 denormals flushed (with `denorm16_64=3` or `ieee=1` omod is ignored while `clamp` still applies), which is the mode a compiler emits an omod for, as the f32 rows above argue; 2^-15 `mul:2` and -0 `mul:2` gave 0x0000 there.",
+    "That flush is modelled only on results that carry an omod.",
+    "The f16 ALU results (`v_fma_f16`, `v_fmac_f16`, …) still scale before narrowing, which differs from this only on overflow, denormals and the sign of zero.",
+    "Checked by `ps_outmods_f16.asm` (`tests/semantic/test_value_semantics.py`, and on a GPU in both runners): each of its six results changes a word when its modifier is dropped, and two words change when the omod is applied before the rounding.",
+    "Checked by `ps_outmods_f16.asm` (`tests/semantic/test_value_semantics.py`, and on a GPU in both runners), `tests/test_cvt_f16_omod_probe.py`, and `tests/semantic/test_cvt_f16_omod.py`."
+  ]
+}

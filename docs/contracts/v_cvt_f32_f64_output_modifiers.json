@@ -1,0 +1,9 @@
+{
+  "piece": "`v_cvt_f32_f64` output modifiers",
+  "status": "cpu_only",
+  "rank": 84,
+  "sentences": [
+    "Convert to f32, apply `mul:2`, `mul:4`, or `div:2` if present, then apply `clamp` to [0, 1] if requested. [LLVM GFX10 assembler tests](https://github.com/llvm/llvm-project/blob/main/llvm/test/MC/AMDGPU/gfx10_asm_vop1.s#L3044-L3054) confirm the modifier encodings.",
+    "`tests/test_f64_conversion.py` checks the resulting SPIR-V data flow."
+  ]
+}

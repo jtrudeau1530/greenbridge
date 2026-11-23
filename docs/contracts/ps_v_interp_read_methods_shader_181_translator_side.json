@@ -1,0 +1,20 @@
+{
+  "piece": "PS `v_interp` read methods (SHADER-181, translator side)",
+  "status": "gpu_verified",
+  "rank": 73,
+  "sentences": [
+    "Bits 0–1 of the FSSM input record's flags byte (byte 7; `fssm_header.read_methods`) give the **read method** of each table position: bit 0 (0x01) = read through `v_interp_mov_f32`, bit 1 (0x02) = read through `v_interp_p1/p2` or the f16 forms.",
+    "They do not give the D3D interpolation mode, which is PSV0's (row \"PS interpolation modes\", `tools/ps_interp_modes.py`, #1256).",
+    "Exactly one bit is set in every corpus record (bit 1 in 51,191, bit 0 in 4,600).",
+    "In all 12,101 PS every bit-0 position the code reads is read only by `v_interp_mov_f32` (4,295 read positions), every bit-1 position only by `p1/p2` or the f16 forms (49,594), and no position is read both ways (1,902 positions are unread, and 88 reads fall past the table).",
+    "The translator follows the read method, which is what the code does: `v_interp_mov` → `Flat`, `p1/p2` → a plain input (perspective, pixel center; `BaryCoordKHR` for raw i/j).",
+    "That this one pair is perspective-center holds because PSV0 lists no centroid, sample or noperspective generic input, and the code reads one barycentric pair (#1256).",
+    "Table positions don't pair one-to-one with PSV0 rows, since the table keeps only the inputs the compiled code uses, so a PSV0 row's mode and the record's read method can differ at a paired position; #1256 counts those cases.",
+    "`rdna2spirv.check_read_methods` refuses a PS whose read position disagrees with its record's read method (`v_interp_mov` of a bit-1 position, `p1/p2`/f16 of a bit-0 one), or whose record has neither or both bits, instead of reading it as perspective-center.",
+    "It refuses 0 of 12,101 PS, and shard 0/12 translates byte-identically to before the check.",
+    "`index.json` records `ps_flat_interpolants`, the bit-0 positions.",
+    "Tests: `tests/test_rdna2spirv_pixelinput.py` and `tests/test_fssm_header.py` (synthetic).",
+    "GPU-checked by @Vonsek on #1246 (RTX 5080 and Radeon integrated graphics, stock `ps_flat` with a hand-built table of read methods 2 and 1): the smooth channels match a per-center perspective reference, the flat channel keeps the provoking value, and flipping either record's read method makes the translator refuse the shader.",
+    "Bit 3 (0x08, 11,619 records) is a Float16-typed parameter per #1256."
+  ]
+}

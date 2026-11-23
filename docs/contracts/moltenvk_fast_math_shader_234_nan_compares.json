@@ -1,0 +1,14 @@
+{
+  "piece": "MoltenVK fast-math (SHADER-234, NaN compares)",
+  "status": "spec_only",
+  "rank": 80,
+  "sentences": [
+    "MoltenVK compiles every shader's MSL with Metal's fast-math on by default (`MVK_CONFIG_FAST_MATH_ENABLED`, default 1), and with it Metal folds an f32 compare of a NaN with itself as if the NaN were an ordinary number: `v_cmpx_eq_f32` and `v_cmpx_le_f32` on (NaN, NaN) give true where the ISA, AMD and NVIDIA give false (`ps_vcmpx_forms`, #1374: word 1 `0xf05e8e16`, want `0xf05e8a12`, bits 2 and 10; found by @zneel and @DomasUrbonas).",
+    "The translation is not involved: the compare is `OpFOrdEqual` / `OpFOrdLessThanEqual`, and the MSL MoltenVK generates (`MVK_CONFIG_SHADER_DUMP_DIR`) is byte-identical with fast-math on and off, so it is Metal's compile option.",
+    "`MVK_CONFIG_FAST_MATH_ENABLED=2` (on demand) does not help, because translated modules don't declare an execution mode that asks for IEEE behaviour; 0 does.",
+    "The test tools (`runtime/test/vulkan_loader.h`, which every Vulkan test program uses to load MoltenVK) set `MVK_CONFIG_FAST_MATH_ENABLED=0` before MoltenVK reads its configuration, unless the variable is already set, so a user's own value still wins; the variable also reaches MoltenVK through the Vulkan loader.",
+    "A runtime that loads MoltenVK on a Mac must do the same.",
+    "Fast-math off does **not** remove the `[[clang::optnone]]` `spvFAdd`/`spvFSub`/`spvFMul` helpers SPIRV-Cross emits for `NoContraction` (11 calls in `ps_ops`'s MSL either way: their cost is the other part of SHADER-234), and it does not fix the row above (SHADER-182): `valu_fuzz.py --family f16 --seed 1` gives the same `v_mul_f16` +0 mismatch with fast-math on and off.",
+    "Confirmed on an Apple A18 Pro (macOS 26.6.2, MoltenVK 1.4.2): `ps_vcmpx_forms` fails on all 4,096 pixels with fast-math on and matches all 4,096 with it off, natively and with wave64 emulation; no other `run_gpu_tests.py` result and none of the 25 `ctest` tests changes."
+  ]
+}

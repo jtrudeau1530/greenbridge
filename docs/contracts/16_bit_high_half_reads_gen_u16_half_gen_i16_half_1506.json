@@ -1,0 +1,12 @@
+{
+  "piece": "16-bit high-half reads (`Gen.u16_half` / `Gen.i16_half`, #1506)",
+  "status": "cpu_only",
+  "rank": 177,
+  "sentences": [
+    "Reading the high 16 bits of a 32-bit word emits `OpShiftRightLogical %uint u 16` (`u16_half`) or `OpShiftRightArithmetic %int (as_int(u)) 16` (`i16_half`) alone, without a trailing `OpBitwiseAnd ... 0xFFFF` or `OpBitFieldSExtract ... 0 16` (used for the low half only).",
+    "On 32-bit inputs `>> 16` already zero- or sign-extends bits 31..16, and AMD's Windows LLPC compiler (measured on RDNA2, drivers 22.40.84.06 in #1506 and 24.10.24 on Ryzen 5 7600 iGPU) miscompiles both `(u >> 16) & 0xFFFF` and `OpBitFieldSExtract (u >> 16) 0 16` after two partial-half writes to `u` by dropping the `>> 16` when the result feeds `OpIAdd`, `OpIMul`, or `OpShiftLeftLogical` (e.g.",
+    "`(0x41b1 << 1) & 0xFFFF` became `0x0000` instead of `0x8362` in `cs_f16fuzz_s2_163_w64`, `s_bitreplicate`'s `((0x41b1 << 8) | 0x41b1) & 0x00ff00ff` became `0xb10000` instead of `0x4100b1`, and `SExtract(0x91b1138b >> 16, 0, 16) + 1` became `0x91b10001` instead of `0xffff91b2`).",
+    "Applies across all 16-bit half readers (`v_*_b16`/`u16`/`i16`, `v_mad_{u,i}16`, `v_min3/max3/med3_{u,i}16`, `v_cvt_f16_{u,i}16`, `v_pack_b32_f16`, `v_frexp_*_f16`, `v_ldexp_f16`, `s_bitreplicate_b64_b32`, and `buffer_store_format_d16_*`).",
+    "Checked by `tests/test_u16_high_half.py` and `tools/valu_fuzz.py --family f16 --seed 2 --programs 200 --wave both` on AMD Ryzen 5 7600 iGPU (driver 24.10.24: 400/400 native, up from 399/400; 200/200 wave64 emulated on both AMD and NVIDIA)."
+  ]
+}

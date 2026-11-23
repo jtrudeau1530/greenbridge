@@ -1,0 +1,13 @@
+{
+  "piece": "`v_add_nc_i16`, `v_sub_nc_i16`",
+  "status": "gpu_verified",
+  "rank": 53,
+  "sentences": [
+    "GFX10 VOP3-only signed 16-bit add and subtract.",
+    "Without `clamp` they are bit-identical to `v_add_nc_u16`/`v_sub_nc_u16` (the low 16 bits wrap) and take the same path: `op_sel:[s0,s1,dst]` picks each source's half and the destination half, and the other half of D is kept.",
+    "With `clamp`, the exact sum or difference of the sign-extended halves saturates to [-32768, 32767] (`SClamp`), where the u16 forms saturate to [0, 0xFFFF].",
+    "Until 2026-11-22 both raised `Unsupported`.",
+    "CPU-checked by `tests/semantic/test_valu_add_sub_nc_i16.py` (a value grid with and without `clamp`, `op_sel` including the destination half, and equality with the u16 forms without `clamp`).",
+    "Measured on native gfx1100: `clamp` saturates the exact sign-extended sum to [-32768, 32767] and the other half of D is kept."
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "piece": "VOP3 FP modifiers on constants",
+  "status": "gpu_verified",
+  "rank": 187,
+  "sentences": [
+    "`tools/shader_ir.py` keeps VOP3 FP source modifiers (`neg(...)`, `|...|`, `-|...|`, `abs(...)`, and nested combinations) as `abs`/`neg` flags on `imm` and `fimm` operands so `abs` clears the sign bit first and `neg` flips it second (matching LLVM `AMDGPUInstPrinter.cpp::printOperandAndFPInputMods` and `llvm/test/MC/AMDGPU/vop3-modifiers.s`).",
+    "Plain signed literals (`-1`, `-1.0`) are unchanged.",
+    "Until 2026-11-22, `-|1.0|` folded `-` into the float before `FAbs` (yielding `+1.0`), `neg(0x3f800000)` / `neg(1)` applied two's-complement integer negation (`-4.0f` / `0xffffffff` NaN instead of `-1.0f` / `0x80000001`), and `|0x...|` / `-|0x...|` dropped `abs`.",
+    "`tools/shader_meta.py` applies the same bit operations in `_imm_u32`.",
+    "Checked on the CPU by `tests/test_shader_ir.py`, `tests/test_shader_meta.py` and `tests/semantic/test_vop3_const_mods.py` (f32, f16, `v_fma_mix_f32`, `v_cmp_class_f32`, f64 SPIR-V structure); GPU-checked for `-\\|-2.0\\|`, `neg(0x3f800000)`, `\\|0xbf800000\\|` and f16 `-\\|0x3c00\\|` by `ps_vop3_const_mods.asm` (Tesla V100 (NVIDIA 580.95.05, Linux))."
+  ]
+}

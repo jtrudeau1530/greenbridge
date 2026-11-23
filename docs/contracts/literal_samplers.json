@@ -1,0 +1,9 @@
+{
+  "piece": "Literal samplers",
+  "status": "spec_only",
+  "rank": 14,
+  "sentences": [
+    "Some shaders build their S# from immediates (for example `0x92, 0xC00000, 0x14500000, 0`).",
+    "The runtime registers those in the descriptor hash table too, by scanning the translated shaders' constant S# values, not only S#s the game binds."
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "piece": "`v_interp_p2_f16` clamp",
+  "status": "cpu_only",
+  "rank": 167,
+  "sentences": [
+    "The VOP3 `clamp` bit on `v_interp_p2_f16` clamps its f16 result to [0, 1], applied before the narrowing like the other f16 results (Mesa ACO `aco_opcodes.py` declares the op `dst(F16)`, which takes output modifiers; llvm-mc encodes `clamp` on it but no omod).",
+    "Until 2026-11-22 the translator dropped it.",
+    "Checked by `tests/semantic/test_interp_f16.py`: attributes 1.5 and -0.25 read with clamp give 1.0 and +0.0, and without it 1.5 and -0.25.",
+    "No GPU test: `vs_ids` gives attributes in [0, 1) only."
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "piece": "`NoContraction` multiply on MoltenVK (SHADER-182)",
+  "status": "gpu_verified",
+  "rank": 79,
+  "sentences": [
+    "On MoltenVK, a multiply whose exact product is a negative zero (`+0 × -1.5`, `-0 × 1.0`) returns +0 in f32, f16 and packed f16 (#1203).",
+    "MoltenVK's SPIRV-Cross turns every `NoContraction` `OpFMul` into its `spvFMul` helper, which returns `fma(l, r, T(0))`.",
+    "A -0 product plus +0 is +0.",
+    "The f16 multiplies are `OpFMul` on `float` or `v2float`, so they take the same path.",
+    "So does the product inside `fma_f16_odd`: `v_fma_f16`, `v_fmac_f16` and `v_pk_fma_f16` return +0 for a -0 product plus a -0 addend.",
+    "SPIRV-Cross [300681bb](https://github.com/KhronosGroup/SPIRV-Cross/commit/300681bbcb8365a8d1eacdacdbdd0249bbf1d6b1) changes the addend to `T(-0.0)`.",
+    "MoltenVK 1.4.2 has the old helper, and so does MoltenVK `main` at `5189f8de` (2026-10-13), which pins the parent commit `aa217aeb`.",
+    "The translator does not change for this.",
+    "`MVK_CONFIG_FAST_MATH_ENABLED=0` does not help, because the helper itself adds +0, and per #1203 neither does `SignedZeroInfNanPreserve` (#664).",
+    "Measured on an Apple M3 Max (macOS 27.3): Metal keeps the sign for `a * b` and for `fma(a, b, -0.0)` with `MTLMathModeFast` and with `MTLMathModeSafe`, and loses it only with the +0 addend.",
+    "With `valu_fuzz.py --family f16`, MoltenVK `5189f8de` as pinned matches 49/50 programs with `--seed 1 --wave 32`, 98/100 with `--seed 1 --emulate` and 98/100 with `--seed 4 --emulate`, and Homebrew MoltenVK 1.4.2 gives the same counts.",
+    "Each mismatch is a -0 product read as +0.",
+    "The same build with SPIRV-Cross `300681bb` matches 50/50, 100/100 and 100/100, as does KosmicKrisp (Mesa 26.3.1).",
+    "For the FMA path, `--seed 330 --wave 32` with `--skip-op v_mul_f16 --skip-op v_pk_mul_f16` matches 49/50 with `aa217aeb` (a `v_fmac_f16` result) and 50/50 with `300681bb` and on KosmicKrisp."
+  ]
+}

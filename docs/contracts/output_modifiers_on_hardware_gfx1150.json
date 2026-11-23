@@ -1,0 +1,17 @@
+{
+  "piece": "Output modifiers on hardware (gfx1150)",
+  "status": "gpu_verified",
+  "rank": 93,
+  "sentences": [
+    "Measured on a Radeon 880M (gfx1150, RDNA3.5; **not** RDNA2) with `tools/f32_fuzz.py --oracle hw`, 46,967 programs: `mul:2`/`mul:4`/`div:2` turn a -0 result (a flushed denormal result included) into +0, and are ignored with MODE.IEEE = 1; with f32 denormals kept they are also ignored for the ALU ops (the transcendental and cube ops still apply them).",
+    "LLVM notes that omod mishandles signed zeros (`SIFoldOperands.cpp`) and D30209 describes -0 being forced to +0 before the modifier.",
+    "The translator keeps -0 (`OpFMul`), so on that evidence it likely differs from hardware (see #1006).",
+    "RDNA2 itself is unmeasured (see #1006).",
+    "Also measured there: with `denorm_mode_32 = 0` f32 denormal operands read as zero and denormal results flush (add/mul/fma/min/max/rounding ops, DX9 mul), exact with 3.",
+    "`v_fma_mix*` f32 operands read as zero when denormal too (SHADER-298: gfx1036, `0x00000001`, `0x807fffff`, and the integer inline constants 1 and 64; f16 operands widen to normal values); its result is not flushed, since that was not measured.",
+    "Invalid operations give `0xffc00000`; a signalling NaN passes unchanged with IEEE off and is quieted with IEEE on.",
+    "RDNA2 does the same: gfx1036 (the integrated GPUs of a Ryzen 9 7950X3D and a Ryzen 7 9800X3D; RDNA2, but not the console's gfx1013), seeds 1 to 6, 38,858 programs, 0 mismatch and 56 omod -0 → +0 deviations, with identical counts through the Linux libdrm launcher and the Windows HIP launcher; `v_rcp_iflag_f32` with `clamp`/`omod` on the same GPU, 6,552 programs, 0 mismatch and 35 such deviations, otherwise behaves like `v_rcp_f32`.",
+    "Also measured there: with `denorm_mode_32 = 0` f32 denormal operands read as zero and denormal results flush (add/mul/fma/min/max/rounding ops, DX9 mul), exact with 3; invalid operations give `0xffc00000`; a signalling NaN passes unchanged with IEEE off and is quieted with IEEE on.",
+    "Details in docs/shader_validation.md (\"32-bit float VALU on the GPU\")."
+  ]
+}

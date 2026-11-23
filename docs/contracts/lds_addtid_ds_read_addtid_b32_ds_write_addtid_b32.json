@@ -1,0 +1,13 @@
+{
+  "piece": "LDS ADDTID (`ds_read_addtid_b32`, `ds_write_addtid_b32`)",
+  "status": "cpu_only",
+  "rank": 111,
+  "sentences": [
+    "The LDS forms address one dword at `M0[15:0] + offset + 4 * lane`, where `offset` is an unsigned 16-bit byte offset and `lane` is the invocation index within the RDNA wave.",
+    "The Workgroup array supplies LDS_BASE.",
+    "The compute/mesh path uses the ordinary LDS addressing and EXEC guard.",
+    "The GDS form raises `Unsupported`.",
+    "Source: RDNA2 ISA §10.4 and §12.13 (opcodes 176/177), LLVM GFX1030 assembly syntax.",
+    "`tests/semantic/test_lds_addtid.py` compares the two forms with ordinary LDS reads/writes over two waves, including partial EXEC and emulated wave64."
+  ]
+}

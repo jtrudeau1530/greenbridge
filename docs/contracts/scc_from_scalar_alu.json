@@ -1,0 +1,14 @@
+{
+  "piece": "SCC from scalar ALU",
+  "status": "gpu_verified",
+  "rank": 56,
+  "sentences": [
+    "`s_and/or/xor/andn2/orn2/nand/nor/xnor_b32` and `s_lshl/lshr_b32` set SCC = result ≠ 0, `s_add/sub_i32` and `s_addk_i32` set it to signed overflow, `s_min_u32`/`s_max_u32` to S0 < S1 / S0 > S1, and `s_min_i32`/`s_max_i32` to the same compared signed: SCC is 1 when S0 is the one chosen, and a tie chooses S1 (RDNA2 ISA, S_MIN_I32: D = S0 < S1 ? S0 : S1, SCC = 1 if S0 is chosen).",
+    "**Before this fix these ops left SCC unchanged**, so a following `s_cbranch_scc*` read a stale flag, and until 2026-11-21 `s_min_i32`/`s_max_i32` set SCC on a tie. 32-bit scalar shifts now mask the amount to 5 bits.",
+    "GPU-checked with `runtime/test/shaders/ps_scc.asm` and `ps_scc_minmax.asm` (NVIDIA GeForce RTX 2060 SUPER, Linux, driver 620.70.06: 4096/4096 pixels exact, and all 4096 differ with the old translator).",
+    "**On lane masks in a wave32 program** (a source is EXEC, VCC or a mask SGPR, or the result goes to EXEC) the 32-bit bitwise ops' result is the whole wave's mask, so SCC is a subgroup vote (`OpGroupNonUniformAny`), as for the `_b64` forms.",
+    "Until 2026-11-22 each lane took its own bit: `s_and_b32 s0, vcc_lo, exec_lo; s_cbranch_scc0` skipped the block in lanes whose bit was 0, and a loop closed by `s_andn2_b32 exec_lo, ...; s_cbranch_scc1` let each lane leave early.",
+    "Found and checked by `tools/cf_diff.py` (FUZZ-8, CPU differential against the ISA model); GPU test `runtime/test/shaders/ps_scc_mask32.asm` passes (s5 == 8 on 2,048 pixels, 192 of them with bit 0, and s5 == 7 on 2,048) on an NVIDIA RTX 4050 Laptop (Linux, driver 620.73.04, natively and under `LEONIDA_W64_EMULATE=1`) and an AMD Radeon 740M (RADV, Mesa 26.3.1), and on an RTX 2060 SUPER per #634.",
+    "A 32-bit op on one half of a wave64 mask still takes the lane's bit (its SCC would be a vote of that half)."
+  ]
+}

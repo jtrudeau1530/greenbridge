@@ -1,0 +1,11 @@
+{
+  "piece": "64-bit constant vector compares",
+  "status": "cpu_only",
+  "rank": 146,
+  "sentences": [
+    "For `i64`, `u64` and `f64`, V_CMP writes the predicate to VCC or the named scalar mask, with inactive lane bits cleared.",
+    "V_CMPX ANDs the predicate into EXEC and preserves VCC.",
+    "Both predicates ignore the source values, including NaNs.",
+    "The 12 instructions in `tests/semantic/fixtures/vopc_constant_64.asm` assemble for gfx1030 and are CPU-checked with active and inactive lanes in `test_vopc_const_ordered.py`. [AMD RDNA 2 ISA, VOPC](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)"
+  ]
+}

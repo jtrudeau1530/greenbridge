@@ -1,0 +1,14 @@
+{
+  "piece": "`v_cvt_flr_i32_f32`, `v_cvt_rpi_i32_f32`",
+  "status": "gpu_verified",
+  "rank": 161,
+  "sentences": [
+    "RDNA ISA pseudocode: `f32_to_i32(floor(S0))` and `f32_to_i32(floor(S0 + 0.5))`, the `+ 0.5` rounded in binary32 like any f32 add (so 0.49999997 gives 1, where an exact round-half-up would give 0).",
+    "`f32_to_i32` saturates as in the row above: INT_MAX / INT_MIN at or past ±2³¹ and for ±inf, 0 for NaN.",
+    "`sat_i32(floor(S0))` and exact `sat_i32(floor(S0 + 0.5))` (computed via `f = Floor(x); (x - f >= 0.5) ? f + 1 : f`, with no binary32 rounding of `S0 + 0.5`: `0x3effffff` → `0`, `0x4b000001` → `0x00800001`, `0x4b7fffff` → `0x00ffffff`).",
+    "Out-of-range values (±2³¹ and beyond, ±inf) and NaNs all saturate by the sign bit of the operand (`+NaN` → `0x7FFFFFFF`, `-NaN` → `0x80000000`, unlike `v_cvt_i32_f32` which returns `0` for NaN); the sign is read from `x` before `Floor` so driver NaN canonicalization cannot flip it.",
+    "Source neg/abs apply first.",
+    "Checked on the CPU by `tests/semantic/test_alu_cvt_flr_rpi.py`, **not yet GPU-verified**.",
+    "**Until 2026-11-22 the translator rounded `S0 + 0.5` in binary32 and returned `0` for NaN.** Hardware-verified natively on RDNA2 (AMD Radeon 680M `gfx1035`: 82/82 wave32 and 82/82 wave64 via `tools/hw_oracle`, plus `gfx1036` confirmation in #1746) and CPU-checked by `tests/semantic/test_alu_cvt_flr_rpi.py`."
+  ]
+}

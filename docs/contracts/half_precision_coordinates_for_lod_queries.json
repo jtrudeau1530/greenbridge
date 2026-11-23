@@ -1,0 +1,10 @@
+{
+  "piece": "Half-precision coordinates for LOD queries",
+  "status": "cpu_only",
+  "rank": 126,
+  "sentences": [
+    "For `image_get_lod a16` on 2D and 2D-array images, the low and high halves of the first address VGPR supply U and V.",
+    "The array layer is excluded from `OpImageQueryLod`; the selected clamped and raw LOD outputs are f32.",
+    "`tests/semantic/fixtures/get_lod_a16.asm` assembles for gfx1030 and checks the query operands and output components through `tests/test_image_load_typed.py`. [AMD RDNA2 ISA, MIMG](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)"
+  ]
+}

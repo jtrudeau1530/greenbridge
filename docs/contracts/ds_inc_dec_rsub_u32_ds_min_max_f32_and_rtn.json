@@ -1,0 +1,12 @@
+{
+  "piece": "`ds_{inc,dec,rsub}_u32`, `ds_{min,max}_f32` (and `_rtn_`)",
+  "status": "cpu_only",
+  "rank": 114,
+  "sentences": [
+    "32-bit LDS atomics lowered inside `Gen.lds_op` via a Workgroup-scope `OpAtomicCompareExchange` CAS loop (no shader float atomic extension needed): `ds_inc_u32` gives `(M >= DATA) ? 0 : M + 1` (unsigned), `ds_dec_u32` gives `(M == 0 || M > DATA) ? DATA : M - 1` (unsigned), `ds_rsub_u32` gives `DATA - M` (wrapping), and `ds_{min,max}_f32` use GLSL.std.450 `NMin`/`NMax` (NaN returns the non-NaN operand, `-0.0 < +0.0`, matching `global_atomic_fmin`/`fmax`).",
+    "The `_rtn_` forms return the pre-op word in `vdst`; inactive lanes skip the op and preserve `vdst`.",
+    "Source: AMD RDNA2 ISA DS encoding.",
+    "CPU-checked by `tests/semantic/test_lds_atomics_cas.py` (edge value grids, NaN/±0/±inf, `offset:`, `vdst` aliasing, inactive lanes, sequential wraparound, Workgroup CAS loop structure, outside-compute and bad-operand rejections).",
+    "**Not GPU-verified.**"
+  ]
+}

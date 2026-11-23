@@ -1,0 +1,15 @@
+{
+  "piece": "Coherent image accesses (`glc`)",
+  "status": "gpu_verified",
+  "rank": 40,
+  "sentences": [
+    "On GFX10 a device-scope (coherent) load is `glc dlc` and a device-scope store `glc`: Mesa sets exactly these bits for `ACCESS_COHERENT` ([`ac_get_hw_cache_flags`](https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/common/ac_shader_util.c), GFX10–10.3 branch).",
+    "In the corpus only the 10 POPS pixel shaders use them: 30 `image_load ... glc dlc` and 50 `image_store ... glc`, all 2D, and in each shader the 3 T#s it loads are the 3 it stores, a read-modify-write of its ordered images.",
+    "A `glc` `image_load` therefore reads the **storage view the stores write** (`OpImageRead` on binding 8 + 3·dim + class, the class picked from the T# FORMAT as for stores), not the sampled array of \"Typed image loads\": a sampled read has no coherent form in SPIR-V, and between critical sections the fragment-shader interlock only makes coherent memory visible ([Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html): non-atomic accesses are private unless `Coherent`; [ARB_fragment_shader_interlock](https://registry.khronos.org/OpenGL/extensions/ARB/ARB_fragment_shader_interlock.txt): stores to `coherent` memory in one critical section are visible to reads in the next).",
+    "A shader with a `glc` image load or store decorates its storage views **`Coherent`**, as vkd3d-proton's dxil-spirv does for rasterizer-ordered views (`dxil_converter.cpp`: \"ROV implies coherent\").",
+    "These 10 modules need `shaderStorageImageReadWithoutFormat` (listed in their index features); every other `image_load` keeps the sampled path and needs no storage feature (SHADER-151).",
+    "`dlc` alone is a CU-scope load and stays non-coherent; `glc` on a sampled read (`image_sample*`, `image_gather*`, `image_load_mip`) or on a dimension without storage views (cube) is `Unsupported`.",
+    "Until 2026-11-22 the coherent loads read the sampled array and nothing was `Coherent`, so a POPS read could miss the previous fragment's store.",
+    "Confirmed by these references, `tests/semantic/test_image_coherent.py` (each read and write's view and type, decorations, capabilities, index features; 7 of its 10 tests fail on the old translator) and a corpus count; **not GPU-checked**: a stale read is a cache race no deterministic test forces."
+  ]
+}

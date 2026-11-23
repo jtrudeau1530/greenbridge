@@ -1,0 +1,18 @@
+{
+  "piece": "`v_sin_f32`, `v_cos_f32`, `v_sin_f16`, `v_cos_f16`",
+  "status": "gpu_verified",
+  "rank": 34,
+  "sentences": [
+    "The operand is an angle in turns (the ISA says valid over +-256; the measurement below finds no such limit on gfx1030).",
+    "`turn_angle` reduces it in turns first, `x - RoundEven(x)` (exact in binary32, in [-0.5, 0.5]), then scales by `2*pi` and calls `Sin`/`Cos`, so the angle stays in [-pi, pi], the only range where GLSL guarantees them (2^-11 absolute).",
+    "Scaling first rounded the fractional turn away (about 1.2e-4 rad near 255 turns, #594); the first fix (#1283) reduced with `Fract`, which rounds `1 - | x | ` for a negative x and lost `-2^-26` (it returned +0; absolute errors up to ~1.7e-7 at -0.1 turns), so the reduction is `RoundEven`-centred.",
+    "`RoundEven` rather than `Round` so +-0.5 turn reduce symmetrically. inf and NaN still give NaN, and a zero operand is passed through unreduced so `sin(-0)` stays -0.",
+    "CPU-checked by `tests/semantic/test_alu_sincos.py` against `sin`/`cos(2*pi*x)` in double (large angles, tiny arguments, whole turns of either sign, +-0, inf/NaN, modifiers, f16) and `tests/semantic/test_valu_sin_cos_turns.py` (#1283).",
+    "GPU test `cs_w32_sincos` (large angles within 1e-3, since the driver `Sin` is only good to 2^-11) is a regression guard, not proof the old form failed on a given driver.",
+    "Measured on an AMD Radeon RX 6800 (gfx1030, not the console's gfx1013) by @shelbykb2 (#616): whole and half turns of either sign give +0 (only `sin(-0)` is -0, so no sign needs copying onto a zero result, as here); there is no +-256 limit on that card (any finite x reduces exactly: `sin(300.25)` = 1, `sin(2^24)` = +0); the f16 forms reduce the same way as the f32 ones; +-inf gives a NaN and a NaN passes through, quieted with IEEE mode on.",
+    "Re-measured natively on gfx1036 (RDNA2, SHADER-134) for f32 and f16 over every quarter turn from 0.25 to 2^24 of either sign and around +-256: the same rules.",
+    "At an odd half turn `sin`, and at an odd quarter turn `cos`, is exactly +0 (either sign of x), where `Sin`/`Cos` of the rounded 2*pi give about -+8.7e-8 (f32) or a +-1-ulp f16 denormal; since 2026-11-22 the translator selects +0 there (`Gen.trig_exact_zero`), checked against 500 measured words by `tests/semantic/test_alu_sincos_turns_hw.py`.",
+    "Known differences from this translation: for Known differences from this translation: at half turns `Sin` of the rounded pi gives about -+8.7e-8 where the hardware returns exactly 0, likewise `cos` at quarter turns; for | x | <= 2^-12 the hardware multiplies by `0x40c90fd5`, not the rounded 2*pi; the inf/NaN words are whatever the host driver returns.",
+    "Not checked on gfx1013."
+  ]
+}

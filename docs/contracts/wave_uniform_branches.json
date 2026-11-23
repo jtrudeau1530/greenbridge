@@ -1,0 +1,14 @@
+{
+  "piece": "Wave-uniform branches",
+  "status": "gpu_verified",
+  "rank": 105,
+  "sentences": [
+    "VCC and EXEC are wave-wide registers, but one invocation holds only its own lane's bit.",
+    "`s_cbranch_vccz/vccnz/execz/execnz` therefore reduce the condition across the subgroup (`OpGroupNonUniformAny`), so the whole wave takes the branch together, as on hardware.",
+    "Before this, each lane decided alone.",
+    "A lane could skip scalar instructions that the hardware wave executes (its SGPRs went stale for later code), and cross-lane ops or barriers inside the block saw a split wave.",
+    "`v_cmp`/`v_cmp_class`/64-bit compares now write 0 for inactive lanes (hardware VOPC behaviour), so the reduction sees the true mask.",
+    "GPU-checked with `runtime/test/shaders/ps_uniform_branch.asm`: lanes whose own VCC bit is 0 run the block's scalar add when their wave has any set bit.",
+    "`s_cbranch_scc0/1` stay per lane; SCC is uniform as long as the SGPRs feeding it are."
+  ]
+}

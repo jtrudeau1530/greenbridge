@@ -1,0 +1,12 @@
+{
+  "piece": "`v_cmp_*_f64`, `v_cmpx_*_f64`",
+  "status": "cpu_only",
+  "rank": 179,
+  "sentences": [
+    "All 16 binary64 vector compare predicates (`f`, `lt`, `eq`, `le`, `gt`, `lg`, `ge`, `o`, `u`, `nge`, `nlg`, `ngt`, `nle`, `neq`, `nlt`, `tru`) for both `v_cmp_` (VCC/SGPR lane mask) and `v_cmpx_` (EXEC narrowing), lowered in `Gen.compare_f64_cond` via pure 32-bit `%uint` IEEE-754 ordering (NaN detection, `-0.0` canonicalized to `+0.0`, sign-magnitude to monotonic unsigned 64-bit key) with no `Float64` capability required and no denormal flushing.",
+    "Supports VGPR/SGPR pairs, `fimm`, sign-extended inline integers (`-16..64`), 32-bit upper-half literals, and VOP3 `abs`/`neg` sign-bit modifiers on both sources; inactive lanes write 0 for `v_cmp_*_f64` and stay inactive for `v_cmpx_*_f64`.",
+    "Source: AMD RDNA2 ISA VOPC/VOP3 binary64 compares.",
+    "CPU-checked by `tests/semantic/test_cmp_f64.py` (all 16 predicates across full IEEE-754 edge grid including subnormals/1-ULP pairs/±0/±inf/sNaN/qNaN, SGPR pairs, constants, `abs`/`neg`, `v_cmpx_*_f64`, inactive lanes, no `Float64` capability, bad-operand rejections).",
+    "**Not GPU-verified.**"
+  ]
+}

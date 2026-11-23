@@ -1,0 +1,11 @@
+{
+  "piece": "Hand-written short assembler forms",
+  "status": "cpu_only",
+  "rank": 128,
+  "sentences": [
+    "`llvm-mc` accepts `v_add_co_ci_u32 vD, src0, src1` (also `v_sub_co_ci_u32`, `v_subrev_co_ci_u32`) with the carry out and in left to VCC, and a modifier list shorter than the operands (`op_sel_hi:[0,0]`, `neg_lo:[1,0]` on a three-source op), whose missing entries are 0; it prints them as `v_add_co_ci_u32_e32 vD, vcc_lo, src0, src1, vcc_lo` and `[0,0,0]`.",
+    "The GPU runner assembles through `llvm-mc -show-encoding`, so it sees the printed form; `tests/semantic/regen_fixtures.py` copies the `.asm` text as written, so the translator takes the source spelling too (it used to raise `IndexError` for these: the carry forms, `v_pk_fma_f16`, `v_fma_mix_*`).",
+    "A probe of 42,000 operand and modifier variations of 302 ALU mnemonics, in the source spelling and as `llvm-mc` prints them, found no other `IndexError`, `KeyError` or `TypeError`.",
+    "CPU-checked by `tests/semantic/test_short_asm_forms.py`."
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "piece": "Signed-byte dot products",
+  "status": "cpu_only",
+  "rank": 107,
+  "sentences": [
+    "`v_dot4_i32_i8 D, S0, S1, S2` (VOP3P) is S2 plus the sum of the four products of the sign-extended bytes of S0 and S1, modulo 2^32; `v_dot4c_i32_i8 D, S0, S1` (VOP2) adds the same sum to D.",
+    "Emitted as four pairs of `OpBitFieldSExtract`, `OpIMul` and `OpIAdd`.",
+    "**Confirmed on RDNA2 hardware** (gfx1036, raw kernels through `tools/hw_oracle`): 10 operand sets, both instructions and both source orders of the accumulating one, with sign-mixed bytes and sums that wrap; the measured words are the table in `tests/semantic/test_alu_dot4_i8.py`.",
+    "`clamp` and `op_sel`/`op_sel_hi` are translated and checked against the same `gfx1036` hardware table: `clamp` saturates `v_dot4_i32_i8` to signed 32-bit `[-2^31, 2^31-1]` (both overflowing sets), and `op_sel`/`op_sel_hi` pick the 16-bit half of S0/S1 for byte pairs 0..1 and 2..3 (e.g.",
+    "`op_sel` 2 / `op_sel_hi` 5 exchanges the 16-bit halves of S1, matching all 5 measured sets — the form of the 89 words `llvm-mc` does not decode, [fspx.md](fspx.md)); non-default S2 half selection stays refused.",
+    "`neg_lo`/`neg_hi`, which `llvm-mc` accepts on `v_dot4_i32_i8` only, are not ignored (`neg_lo` flips bit 15 and `neg_hi` bit 31 of S0 or S1, and on S2 `neg_hi` clears bit 31 before `neg_lo` flips it; 5 sets under 8 forms, 45 words): any set bit stays Unsupported, while an all-zero field is the plain instruction.",
+    "Counts: the 29 FSPX programs use the pair 27,271 times (`v_dot4c_i32_i8` 25,813, `v_dot4_i32_i8` 1,458), all in 13 programs; none of the game's own 26,503 shaders has either encoding (0 of the 12,791 words `llvm-mc` cannot decode there with gfx1013)."
+  ]
+}

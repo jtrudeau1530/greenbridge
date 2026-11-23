@@ -1,0 +1,12 @@
+{
+  "piece": "A16 sample offsets",
+  "status": "spec_only",
+  "rank": 45,
+  "sentences": [
+    "For the supported `image_sample*_o` forms, the first address VGPR retains the signed texel-offset fields.",
+    "The following coordinates and any trailing LOD use packed binary16 halves, low half first.",
+    "LLVM counts extra operands as whole words before packing coordinates and LOD ([getAddrSizeMIMGOp](https://llvm.org/docs/doxygen/AMDGPUBaseInfo_8cpp_source.html#l00342)).",
+    "On RTX 5080 and Radeon Graphics, `ps_texoff.asm` checked 64 distinct offsets applied to packed U/V at texel (3,5) against the expected texel for each of 4096 pixels.",
+    "Swapping the halves or dropping the offset changed 4032 pixels per GPU."
+  ]
+}

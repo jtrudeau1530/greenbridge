@@ -1,0 +1,11 @@
+{
+  "piece": "Images and samplers",
+  "status": "gpu_verified",
+  "rank": 17,
+  "sentences": [
+    "`image_sample_l` on 2D arrays used to read its LOD from the array layer; it now reads the LOD after all coordinates.",
+    "`image_get_lod` and `image_gather4_lz` also work on 2D arrays.",
+    "With `d16` every sample result is f16, packed two to a VGPR from the low half (the packed D16 of GFX10, as LLVM returns D16 image data); `image_sample_c_lz`/`_c_lz_o` follow it too, and until 2026-11-21 their compare result was written as f32 bits, which read as 0 in the low half.",
+    "Checked by `tests/test_translate.py` (`test_depth_compare_sample_result_width`) and GPU-checked with `runtime/test/shaders/ps_sample_c_lz.asm` (`vk_texture_test dref`: a D32 texture and a LESS_OR_EQUAL compare sampler) on an NVIDIA GeForce RTX 2060 SUPER (Linux, driver 620.70.06): 4096/4096 pixels exact for f32 and `d16`; with the old translator the `d16` result read 0 in the 2048 pixels whose compare passes."
+  ]
+}

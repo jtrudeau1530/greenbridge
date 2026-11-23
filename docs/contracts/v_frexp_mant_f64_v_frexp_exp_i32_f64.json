@@ -1,0 +1,19 @@
+{
+  "piece": "`v_frexp_mant_f64`, `v_frexp_exp_i32_f64`",
+  "status": "cpu_only",
+  "rank": 159,
+  "sentences": [
+    "Binary64 versions of `v_frexp_mant_f32` and `v_frexp_exp_i32_f32`, computed bit-exactly on the `(lo, hi)` dword pair without requiring `OpCapability Float64` or `Int64` unless VOP3 output modifiers are used.",
+    "A normal input has biased exponent `1..2046` (bits `[62:52]`): `v_frexp_mant_f64` sets the biased exponent to `1022` (`0x3FE00000`, mantissa in `[0.5, 1)` with sign and low mantissa bits kept), and `v_frexp_exp_i32_f64` returns `e - 1022` as a 32-bit signed integer so `mantissa × 2^exponent == input`.",
+    "Under the default f16/f64 denormal mode (`denorm_mode_16_64` = 3, matching `v_frexp_mant_f16`/`v_frexp_exp_i16_f16`), non-zero subnormals (`e == 0`, 52-bit fraction `≠ 0`) are normalized into `[0.5, 1)` with sign preserved and exponent `msb − 1073` (`-1073..-1022`; e.g.",
+    "`0x0000000000000001` → `0x3FE0000000000000` / `-1073`, `0x000FFFFFFFFFFFFF` → `0x3FEFFFFFFFFFFFFE` / `-1022`).",
+    "Zero and denormals give signed zero and exponent `0`; infinities and NaNs pass through unchanged with exponent `0`.",
+    "VOP3 source `abs`/`neg` flip/clear bit 31 of `hi`; VOP3 output modifiers (`mul:2`/`mul:4`/`div:2`, then `clamp`) apply to `v_frexp_mant_f64` via `clamp_mods_f64` (`OpCapability Float64`) and are rejected on `v_frexp_exp_i32_f64`.",
+    "Source: AMD [RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) (`V_FREXP_MANT_F64`, `V_FREXP_EXP_I32_F64`) and LLVM `VOP1Instructions.td`.",
+    "**Measured natively** on an AMD Radeon(TM) Graphics RDNA2 GPU (`gfx1036`, not the console's `gfx1013`; Windows driver 32.0.21042.62, `tools/hw_oracle`, wave32 and wave64 identical on every case): under `IEEE=0, denorm_mode_16_64=3, DX10_CLAMP=1` all 71 cases (all 52 single-bit subnormal positions `0..51`, lo/hi boundary-crossing multi-bit subnormals, negative subnormals, `±0`, normals, `±inf`, `qNaN`, `sNaN`, plus VOP3 `abs`/`neg`/`clamp`) matched bit-for-bit.",
+    "Until 2026-11-22 the translator flushed binary64 subnormals to `±0` / exponent `0`, which the hardware does only under `denorm_mode_16_64=0`.",
+    "Not modelled (the game runs with `IEEE=0, denorm_mode_16_64=3`): `IEEE=1` quieting signalling NaNs (`0x7FF0000000000001` → `0x7FF8000000000001`), `denorm_mode_16_64=0` flushing subnormals, and `denorm_mode_16_64=3` ignoring `omod`.",
+    "**Not measured on hardware** (denormal input handling and NaN payload follow the f32 rule).",
+    "Checked on the CPU and with `spirv-val` by `tests/semantic/test_alu_frexp_f64.py`; not run on the shader corpus."
+  ]
+}

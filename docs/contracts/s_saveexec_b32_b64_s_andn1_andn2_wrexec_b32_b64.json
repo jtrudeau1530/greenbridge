@@ -1,0 +1,15 @@
+{
+  "piece": "`s_*_saveexec_b32/b64`, `s_andn1/andn2_wrexec_b32/b64`",
+  "status": "cpu_only",
+  "rank": 4,
+  "sentences": [
+    "RDNA2 ISA SOP1. saveexec: `D = EXEC; EXEC = f(S0, EXEC); SCC = (EXEC != 0)`. wrexec: `EXEC = f(S0, EXEC); D = EXEC`.",
+    "`f` is one of `and`, `or`, `xor`, `andn1` (`~S0 & EXEC`), `andn2` (`S0 & ~EXEC`), `orn1`, `orn2`, `nand`, `nor`, `xnor`, the table in `Gen.EXEC_LOGIC`.",
+    "The definitions match `tools/cf_ref.py` `_SAVEEXEC`, the FUZZ-8 model.",
+    "Each invocation holds its own lane's bit (0 or ~0), so `f` is the bitwise op on that bit.",
+    "A lane EXEC had off becomes active when `f` gives 1 for it (`nand`, `nor`, `orn1`, `orn2`, `xnor`, ...), as on hardware, and SCC is the wave vote.",
+    "Until 2026-11-22 only `and`/`or`/`andn2_saveexec` and `andn2_wrexec` were translated.",
+    "CPU-checked by `tests/semantic/test_saveexec_variants.py` (all ten saveexec kinds in wave32 and wave64, both wrexec kinds, partial EXEC and S0, an empty result, every lane against `cf_ref._SAVEEXEC`) and by `tools/cf_diff.py` (300 programs × wave32/64 still pass).",
+    "**Not GPU-verified** for the seven new kinds."
+  ]
+}

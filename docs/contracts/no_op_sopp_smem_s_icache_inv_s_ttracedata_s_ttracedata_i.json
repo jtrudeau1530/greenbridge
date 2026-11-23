@@ -1,0 +1,12 @@
+{
+  "piece": "No-op SOPP/SMEM (`s_icache_inv`, `s_ttracedata`, `s_ttracedata_imm`, `s_code_end`, `s_version`, `ds_nop`, `v_clrexcp`)",
+  "status": "cpu_only",
+  "rank": 59,
+  "sentences": [
+    "Instruction-cache invalidate, thread-trace data, end-of-code padding, the ISA version marker and the DS no-operation have no register, memory, SCC, VCC or EXEC effect, so they are in `NOOPS` with `s_nop` / `v_nop` / `v_pipeflush`.",
+    "`v_clrexcp` clears the TRAPSTS exception bits, which nothing translated reads (`s_getreg_b32` is unsupported and there are no traps), so it is a no-op too (since 2026-11-22; before, both it and `ds_nop` raised `Unsupported`).",
+    "The data-cache invalidations (`buffer_gl0_inv`, `buffer_gl1_inv`, `s_dcache_inv`, `s_gl1_inv`) concern coherence between waves and stay `Unsupported`.",
+    "Source: RDNA2 ISA SOPP/SOPK/SMEM/DS/VOP1.",
+    "CPU-checked by `tests/semantic/test_sopp_noops.py` (values, SCC and VCC survive; the data-cache invalidations are still rejected)."
+  ]
+}

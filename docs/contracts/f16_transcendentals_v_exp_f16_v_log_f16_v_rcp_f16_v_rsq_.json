@@ -1,0 +1,21 @@
+{
+  "piece": "f16 transcendentals (`v_exp_f16`, `v_log_f16`, `v_rcp_f16`, `v_rsq_f16`, `v_sqrt_f16`, `v_sin_f16`, `v_cos_f16`)",
+  "status": "gpu_verified",
+  "rank": 82,
+  "sentences": [
+    "Measured on an RX 6700 XT (gfx1031, not the console's gfx1013) with `tools/f16_trans_sweep.py`: all 65,536 inputs of each op, wave32 and wave64 (identical on every input), five MODEs (FUZZ-29).",
+    "With f16 denormals kept (`denorm_mode_16_64 = 3`, the assembler default and what the translator assumes), `v_exp/log/rcp/rsq/sqrt_f16` are **correctly rounded on every input that is not a NaN** (0 ulp).",
+    "`v_sin/v_cos_f16` take turns and reduce them exactly over the whole f16 range (no ±256 limit): compared with sin/cos(2πx), every result for |x| > 1 is bit-exact, and for |x| ≤ 1 only 14 (sin) and 4 (cos) of 30,722 are 1 ulp off.",
+    "So the translator's rule (widen to f32, the GLSL.std.450 function, round to nearest even back to f16) matches the hardware as far as the driver's f32 function is accurate.",
+    "For sin/cos that holds only once the angle is reduced in turns first (#594): with the f32 product 6.2831855 · x, 16,366 sin and 2,036 cos inputs are more than 1 ulp off, up to 9,944 ulp (sin of 64,640 turns: 0.0267 instead of 0).",
+    "With `denorm_mode_16_64 = 0`, a denormal operand reads as a zero of its sign, and a denormal result is written as a zero of its sign.",
+    "That differs from the f32 ops in the row above, which flush in both modes.",
+    "The f16 field of FP_ROUND is ignored: round toward zero gives the same words as round to nearest on every input.",
+    "IEEE changes only signalling NaNs.",
+    "With IEEE off they pass through unchanged; with IEEE on they are quieted (bit 9 set).",
+    "Payload and sign are kept either way, and quiet NaNs pass unchanged in every mode.",
+    "Where SPIR-V leaves the result undefined, the hardware gives: log(±0) = -inf, rcp(±0) = ±inf, rsq(+0) = +inf, rsq(-0) = -inf, sqrt(-0) = -0, and `0xfe00` for log/rsq/sqrt of a negative (-inf included) and for sin/cos(±inf).",
+    "`v_exp_f16`/`v_log_f16` give the same counts on gfx1036 (RDNA2, AMD Windows driver; SHADER-135).",
+    "**Not modelled yet:** `Gen.f16_bits` quiets every NaN (the hardware keeps a signalling NaN with IEEE off), and the undefined cases above are left to the driver."
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "piece": "Images and samplers (core)",
+  "status": "gpu_verified",
+  "rank": 18,
+  "sentences": [
+    "Bindless.",
+    "Set 0: binding 0 = 2D sampled images, 1 = samplers, 2 = descriptor hash table (storage buffer), 3 = 2D-array images (**cube textures are bound here as 6-layer 2D-array views**, cube arrays as 6N layers: the shader already selected the face with `v_cube*`), 4 = r32ui storage images, 5 = 1D, 6 = 3D.",
+    "A cube sample's s and t come in [1, 2] and its third coordinate is 8·slice + face, as the hardware takes them (Mesa `ac_nir_lower_tex_coords.c`, LLPC `ImageBuilder.cpp`); the view is read at (s − 1, t − 1), layer 6·slice + face.",
+    "GPU-checked with `runtime/test/shaders/ps_cube_sample.asm` (`vk_texture_test cube`).",
+    "For a native Metal path, `tools/spirv_metal_set0.py` sizes set 0's runtime arrays from `vulkan_bindless.h` and moves each binding to its own argument-buffer ID range (binding b starts at the capacities of bindings 0..b-1 added up), to convert with SPIRV-Cross `--msl-decoration-binding`: SPIRV-Cross 1.4.363.0 otherwise puts every runtime array at one ID and comments all but one out as \"Overlapping binding\" (SHADER-161).",
+    "`cs_imgstore` converted this way writes all 3×64 texels correctly in a native Metal dispatch on an Apple A18 Pro."
+  ]
+}

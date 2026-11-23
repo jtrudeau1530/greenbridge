@@ -1,0 +1,32 @@
+{
+  "piece": "d16 and f16 format narrowing",
+  "status": "cpu_only",
+  "rank": 151,
+  "sentences": [
+    "The f16 of every d16 result (image samples and gathers, the `image_sample_c_lz` compare result, typed buffer loads) and of the f16 formats a typed buffer store writes is narrowed with integer ops (`Gen.f16_bits`; #489, #711), not with `PackHalf2x16`: to nearest even, except the typed-buffer float conversions, which round toward zero (below).",
+    "AMD drivers lower `PackHalf2x16` to `v_cvt_pkrtz_f16_f32`, which rounds toward zero (#489), and there about half of all unorm8, unorm16 and snorm8 values loaded with d16 came out 1 ulp low (123 of 256, 31,742 of 65,536 and 110 of 256).",
+    "Packed MUBUF and MTBUF loads clamp unsigned 32-bit channels to 65535 before writing each half.",
+    "On native gfx1036, values 65534 and 65535 survived, while 65536, 65537 and 0xffffffff all produced 0xffff, across all four load widths in wave32 and wave64.",
+    "Packed `buffer_load_format_d16_x` and `_xyz` write only the low 16 bits of the final VGPR.",
+    "Its upper half survives even when the load is out of bounds.",
+    "Native gfx1036 wave32 and wave64 confirmed this with RGBA8_UINT and RGBA8_UNORM, two destination seeds, and both even-component loads as full-write controls.",
+    "Full pairs are packed by `pack_f16_pair_int` and an odd final buffer component is narrowed with `f16_bits` for float/normalized formats.",
+    "These memory conversions do not use `f16_pack2`: they come from the texture and buffer units, not the VALU whose rounding `MODE.FP_ROUND` sets (#753).",
+    "**Typed buffer floats are narrowed toward zero (SHADER-358).** Measured natively on gfx1036 (RDNA2, wave32 and wave64, `tools/hw_oracle`): `buffer_store_format_*` into `16_FLOAT`/`16_16_FLOAT`/`16_16_16_16_FLOAT` and `buffer_load_format_d16_*` from `32_FLOAT`/`32_32_FLOAT`/`32_32_32_32_FLOAT` round an f32 toward zero, give ±65504 for a finite value past the f16 range (65520 stores 0x7bff, not infinity), flush an f32 denormal to a signed zero, keep infinities, and keep a NaN's sign and top 10 payload bits without quieting it (1 if those are 0: 0x7fa00000 gives 0x7d00, 0x7f800001 gives 0x7c01); gfx1150 does the same for the stores (#1548).",
+    "The translator does that with `Gen.mem_f16`; until 2026-11-22 it rounded these to nearest even and overflowed to infinity.",
+    "UNORM/SNORM d16 loads keep the rounding above (nearest even of the exact quotient, re-measured on gfx1036 for every 8-bit value and a 16-bit sample).",
+    "Checked by `tests/semantic/test_buffer_f16_narrowing_hw.py` (45 measured values in four forms).",
+    "Image d16 results are still inferred to round to nearest even (SHADER-308). #489's own narrower, `f32_to_f16_int`, was folded into `f16_bits` on 2026-11-22: the two gave the same bits on 30,648 inputs (every f32 exponent, ties, the subnormal and overflow edges, NaN), and `f16_bits` lost its one GLSL.std.450 instruction (`UMin`) so the packer stays free of them.",
+    "For typed buffer loads the rounding is measured (BUILD-161, `tools/d16_format_probe.py`).",
+    "On an RX 6700 (gfx1031, AMD Windows driver 32.0.21045.29003), every UNORM8, SNORM8, UNORM10, UNORM16 and SNORM16 value was loaded through `buffer_load_format_d16_x` and `tbuffer_load_format_d16_x`, in wave32 and wave64.",
+    "The hardware rounds the exact quotient once, straight to f16, to nearest even, with f16 denormals kept (65,536 of 65,536 UNORM16 and SNORM16 values).",
+    "It does not round to f32 first: that double rounding is 1 ulp high on exactly four values (UNORM16 0xffaf and 0xffef, SNORM16 0x7ff7 and 0x8009).",
+    "Over every width from 1 to 16 bits, only two f32 quotients land on an f16 halfway point: 0x3f7ff000 (16379/16383, 32759/32767, 65519/65535) and 0x3f7fb000 (65455/65535).",
+    "`Gen.d16_norm_f16` takes the f16 below for those two, for normalized formats only; a 32_FLOAT 0x3f7ff000 is a real tie and still rounds to even.",
+    "`buffer_load_format_x` without d16 returned the correctly rounded f32 quotient for all of them, the decode `norm_bits` builds.",
+    "A 16_FLOAT d16 load returned its own bits for all 65,536 encodings.",
+    "MUBUF and MTBUF agreed everywhere.",
+    "For d16 image results, round to nearest even is still inferred, as in #489, not measured. #489's own narrower, `f32_to_f16_int`, was folded into `f16_bits` on 2026-11-22: the two gave the same bits on 30,648 inputs (every f32 exponent, ties, the subnormal and overflow edges, NaN), and `f16_bits` lost its one GLSL.std.450 instruction (`UMin`) so the packer stays free of them.",
+    "Checked by `tests/test_translate.py` (`test_depth_compare_sample_result_width`, `test_buffer_format_f16_narrowing_avoids_packhalf2x16`), `tests/test_d16_pack.py` and `tests/semantic/test_buffer_load_format.py` (`D16NormalizedRounding`)."
+  ]
+}

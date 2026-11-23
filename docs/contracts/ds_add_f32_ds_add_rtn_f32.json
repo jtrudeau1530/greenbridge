@@ -1,0 +1,15 @@
+{
+  "piece": "`ds_add_f32`, `ds_add_rtn_f32`",
+  "status": "cpu_only",
+  "rank": 112,
+  "sentences": [
+    "`M = M + DATA` as binary32 on the LDS dword (RDNA2 ISA, `DS_ADD_F32`); the `_rtn_` form returns the old M.",
+    "No core SPIR-V atomic adds floats on Workgroup memory, so it is an `OpAtomicCompareExchange` loop with an `OpFAdd` (round to nearest even, `NoContraction`).",
+    "That is exact under contention: every update is one successful exchange of the value it read.",
+    "**Not measured:** how the LDS adder treats denormals and NaN payloads; the result is `OpFAdd`'s IEEE sum.",
+    "The f32 min/max forms are #2495's.",
+    "Until 2026-11-22 both raised `Unsupported`.",
+    "CPU-checked by `tests/semantic/test_lds_add_f32.py` (a value grid, the non-returning form, `offset:`, ties to even, -0 + +0, overflow to ±inf, seeded values, against a once-rounded double sum).",
+    "**Not GPU-verified.**"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "piece": "`image_sample_c_l`",
+  "status": "spec_only",
+  "rank": 22,
+  "sentences": [
+    "Scalar 2D depth comparison (`dmask:0x1`) takes the f32 reference, XY coordinates and explicit mip in that order.",
+    "Under A16 the reference stays full-width; XY share a VGPR and LOD uses the next low half.",
+    "D16 returns the comparison in the low half of the destination.",
+    "Confirmed against LLVM AMDGPU's `llvm.amdgcn.image.sample[.a16].dim.ll` lowering and synthetic Vulkan 1.2 modules in `test_explicit_mip_depth_compare`."
+  ]
+}

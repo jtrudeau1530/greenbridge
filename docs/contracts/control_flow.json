@@ -1,0 +1,20 @@
+{
+  "piece": "Control flow",
+  "status": "cpu_only",
+  "rank": 5,
+  "sentences": [
+    "Reducible graphs use structured branches and natural loops.",
+    "Irreducible graphs use the dispatch-loop form, which can also be forced with `--dispatch-loop` for comparisons.",
+    "The control-flow unit test checks 18,228 generated graphs.",
+    "Irreducible graphs use node splitting (`cfg_structure.split_irreducible`, up to `min(2*N, N+64)` blocks) and fall back to the dispatch-loop form when capped; it can also be forced with `--dispatch-loop` for comparisons.",
+    "`cfg_structure.structure`, `cfg_structure.run`, and `rdna2spirv.assemble`'s structured emitter are iterative and hoist each guarded member's dominated tail continuation out of its enclosing guard (exact by strict dominance: no block outside the guard's subtree can target the continuation), keeping `OpSelectionMerge` nesting O(1) on sequential diamond/loop chains instead of nesting O(N) deep and hitting Python's recursion limit on multi-thousand-block shaders (e.g. 2,000 sequential diamonds nest to depth 2 instead of 2,000).",
+    "The control-flow unit test (`tests/test_cfg_structure.py`) checks 20,000 generated graphs plus 2,000-diamond, 1,200-loop, and 1,500-early-exit chains.",
+    "AMD A/B checks compare the two forms for selected pixel shaders with defined test inputs.",
+    "For shaders that never export colour, the comparison checks pixel coverage.",
+    "**Nesting is bounded (SHADER-299):** a tree deeper than `MAX_STRUCTURED_DEPTH` (16) is emitted in the dispatch-loop form instead, since `spirv-val` time grows roughly with the cube of the measured nesting depth.",
+    "Over the 1.0.2.1 corpus (26,503 modules, `spirv-val` 2026.4): the deepest block of a module is nested 118 constructs deep, 12,963 modules are structured (median 15) and 6,000 of those are deeper than 16; an estimated 85% of the corpus's `spirv-val` time is in modules nested 20 or deeper.",
+    "Median `spirv-val` time for the same module in each form: depth 20 181 -> 129 ms (1.4x), 30 507 -> 371 (1.4x), 50 1,712 -> 738 (2.3x), 64 2,692 -> 1,163 (2.3x), 77 5,122 -> 1,130 (4.5x), and the deepest (118) 13,683 -> 1,352 ms (10.1x).",
+    "Depth 5-12 shows no gain (at depth 6 the flat form is slightly slower), which is why the bound sits at 16.",
+    "Both forms pass `spirv-val` on a 200-shader slice (200/200 each), and `gen.nesting` records the tree depth."
+  ]
+}

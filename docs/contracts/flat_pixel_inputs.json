@@ -1,0 +1,10 @@
+{
+  "piece": "Flat pixel inputs",
+  "status": "spec_only",
+  "rank": 69,
+  "sentences": [
+    "A pixel input location read only by `v_interp_mov_f32` is declared `Flat`.",
+    "Locations read with `v_interp_p1/p2` remain interpolated.",
+    "The `ps_flat` GPU test passes integer IDs through the first vertex alongside interpolated UVs."
+  ]
+}

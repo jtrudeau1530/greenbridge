@@ -1,0 +1,9 @@
+{
+  "piece": "Quad-byte SAD 64-bit source operands",
+  "status": "spec_only",
+  "rank": 133,
+  "sentences": [
+    "The GFX10.3 `null` operand supplies zero for the 64-bit input window in all three quad-byte SAD operations and for the 64-bit addend of the two packed forms.",
+    "Confirmed with LLVM gfx1030 assembly and scalar byte-difference references in `test_alu_qsad.py` and `test_alu_mqsad_u32.py`."
+  ]
+}

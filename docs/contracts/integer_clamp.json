@@ -1,0 +1,17 @@
+{
+  "piece": "Integer clamp",
+  "status": "gpu_verified",
+  "rank": 52,
+  "sentences": [
+    "The VOP3 `clamp` bit on `v_add_nc_u32`, `v_sub_nc_u32`, `v_subrev_nc_u32` saturates the result to [0, 0xFFFFFFFF], and on `v_add_nc_i32`/`v_sub_nc_i32` to [0x80000000, 0x7FFFFFFF]; without it they wrap.",
+    "GFX9+ semantics: LLVM selects `uaddsat`/`usubsat` and `saddsat`/`ssubsat` to exactly these ops with clamp set.",
+    "**Until this change clamp was silently ignored on the unsigned ops** (and the signed ones were `Unsupported`).",
+    "Checked on the CPU by `tests/semantic/test_alu_add_nc_clamp.py`.",
+    "The carry-out unsigned ops (`v_add_co_u32`, `v_sub_co_u32`, `v_subrev_co_u32`, `v_add_co_ci_u32`, `v_sub_co_ci_u32`, `v_subrev_co_ci_u32`) with VOP3 `clamp` likewise saturate D to `0xFFFFFFFF` on add carry or `0` on sub borrow while still reporting the real carry/borrow bit in `sdst` (**until 2026-11-22 the translator ignored `clamp` on all six**); confirmed natively on RDNA2 (AMD Radeon 680M `gfx1035` wave32 & wave64 via `tools/hw_oracle`, and independently on `gfx1036` in #1746) and CPU-checked by `tests/semantic/test_alu_add_co_clamp.py`.",
+    "The 16-bit unsigned add/sub (`v_add_nc_u16`, `v_sub_nc_u16`, and the `v_add_u16`/`v_sub_u16`/`v_subrev_u16` `_e64` names) saturate to [0, 0xFFFF] with `clamp` (llvm-mc 21 gfx1030 encodes the bit on them, and LLVM selects i16 `uaddsat`/`usubsat` to them); **until 2026-11-22 the translator wrapped instead**.",
+    "`clamp` on any other 16-bit integer op raises `Unsupported`.",
+    "CPU-checked by `tests/semantic/test_alu_u16_clamp.py` (the high half of the destination is kept), **not GPU-verified**.",
+    "CPU-checked by `tests/semantic/test_alu_u16_clamp.py` (the high half of the destination is kept), and **Hardware-verified on RDNA2** (AMD Radeon 680M, `gfx1035`, Windows 11, driver `26.5.1`, wave32 and wave64 via `tools/int_hw_probe.py --oracle both`, SHADER-137): all 32-bit and 16-bit `*_nc_*` `clamp` cases (including `op_sel` and kept destination half on u16) match hardware bit-for-bit.",
+    "**Open divergence measured on the same hardware:** `v_add_co_u32`, `v_sub_co_u32`, `v_subrev_co_u32`, `v_add_co_ci_u32`, `v_sub_co_ci_u32` and `v_subrev_co_ci_u32` with `clamp` saturate D (`0xFFFFFFFF` / `0`) while still reporting the real carry/borrow in `sdst`, whereas the translator currently ignores `clamp` on these carry-out ops."
+  ]
+}

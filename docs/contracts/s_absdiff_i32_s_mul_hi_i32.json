@@ -1,0 +1,12 @@
+{
+  "piece": "`s_absdiff_i32`, `s_mul_hi_i32`",
+  "status": "gpu_verified",
+  "rank": 55,
+  "sentences": [
+    "`s_absdiff_i32`: D = \\|S0 − S1\\| with the 32-bit difference wrapped first (0x7FFFFFFF − 0x80000000 → 1; a difference of −2³¹ stays 0x80000000), SCC = D ≠ 0.",
+    "`s_mul_hi_i32`: high word of the signed 64-bit product, SCC kept.",
+    "From the RDNA2 ISA pseudocode; checked on the CPU by `tests/semantic/test_salu_absdiff_mul_hi.py`.",
+    "**Hardware-verified** on an AMD Radeon RX 7900 XTX (gfx1100, Windows 11, driver 26.10.1) as raw wave32 kernels through `tools/hw_oracle`: `s_absdiff_i32(0x7FFFFFFF, 0x80000000)` = 1 and `s_absdiff_i32(0x80000000, 0)` = 0x80000000, both with SCC = 1, and equal operands give 0 with SCC = 0; `s_mul_hi_i32(0x7FFFFFFF, 0x7FFFFFFF)` = 0x3FFFFFFF and `s_mul_hi_i32(-1, 1)` = 0xFFFFFFFF, with SCC left as it was.",
+    "Also verified on native RDNA2 (gfx1036, AMD Radeon Graphics): 500 programs in `tools/salu_diff.py` (`--oracle translator,hw`) matched bit-for-bit with 0 mismatches, and the high product word and SCC retention confirmed across edge values."
+  ]
+}

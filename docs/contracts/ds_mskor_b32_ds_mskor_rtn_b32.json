@@ -1,0 +1,14 @@
+{
+  "piece": "`ds_mskor_b32`, `ds_mskor_rtn_b32`",
+  "status": "gpu_verified",
+  "rank": 113,
+  "sentences": [
+    "`tmp = M[A]; M[A] = (tmp & ~DATA) | DATA2`; the `_rtn_` form returns `tmp` (RDNA2 ISA, DS).",
+    "Emitted as an atomic AND with `~DATA`, whose result is `tmp`, then an atomic OR with `DATA2`, so the returned value is exact.",
+    "DATA2 bits outside DATA are ORed in too, as the formula says; it isn't a masked insert.",
+    "**Approximation:** the memory ends as the single op leaves it unless another lane's op on the same dword lands between the two atomics.",
+    "Until 2026-11-22 both raised `Unsupported`.",
+    "CPU-checked by `tests/semantic/test_lds_mskor.py` (a value grid, the non-returning form, DATA2 outside DATA, `offset:`, seeded values).",
+    "Measured on native gfx1100, including DATA2 bits outside DATA being ORed in, so it is not a masked insert."
+  ]
+}

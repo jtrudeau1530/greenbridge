@@ -1,0 +1,15 @@
+{
+  "piece": "Byte permute",
+  "status": "gpu_verified",
+  "rank": 131,
+  "sentences": [
+    "`v_perm_b32`: result byte i = BYTE_PERMUTE({src0, src1}, selector byte i), src1 = bytes 0–3 (AMD \"RDNA 2\" ISA reference, VOP3 opcode 836 V_PERM_B32, `byte_permute` pseudocode, page 189 of the PDF).",
+    "Selector 0–7 picks that byte; **8, 9, 10, 11 give 0xff if bit 7 of byte 1, 3, 5, 7 is set, else 0x00**; 12 gives 0x00; 13 and above give 0xff.",
+    "**Until 2026-11-21 selectors 8–11 gave 0x00 regardless of the sign bit**.",
+    "In the 26,503-shader disassembled corpus (measured via `tools/feature_scan.py`), 0 of 10,500 shaders (11,930 `v_perm_b32` instructions) use selectors 8–11 or >= 13: all 11,258 immediate and 672 constant-register selectors (0 unresolved) use only bytes 0–7 (36,234) and 12 (11,486).",
+    "GPU-checked with `runtime/test/shaders/ps_ops7.asm` (also `v_alignbit_b32` with a shift of 36, `v_med3_i32` vs `v_med3_u32`) and `ps_ops8.asm` (`v_mul_hi_u32/i32`, `v_bcnt_u32_b32`, `v_ffbl_b32`, `v_ffbh_u32` of 0, `v_xad_u32`, `v_add3_u32`), 4096/4096 pixels on an AMD Radeon iGPU (Ryzen 7 9800X3D, RDNA2, AMD driver 25.10.36) and an NVIDIA GeForce RTX 5070 (driver 621.24); before the fix `ps_ops7` gave 0x00000000 for the sign-selector word on both.",
+    "Also executed by `tests/semantic/test_value_semantics.py`.",
+    "When S2 is a literal or a currently known SGPR constant, the translator emits fixed byte extracts/inserts (including sign replication), folds the zero and 0xff bytes, and uses the selected source directly for a whole-word identity.",
+    "`tests/semantic/test_perm_known_selector.py` checks the resulting words and that selector dispatch only remains for a clobbered SGPR."
+  ]
+}

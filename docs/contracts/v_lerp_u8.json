@@ -1,0 +1,15 @@
+{
+  "piece": "`v_lerp_u8`",
+  "status": "gpu_verified",
+  "rank": 136,
+  "sentences": [
+    "Per byte i: `D.b[i] = (S0.b[i] + S1.b[i] + (S2.b[i] & 1)) >> 1`, an unsigned average where bit 0 of S2's byte decides whether 0.5 rounds up.",
+    "The 9-bit sum shifted right by 1 fits back in its byte, so nothing carries between bytes.",
+    "`clamp` raises `Unsupported` (the ISA doesn't define it for this op).",
+    "Source: RDNA2 ISA VOP3 opcode 333.",
+    "CPU-checked by `tests/semantic/test_alu_lerp_u8.py` (#577): a 9×9×5 grid of edge and rounding words, 40 seeded cases, an SGPR source with an inline S2, `clamp` rejected.",
+    "Not in the translated corpus, not GPU-checked.",
+    "**Hardware-verified on RDNA2** (`gfx1035`, wave32 and wave64 via `tools/int_hw_probe.py --oracle both`, SHADER-137).",
+    "Measured on native gfx1036 (AMD Radeon Graphics, RDNA2) through tools/hw_oracle across byte edge values and rounding bit variations: 0 mismatches against the ISA reference."
+  ]
+}

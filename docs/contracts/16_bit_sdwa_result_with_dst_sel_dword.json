@@ -1,0 +1,12 @@
+{
+  "piece": "16-bit SDWA result with `dst_sel:DWORD`",
+  "status": "gpu_verified",
+  "rank": 28,
+  "sentences": [
+    "A 16-bit op in SDWA form (`v_add/sub/subrev/mul/min/max_f16_sdwa`, the f16 unary ops, `v_cvt_u16_f16`, `v_cvt_i16_f16`, `v_cvt_f16_u16`, `v_cvt_f16_i16`) with `dst_sel:DWORD` writes the whole VGPR: the 16-bit result zero-extended, **whatever `dst_unused` says**.",
+    "The keep-the-high-half rule of the row above is for the non-SDWA forms only; with `dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE` the high half is kept as usual.",
+    "**Until 2026-11-22 the translator kept the high half for `dst_sel:DWORD`** (`Gen.insn` marked an SDWA destination only for a `dst_sel` other than DWORD).",
+    "Measured natively on an AMD Radeon iGPU (gfx1036, RDNA2, Windows driver 26.10.1) with `python -I tools/sdwa_diff.py --oracle hw` (#2113) and with the program of `runtime/test/shaders/ps_sdwa_dword_hi.asm` through `tools/hw_oracle`: destinations 0xdeadbeef give 0x00004000 (`v_add_f16`, PRESERVE), 0x00000003 (`v_cvt_u16_f16`, PAD), 0x00004700 (`v_cvt_f16_u16`, PRESERVE), 0x0000c000 (`v_mul_f16`, SEXT); the same ops with `dst_sel:WORD_0 UNUSED_PRESERVE` give 0xdead4000, 0xdead0003, 0xdead4700, 0xdeadc000.",
+    "GPU-checked through Vulkan with `ps_sdwa_dword_hi.asm` on an RTX 5080 (driver 616.92) and the same Radeon iGPU (4096/4096 pixels each); CPU-checked in `tests/semantic/test_value_semantics.py`."
+  ]
+}

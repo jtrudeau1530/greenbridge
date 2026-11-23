@@ -1,0 +1,13 @@
+{
+  "piece": "SDWA select on an f16 inline constant",
+  "status": "gpu_verified",
+  "rank": 31,
+  "sentences": [
+    "In an `_sdwa` 16-bit float op, an inline float constant is first the f16 value over a zero high half (row above) and `src0_sel`/`src1_sel` then narrows those 32 bits like a register's, zero-extended, before neg/abs and the op: `1.0` under `WORD_1` reads +0.0, `2.0` under `BYTE_1` reads the f16 denormal `0x0040`.",
+    "An SGPR source, and an integer op reading the f32 bits of a float constant (`v_cvt_f16_u16_sdwa d, 1.0 src0_sel:WORD_1` converts 0x3f80), are narrowed the same way.",
+    "**Until 2026-11-22 the translator used the whole f16 constant** (`v_add_f16_sdwa d, 1.0, v src0_sel:WORD_1` with v = 0.5 gave 1.5).",
+    "Measured on an AMD Radeon iGPU (gfx1036, Ryzen 9 9950X3D, driver 26.10.1) with `tools/hw_oracle` (raw HIP kernel, wave32): the four words of `runtime/test/shaders/ps_sdwa_f16_const.asm`; found with `python -I tools/sdwa_diff.py --oracle hw` (#2113).",
+    "GPU test `ps_sdwa_f16_const`, 4096/4096 pixels on an NVIDIA GeForce RTX 5080 (driver 616.92) and the same Radeon iGPU through Vulkan; both fail without the fix.",
+    "Also executed by `tests/semantic/test_value_semantics.py`."
+  ]
+}

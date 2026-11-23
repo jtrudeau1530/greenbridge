@@ -1,0 +1,23 @@
+{
+  "piece": "Mesh shaders as compute (`--mesh-compute`)",
+  "status": "gpu_verified",
+  "rank": 49,
+  "sentences": [
+    "For devices without `VK_EXT_mesh_shader` (NVIDIA Pascal, for one).",
+    "Each mesh shader becomes a `GLCompute` module with the same workgroup size and code; only the epilogue changes.",
+    "Instead of `OpSetMeshOutputsEXT` and the mesh outputs, after the same barrier lane 0 writes the vertex and primitive counts, lane i < vertex count writes its vertex and lane i < primitive count its primitive into this workgroup's **slot** of an output buffer: slot = linear workgroup index (x + y·nx + z·nx·ny) × `slot_bytes`, computed in 64 bits.",
+    "The buffer's device address is in push-constant dwords 36–37, so these modules declare 152 bytes.",
+    "Slot layout (`rdna2spirv.mesh_compute_layout`, recorded per shader as `mesh_compute` in the index), all 16-byte aligned: a header (vertex count, primitive count), then `max_vertices` vertices, each holding the position, the clip and then cull distances padded to whole vec4s, and one vec4 per param location; then `max_primitives` primitives of three vertex indices plus 1 if culled.",
+    "The modules need no mesh capability, extension or `shaderClipDistance`.",
+    "`tools/mesh_compute_vs.py` writes the vertex shader that draws the slots with a non-indexed `vkCmdDraw(groups × max_primitives × 3)`: vertex v is workgroup v / (3·max_primitives), primitive (v / 3) mod max_primitives, corner v mod 3.",
+    "A primitive past the count, or one culled, gets one position outside the clip volume at all three corners and is clipped.",
+    "Otherwise the corner's index, clamped to `max_vertices` − 1, selects the vertex, and its position, distances and params go out at the mesh shader's locations, so the pixel shader is unchanged.",
+    "One draw rasterizes in vertex order, which is workgroup then primitive order, as with mesh workgroups.",
+    "Corpus: all 9,282 mesh shaders are 128×1×1 with 128/128 outputs, wave64, 0–18 params, clip distances in 1,906, cull distances and per-primitive attributes in none, no task shaders.",
+    "On a 32-wide device combine it with `--wave64-emulate`.",
+    "GPU-checked on an NVIDIA GeForce GTX 1060 6GB (Pascal: no mesh shaders; driver 560.94, Windows 10) with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`: `ms_tri`, `ms_w64x_ballot` and `ms_wave_info_s3` 4096/4096 pixels exact, `ms_clip` 2048/4096 covered as expected, `ms_v5_workgroup` 24/24 workgroup coordinates, zero Khronos validation messages.",
+    "Checked in `tests/test_mesh_compute.py`.",
+    "The runtime side, turning a `DispatchMesh` into that dispatch, a barrier and the draw, is the follow-up (it needs the graphics pipelines of #291).",
+    "Unused primitives still run the vertex shader; compaction with an indirect draw would avoid that."
+  ]
+}

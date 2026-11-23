@@ -1,0 +1,17 @@
+{
+  "piece": "Floating-point operations",
+  "status": "spec_only",
+  "rank": 77,
+  "sentences": [
+    "Separate floating-point instructions carry `NoContraction` so the driver preserves their individual rounding.",
+    "The instructions that fuse multiply-add (`v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32`, `v_fma_mix*`) round **once** on RDNA2 (measured on gfx1150 by `tools/f32_fuzz.py --oracle hw`: 72 of 72 cancellation probes fused).",
+    "SPIR-V has two ways to say that.",
+    "`GLSL.std.450 Fma` is the default (`--fma glsl`), but the Vulkan SPIR-V environment gives it the precision \"inherited from `OpFMul` followed by `OpFAdd`\", so a driver may legally round twice; `tools/f32_fuzz.py` and `runtime/test/shaders/cs_fma_fused.asm` are the tests that notice.",
+    "`tools/f32_fuzz.py` and `runtime/test/shaders/cs_fma_fused.asm` are the tests that notice — on an AMD Radeon RX 6800 (Mesa RADV 26.2.6-arch3.1, Linux), RADV/ACO actually splits 5 of the 7 f32 FMAs in `cs_fma_fused` under `--fma glsl` (folding/splitting against the live `v_mul_f32` product `a*a`) and emits single-rounded `v_fma_f32` (8/8 exact) under `--fma khr`.",
+    "`--fma khr` emits `OpFmaKHR` (`SPV_KHR_fma`, capability `FMAKHR`; \"correctly rounded\"), which needs `VK_KHR_shader_fma` with `shaderFmaFloat32` on the device.",
+    "The index then lists capability `FMAKHR`, extension `SPV_KHR_fma` and feature `shaderFmaFloat32` for exactly the shaders that use it, and the output of every shader without a fused multiply-add is byte-identical under both options.",
+    "`khr` is not the default because a device without the extension would fail pipeline creation; a runtime that knows its device has `shaderFmaFloat32` should translate with `--fma khr`.",
+    "The f16 forms (`v_fma_f16`, `v_fmac_f16`, `v_pk_fma_f16`) never use either: they are exact round-to-odd arithmetic built from `OpFMul`/`OpFAdd` with `NoContraction` (`Gen.fma_f16_odd`), so a fused f32 `Fma` would not change them (`v_fma_mixlo_f16`/`v_fma_mixhi_f16` under the toward-zero MODE are the exception: `fma_mix_odd` needs the exact product error `Fma(x, y, -p)`, which is only guaranteed with `OpFmaKHR`), and an f16 `OpFmaKHR` (`shaderFmaFloat16`) is not used.",
+    "There is no f64 fused multiply-add in the translator yet (`v_add_f64` only)."
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "piece": "`v_mac_legacy_f32`",
+  "status": "cpu_only",
+  "rank": 178,
+  "sentences": [
+    "The GFX10.1 VOP2 form of `v_mad_legacy_f32` with D as the addend: D = legacy(S0 * S1) + D, where 0 times anything (inf and NaN included) is +0, with the same denormal flush and VOP3 modifiers.",
+    "D is read before it is written, as for `v_mac_f32` (LLVM `VOP2Instructions.td`: `V_MAC_LEGACY_F32` has `$src2` tied to `$vdst`).",
+    "Until 2026-11-22 it raised `Unsupported`.",
+    "CPU-checked by `MacLegacyF32Tests` in `tests/semantic/test_valu_f32_min3_max3_mad.py` (a 15x8x6 grid against the `v_mad_legacy_f32` reference, the zero rule, clamp/neg, D aliased as a source).",
+    "**Not GPU-verified**: like the other mad opcodes it exists on gfx1010-1013 only, so no RDNA2 desktop part runs it."
+  ]
+}

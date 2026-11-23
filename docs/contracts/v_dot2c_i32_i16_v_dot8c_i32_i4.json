@@ -1,0 +1,13 @@
+{
+  "piece": "`v_dot2c_i32_i16`, `v_dot8c_i32_i4`",
+  "status": "cpu_only",
+  "rank": 192,
+  "sentences": [
+    "VOP2/VOP3 accumulating forms of `v_dot2_i32_i16` and `v_dot8_i32_i4` (`D = sum(S0.elem[k] * S1.elem[k]) + D`, signed 2×16-bit and 8×4-bit).",
+    "Wraps at 32 bits by default and saturates to `[INT32_MIN, INT32_MAX]` with VOP3 `clamp` (sharing the `v_dot2_i32_i16`/`v_dot8_i32_i4` signed-carry path); `op_sel`, `neg`/`abs`, and DPP/SDWA are refused.",
+    "Registered in read-before-write VGPR tracking alongside `v_dot4c_i32_i8`.",
+    "Source: LLVM AMDGPU `VOP2Instructions.td` (`HasDot4Insts` / `HasDot3Insts`, `gfx908` VOP2/VOP3 syntax; not in the default `gfx1013`/`gfx103x` feature set).",
+    "**Not measured on AMD hardware** (translated Vulkan lowering checked on RTX 5070 by @duudiis: 40,960/40,960 exact words across wave32 and emulated wave64).",
+    "Checked bit-for-bit on the CPU (`spirv_mini_interp`) and with `spirv-val` by `tests/semantic/test_alu_dotc.py`; not run on the shader corpus."
+  ]
+}

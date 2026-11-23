@@ -1,0 +1,10 @@
+{
+  "piece": "2D `image_sample_l`",
+  "status": "cpu_only",
+  "rank": 42,
+  "sentences": [
+    "The T# FORMAT selects the sampled image type, and every type uses the LOD following the two coordinates.",
+    "Vulkan requires the sampled type and signedness to match the view.",
+    "The CPU test in `tests/test_image_load_typed.py` checks the R32 UINT, SINT and FLOAT descriptor branches, the float fallback on a lookup miss and the LOD register with full-width and D16 results. [Vulkan sampling validation](https://docs.vulkan.org/spec/latest/chapters/textures.html#textures-input-validation)"
+  ]
+}

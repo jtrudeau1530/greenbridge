@@ -1,0 +1,13 @@
+{
+  "piece": "`v_fmac_f16`, `v_interp_p2/mov_f32` output modifiers",
+  "status": "cpu_only",
+  "rank": 170,
+  "sentences": [
+    "VOP3 `mul:2`/`mul:4`/`div:2` (applied first) and `clamp` to [0, 1] apply to `v_fmac_f16_e64` (before narrowing to f16, matching `v_fma_f16`, high half preserved) and to `v_interp_p2_f32_e64` / `v_interp_mov_f32_e64` (no-op when no modifier is present).",
+    "Until 2026-11-22 all three dropped output modifiers.",
+    "Source: LLVM `llvm/test/MC/AMDGPU/gfx10_asm_vop2.s` (`v_fmac_f16_e64`) and `gfx10_asm_vop3.s` (`v_interp_p2_f32_e64`, `v_interp_mov_f32_e64`).",
+    "Checked on the CPU by `tests/semantic/test_f16_fma_rounding.py` (`test_fmac_output_modifiers`) and `tests/semantic/test_interp_f32_mods.py`, and on a GPU by `ps_fmac_f16_mods.asm`, `ps_interp_f32_mods.asm` and `ps_interp_mov_mods.asm` (the last two drawn with `vs_interp_consts.asm`, whose params are constant over the triangle; each modifier and the omod-before-clamp order change a word; Tesla V100 (NVIDIA 580.95.05, Linux)).",
+    "**The hardware ignores the f16 omod in the MODE the translator assumes:** on an RDNA2 iGPU (gfx1036) `mul:2`/`mul:4`/`div:2` change an f16 result (`v_fmac_f16`, `v_add/mul/fma_f16`, `v_cvt_f16_f32`, `v_exp/rcp_f16`) only with IEEE 0 and `denorm_mode_16_64 = 0`, and do nothing with f16 denormals kept; omod comes before clamp, and clamp gives +0 for -0 and, with DX10_CLAMP 1, for a NaN (SHADER-135, docs/shader_validation.md).",
+    "The translator is not changed yet: which of omod and the kept f16 denormals is wrong for the game is a corpus question."
+  ]
+}

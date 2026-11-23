@@ -1,0 +1,14 @@
+{
+  "piece": "Vertex fetch",
+  "status": "spec_only",
+  "rank": 24,
+  "sentences": [
+    "`s_swappc_b64` at the start of a VS calls a driver-generated fetch program that isn't in the blob.",
+    "It's replaced by Vulkan vertex inputs: each `ISG1` input-signature element (DXBC container) becomes an input at **location = its D3D input register**, typed by its component type, and is written to **v(4 + 4·register + component)**.",
+    "That rule was checked over all 788 fetch-calling shaders: in 783 every read-before-write VGPR is predicted by it (715 exact).",
+    "Reads of components the element doesn't declare (e.g.",
+    "`.w` of an `xyz` position, 3 VS) are allowed: the fetch returns the format defaults (0, 0, 1), and Vulkan fills a `vec4` input from a narrower format the same way.",
+    "Inputs are declared as `vec4`.",
+    "**The runtime must bind vertex buffers by the game's D3D12 input layout, location = input register.**"
+  ]
+}

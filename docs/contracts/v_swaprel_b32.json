@@ -1,0 +1,16 @@
+{
+  "piece": "`v_swaprel_b32`",
+  "status": "gpu_verified",
+  "rank": 149,
+  "sentences": [
+    "GFX10 VOP1 opcode 104: swap `VGPR[D + M0[25:16]]` and `VGPR[S0 + M0[9:0]]`, the two M0 fields `v_movrelsd_2_b32` uses; the other M0 bits are ignored (RDNA2 ISA opcode description).",
+    "Both registers are read before either is written.",
+    "When both name one register it keeps its value.",
+    "Inactive lanes keep both registers (`OpSelect` on `active`).",
+    "As for `v_movrel*`, the hardware's range check against the VGPR allocation is not modelled.",
+    "A non-VGPR operand raises `Unsupported`.",
+    "Until 2026-11-22 the op raised `Unsupported`.",
+    "CPU-checked by `tests/semantic/test_alu_swaprel.py` (both fields, ignored M0 bits, a self-swap, a register-file model).",
+    "**Hardware-verified on RDNA2** (`gfx1035`, Windows 11, driver `26.5.1`, wave32 & wave64 via `tools/int_hw_probe.py --oracle both --group valu_swaprel`): M0[25:16] & M0[9:0] offsets, ignored upper M0 bits (`0xfc01fc02`), self-swap, and inactive EXEC lanes all match bit-for-bit."
+  ]
+}

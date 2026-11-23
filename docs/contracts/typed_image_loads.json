@@ -1,0 +1,31 @@
+{
+  "piece": "Typed image loads",
+  "status": "gpu_verified",
+  "rank": 122,
+  "sentences": [
+    "A noncoherent cube `image_load` reads the 2D-array sampled binding (3) with integer coordinates and layer.",
+    "Its T# format selects the float, uint or sint alias, including for D16.",
+    "The [RDNA2 ISA §8.2.1](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) assigns D16 conversion to the image format.",
+    "The synthetic `cube_load_d16.asm` checks the generated views and format choices on the CPU.",
+    "`image_load` on 1D/2D/2D-array/3D images uses the same T# FORMAT tables as stores, and fetches every format with `OpImageFetch` from the sampled array of its dimension (bindings 0, 3, 6, 5): UINT/SINT formats through **uint/sint aliases of that array** (same set and binding, an `OpTypeImage` of `%uint`/`%int`; Vulkan allows several variables on one binding when the descriptor type fits), everything else through the float array.",
+    "A lookup miss (index 0) takes the float path, since the fallback there is RGBA8_UNORM.",
+    "Results are the raw bits of the dmask components.",
+    "**The runtime binds each image's view in its own format at its index of the sampled array** (what `bind_image` in `runtime/shims/d3d12_vulkan_device.cpp` already does for SRVs and UAVs), so the view's numeric type matches the alias that reads it.",
+    "No storage image is read, so shaders that only load need neither `shaderStorageImageReadWithoutFormat` (missing on Intel Xe-LP, #619) nor `shaderStorageImageWriteWithoutFormat` (SHADER-151).",
+    "Until 2026-11-22 integer formats were read with `OpImageRead` from the uint/sint storage arrays (bindings 8–19), which hold only unordered-access views and 256 entries: a read-only integer texture found the fallback there, or an index past the array's end.",
+    "Like the float path, the fetch goes through the texture path, so it sees writes made before the dispatch, not ones made earlier in the same dispatch.",
+    "**d16 loads take the same branch** (#1136) and pack the dmask components two per VGPR, low half first: f16 (round to nearest even, integer ops, no `PackHalf2x16`) from the float array, the low 16 bits of each value from the uint/sint aliases (truncated).",
+    "**d16 loads take the same branch** (#1136) and pack the dmask components two per VGPR, low half first: f16 (round to nearest even, integer ops, no `PackHalf2x16`) from the float array, each value from the uint/sint aliases saturated to the 16-bit range of its signedness (`saturate_int16`).",
+    "For odd component counts (1 or 3 in `dmask`), the trailing destination VGPR preserves its existing high 16 bits (`write_lo16`), matching native `gfx1036` hardware where a seeded `0x5a5a` high half survived 1-component UINT/SINT `image_load` and `image_load_mip`; until 2026-11-22 the unused high half was zeroed.",
+    "Before #1136, a d16 load always read the float view, so a `Texture2D<min16uint>` `Load` returned garbage.",
+    "CPU-checked by `tests/test_image_load_typed.py` (capabilities, bindings and component types for every dimension; the branch for all 512 FORMAT values, found and missed).",
+    "GPU-checked with `runtime/test/shaders/cs_imgload.asm` through `vk_store_test load`, on a device made without `shaderStorageImageReadWithoutFormat`: r32 uint and r32 sint images filled before the dispatch, both read with `image_load` and their sum stored, every texel exact on an RTX 2080 Ti (NVIDIA 621.14, Windows 11), clean under the validation layer with GPU-assisted validation; the test fails a module that declares `StorageImageReadWithoutFormat`. d16: CPU-checked by `tests/test_image_load_d16_typed.py` (the uint/sint fetches go through the aliases, no storage image is read, the SPIR-V validates); GPU-checked with `runtime/test/shaders/cs_imgload_d16.asm` through `vk_store_test load`: both pre-filled texels read with d16 loads (the sint one sign-extended from bit 15 in the shader) and their sum stored, every texel exact on the RTX 2080 Ti with GPU-assisted validation (#1136 checked its first form, a store and d16 read-back in one dispatch, on an RTX 5070, and `cs_imgload_d16` passes unchanged on an AMD RX 7600 (gfx1102, RADV Mesa 27.0.0-devel) in `run_gpu_tests.py`).",
+    "GPU-checked with `runtime/test/shaders/cs_imgload_d16.asm` through `vk_store_test load`: both pre-filled texels read with d16 loads (the sint one sign-extended from bit 15 in the shader) and their sum stored, every texel exact on the RTX 2080 Ti with GPU-assisted validation (#1136 checked its first form, a store and d16 read-back in one dispatch, on an RTX 5070). 2D `image_load_mip` uses the same numeric-type selection and passes the address register's mip to each fetch.",
+    "Its D16 form packs the selected components in ascending order, two per VGPR.",
+    "An RGBA8 two-level texture was checked on RTX 5080 and Radeon Graphics: all four exported halves matched the CPU reference for UINT, SINT and UNORM, and forcing level 0 changed every pixel.",
+    "Checked on RTX 5080 and Radeon Graphics with R8G8B8A8 UINT, SINT and UNORM textures: level 1 matched the CPU reference at every pixel with GPU-assisted validation, and forcing level 0 changed all 4096 pixels for each format.",
+    "Native gfx1036 saturated 32-bit UINT/SINT texels to the unsigned/signed 16-bit range in both D16 load forms; the translated 2D load matched both limits on RTX 5080 and Radeon Graphics.",
+    "Native gfx1036 does the same on every dimension (SHADER-387, `tools/image_d16_probe.py`): 32_UINT and 32_32_UINT texels saturate to [0, 0xffff] and 32_SINT and 32_32_SINT texels to [-32768, 32767], never truncate, in 1D, 2D, 2D-array and 3D images, through `image_load` and `image_load_mip` alike; two-channel results pack x low and y high, and a one-channel result keeps the seeded high half.",
+    "The translated d16 loads on 1D, 2D-array and 3D images still lack GPU checks."
+  ]
+}

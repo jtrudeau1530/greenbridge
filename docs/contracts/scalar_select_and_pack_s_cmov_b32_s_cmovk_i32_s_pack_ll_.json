@@ -1,0 +1,12 @@
+{
+  "piece": "Scalar select and pack (`s_cmov_b32`, `s_cmovk_i32`, `s_pack_ll/lh/hh_b32_b16`)",
+  "status": "gpu_verified",
+  "rank": 143,
+  "sentences": [
+    "`s_cmov_b32` / `s_cmovk_i32`: D = SCC ? S0 : D (`s_cmovk_i32`'s S0 is the 16-bit immediate, sign-extended); SCC is read, not written; the destination must be an SGPR (a lane-mask destination, and `s_cmov_b64`, stay `Unsupported`, #210).",
+    "`s_pack_*`: the low half of D from S0, the high half from S1, the letters naming the half of each (l = 15:0, h = 31:16), S0 first; GFX10 has no `s_pack_hl`; SCC not written.",
+    "Source: RDNA2 ISA SOP1/SOP2/SOPK.",
+    "CPU-checked by `tests/semantic/test_salu_cmov.py` and `test_salu_pack.py`; the translated shaders were run on NVIDIA by reviewers (`s_cmov*`: RTX 5090, RTX 4050 and Radeon 740M in #613; `s_pack_*`: RTX 5090 in #449).",
+    "**Hardware-verified on RDNA2** (`gfx1035`, wave32 and wave64 via `tools/int_hw_probe.py --oracle both`, SHADER-137, SCC kept)."
+  ]
+}

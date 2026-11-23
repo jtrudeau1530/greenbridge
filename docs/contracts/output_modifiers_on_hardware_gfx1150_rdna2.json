@@ -1,0 +1,17 @@
+{
+  "piece": "Output modifiers on hardware (gfx1150, RDNA2)",
+  "status": "gpu_verified",
+  "rank": 94,
+  "sentences": [
+    "Measured on a Radeon 880M (gfx1150, RDNA3.5; **not** RDNA2) with `tools/f32_fuzz.py --oracle hw`, 46,967 programs: `mul:2`/`mul:4`/`div:2` turn a -0 result (a flushed denormal result included) into +0, and are ignored with MODE.IEEE = 1; with f32 denormals kept they are also ignored for the ALU ops (the transcendental and cube ops still apply them).",
+    "LLVM notes that omod mishandles signed zeros (`SIFoldOperands.cpp`) and D30209 describes -0 being forced to +0 before the modifier.",
+    "The translator keeps -0 (`OpFMul`), so on that evidence it likely differs from hardware (see #1006).",
+    "**RDNA2 does the same, rule for rule** (SHADER-353): on an RX 6700 XT (gfx1031, a discrete RDNA2 part, not the console's gfx1013; AMD Windows driver 26.11.2), seeds 1 to 6, 39,101 programs, 0 mismatch and 66 omod -0 → +0 deviations.",
+    "Per MODE, counting only the programs where the omod changes the result: with IEEE off and f32 denormals flushed (the game's mode) it is applied every time (2,680, and the 66 -0 results become +0); with denormals kept it is ignored by the ALU ops (1,811) and applied by `v_rcp/rcp_iflag/rsq/sqrt/exp/log_f32` and the four cube ops (869, -0 → +0 only there); with IEEE on it is ignored (2,650) and a -0 result stays -0.",
+    "Earlier, gfx1036 (the integrated GPUs of a Ryzen 9 7950X3D and a Ryzen 7 9800X3D) gave seeds 1 to 6, 38,858 programs, 0 mismatch and 56 such deviations, with identical counts through the Linux libdrm launcher and the Windows HIP launcher; `v_rcp_iflag_f32` with `clamp`/`omod` on the same GPU, 6,552 programs, 0 mismatch and 35 such deviations, otherwise behaves like `v_rcp_f32`.",
+    "Also measured there: with `denorm_mode_32 = 0` f32 denormal operands read as zero and denormal results flush (add/mul/fma/min/max/rounding ops, DX9 mul), exact with 3.",
+    "`v_fma_mix*` f32 operands read as zero when denormal too (SHADER-298: gfx1036, `0x00000001`, `0x807fffff`, and the integer inline constants 1 and 64; f16 operands widen to normal values); its result is not flushed, since that was not measured.",
+    "Invalid operations give `0xffc00000`; a signalling NaN passes unchanged with IEEE off and is quieted with IEEE on.",
+    "Details in docs/shader_validation.md (\"32-bit float VALU on the GPU\")."
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "piece": "`s_round_mode`",
+  "status": "spec_only",
+  "rank": 164,
+  "sentences": [
+    "SIMM16[3:0] sets FP_ROUND.",
+    "The translator accepts FP32 nearest-even with FP16/64 nearest-even or toward-zero and writes the same per-invocation state as `s_setreg_imm32_b32`.",
+    "Other rounding modes raise Unsupported.",
+    "AMD RDNA2 ISA tables 15 and 24; synthetic positive and negative halfway-neighbour conversions in `test_scalar_noop_waitcnt.py` check both modes in one shader."
+  ]
+}

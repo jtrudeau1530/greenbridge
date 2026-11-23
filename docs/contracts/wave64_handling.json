@@ -1,0 +1,21 @@
+{
+  "piece": "Wave64 handling",
+  "status": "gpu_verified",
+  "rank": 97,
+  "sentences": [
+    "Wave size is detected per shader from the code (64-bit EXEC writes, `exec_hi`, `v_mbcnt_hi`, `*_saveexec_b64`/`*_wrexec_b64`, and 64-bit lane-mask SOP ops `s_bcnt[01]_i32_b64` / `s_ff[01]_i32_b64` / `s_wqm_b64` / `s_bfm_b64` even when the mask is an ordinary SGPR pair; mesh shaders are always wave64).",
+    "Wave size comes from the sidecar `fssm/<name>.fssm` header flags word `u32[0xD4]` bit 5 (`0x20` = wave32, `0` = wave64; `fssm_header.wave_size()`), cross-checked against wave64/wave32 code markers (`WAVE64_RE` / `WAVE32_RE`: a contradicting header and code listing raises `Unsupported`), and falls back to the code-marker heuristic (64-bit EXEC/VCC writes, `exec_hi`, `v_mbcnt_hi`, `*_saveexec_b64`/`*_wrexec_b64`, and 64-bit lane-mask SOP ops `s_bcnt[01]_i32_b64` / `s_ff[01]_i32_b64` / `s_wqm_b64` / `s_bfm_b64`, plus wave64 for mesh shaders) when no `FSSM`-magic sidecar is present (FSPX programs or synthetic listings).",
+    "Confirmed across all 26,503 corpus blobs with 0 contradictions against GFX10 SOP1/SOP2/SOPC/VOP3 encodings: 23,841 wave64 (1,154 CS, 195 GS, 9,282 MS, 10,974 PS, 2,236 VS) and 2,662 wave32 (1,535 CS, 1,127 PS); the code-marker heuristic alone misclassified 2,287 markerless wave64 shaders as wave32 (287 CS: 162 straight-line and 125 branchy, including 11 with `v_readlane_b32`, 35 `v_readfirstlane_b32`, 29 `ds_swizzle_b32`, 14 `s_barrier`; 943 PS: 906 straight-line and 37 branchy; 1,057 VS: 1,020 straight-line and 37 branchy); CPU-checked by `tests/test_fssm_header.py` and `tests/test_fssm_wave_size.py`.",
+    "Until 2026-11-21 a mask-only wave64 program with no EXEC markers was translated as wave32, so `s_bcnt1_i32_b64` counted one half (#210).",
+    "GPU-checked with `runtime/test/shaders/cs_w64_mask_detect.asm` (48 set bits of `(lane & 5) != 0`) on NVIDIA GeForce RTX 5060 under `LEONIDA_W64_EMULATE=1`.",
+    "The hardware lane is exact in compute and mesh shaders (LocalInvocationIndex mod 64 or 32) and is used by `v_mbcnt` and EXEC writes.",
+    "In other stages it's the subgroup lane.",
+    "Constant EXEC writes (`s_mov_b32 exec_lo/exec_hi, K`) set each lane from its own bit of K, as `(K >> lane) & 1` (shift and mask: Intel's Windows driver evaluated `OpBitFieldUExtract` of a constant that fits in 16 bits with the lane taken mod 16, so `exec_lo = 0xffff` ran all 32 lanes; GPU-checked with `runtime/test/shaders/cs_exec_const.asm` on Intel UHD Graphics 770, driver 32.0.101.6129, and NVIDIA GeForce RTX 4080 SUPER); before, any non-zero constant turned every lane on.",
+    "A register written to `exec_hi` sets lanes 32–63 only.",
+    "VCC's halves follow the same rule while VCC holds a lane mask: a 32-bit write to `vcc_lo` sets lanes 0–31 of the mask and one to `vcc_hi` lanes 32–63 (until 2026-11-22 a `vcc_lo` write set all 64 lanes and a `vcc_hi` write never reached the mask that `s_cbranch_vccz`/`v_cndmask` read; CPU-checked by `tests/semantic/test_wave64_vcc_half_write.py`, not GPU-checked).",
+    "Mask and `0`/`-1` half-writes to `vcc_lo`/`vcc_hi` keep VCC tracked as a lane mask across subsequent ops (`s_bcnt1_i32_b64`, further half-writes), whereas plain-data writes (`s_buffer_load_dword vcc_lo`, `s_load_dword`, scalar ALU, non-mask constants) end VCC's mask state and store the scalar word across all 64 lanes instead of updating only one mask half (confirmed on 1 wave64 PS in the 1.0.2.1 corpus and `tests/semantic/test_wave64_vcc_half_write.py`).",
+    "GPU-checked with `runtime/test/shaders/cs_exec64.asm`: lanes 16–47 enabled from two constants, exact on a 32-wide-subgroup GPU.",
+    "Still approximate on 32-wide subgroups: cross-lane ops between the two halves of a wave64 (readlane/permlane/DPP/shuffles across lane 31/32, wave-wide reductions).",
+    "The metadata index marks every wave64 shader so a runtime can request `requiredSubgroupSize = 64` where supported (AMD), which makes those exact too."
+  ]
+}

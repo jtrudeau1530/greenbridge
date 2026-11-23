@@ -1,0 +1,13 @@
+{
+  "piece": "Floating-point class compare",
+  "status": "gpu_verified",
+  "rank": 88,
+  "sentences": [
+    "`v_cmp_class_f32` writes the selected class to a lane mask.",
+    "`v_cmpx_class_f32` intersects the existing EXEC with that same predicate and preserves VCC, as specified in [AMD's RDNA2 ISA §12.9](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf).",
+    "VOP3 `abs` and `neg` on `src0` are applied as raw sign-bit moves on the 32-bit integer bits (`OpBitwiseAnd 0x7FFFFFFF`, then `OpBitwiseXor 0x80000000`) rather than `FAbs`/`OpFNegate`, so signalling NaNs stay signalling (class bit 0) and subnormals are never flushed.",
+    "**Hardware-measured natively on RDNA2 (`gfx1036`)** via `tools/hw_oracle` (Ryzen 7 9800X3D iGPU, Linux AMDGPU DRM): 672/672 exact across 21 representative IEEE-754 values (including 5 sNaNs) × 4 modifier forms (`v`, `-v`, `|v|`, `-|v|`) × 10 class bits for both `v_cmp_class_f32_e64` and `v_cmpx_class_f32_e64` in wave32 and wave64 across all four `(IEEE=0/1, denorm32=0/3)` modes (until 2026-11-22 `Gen.cmp_class` used `src_f` → `FAbs`/`OpFNegate`, which quieted modified sNaNs in `spirv_mini_interp.py`).",
+    "Corpus count (26,503 shaders): `v_cmp_class_f32` appears 37,026 times in 7,101 shaders (0 with VOP3 `abs`/`neg` on `src0`).",
+    "Checked on CPU + `spirv-val` by `tests/semantic/test_cmp_class_f32_mods.py` and `tests/semantic/test_valu_f32_class_rndne.py`; `cs_cmpx_class_f32` checks both encodings with quiet NaN, positive infinity and signed zero, and verifies that a previously inactive lane stays inactive (GPU-checked on RTX 4070 SUPER driver 616.92 and AMD RX 9070 XT RADV Mesa 26.2.6, plus direct Vulkan compute verification of modified sNaNs on RX 9070 XT and Radeon 610M `gfx1036`)."
+  ]
+}

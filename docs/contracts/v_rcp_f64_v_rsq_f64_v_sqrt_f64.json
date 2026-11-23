@@ -1,0 +1,11 @@
+{
+  "piece": "`v_rcp_f64`, `v_rsq_f64`, `v_sqrt_f64`",
+  "status": "cpu_only",
+  "rank": 86,
+  "sentences": [
+    "Double-precision reciprocal (`OpFDiv %double 1.0 x`), inverse square root (`GLSL.std.450 InverseSqrt`), and square root (`GLSL.std.450 Sqrt`), requiring `Float64` (`shaderFloat64`).",
+    "VOP3 input modifiers (`abs`, `neg`) apply to the double operand, and output modifiers (`mul:2`, `mul:4`, `div:2`, then `clamp` to [0, 1]) apply via `clamp_mods_f64` (LLVM `VOP1Inst` / `VOP_F64_F64` in `VOP1Instructions.td`, `HasClamp` and `HasOMod` via `VOPProfile`).",
+    "Special-value edge cases (`±0`, negative inputs, NaN) follow the driver's SPIR-V `OpFDiv`/`InverseSqrt`/`Sqrt` rules, as for the f32 forms.",
+    "Checked by `tests/test_f64_transcendentals.py` (SPIR-V data flow and `spirv-val`)."
+  ]
+}

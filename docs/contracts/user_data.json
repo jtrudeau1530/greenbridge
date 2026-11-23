@@ -1,0 +1,11 @@
+{
+  "piece": "User data",
+  "status": "spec_only",
+  "rank": 6,
+  "sentences": [
+    "**Push constants, 144 bytes:** dwords 0–31 = initial s0–s31 (the user SGPRs the console driver loads from the root signature: descriptor-table pointers, constants and so on), dwords 32–33 = the 64-bit **heap base**, dwords 34–35 = the **code base**: the Xbox VA where the runtime uploaded this shader's whole FSSM blob.",
+    "`--mesh-compute` modules add dwords 36–37, the output buffer address (152 bytes; see \"Mesh shaders as compute\").",
+    "`--pc-tail-ubo` keeps only dwords 0–31 here (128 bytes) and moves the rest to a uniform block (see \"Push-constant tail as a uniform block\").",
+    "The runtime has to reproduce the console driver's root-signature-to-user-SGPR mapping; that comes from the exe or driver behaviour."
+  ]
+}

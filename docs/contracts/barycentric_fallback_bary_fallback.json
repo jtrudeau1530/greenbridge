@@ -1,0 +1,21 @@
+{
+  "piece": "Barycentric fallback (`--bary-fallback`)",
+  "status": "gpu_verified",
+  "rank": 102,
+  "sentences": [
+    "For devices without `VK_KHR_fragment_shader_barycentric` (NVIDIA Pascal, for one).",
+    "The raw pair a PS reads (\"PS system inputs\": 321 PS) comes from an ordinary vec3 input, `%bary`, at the lowest location none of the shader's attributes uses, instead of `BuiltIn BaryCoordKHR`.",
+    "The module then needs neither the `FragmentBarycentricKHR` capability nor the extension, and the index records the location as `bary_fallback_input`.",
+    "The stage before the PS writes (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices: `tools/bary_fallback_gs.py` writes that pass-through geometry shader from the index (Position and the PS's input locations copied unchanged).",
+    "Default (perspective) interpolation of those weights is the perspective-correct barycentric, the value `BaryCoordKHR` has, so `.y`/`.z` stay AMD's i/j; shaders that don't read the pair translate to the same module either way.",
+    "GPU-checked on an NVIDIA GeForce GTX 1060 6GB (Pascal, no barycentric extension; driver 560.94, Windows 10) with `LEONIDA_BARY_FALLBACK=1`: `ps_bary` 4096/4096 pixels exact, and `ps_uniform_branch` and `ps_scc_mask32` pass, through `run_gpu_tests.py` and `build.py` + `check.py`, with zero Khronos validation messages.",
+    "Checked in `tests/semantic/test_bary_fallback.py`.",
+    "For a known VS/PS pair, `python -I tools/bary_fallback_gs.py DIR --pair VS PS` builds `PS.bary_gs.clipN.spv`.",
+    "It copies the producer’s `ClipDistance[N]` at each emitted vertex, using the VS index field `clip_distance_count`.",
+    "On RTX 5080 and Radeon integrated graphics, two independently shifted clip planes yielded 512, 1024, 2048 or 4096 covered pixels, matching the native barycentric path.",
+    "For a cull-only VS the pair writes `PS.bary_gs.cullN.spv` from `cull_distance_count`.",
+    "A two-plane synthetic draw on the same GPUs covered 0 pixels when every vertex was negative for either plane and all 4096 when each plane had a nonnegative vertex.",
+    "The helper rejects mixed clip/cull arrays.",
+    "The runtime building that GS per pipeline is the follow-up (it needs the graphics pipelines of #291)."
+  ]
+}

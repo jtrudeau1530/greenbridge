@@ -1,0 +1,12 @@
+{
+  "piece": "2D array resource dimensions",
+  "status": "spec_only",
+  "rank": 16,
+  "sentences": [
+    "For `image_get_resinfo` on a 2D array, X/Y are the width/height at the requested mip, Z is the view layer count and W is its mip count.",
+    "The query reads the sampled array at binding 3.",
+    "A native gfx1036 kernel returned (19,11,5,3), (9,5,5,3) and (4,2,5,3) for the three mips of a synthetic array.",
+    "On RTX 5080 and Radeon Graphics the translated query matched those tuples and returned (4,2,3,2) at relative mip 1 with a view starting at mip 1 and covering three layers.",
+    "The registered `ps_array_resinfo` draw checks all 4096 pixels against (8,8,12,1)."
+  ]
+}

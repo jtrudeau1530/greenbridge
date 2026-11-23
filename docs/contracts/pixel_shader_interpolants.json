@@ -1,0 +1,12 @@
+{
+  "piece": "Pixel-shader interpolants",
+  "status": "gpu_verified",
+  "rank": 71,
+  "sentences": [
+    "When a sidecar `fssm/<name>.fssm` holds a pixel-input table (`tools/fssm_header.py`: 8-byte records from 0x138 while the first byte is 6; table position = `v_interp attr` number), every position 0..count−1 is declared as a fragment input at that Location, including positions the code never reads (the table overcounts the code's distinct `v_interp` attrs in 775 of 12,101 PS: 300 by one, 475 by two or more; only the 10 records starting with kind 7 undercount).",
+    "A 32-bit `v_interp` read (`p1/p2/mov`) of a 16-bit-flagged position (flag bit 4; **measured natively on RDNA2**, AMD Radeon 680M `gfx1035` in wave32 and wave64 via `tools/vinterp_hw_probe.py --oracle both`, SHADER-430: the VINTRP unit reads the same LDS parameter-cache dwords at `M0 + 48·attr + {8·c, 8·c + 4, 32 + 4·c}` with no hidden 16-bit unpacking, so `v_interp_mov_f32` returns the raw 32-bit parameter word and `v_interp_p1_f32`/`v_interp_p2_f32` interpolate those 32-bit words as binary32), and reads past the table still declare an input (the value is undefined on hardware). 11,199 such inputs corpus-wide, matching the `*_f16` interpolation opcodes in 99.7%) sees the value rounded to f16 (round to nearest, f16 denormals flushed to signed zero, back to f32) via a single `OpQuantizeToF16` (a `PackHalf2x16`/`UnpackHalf2x16` round-trip is folded to a no-op by at least one Vulkan driver, RTX 5080); reads through the `*_f16` opcodes already narrow and are unchanged (on a location an f16 op also reads, the f32 read is of the per-vertex raw word, \"16-bit interpolation\"; on gfx1036 a 32-bit `p1/p2_f32` read of a packed channel takes the raw LDS words as f32 bits, one fma each (SHADER-430, `tools/interp_hw_probe.py`); what P10/P20 words the SPI stores for such a channel is unverified), and reads past the table still declare an input (the value is undefined on hardware).",
+    "Without a sidecar, or with an empty table, the output is byte-identical to the code-driven path.",
+    "Confirmed by synthetic fixtures plus mini-interpreter agreement (`tests/test_rdna2spirv_pixelinput.py`: an f32 read of a flagged slot with input 1.1 yields the f16-rounded 1.099609375; unflagged and table-less controls yield exact 1.1) and `tests/test_vinterp_hw_probe.py`.",
+    "The `index.json` entry records `ps_interpolants` (count) and `ps_fp16_interpolants` (flagged positions)."
+  ]
+}

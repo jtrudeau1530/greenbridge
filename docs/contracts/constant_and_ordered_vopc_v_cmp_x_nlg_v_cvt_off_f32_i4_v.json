@@ -1,0 +1,14 @@
+{
+  "piece": "Constant and ordered VOPC, `v_cmp(x)_nlg_*`, `v_cvt_off_f32_i4`, `v_pipeflush`",
+  "status": "gpu_verified",
+  "rank": 147,
+  "sentences": [
+    "`v_cmp(x)_f_*` is always false, `v_cmp(x)_t_*` (integers) and `v_cmp(x)_tru_*` (floats) always true; `v_cmp(x)_o_{f32,f16}` is true when neither source is NaN, `_u_` when either is (`OpIsNan`), and `_nlg_` when `x == y` or either source is NaN (`OpFUnordEqual`, completing all 16 IEEE-754 RDNA2 float VOPC predicates; LLVM `gfx10_asm_vopc.s`); the result goes through the usual VOPC path (VCC, an SGPR mask, or EXEC for `v_cmpx`; off lanes give 0).",
+    "`v_cvt_off_f32_i4`: D = sext(S0[3:0]) / 16 (the ISA's CVT_OFF_TABLE, -0.5 .. 0.4375), exact, output modifiers apply.",
+    "`v_pipeflush` only flushes the VALU pipeline and is translated as nothing, like `v_nop`.",
+    "Source: RDNA2 ISA VOPC and VOP1.",
+    "CPU-checked by `tests/semantic/test_vopc_const_ordered.py`, `tests/semantic/test_float_compares.py` (`nlg`; GPU-checked by `ps_cmp_nlg.asm`: f32 and f16 with ±0, quiet and signalling NaN, ±inf and ignored f16 high halves, the e64 form with `abs`/`neg`, and `v_cmpx_nlg` on equal and NaN operands, Tesla V100 (NVIDIA 580.95.05, Linux)), `test_alu_cvt_off.py` (GPU-checked by `ps_cvt_off.asm`, upper bits ignored and `mul:4` with and without `clamp`), `test_valu_pipeflush.py`; the constant/ordered float compares were run on an RTX 5090 (16 draws, quiet and signalling NaNs) and the suite on RTX 4050 / Radeon 740M in #620; `v_pipeflush` on RTX 5090 / RTX 3060 in #735.",
+    "All 16 f16 predicates (`v_cmp_{f,lt,eq,le,gt,lg,ge,o,u,nge,nlg,ngt,nle,neq,nlt,tru}_f16`, e32 and e64) are GPU-checked on quiet and signalling NaN, +-0, +-inf, denormals and junk high halves by `ps_vcmp_f16.asm` and `ps_vcmp_f16_e64.asm` (RTX 5080 and Radeon gfx1036, 4096/4096 exact), CPU side `tests/semantic/test_vcmp_f16.py`.",
+    "The 16 `v_cmpx_*_f16` forms (e32 and e64) are GPU-checked the same way by `ps_vcmpx_f16.asm` and `ps_vcmpx_f16_e64.asm` (EXEC result on every case, VCC kept, EXEC only narrowed; RTX 5080 and Radeon gfx1036), CPU side `tests/semantic/test_vcmpx_f16.py`."
+  ]
+}
