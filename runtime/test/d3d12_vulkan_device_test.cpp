@@ -627,6 +627,56 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"buffer width 0", buffer_desc(0), 0},
         {"buffer height 2", bad_buffer, 0},
         {"buffer with a format", typed_buffer, 0},
+        // Resource flag handling (D3D-467).
+        {"buffer render target", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+             return d;
+         }(), 0},
+        {"buffer render target UAV", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             return d;
+         }(), 0},
+        {"buffer cross adapter", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+             return d;
+         }(), 0},
+        {"buffer depth stencil (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+             return d;
+         }(), 0},
+        {"buffer simultaneous access (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+             return d;
+         }(), 0},
+        {"buffer video decode reference only (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY;
+             return d;
+         }(), 0},
+        {"buffer flag 0x1000 (invalid)", [&] {
+             auto d = buffer_desc(256);
+             d.Flags = D3D12_RESOURCE_FLAGS(0x1000);
+             return d;
+         }(), 0},
+        {"tex2d deny shader resource alone (invalid)", [&] {
+             auto d = texture_desc(16, 16, rgba8, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+             return d;
+         }(), 0},
+        {"tex2d single sample quality 1", [&] {
+             auto d = texture_desc(16, 16, rgba8, none);
+             d.SampleDesc.Quality = 1;
+             return d;
+         }(), 16 * 16 * 4},
+        {"tex2d single sample quality center pattern", [&] {
+             auto d = texture_desc(16, 16, rgba8, none);
+             d.SampleDesc.Quality = 0xffffffff;
+             return d;
+         }(), 16 * 16 * 4},
         {"256x256 full chain", texture_desc(256, 256, rgba8, none, 0), 256 * 256 * 4},
         {"16x16 small", with(texture_desc(16, 16, rgba8, none), k4), 16 * 16 * 4},
         {"16x16 small render target", with(texture_desc(16, 16, rgba8, rt), k4), 16 * 16 * 4},

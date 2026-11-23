@@ -7414,10 +7414,18 @@ private:
         constexpr D3D12_RESOURCE_FLAGS attachment =
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            // Host D3D12 accepts ALLOW_RENDER_TARGET, ALLOW_CROSS_ADAPTER, UAV, DENY_SHADER_RESOURCE,
+            // RAYTRACING_ACCELERATION_STRUCTURE and 0x400 on buffers; refuses ALLOW_DEPTH_STENCIL,
+            // ALLOW_SIMULTANEOUS_ACCESS, VIDEO_DECODE_REFERENCE_ONLY and other flags (D3D-467).
+            constexpr UINT buffer_flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                          D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+                                          D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                          D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE | 0x400;
             if (!desc.Width || desc.Width > UINT64_MAX - align_64k || desc.Height != 1 || desc.DepthOrArraySize != 1 ||
                 desc.MipLevels != 1 || desc.Format != DXGI_FORMAT_UNKNOWN || desc.SampleDesc.Count != 1 ||
                 desc.SampleDesc.Quality != 0 || desc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR ||
-                (desc.Alignment && desc.Alignment != align_64k) || (desc.Flags & attachment))
+                (desc.Alignment && desc.Alignment != align_64k) || (UINT(desc.Flags) & ~buffer_flags))
                 return kInvalidAllocation;
             return {align_up(desc.Width, align_64k), align_64k};
         }
@@ -7436,7 +7444,7 @@ private:
             volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
         if (!desc.Width || !desc.Height || !desc.DepthOrArraySize || desc.Width > max_extent ||
             desc.Height > max_extent || desc.DepthOrArraySize > max_layers || !samples || samples > D3D12_MAX_MULTISAMPLE_SAMPLE_COUNT ||
-            (samples & (samples - 1)) || desc.SampleDesc.Quality != 0 ||
+            (samples & (samples - 1)) || (samples > 1 && desc.SampleDesc.Quality != 0) ||
             desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
             return kInvalidAllocation;
         const UINT16 full = full_mips(desc.Width, desc.Height, depth);
@@ -7444,6 +7452,8 @@ private:
         if (!resolved.MipLevels) resolved.MipLevels = full;
         if (resolved.MipLevels > full) return kInvalidAllocation;
         const bool depth_stencil = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) && !depth_stencil)
+            return kInvalidAllocation;
         if (samples > 1 && (volume || one_d || resolved.MipLevels != 1 || !(desc.Flags & attachment) ||
                             (desc.Flags & attachment) == attachment ||
                             (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
