@@ -401,6 +401,14 @@ struct BundledLoaderEntry {
 SRWLOCK g_bundled_lock = SRWLOCK_INIT;
 std::vector<BundledLoaderEntry>* g_bundled_loaders = nullptr;
 
+struct XMemHooksEntry {
+    const void* owner;
+    const XMemAllocationHooks* hooks;
+};
+
+SRWLOCK g_xmem_hooks_lock = SRWLOCK_INIT;
+std::vector<XMemHooksEntry>* g_xmem_hooks = nullptr;
+
 struct SrwLockGuard {
     SRWLOCK* lock;
     explicit SrwLockGuard(SRWLOCK& l) : lock(&l) { AcquireSRWLockExclusive(lock); }
@@ -491,6 +499,31 @@ bool owns_bundled_module_handle(void* module) {
     for (const auto& entry : snapshot_bundled_loaders())
         if (entry.ops->owns_handle(entry.ctx, module)) return true;
     return false;
+}
+
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
+    if (!owner || !hooks) return;
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    if (!g_xmem_hooks) g_xmem_hooks = new std::vector<XMemHooksEntry>;
+    g_xmem_hooks->push_back({owner, hooks});
+}
+
+void remove_xmem_allocation_hooks(const void* owner) {
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    if (!g_xmem_hooks) return;
+    auto& list = *g_xmem_hooks;
+    for (auto it = list.begin(); it != list.end();) {
+        if (it->owner == owner) {
+            it = list.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+const XMemAllocationHooks* xmem_allocation_hooks() {
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    return g_xmem_hooks && !g_xmem_hooks->empty() ? g_xmem_hooks->back().hooks : nullptr;
 }
 
 Table::Table(const Entry* entries, size_t count) {
