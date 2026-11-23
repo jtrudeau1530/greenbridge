@@ -1,6 +1,9 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
 
+#include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
+#include <d3dkmthk.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -1047,12 +1050,45 @@ private:
 
 // Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
+
+// The adapter's user-mode driver version, as DXGI's CheckInterfaceSupport(IDXGIDevice) reports it: what
+// D3DKMTQueryAdapterInfo(KMTQAITYPE_UMD_DRIVER_VERSION) gives for the adapter's LUID (measured equal to host DXGI on
+// an RTX 5060 Ti, 0x0020000000100842 for driver 621.14, and on WARP). gdi32's entry points are looked up at run
+// time and the host dxgi.dll isn't used; 0 when they are missing (Wine) or the query fails.
+LARGE_INTEGER umd_driver_version(LUID luid) {
+    LARGE_INTEGER version{};
+    if (!luid.LowPart && !luid.HighPart) return version;
+    HMODULE gdi32 = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi32) gdi32 = LoadLibraryW(L"gdi32.dll");
+    if (!gdi32) return version;
+    const auto open = reinterpret_cast<decltype(&D3DKMTOpenAdapterFromLuid)>(
+        GetProcAddress(gdi32, "D3DKMTOpenAdapterFromLuid"));
+    const auto query = reinterpret_cast<decltype(&D3DKMTQueryAdapterInfo)>(
+        GetProcAddress(gdi32, "D3DKMTQueryAdapterInfo"));
+    const auto close = reinterpret_cast<decltype(&D3DKMTCloseAdapter)>(GetProcAddress(gdi32, "D3DKMTCloseAdapter"));
+    if (!open || !query || !close) return version;
+    D3DKMT_OPENADAPTERFROMLUID adapter{};
+    adapter.AdapterLuid = luid;
+    if (open(&adapter) != 0) return version;
+    D3DKMT_UMD_DRIVER_VERSION umd{};
+    D3DKMT_QUERYADAPTERINFO info{};
+    info.hAdapter = adapter.hAdapter;
+    info.Type = KMTQAITYPE_UMD_DRIVER_VERSION;
+    info.pPrivateDriverData = &umd;
+    info.PrivateDriverDataSize = sizeof(umd);
+    if (query(&info) == 0) version = umd.DriverVersion;
+    D3DKMT_CLOSEADAPTER closing{adapter.hAdapter};
+    close(&closing);
+    return version;
+}
+
 class Adapter final : public IDXGIAdapter3 {
 public:
     Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical)
         : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical) {
         if (parent_) parent_->AddRef();
         populate_desc();
+        umd_version_ = umd_driver_version(desc_.AdapterLuid);
         reservations_ = adapter_reservation_state(desc_.AdapterLuid, physical_);
     }
 
@@ -1122,7 +1158,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE CheckInterfaceSupport(REFGUID interface_name, LARGE_INTEGER* umd_version) override {
         if (interface_name == __uuidof(IDXGIDevice)) {
-            if (umd_version) umd_version->QuadPart = 0;
+            if (umd_version) *umd_version = umd_version_;
             return S_OK;
         }
         return DXGI_ERROR_UNSUPPORTED;
@@ -1292,6 +1328,7 @@ private:
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     DXGI_ADAPTER_DESC2 desc_{};
+    LARGE_INTEGER umd_version_{};  // CheckInterfaceSupport(IDXGIDevice): the adapter's user-mode driver version
     bool has_memory_budget_ = false;
     std::shared_ptr<ReservationState> reservations_;
 };

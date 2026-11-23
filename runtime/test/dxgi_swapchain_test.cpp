@@ -1106,6 +1106,36 @@ int main() {
         if (desc0.VendorId != desc1.VendorId || desc2.DeviceId != desc1.DeviceId)
             return fail("Adapter desc mismatch between GetDesc/GetDesc1/GetDesc2");
 
+        // CheckInterfaceSupport(IDXGIDevice) reports the adapter's user-mode driver version, as host DXGI does for
+        // the adapter with the same LUID (RTX 5060 Ti / 621.14: 0x0020000000100842), not 0.
+        {
+            LARGE_INTEGER ours{};
+            if (FAILED(adapter3->CheckInterfaceSupport(__uuidof(IDXGIDevice), &ours)))
+                return fail("Adapter CheckInterfaceSupport(IDXGIDevice) failed");
+            IDXGIFactory4* host_factory = nullptr;
+            IDXGIAdapter1* host_adapter = nullptr;
+            // The host dxgi.dll, loaded at run time: this test doesn't link it, and a Wine run without it skips.
+            HMODULE host_dxgi = LoadLibraryW(L"dxgi.dll");
+            const auto create_factory = host_dxgi ? reinterpret_cast<decltype(&CreateDXGIFactory1)>(
+                GetProcAddress(host_dxgi, "CreateDXGIFactory1")) : nullptr;
+            if (create_factory && SUCCEEDED(create_factory(IID_PPV_ARGS(&host_factory))) && host_factory &&
+                SUCCEEDED(host_factory->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&host_adapter))) &&
+                host_adapter) {
+                LARGE_INTEGER host{};
+                const HRESULT hr = host_adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &host);
+                host_adapter->Release();
+                host_factory->Release();
+                if (SUCCEEDED(hr) && host.QuadPart != ours.QuadPart) {
+                    std::fprintf(stderr, "FAIL: UMD version 0x%016llx, host DXGI 0x%016llx\n",
+                                 static_cast<unsigned long long>(ours.QuadPart),
+                                 static_cast<unsigned long long>(host.QuadPart));
+                    return 1;
+                }
+            } else if (host_factory) {
+                host_factory->Release();
+            }
+        }
+
         // EnumAdapterByLuid with matching LUID succeeds; bogus LUID returns DXGI_ERROR_NOT_FOUND.
         IDXGIAdapter3* by_luid = nullptr;
         if (FAILED(factory->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&by_luid))) || !by_luid)
