@@ -1227,13 +1227,12 @@ bool fallback_supports(const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
 }
 
 // CopyFile2 through CopyFileExW, for hosts without it (only for calls fallback_supports). The cancel flag has the
-// same type in both; one already set is answered here, since Wine 9's CopyFileExW doesn't read it. A COPYFILE2
-// progress routine has another signature and message set, so it isn't called here.
+// same type in both (one already set is answered by copy_file2 before this runs). A COPYFILE2 progress routine has
+// another signature and message set, so it isn't called here.
 HRESULT copy_file2_fallback(const wchar_t* source, const wchar_t* destination,
                             const COPYFILE2_EXTENDED_PARAMETERS* parameters) {
     const DWORD flags = parameters ? parameters->dwCopyFlags & kFallbackPassedFlags : 0;
     BOOL* const cancel = parameters ? parameters->pfCancel : nullptr;
-    if (cancel && *cancel) return HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED);
     if (::CopyFileExW(source, destination, nullptr, nullptr, cancel, flags)) return S_OK;
     const DWORD error = GetLastError();
     return HRESULT_FROM_WIN32(error ? error : ERROR_GEN_FAILURE);
@@ -1255,6 +1254,10 @@ HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS*
     std::filesystem::path source, destination;
     DWORD error = 0;
     if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
+    // A cancel flag already set is answered here, for the host's CopyFile2 as well as the fallback: Windows returns
+    // ERROR_REQUEST_ABORTED and writes nothing, while Wine reads the flag in neither call (Wine 11.20's CopyFile2 logs
+    // "pfCancel is not supported" and copies, dlls/kernelbase/file.c copy_file; Wine 9 has only CopyFileExW).
+    if (parameters && parameters->pfCancel && *parameters->pfCancel) return HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED);
     if (host) return host(source.c_str(), destination.c_str(), parameters);
     return copy_file2_fallback(source.c_str(), destination.c_str(), parameters);
 }
