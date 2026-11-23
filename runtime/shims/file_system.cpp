@@ -2,9 +2,9 @@
 //
 // A GDK title names its files on the console's drives, "GAME:\\data\\x.sps" being one in the installed game folder, so
 // the imports it makes of CreateFile*, FindFirstFile*/FindNextFile*/FindClose, GetFileAttributes*/GetFileAttributesEx*,
-// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes* are answered
-// here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
-// GPL-2.0-only, as facts). The rules:
+// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes*, and of the
+// CRT's remove, _wremove and _wstat64, are answered here (docs/runtime_imports.md, "Console paths and the write
+// overlay"; the prefixes come from ivall/xcl, GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
 //     the overlay (RT-218); any other path is a host path and goes to the host;
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
@@ -24,8 +24,11 @@
 // host directly.
 #include <windows.h>
 #include <intrin.h>
+#include <sys/stat.h>
 
 #include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -333,6 +336,22 @@ bool empty_in_view(const Roots& r, const std::vector<std::wstring>& parts) {
 BOOL fail_bool(DWORD error) {
     SetLastError(error);
     return FALSE;
+}
+
+// A CRT file function reports failure with errno and -1, where the Win32 calls above use the last error and
+// FALSE, so the same refusal is spelled for the CRT's caller.
+int fail_errno(DWORD error) {
+    switch (error) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND: errno = ENOENT; break;
+        case ERROR_ACCESS_DENIED: errno = EACCES; break;
+        case ERROR_ALREADY_EXISTS:
+        case ERROR_FILE_EXISTS: errno = EEXIST; break;
+        case ERROR_INVALID_NAME:
+        case ERROR_INVALID_PARAMETER: errno = EINVAL; break;
+        default: errno = EIO; break;
+    }
+    return -1;
 }
 
 Target read_target(const std::wstring& path) {
@@ -971,6 +990,38 @@ BOOL WINAPI delete_file_a(LPCSTR name) {
     return delete_file_w(wide.c_str());
 }
 
+// ---- The CRT's own file entry points
+//
+// The retail executable imports remove and _wstat64 from api-ms-win-crt-filesystem-l1-1-0.dll, and one package DLL
+// imports _wremove from the same set, all with the same GAME: paths it opens through CreateFileW. Bound to the host
+// UCRT that drive does not exist, so the three are answered over the same overlay/package view here; a host path goes
+// to the CRT unchanged.
+int __cdecl crt_remove_w(LPCWSTR name) {
+    if (!name) return fail_errno(ERROR_INVALID_PARAMETER);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts);
+    if (parsed == Parsed::Host) return ::_wremove(name);
+    if (parsed == Parsed::Refused) return fail_errno(ERROR_INVALID_NAME);
+    if (!delete_file_w(name)) return fail_errno(::GetLastError());
+    return 0;
+}
+
+int __cdecl crt_remove_a(LPCSTR name) {
+    if (!name) return fail_errno(ERROR_INVALID_PARAMETER);
+    return crt_remove_w(widen_ansi(name).c_str());
+}
+
+int __cdecl crt_wstat64(LPCWSTR name, struct _stat64* info) {
+    if (!name || !info) return fail_errno(ERROR_INVALID_PARAMETER);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts);
+    if (parsed == Parsed::Host) return ::_wstat64(name, info);
+    if (parsed == Parsed::Refused) return fail_errno(ERROR_INVALID_NAME);
+    const Target t = read_target(name);
+    if (t.error) return fail_errno(t.error);
+    return ::_wstat64(t.path.c_str(), info);
+}
+
 // ---- Folders: created in the overlay, removed by a marker when the package has them
 
 namespace {
@@ -1398,6 +1449,13 @@ using namespace rt::fs;
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
         {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+
+// The CRT file entry points, reached through the UCRT's own names rather than kernel32's. One package DLL calls
+// _wremove directly through its IAT, so the wide delete is served next to the narrow one.
+#define CRT_FILE_API(dll)                                                                       \
+    {dll, "remove", reinterpret_cast<void*>(&crt_remove_a)},                                    \
+        {dll, "_wremove", reinterpret_cast<void*>(&crt_remove_w)},                              \
+        {dll, "_wstat64", reinterpret_cast<void*>(&crt_wstat64)}
 }  // namespace
 
 SHIM_TABLE(file_system,
@@ -1406,4 +1464,7 @@ SHIM_TABLE(file_system,
     FILE_API("api-ms-win-core-file-l1-1-0.dll"),
     FILE_API("api-ms-win-core-file-l1-2-0.dll"),
     FILE_API("api-ms-win-core-file-l2-1-0.dll"),
+    CRT_FILE_API("api-ms-win-crt-filesystem-l1-1-0.dll"),
+    CRT_FILE_API("ucrtbase.dll"),
+    CRT_FILE_API("ucrtbased.dll"),
 );

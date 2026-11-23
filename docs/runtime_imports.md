@@ -232,7 +232,10 @@ A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file 
 `GAME:` maps to the game folder and that writes go to a writable overlay instead of the package, which stays read-only.
 `gta6rt` therefore shims `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`, `GetFileAttributesA/W`,
 `GetFileAttributesExA/W` and `DeleteFileA/W` (`runtime/shims/file_system.cpp`), under `kernel32.dll`, `kernelbase.dll`
-and the `api-ms-win-core-file-*` sets a GDK title links against.
+and the `api-ms-win-core-file-*` sets a GDK title links against. The CRT's `remove` and `_wstat64`, which the
+executable imports from `api-ms-win-crt-filesystem-l1-1-0.dll`, and `_wremove`, which a package DLL imports from the
+same set, take the same `GAME:` paths and are answered over the same overlay and package view (under that set and
+`ucrtbase.dll`/`ucrtbased.dll`), because the host UCRT has no such drive.
 
 - A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. A path without the prefix is a host path and is
   passed to the host unchanged. `--game-dir` defaults to the image's folder. `gta6rt` makes it and `--overlay`
