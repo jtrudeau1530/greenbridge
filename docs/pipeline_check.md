@@ -6,6 +6,11 @@ constant contract. It is a driver-level check: it proves the modules and pipelin
 the Vulkan implementation, not that the shader results are correct. Value-level checks are in
 `docs/shader_validation.md`.
 
+Timing and memory figures in this page were measured with `MESA_SHADER_CACHE_DISABLE=true`. Without it, RADV's
+on-disk shader cache (`~/.cache/mesa_shader_cache`, about 1.1 GB after a full corpus run) turns a repeated module
+into a cache hit: 0.1 s and ~114 MB instead of a real compilation. That is what a resume run wants, but not what a
+measurement should report.
+
 The checker exits nonzero if a module fails to load, a pipeline fails to compile, or the requested final
 cache save fails. It still finishes checking the other entries and attempts the final save so the next run
 can reuse successful pipelines. Before creating a Vulkan shader module, it checks that the file has a
