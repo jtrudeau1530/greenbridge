@@ -47,6 +47,19 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertIn("vk_sampler_test", harnesses)
         self.assertEqual(harnesses - self.programs, set(), "missing from build_runtime.ps1's cl.exe fallback")
 
+    def test_the_fallback_builds_every_harness_a_tool_starts(self):
+        """EGEN-FALLBACK-SANDBOX-SWEEP: tools/sandbox.py starts runtime/build/vk_sandbox(.exe) and ends at
+        "unsupported: vk_sandbox is not built" without it; tools/ps_sweep.py --exe and
+        tools/ab_control_flow.py --all-attachments start runtime/build/vk_ps_sweep.exe. CMake builds both, the cl.exe
+        fallback built neither, so neither pixel check of translated shaders could run from a fallback build."""
+        named = set()
+        for folder in ("tools", "scripts", "runtime/test/shaders"):
+            for path in (ROOT / folder).rglob("*.py"):
+                named |= set(re.findall(r'"(vk_[a-z0-9_]+)"', path.read_text(encoding="utf-8")))
+        harnesses = {n for n in named if (ROOT / "runtime" / "test" / f"{n}.cpp").is_file()}
+        self.assertTrue({"vk_sandbox", "vk_ps_sweep"} <= harnesses)
+        self.assertEqual(harnesses - self.programs, set(), "missing from build_runtime.ps1's cl.exe fallback")
+
     def test_the_launcher_compiles_every_source_cmake_gives_gta6rt(self):
         """BUILD-680: main.cpp calls rt::fs::configure, but the fallback left out shims/file_system.cpp (LNK2019).
         Every source of CMake's add_executable(gta6rt ...) must be in the fallback's launcher list ($files)."""

@@ -105,6 +105,11 @@ if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNO
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_compute_test.cpp" /Fe:vk_compute_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_store_test.cpp" /Fe:vk_store_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_image_fuzz.cpp" /Fe:vk_image_fuzz.exe || exit /b 1
+rem tools/sandbox.py starts vk_sandbox, and tools/ps_sweep.py --exe / tools/ab_control_flow.py --all-attachments start
+rem vk_ps_sweep, by name from runtime\build; without them the sandbox says "vk_sandbox is not built" and the sweep has
+rem no harness to pass. CMake builds both in its Vulkan tools loop (EGEN-FALLBACK-SANDBOX-SWEEP).
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_sandbox.cpp" /Fe:vk_sandbox.exe || exit /b 1
+if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_ps_sweep.cpp" /Fe:vk_ps_sweep.exe || exit /b 1
 "@
 }
 
