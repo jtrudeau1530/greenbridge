@@ -791,7 +791,7 @@ class OnHardware(unittest.TestCase):
         # image_fuzz's 64x64 cases (16,384) and this one need.
         lines = ["v_lshlrev_b32 v2, 5, v0", "v_mov_b32 v1, 0xabcd0001"]
         lines += [f"global_store_b32 v2, v1, s[2:3] offset:{4 * j}" for j in range(8)]
-        lines += ["s_waitcnt vmcnt(0)"]
+        lines += ["s_waitcnt vmcnt(0)", "s_endpgm"]
         kernel = asm.Kernel(lines, wave=32, threads=1024, words=8192, raw=True)
         self.assertEqual(self.oracle.run([kernel]), [[0xABCD0001] * 8192])
 
