@@ -238,8 +238,9 @@ answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetC
 `XNetworkingImpl` answers as a console without a network would: the connectivity hint is initialized with no
 connectivity (level None), the port and URL security-information queries fail with
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
-certificate check fails the same way, change registrations return tokens that never fire, and the three
-`IXNetworkingImpl2` additions are `E_NOTIMPL`.
+certificate check fails the same way, the two change registrations send the one initial notification Microsoft
+documents (on the queue's completion port, the process queue when none is given: the hint above, or port 0) and
+none after, and the three `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
 `XUserImpl` (`runtime/shims/xgameruntime_user.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
 calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.

@@ -378,12 +378,60 @@ void check_run_time_load() {
         using Verify = HRESULT(STDMETHODCALLTYPE*)(void*, void*, const void*);
         check(reinterpret_cast<Verify>(slot(n, 14))(n, nullptr, nullptr) == no_network,
               "slot 14 (XNetworkingVerifyServerCertificate) fails offline");
-        XTaskQueueRegistrationToken token{};
-        using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+        struct Seen {
+            int calls;
+            Hint hint;
+            uint16_t port;
+        };
+        using HintCallback = void(CALLBACK*)(void*, const Hint*);
+        using PortCallback = void(CALLBACK*)(void*, uint16_t);
+        using RegisterHint = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, HintCallback,
+                                                         XTaskQueueRegistrationToken*);
+        using RegisterPort = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, PortCallback,
+                                                         XTaskQueueRegistrationToken*);
         using Unregister = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
-        check(reinterpret_cast<Register>(slot(n, 16))(n, nullptr, nullptr, nullptr, &token) == S_OK && token.token &&
-                  reinterpret_cast<Unregister>(slot(n, 17))(n, token, true),
-              "slots 16/17 register and unregister a connectivity-hint callback");
+        const auto register_hint = reinterpret_cast<RegisterHint>(slot(n, 16));
+        const auto register_port = reinterpret_cast<RegisterPort>(slot(n, 6));
+        const auto unregister_hint = reinterpret_cast<Unregister>(slot(n, 17));
+        const auto unregister_port = reinterpret_cast<Unregister>(slot(n, 7));
+        HintCallback on_hint = [](void* ctx, const Hint* h) {
+            auto* s = static_cast<Seen*>(ctx);
+            ++s->calls;
+            if (h) s->hint = *h;
+        };
+        PortCallback on_port = [](void* ctx, uint16_t p) {
+            auto* s = static_cast<Seen*>(ctx);
+            ++s->calls;
+            s->port = p;
+        };
+        XTaskQueueRegistrationToken token{};
+        check(register_hint(n, nullptr, nullptr, nullptr, &token) == E_INVALIDARG &&
+                  register_port(n, nullptr, nullptr, nullptr, &token) == E_INVALIDARG,
+              "slots 6/16 refuse a null callback");
+        XTaskQueueHandle manual = nullptr;
+        XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &manual);
+        Seen hint_seen{0, {9, 9, 9, false, true, true, true}, 0};
+        Seen port_seen{0, {}, 7};
+        XTaskQueueRegistrationToken hint_token{}, port_token{};
+        const bool registered = register_hint(n, manual, &hint_seen, on_hint, &hint_token) == S_OK && hint_token.token &&
+                                register_port(n, manual, &port_seen, on_port, &port_token) == S_OK && port_token.token;
+        const bool none_before_dispatch = hint_seen.calls == 0 && port_seen.calls == 0;
+        while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
+        const Hint& h = hint_seen.hint;
+        check(registered && none_before_dispatch && hint_seen.calls == 1 && h.level == 1 && h.cost == 0 &&
+                  h.initialized && !h.approaching && !h.over && !h.roaming,
+              "slot 16 sends one initial notification on the queue's completion port: initialized, no connectivity");
+        check(port_seen.calls == 1 && port_seen.port == 0, "slot 6 sends one initial notification too: port 0");
+        check(unregister_hint(n, hint_token, true) && unregister_port(n, port_token, true),
+              "slots 17/7 unregister them");
+        Seen late{};
+        XTaskQueueRegistrationToken late_hint{}, late_port{};
+        const bool unregistered = register_hint(n, manual, &late, on_hint, &late_hint) == S_OK &&
+                                  register_port(n, manual, &late, on_port, &late_port) == S_OK &&
+                                  unregister_hint(n, late_hint, false) && unregister_port(n, late_port, false);
+        while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
+        check(unregistered && late.calls == 0, "a registration ended before its queue is dispatched sends nothing");
+        XTaskQueueCloseHandle(manual);
         uint16_t port = 7;
         using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);
         using NotImpl = HRESULT(STDMETHODCALLTYPE*)(void*);
