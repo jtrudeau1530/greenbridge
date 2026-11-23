@@ -6864,6 +6864,9 @@ class Gen:
                 raise Unsupported(op + " modifiers")
             sel, selhi = bits("op_sel", [0, 0]), bits("op_sel_hi", [1, 1])
             neg_lo, neg_hi = bits("neg_lo", [0, 0]), bits("neg_hi", [0, 0])
+            # a three-entry list (op_sel:[1,0,0], as in tests/semantic/fixtures/disasm/ps_ops6.s) is read by its first
+            # two entries, as before #3853
+            sel, selhi, neg_lo, neg_hi = (v[:2] if len(v) == 3 else v for v in (sel, selhi, neg_lo, neg_hi))
             if (len(sel) != 2 or len(selhi) != 2 or len(neg_lo) != 2 or len(neg_hi) != 2
                     or any(b not in (0, 1) for b in sel + selhi) or any(neg_lo) or any(neg_hi)):
                 raise Unsupported(op + " modifiers")

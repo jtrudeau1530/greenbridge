@@ -219,7 +219,8 @@ class PkShiftB16Tests(unittest.TestCase):
             "v_pk_lshrrev_b16 v0, v1, v2 div:2",
             "v_pk_lshlrev_b16 v0, v1, -v2",
             "v_pk_ashrrev_i16 v0, |v1|, v2",
-            "v_pk_lshlrev_b16 v0, v1, v2 op_sel:[0,0,0]",
+            # a three-entry op_sel is llvm-mc gfx1013 syntax (runtime/test/shaders/ps_ops6.asm) and is accepted
+            "v_pk_lshlrev_b16 v0, v1, v2 op_sel:[0,0,0,0]",
             "v_pk_lshrrev_b16 v0, v1, v2 op_sel_hi:[1]",
             "v_pk_ashrrev_i16 v0, v1, v2 op_sel:[0,2]",
             "v_pk_lshlrev_b16 v0, v1, v2 op_sel:bad",

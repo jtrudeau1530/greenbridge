@@ -1,4 +1,5 @@
-"""v_cvt_f64_i32, v_cvt_f64_u32, v_cvt_i32_f64 and v_cvt_u32_f64 are not implemented in tools/rdna2spirv.py.
+"""v_cvt_i32_f64 and v_cvt_u32_f64 are not implemented in tools/rdna2spirv.py. v_cvt_f64_i32 and v_cvt_f64_u32 are
+since #2521, and tests/semantic/test_int32_to_f64.py runs them through the translator.
 
 The previous version of this file tested a private Python model of the four conversions and never called the
 translator, so it passed whatever the translator did.  Until the ops are lowered, the honest test is that the
@@ -15,11 +16,8 @@ import support  # noqa: E402
 import rdna2spirv  # noqa: E402
 
 CASES = [
-    ("v_cvt_f64_i32", "v_cvt_f64_i32_e32 v[2:3], v1"),
-    ("v_cvt_f64_u32", "v_cvt_f64_u32_e32 v[2:3], v1"),
     ("v_cvt_i32_f64", "v_cvt_i32_f64_e32 v2, v[0:1]"),
     ("v_cvt_u32_f64", "v_cvt_u32_f64_e32 v2, v[0:1]"),
-    ("v_cvt_f64_i32", "v_cvt_f64_i32_e64 v[2:3], v1 clamp"),
     ("v_cvt_i32_f64", "v_cvt_i32_f64_e64 v2, -|v[0:1]|"),
 ]
 
