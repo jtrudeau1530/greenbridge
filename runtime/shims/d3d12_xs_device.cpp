@@ -1925,8 +1925,13 @@ D3D12_RESOURCE_DESC desc_of(const D3D12_RESOURCE_DESC1& desc1) {
     return desc;
 }
 
-// The PC allocation size of `desc`, or 0 when the device has none to give.
+// The console allocation size of `desc` (a listed render target's whole tiles, as slot 25 answers, else the PC size),
+// or 0 when the device has none to give. The PC size of a 4K RGBA8 target is a tile larger on AMD and two of them
+// overrun the title's 64 MiB arena at stop 17 (#7240).
 std::size_t xmem_size(DeviceProxy* self, const D3D12_RESOURCE_DESC& desc) {
+    if (const UINT64 tiles = console_render_target_size(desc);
+        tiles && tiles <= (std::numeric_limits<std::size_t>::max)())
+        return static_cast<std::size_t>(tiles);
     const D3D12_RESOURCE_ALLOCATION_INFO info = self->real->GetResourceAllocationInfo(0, 1, &desc);
     if (info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX ||
         info.SizeInBytes > (std::numeric_limits<std::size_t>::max)())
