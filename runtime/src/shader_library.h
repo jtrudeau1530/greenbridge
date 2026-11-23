@@ -294,20 +294,35 @@ inline std::string sha256_hex(std::span<const std::uint8_t> data) {
 // ---------------------------------------------------------------------------------------------------------------
 // JSON (the subset the translator's index uses, which is all of JSON except number precision beyond double)
 
+struct JsonObjectEntry;
+
 struct Json {
     enum class Kind { null, boolean, number, string, array, object } kind = Kind::null;
     bool boolean = false;
     double number = 0;
     std::string string;
     std::vector<Json> array;
-    std::vector<std::pair<std::string, Json>> object;
+    // Declared through the incomplete JsonObjectEntry and destroyed out of line: a vector element type that holds a
+    // Json by value cannot be instantiated while Json is still being defined. GCC tolerates it, Clang with libstdc++
+    // does not (the pair<string, Json> form used to fail to build there). Structured bindings still work.
+    std::vector<JsonObjectEntry> object;
 
-    const Json* find(std::string_view key) const {
-        for (const auto& [k, v] : object)
-            if (k == key) return &v;
-        return nullptr;
-    }
+    ~Json();
+    const Json* find(std::string_view key) const;
 };
+
+struct JsonObjectEntry {
+    std::string key;
+    Json value;
+};
+
+inline Json::~Json() = default;
+
+inline const Json* Json::find(std::string_view key) const {
+    for (const auto& [k, v] : object)
+        if (k == key) return &v;
+    return nullptr;
+}
 
 class JsonReader {
 public:
