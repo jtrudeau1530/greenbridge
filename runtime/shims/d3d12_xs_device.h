@@ -9,9 +9,10 @@
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
-//   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
-//             initialState, riid, out). The type is the first word of the Xbox desc; there is no node-mask argument
-//             in the console call (public HLE; the PC six-argument form differs).
+//   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> the slot 12 console list proxy over PC
+//             CreateCommandList(0, type, allocator, initialState). The type is the first word of the Xbox desc; there
+//             is no node-mask argument in the console call (public HLE; the PC six-argument form differs). An riid the
+//             proxy does not answer (the console's own list IID) is answered with the proxy.
 //   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
 //             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
 //             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
