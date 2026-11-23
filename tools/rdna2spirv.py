@@ -11969,6 +11969,35 @@ class Gen:
         "image_gather4_c_b_cl", "image_gather4_c_b_cl_o",
     )
 
+    def unnormalized_sizes(self, img, ncoord, is3d):
+        """The image's level-0 size along each spatial axis as floats, for the MIMG `unorm` bit: its coordinates (and
+        _d gradients) are in texels, and dividing them by this size gives the normalized ones Vulkan samples with. An
+        array layer is an index either way and has no entry."""
+        self.uses_query = True
+        n = 3 if is3d else min(ncoord, 2)
+        sz = self.tmp()
+        self.emit(f"{sz} = OpImageQuerySizeLod {('%int', '%v2int', '%v3int')[ncoord - 1]} {img} "
+                  f"{self.as_int(self.cu(0))}")
+        sizes = []
+        for k in range(n):
+            c = sz
+            if ncoord > 1:
+                c = self.tmp()
+                self.emit(f"{c} = OpCompositeExtract %int {sz} {k}")
+            s = self.tmp()
+            self.emit(f"{s} = OpConvertSToF %float {c}")
+            sizes.append(s)
+        return sizes
+
+    def unnormalize(self, vals, sizes):
+        """vals[k] / sizes[k] for each size; the values after them are returned unchanged."""
+        out = []
+        for v, s in zip(vals, sizes):
+            q = self.tmp()
+            self.emit(f"{q} = OpFDiv %float {v} {s}")
+            out.append(q)
+        return out + list(vals[len(sizes):])
+
     # SQ_IMG_SAMP_WORD0 address modes (Mesa src/amd/registers/gfx10-rsrc.json: CLAMP_X = bits [2:0], CLAMP_Y = [5:3];
     # values: SQ_TEX_* in Mesa's gfx6.json, as RADV's radv_tex_wrap maps VkSamplerAddressMode onto them): 0 wrap, 1 mirror, 2 clamp last texel, 3 mirror once last texel,
     # 4 clamp half border, 5 mirror once half border, 6 clamp border, 7 mirror once border.
@@ -12598,6 +12627,16 @@ class Gen:
             if not typed_sample and not no_sampled_img:
                 self.emit(f"{si} = OpSampledImage %{stype} {img} {smp}")
             f = [self.tof(c) for c in coords]
+            # The MIMG unorm bit forces the address to be unnormalized (LLVM AMDGPU modifier syntax: "Force the address
+            # to be unnormalized"), i.e. in texels. The explicit-LOD gathers below apply it in their own texel
+            # arithmetic; the other gathers and the samples divide the coordinates (and _d gradients) by the level-0
+            # size, Vulkan's rule for unnormalized coordinates. Which level's texels an explicit LOD above 0 means was
+            # not measured on RDNA2. A cube has no texel-space form in Vulkan and none was measured, so it is refused
+            # rather than sampled as normalized.
+            unorm = "unorm" in mods and op not in self.GATHER4_LOD_OPS and op not in ("image_gather4_l",
+                                                                                      "image_gather4_l_o")
+            if unorm and dim == "dim:SQ_RSRC_IMG_CUBE":
+                raise Unsupported(op + " unorm CUBE")
             if op in self.GATHER4_LOD_OPS:
                 self.emit_gather4_lod(op, a, mods, dim, img, img_idx, si, coords, f, ncoord, is3d, dmask, vdata, a16, d16)
                 return
@@ -12722,6 +12761,8 @@ class Gen:
                 # Gather the 2x2 footprint of one channel (dmask picks it) at mip 0 -> 4 results.
                 if bin(dmask).count("1") != 1 or ncoord not in (2, 3) or is3d or len(f) < ncoord:
                     raise Unsupported("image_gather4_lz form")
+                if unorm:
+                    f = self.unnormalize(f, self.unnormalized_sizes(img, ncoord, is3d))
                 if dim == "dim:SQ_RSRC_IMG_CUBE":
                     f = self.cube_coords(f)
                 uv = self.tmp()
@@ -12788,11 +12829,16 @@ class Gen:
             ref = None
             if kind.startswith("_c"):
                 ref, f = f[0], f[1:]
+            sizes = self.unnormalized_sizes(img, ncoord, is3d) if unorm else None
             grads = None
             if kind == "_d":
                 # Address order: all dP/dx components, all dP/dy components, then the coordinates.
                 if len(f) < 2 * grad_width + ncoord:
                     raise Unsupported(op + " coords")
+                if sizes:
+                    # Texel-unit gradients, like the coordinates (grad_width is the spatial axis count).
+                    f = (self.unnormalize(f[:grad_width], sizes) + self.unnormalize(f[grad_width:2 * grad_width], sizes)
+                         + f[2 * grad_width:])
                 if grad_width == 1:
                     grads = (f[0], f[1])
                 else:
@@ -12809,6 +12855,8 @@ class Gen:
                 minlod, f = f[ncoord], f[:ncoord]
             if len(f) < ncoord:
                 raise Unsupported(op + " coords")
+            if sizes:
+                f = self.unnormalize(f, sizes)       # the LOD after the coordinates (_l) stays as it is
             if dim == "dim:SQ_RSRC_IMG_CUBE":
                 f = self.cube_coords(f)
             if ncoord == 1:

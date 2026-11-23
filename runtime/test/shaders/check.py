@@ -537,6 +537,7 @@ TEXTURE_CONSTANTS = {
     "ps_gather_border": (32776.0, 34935.0, 34680.0, 28679.0),  # SHADER-348: border modes 6 and 7, derived in the .asm
     "ps_gather4_c_l": (6.0, 9.0, 17459.0, 9.0),  # image_gather4_c_l / _c_l_o / _cl / _c_b_cl_o d16
     "ps_array_resinfo": (8.0, 8.0, 12.0, 1.0),  # binding 3, index 1: two 6-face cubes, one mip
+    "ps_sample_unorm": (42.0, 14.0, 28.0, 1827.0),  # the MIMG unorm bit on samples and image_gather4_lz, in the .asm
 }
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 NAN_PAYLOAD_TEST = "ps_nan_payload"
