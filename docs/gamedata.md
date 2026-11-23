@@ -253,11 +253,107 @@ corner, 1.0%; as the top-left corner with y growing downwards, 82.5%. The `level
 same picture: 99.83%, 1.0% and 83.0%. The centre
 reading also gives a minimum x of exactly -13,312, the `PAMH` heightmap's minimum x above.
 
-Tile names: none of the four `tileTextureNamePrefix` values starts an archive entry name or a texture-dictionary
-item name in the local catalog (118,925 named items, 119,090 item hashes). Neither the global nor the sector
-fallback names match an item name or its joaat hash, and ten `prefix + x + y + suffix` spellings over all
-2,112 tiles match nothing in three atlases and one hash in the fourth. The tile textures are therefore either
-outside the scanned archives or named another way; this is unresolved.
+Tile names: the tile textures do exist, but none is named after the tile. Every tile carries only the grid's
+`tileTextureNameSuffix` as its texture name, one tile per texture dictionary, and the dictionary names are not in
+the data. That is why `tileTextureNamePrefix` spellings and the fallback names matched no archive entry or item name
+in the earlier catalog search. `tools/world_grid_atlas.py` (below) finds them in the texture manifests of
+`make_game.py --stages assets`.
+
+### What the four grids hold
+
+All four are water data. Every count below is in the tool's printed summary or is the named `--json` field;
+`levels` and `textures` are `levels.rpf` and `textures.rpf`.
+
+| Grid (`clientSystemName`) | Tile texture | Tile dictionaries | Fallback (pixels per tile) | Placed |
+|---|---|---:|---|---:|
+| `WaterSystemHeightMap` | `watersystemheightmap`, 512 x 512 `R16_UNORM` | 738 in `levels` | 1024 x 2112 `R16_UNORM` (32) | 737 |
+| `shorelinegrid1` | `shore_wave_placement_set1`, 256 x 256 `B8G8R8A8_UNORM` | 268 in `levels` | 1024 x 2112 `BC7_UNORM` (32) | 262 |
+| `waterfogatlas` | `waterfog`, 128 x 128 `BC6H_UF16` | 1,313 in `textures` | 512 x 1056 `BC6H_UF16` (16) | 592 |
+| `waterfogatlas2` | `waterfog2`, 128 x 128 `BC6H_UF16` | the same 1,313 | 512 x 1056 `BC6H_UF16` (16) | 592 |
+
+- Each `globalFallbackTextureName` is a mosaic of the whole 32 x 66 grid. Fallback image row 0 is the grid's north
+  edge (largest y, see the fit below), and cell = row * 32 + column.
+- The two fog grids share their dictionaries: each of the 1,313 holds one `waterfog` and one `waterfog2`.
+- `shared_minigame000` holds the `mapswap_tblux` sector-override fallback of all four grids (`sector_fallbacks`)
+  and a few more tiles (`tiles_in_other_archives`: 10 water height, 2 shoreline, 1 fog pair). They are counted
+  and printed, not placed.
+- The water-height fallback has 1,134 constant cells of 2,112; its most common value, 20,480, covers 55.74% of the
+  pixels, and the values run from 20,470 to 49,247.
+
+### Placing the tiles
+
+A tile's cell is recovered by comparing it with its grid's fallback mosaic, then checked against archive order.
+
+- Water height and fog (`method: content`): each tile is point-sampled to the fallback's pixels per tile and
+  compared with every cell by mean absolute difference; the two fog textures of a dictionary are matched together.
+  An anchor is a tile with detail (standard deviation above 0.5) whose runner-up distance is at least twice the
+  best and 0.5 above it. 737 of 738 water-height tiles are anchors; the one flat tile stays unplaced. For fog,
+  617 dictionaries have detail in either texture and 561 are anchors.
+- Shoreline (`method: mask`): the fallback's most common colour, `(0, 128, 0, 128)`, is background. Tiles and cells
+  are compared by intersection over union of their feature masks (pixels more than 32 from the background), 264
+  fallback cells have features and 6 tiles have none. The tiles, in archive order, are aligned to cells in text
+  order (next point) by a dynamic programme that maximises the summed overlap. A tile is placed when it overlaps
+  the cell it is aligned to: 262 are (median overlap 0.83, `overlap_median`), and the 6 unplaced ones are the 6
+  without features. 208 tiles match one cell clearly without the order (best overlap more than 0.2 above the
+  runner-up); these are the shoreline anchors, and the alignment moves none of them
+  (`anchors_moved_by_alignment` 0).
+- **Archive order:** the tile dictionaries are stored in the order of their cells sorted as text of the decimal
+  cell index (`sorted(cells, key=str)`). Ascending steps of the anchors in archive order (`anchor_order`):
+
+| Order of the cells | Water height | Fog | Shoreline |
+|---|---:|---:|---:|
+| text of the cell index | 736 / 736 | 560 / 560 | 207 / 207 |
+| cell index as a number | 735 / 736 | 559 / 560 | 206 / 207 |
+| text of `row_column` | 709 / 736 | 540 / 560 | 189 / 207 |
+| text of `column_row` | 700 / 736 | 526 / 560 | 173 / 207 |
+
+Number order differs from text order only where the cell index changes its digit count. The one break of
+number order in each grid is there: in the `--json` placements the three-digit cells (from 912 in water height)
+are stored after the last four-digit cells, where text order puts them. The dictionary names most likely
+contain the decimal cell index; with one deciding step per grid this is a strong hint, not a read name.
+- Between two anchors, tiles are placed by archive order when their number equals the free cells between them
+  (`placed_by_order`): 31 fog tiles, none for water height. 721 fog dictionaries stay unplaced; 677 of them have
+  no detail in either texture (`unplaced_without_detail`), which content cannot place.
+- Cross-check (`in_water_height_cells`, `anchors_in_water_height_cells`, `placed_by_order_in_water_height_cells`):
+  all 262 placed shoreline tiles and all 561 fog anchors lie in a cell that also has a water-height tile; of the
+  31 fog tiles placed by order, 16 do.
+
+### Water-height values and `zInflation`
+
+The water-height values follow the ground. Over the fallback pixels above 36,000, a least-squares fit against the
+`MHIU` terrain heights (`water_fit`) gives:
+
+| `MHIU` payload | Units per metre | Value at 0 m | r (north up) | r (south up) |
+|---|---:|---:|---:|---:|
+| `0x144000` | 40.81 | 32,947 | 0.9457 | -0.2193 |
+| `0x16E000` | 40.97 | 32,815 | 0.9935 | -0.2187 |
+
+Reading row 0 as the south edge destroys the fit, which is why row 0 is north. Under the better fit, the
+fallback's 20,470 to 49,247 is -301.3 to 401.1 m (`water_metres`), close to the `PAMH` Z box of -302 to 404 m. The
+fit is consistent with a `R16_UNORM` value spread over -800 to 800 m (65,536 / 1,600 = 40.96 units per metre, 0 m
+at 32,768). Under that reading the dominant 20,480 is -300 m, at the floor of the `PAMH` Z box (-302 m) and below
+all ground in `MHIU` (-50 m), which would make it a "no water" value. Both readings are hypotheses: the scale comes from a fit, not from a field.
+
+`zInflation` was not observed at runtime. All four documents have origin z = 0 and `zInflation` 1,000, so if the
+runtime turns each 2D tile into a box from origin z - 1,000 to origin z + 1,000 for its stream test, that box
+covers every height the world data describes. The tool reports (`z_check`) that all 3 heightmap Z ranges in
+`common.rpf` (`PAMH` -302 to 404 m, both `MHIU` -50 to 500 m) lie inside -1,000 to 1,000, and the water heights
+above fall inside it as well. This is a consistency check of that reading, not a measurement of the runtime:
+nothing here shows whether the box is used for the stream test, the camera, or something else.
+
+```powershell
+python -I tools/rpf9_carve.py <game>\common.rpf <work>\carve\common
+python -I tools/world_grid_atlas.py <work> --carve <work>\carve\common --json <scratch>\grid_atlas.json
+python -I tests/test_world_grid_atlas.py
+```
+
+The tool imports numpy and Pillow (Pillow decodes `BC6H`); its placement, ordering and fitting logic is plain
+Python, and the tests of that part run on the standard library alone. The forward check in the tests builds four
+synthetic grids with tiles at known cells, stored in text order, and requires every tile with content to come back
+at its cell; stored in number order instead, the text-order check reports breaks. The `--json` file holds the cell
+of every placed tile, derived from your own copy of the game: keep it local.
+
+### `TextureGridInfo`
 
 In the 1.0.2.1 exports, one content change set lists four grid metadata registrations and three candidate
 archive paths as siblings. The list gives no per-grid archive assignment. The two fog grids share a tile
@@ -275,8 +371,9 @@ radius and the same 1,000 `zInflation`, around a different origin. Tested the sa
 placements fall inside with `origin` as the centre, 0.01% as the minimum corner and 11.8% as the top-left
 corner, so the centre convention holds for both document types.
 
-Not measured here (hypothesis): what the four grids hold (their names suggest per-tile map data for separate
-client systems), and how `zInflation` widens a tile's streaming box vertically.
+The tool looks up both fallback names of this document (`texture_grids`): `fallen_snow_cov_fallback_low` is in
+`textures.rpf` and `fallen_snow_cov_fallback_high` is in none of the exported manifests. The document has no tile
+name field, so the tool does not look for its tiles, and what this grid holds is not measured.
 
 ## XML documents
 
