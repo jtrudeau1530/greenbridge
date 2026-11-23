@@ -21,6 +21,7 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <string>
 #include <utility>
 
 #include "shims.h"
@@ -219,6 +220,52 @@ UINT WINAPI XMemResetWriteWatch(void* base_address, SIZE_T region_size) {
     return ResetWriteWatch(base_address, region_size);
 }
 
+// BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE type, SIZE_T size). Its reference page and the XMEM_TRANSFER_TYPE enum
+// page (gaming/gdk/docs/reference/system/xmem/{functions/xmemtransfermemory,enums/xmem_transfer_type}) are NDA
+// topics on Microsoft Learn, so the shape comes from public code built against the GDK's xmem.h: Microsoft's
+// XBOX-MonoGame-NetRumble sample (console/NetRumble.Bootstrap/Main.cpp) and FNA-XNA/NativeAOT-Xbox (Bootstrap/Main.cpp)
+// both call `if (!XMemTransferMemory(XMemTransferTitleToSystem, additionalKernelPoolMemory))` with a `const size_t`,
+// commented "Transfer additional memory to kernel pool" and "Must be multiples of 2MB sizes". So: two arguments, the
+// enum (32 bits) in ECX and the size in RDX, and a zero return is failure. The public XLaunchNewGame page adds that
+// "Memory transferred to the system using XMemTransferMemory (NDA topic) is persisted", and the game-save debugging
+// page suggests it for E_OUTOFMEMORY "to transfer some memory to the system partition".
+//
+// On the console it moves budget between the title's partition and the system's. A PC has one pool and no budget
+// split, so there is nothing to move: every direction and size returns TRUE and nothing is allocated or reserved. Not
+// known (the pages are NDA): the numeric XMEM_TRANSFER_TYPE values, and whether the console refuses or rounds a size
+// that is not a multiple of 2 MiB. Refusing would stop a title at startup (both samples return -1), while succeeding
+// changes nothing here. TRUE is 1 in EAX, so it also reads as true if the real return type is a one-byte bool.
+//
+// gta6rt --trace FILE: the first call for each distinct (type, size) pair goes to the startup trace as an
+// "xmem_transfer" event with the caller as module+RVA, so a run with the executable records the values it passes.
+BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] xmem: XMemTransferMemory(type %u, %zu bytes): a PC has no title/system memory partition; "
+                     "returning TRUE without moving anything (logged once)\n",
+                     type, static_cast<size_t>(size));
+    }
+    if (rt::startup_trace::enabled()) {
+        static std::mutex mutex;
+        static std::set<std::pair<uint32_t, uint64_t>> seen;
+        bool first = false;
+        {
+            const std::lock_guard lock(mutex);
+            first = seen.insert({type, static_cast<uint64_t>(size)}).second;
+        }
+        if (first) {
+            rt::startup_trace::event(
+                "xmem_transfer",
+                "\"api\":\"XMemTransferMemory\",\"type\":" + std::to_string(type) +
+                    ",\"size\":" + std::to_string(static_cast<uint64_t>(size)) + ",\"caller\":" +
+                    rt::startup_trace::quote(
+                        rt::startup_trace::where(reinterpret_cast<uint64_t>(_ReturnAddress()))));
+        }
+    }
+    return TRUE;
+}
+
 // kernel32!VirtualAlloc as a title calls it. The console's allocation type has two bits of its own, MEM_GRAPHICS
 // (0x10000000, memory the GPU reads) and MEM_TITLE (0x40000000, the title's own heap). On a PC the host rejects both
 // with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
@@ -258,4 +305,5 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
+    {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
 );

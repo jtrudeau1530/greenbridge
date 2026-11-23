@@ -80,6 +80,15 @@ The six unique Xbox-specific imports (eight consumer/import pairs) are exactly t
 The video path (`Bink2Scarlett.dll`), the BVH builder and the FidelityFX upscaler therefore all go through the
 two shim DLLs that already exist. `libHttpClient.GDK.dll` and `XCurl.dll` import only desktop APIs.
 
+`xmem.dll!XMemTransferMemory` is not imported by any of these DLLs, but a Series executable calls it during startup
+(reported in [#5934](https://github.com/ItsNotRexed/Leonida/issues/5934#issuecomment-7101779516)). Its GDK reference
+page is an NDA topic, but Microsoft's public [NetRumble](https://github.com/microsoft/XBOX-MonoGame-NetRumble/blob/203255e785f2ab2671a9d83b724eaa14d5b07414/console/NetRumble.Bootstrap/Main.cpp#L135-L145)
+sample and FNA's [NativeAOT-Xbox](https://github.com/FNA-XNA/NativeAOT-Xbox/blob/b9dc547afd0e05f45764d670ec49e0ac7997a301/Bootstrap/Main.cpp#L117-L124)
+bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))` with a `size_t` in multiples of
+2 MiB, to move budget from the title's memory partition to the system's. A PC has no such partition, so the shim
+returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
+and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.
