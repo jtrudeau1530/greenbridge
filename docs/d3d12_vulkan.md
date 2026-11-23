@@ -2877,8 +2877,12 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   (`composed_presents()` does not move; the test compares the bytes of a blit with the compose pass at 1:1 and they are
   equal). Anything else goes through `VulkanPresenter::present_planes`: a compute pass (`runtime/src/present_compose.comp`,
   SPIR-V embedded as `depth24_convert` is, built with `glslc --target-env=vulkan1.1 -O -mfmt=c`) writes an RGBA16F image of
-  the swapchain's size, and a `vkCmdBlitImage` (same size, nearest) puts it in the swapchain image, which keeps the
-  swapchain `TRANSFER_DST`-only and the capture path unchanged. The planes are read with `texelFetch` (no sampler, so any
+  the swapchain's size, and a `vkCmdBlitImage` (same size, nearest) puts it in the swapchain image, so the layer writes
+  the swapchain only by transfer (no storage usage) and the capture path is unchanged. The swapchain also asks for
+  `COLOR_ATTACHMENT`, which the layer never uses: overlays that hook the swapchain (Bandicam's
+  `VK_LAYER_bandicam_helper`, measured) draw into its images through a framebuffer, and without it every frame raised
+  `VUID-VkFramebufferCreateInfo-pAttachments-00877` and `VUID-VkImageViewCreateInfo-image-04441`. Surfaces always
+  report it, and the DXGI swapchain (`dxgi_swapchain.h`) already requested it. The planes are read with `texelFetch` (no sampler, so any
   sampled float/UNORM/sRGB format works and filtering never reads outside the source rectangle); an sRGB-format source is
   decoded by the texture unit and encoded again, so its bytes are read as stored. Plane 0: `pSrcViewRects[0]` (else the
   whole texture) scaled to `pDestPlacementBase` (fractions of the output; null is the whole output; outside it is black),

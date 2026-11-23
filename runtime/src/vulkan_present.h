@@ -996,6 +996,13 @@ private:
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if ((caps.supportedUsageFlags & usage) != usage) return false;
+        // Not used by the presenter itself (it blits or copies into the images), but overlays that hook the swapchain
+        // draw their own frame into its images through a framebuffer, which needs COLOR_ATTACHMENT: without it
+        // Bandicam's VK_LAYER_bandicam_helper builds framebuffers and image views on images that don't allow it
+        // (VUID-VkFramebufferCreateInfo-pAttachments-00877, VUID-VkImageViewCreateInfo-image-04441). The surface
+        // reports it for every swapchain (the spec requires it in supportedUsageFlags), and the DXGI swapchain
+        // (dxgi_swapchain.h) already asks for it.
+        if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
         std::uint32_t count = 0;
         if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, nullptr) != VK_SUCCESS || !count)
