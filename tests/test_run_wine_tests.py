@@ -488,10 +488,13 @@ class MainTest(unittest.TestCase):
     def command(self, name):
         return [WINDOWS_ROOT + "/artifact/" + name]
 
-    def run_main(self, entries, *extra, stderr=False, root=None):
+    def run_main(self, entries, *extra, stderr=False, root=None, wine=sys.executable):
         listing = self.list_tests(entries)
         argv = ["run_wine_tests.py", "--tests", listing, "--windows-root", WINDOWS_ROOT,
-                "--root", str(self.root if root is None else root), "--wine", sys.executable.replace(os.sep, "/"), *extra]
+                "--root", str(self.root if root is None else root)]
+        if wine is not None:
+            argv += ["--wine", wine.replace(os.sep, "/")]
+        argv += extra
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = rwt.main()
@@ -511,6 +514,18 @@ class MainTest(unittest.TestCase):
             code, out, _ = self.run_main([entry], "--require", "ok", root=".")
         self.assertEqual(code, 0, out)
         self.assertIn("[PASS] ok", out)
+
+    @unittest.skipUnless(os.name == "posix", "uses a symlink as a Wine executable")
+    def test_relative_wine_command_is_resolved_before_changing_directories(self):
+        (self.root / "local wine").symlink_to(sys.executable)
+        command = "'./local wine' -B"
+        entry = ctest_entry("ok", self.command("ok.py"))
+        with contextlib.chdir(self.root):
+            for wine, env in ((command, "missing-wine"), (None, command)):
+                with self.subTest(wine=wine), mock.patch.dict(os.environ, {"WINE": env}):
+                    code, out, _ = self.run_main([entry], "--require", "ok", wine=wine)
+                    self.assertEqual(code, 0, out)
+                    self.assertIn("[PASS] ok", out)
 
     def test_a_required_test_that_fails_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))], "--require", "bad")
