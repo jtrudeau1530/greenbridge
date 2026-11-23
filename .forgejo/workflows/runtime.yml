@@ -127,6 +127,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: KhronosGroup/Vulkan-Headers
+          github-server-url: https://github.com
           ref: 6802bb4733b63ed5efd3adb308a6c885ef180ea1 # vulkan-sdk-1.4.363.0
           path: .vulkan-headers
           sparse-checkout: include
