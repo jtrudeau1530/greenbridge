@@ -2330,6 +2330,13 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         log(f"runtime: built. Inspect the game's imports with Wine:\n  {shlex.join([start, '--dry-run'])}")
 
 
+def nonempty_path(text: str) -> str:
+    """--game/--out/--work/--runtime-build: an empty value would read as 'not given' and fall back to a default."""
+    if text.strip() == "":
+        raise argparse.ArgumentTypeError("must not be empty")
+    return text
+
+
 def positive_int(text: str) -> int:
     """--jobs: 0 or less would start no translation shard and merge an empty index as if the step had finished."""
     try:
@@ -2667,12 +2674,12 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
-    ap.add_argument("--game", help="your package folder (found automatically if left out; a share path "
+    ap.add_argument("--game", type=nonempty_path, help="your package folder (found automatically if left out; a share path "
                                     "\\\\server\\share\\... goes here)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
-    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
+    ap.add_argument("--out", type=nonempty_path, help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
                                   "whose Documents iCloud syncs)")
-    ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
+    ap.add_argument("--work", type=nonempty_path, help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
@@ -2680,7 +2687,7 @@ def main() -> int:
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
-    ap.add_argument("--runtime-build", metavar="DIR",
+    ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
                          "on Windows, also use vk_pipeline_check.exe from DIR if present")
