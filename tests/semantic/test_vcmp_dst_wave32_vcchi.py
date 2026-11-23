@@ -188,6 +188,55 @@ COMPARE_NULL_EXEC_CASES = [
 
 
 class VcmpDstWave32VccHiTests(unittest.TestCase):
+    def test_wave32_vcc_hi_mixed_mask_scalar_counts(self):
+        for selected_lane in (7, 20):
+            body = [
+                f"v_cmp_eq_u32_e64 vcc_lo, v0, {selected_lane}",
+                "s_and_b32 vcc_hi, vcc_lo, 0xFFFF",
+                "s_cselect_b32 s5, 1, 0",
+                "v_mov_b32 v8, s5",
+                "v_cndmask_b32_e64 v4, 0, 1, vcc_hi",
+                "s_bcnt1_i32_b32 s4, vcc_hi",
+                "v_mov_b32 v5, s4",
+                "v_mbcnt_lo_u32_b32 v6, vcc_hi, 0",
+                "v_lshlrev_b32 v7, 2, v0",
+                "buffer_store_dword v4, v7, s[0:3], 0 offen",
+                "buffer_store_dword v5, v7, s[0:3], 0 offen offset:128",
+                "buffer_store_dword v6, v7, s[0:3], 0 offen offset:256",
+                "buffer_store_dword v8, v7, s[0:3], 0 offen offset:384",
+            ]
+            mem = _run_cs("vcchi_mixed_mask_scalar", body, wave_size=32)
+            mask = (1 << selected_lane) & 0xFFFF
+            cases = {
+                "cndmask": (0, [mask >> lane & 1 for lane in range(32)]),
+                "bcnt": (128, [mask.bit_count()] * 32),
+                "mbcnt": (256, [(mask & ((1 << lane) - 1)).bit_count() for lane in range(32)]),
+                "scc": (384, [int(mask != 0)] * 32),
+            }
+            for consumer, (offset, expected) in cases.items():
+                with self.subTest(selected_lane=selected_lane, consumer=consumer):
+                    self.assertEqual([mem[offset + 4 * lane] for lane in range(32)], expected)
+
+    def test_wave32_vcc_hi_plain_bitwise_data_stays_scalar(self):
+        body = [
+            "s_mov_b32 s4, 0x12345678",
+            "s_and_b32 vcc_hi, s4, 0xFFFF",
+            "v_mov_b32 v4, vcc_hi",
+            "s_bcnt1_i32_b32 s5, vcc_hi",
+            "v_mov_b32 v5, s5",
+            "v_mbcnt_lo_u32_b32 v6, vcc_hi, 0",
+            "v_lshlrev_b32 v7, 2, v0",
+            "buffer_store_dword v4, v7, s[0:3], 0 offen",
+            "buffer_store_dword v5, v7, s[0:3], 0 offen offset:128",
+            "buffer_store_dword v6, v7, s[0:3], 0 offen offset:256",
+        ]
+        mem = _run_cs("vcchi_plain_bitwise_data", body, wave_size=32)
+        word = 0x5678
+        self.assertEqual([mem[4 * lane] for lane in range(32)], [word] * 32)
+        self.assertEqual([mem[128 + 4 * lane] for lane in range(32)], [word.bit_count()] * 32)
+        self.assertEqual([mem[256 + 4 * lane] for lane in range(32)],
+                         [(word & ((1 << lane) - 1)).bit_count() for lane in range(32)])
+
     def _native_modes(self):
         return [(32, False), (64, False)]
 

@@ -242,6 +242,9 @@ def step(state, ins, wave64=True):
         elif op.endswith("b64") and (ms or dst_t in ("vcc", "vcc_lo")) and \
                 all(k is not None or x["k"] == "imm" for k, x in zip(kinds, a[1:])):
             put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK, wave64)
+        elif op.endswith("b32") and dst_t == "vcc_hi" and not wave64 and ms and \
+                all(_maskable_b32(x) for x in a[1:]):
+            put(state, a[0], MASK, wave64)
         elif op.endswith("b32") and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]):
             put(state, a[0], MASK, wave64)
         elif op.endswith("b32") and dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS and \

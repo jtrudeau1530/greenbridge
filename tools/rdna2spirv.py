@@ -5577,7 +5577,10 @@ class Gen:
             return False, None
         t = d.get("t", "")
         if not self.wave64:
-            return t in ("exec_lo", "vcc_lo", "exec", "vcc"), None
+            return (
+                t in ("exec_lo", "vcc_lo", "exec", "vcc")
+                or (t == "vcc_hi" and any(self.holds_lane_mask(s) for s in srcs))
+            ), None
         if t in ("exec_lo", "exec_hi"):
             return True, "hi" if t == "exec_hi" else "lo"
         if t in ("vcc_lo", "vcc_hi") and ("vcc" in self.cur_masks or any(self.holds_lane_mask(s) for s in srcs)):
