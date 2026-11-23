@@ -14,7 +14,8 @@ runtime/build/generated). For those, the drive of --windows-root is pointed at -
 
 Every test is run and reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
---timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
+--timeout caps each test. A shorter positive CTest TIMEOUT takes precedence. On POSIX the
+runner stops the test and its process group when the deadline expires.
 """
 import argparse
 import json
@@ -24,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -118,6 +120,27 @@ def regex_list(value: str | list[str]) -> list[str]:
     return [value] if isinstance(value, str) else value
 
 
+def run_test_process(argv: list[str], *, cwd: str, env: dict[str, str],
+                     timeout: float) -> subprocess.CompletedProcess:
+    options = dict(cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if os.name != "posix":
+        return subprocess.run(argv, **options, timeout=timeout)
+
+    # Wine's Windows children and launcher wrappers can outlive the immediate child.
+    with subprocess.Popen(argv, **options, start_new_session=True) as proc:
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            # The launcher may have exited while a helper still holds the output pipe.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            raise
+        return subprocess.CompletedProcess(argv, proc.returncode, out)
+
+
 def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
     props = properties(test)
@@ -163,8 +186,7 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
             timeout = min(timeout, ctest_timeout)
     start = time.monotonic()
     try:
-        proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=timeout)
+        proc = run_test_process(argv, cwd=cwd, env=env, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
         return "fail", f"timed out after {timeout} s\n{out}"
