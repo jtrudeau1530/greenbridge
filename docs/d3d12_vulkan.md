@@ -1818,6 +1818,10 @@ Things that can invalidate this simple model, all **Open**:
   `CreateSampler2` encodes the same description (the five `D3D12_STATIC_BORDER_COLOR` values, two of them UINT, and
   the 1.2 flags), and gets a sampler in set 0 and a key in the hash table without a heap slot. The entry outlives
   the root signature. `d3d12_descriptor_test` checks the key before and after and samples with it.
+  loads it by value works; a shader that expects a driver table needs that table's location. **Measured
+  (SHADER-735): no sampling instruction in the corpus was found reading an S# from a fixed table** (0 of 366,628;
+  0.66% stay undetermined under the conservative reading), so on this evidence the layer has none to emulate; the
+  counts and their limits are under "Where the sampled S# comes from" below.
 - **Descriptor-table high-dword truncation.** If a shader forces the high dword of a table pointer to zero, the
   table must be below 4 GB; the layer allocates all shader-visible heaps there. If a shader forces a resource VA's
   high dword to zero, the resource must also be low; that would constrain the arena layout. Measured on 2026-11-22
@@ -1833,6 +1837,55 @@ Things that can invalidate this simple model, all **Open**:
   high dword. So what is measured to need the low 4 GB is the descriptor heaps; buffer addresses reach the shaders
   inside V#s (48-bit bases) or in VGPRs for `global_*`, and this count sees neither, so it does not show that
   buffers may sit above 4 GB.
+
+**Where the sampled S# comes from** (SHADER-735; counts only). `tools/sampler_source_census.py` follows the four
+SGPRs of the sampler operand of every `image_sample*`, `image_gather4*` and `image_get_lod` back to where their
+values are made: through constants, scalar loads, SGPRs spilled to a VGPR and read back, and joins, where it keeps
+the sources of every path. Over the 1.0.2.1 corpus (26,503 listings, none skipped; the ones with embedded data
+words are re-anchored as the translator does) 14,025 shaders sample, with 366,628 such instructions:
+
+| stage | sampling instructions | loaded through user data | literal | held in user SGPRs | other base | undetermined |
+|---|---|---|---|---|---|---|
+| CS | 120,816 | 63,141 | 57,674 | 0 | 0 | 1 |
+| MS | 21,992 | 10,142 | 9,723 | 0 | 0 | 2,127 |
+| PS | 221,157 | 115,109 | 106,048 | 0 | 0 | 0 |
+| VS | 2,663 | 1,020 | 1,351 | 0 | 0 | 292 |
+| all (the 195 GS do not sample) | 366,628 | 189,412 | 174,796 | 0 | 0 | 2,420 |
+
+- **Other base** is what a driver table would be: some dword of the S#, on some path, held in or loaded through a
+  constant address, a system SGPR (at or above `USER_SGPR` in CS; `s32` and up in the graphics stages, and the
+  NGG `s3` in MS and GS) or a code-relative address. It wins over every other class, the undetermined one
+  included, and it is empty in every stage.
+- **Loaded through user data**: an `s_load_dwordx4` or wider at an address that starts from a user SGPR, 179,602
+  at a static offset (0x540 at most) and 9,810 at a run-time one. No constant is added to any of these pointers,
+  so `constant table address + user index`, which is the same arithmetic as `user pointer + constant` and which
+  the classes could not tell apart, does not occur either. All 189,412 are in shaders whose `SFI0` sets the
+  sampler-heap bit: no shader without it loads an S# from memory. Whether one of these loads goes through a
+  descriptor table or through the sampler heap base of section 3.4 the shader cannot say; both are a user SGPR.
+- **Literal**: four immediates, 105,235 in shaders with the sampler-heap bit and 69,561 in shaders without it,
+  which sample with nothing else. 28,659 of them, in 6,824 shaders, build one dword with `s_brev_b32`.
+  `tools/shader_meta.py` does not fold that instruction, so `literal_samplers` in the index does not list those
+  S#s yet and the layer cannot register them from it.
+- **Undetermined** (0.66%, in 300 shaders): with every edge followed, some path brings something else into the S#
+  registers. 2,355 read the S# back from a VGPR it was spilled to, and one path does not save it there (on the
+  paths that do, it is a load through user data); in 64 the paths bring a literal and a load through user data;
+  in 1 a path brings a value the dataflow does not follow. All of them go away with one kind of edge: the S# is
+  made or saved inside a region the compiler jumps over with `s_cbranch_execz` when no lane is active, and the
+  sample comes after the region. Without the taken edge of those branches (the region always runs, as it does
+  whenever a lane is active) the same analysis gives all 2,420 a class: 2,419 loaded through user data, 1
+  literal. The table keeps them apart because that second reading trusts that nothing samples on the skipping
+  path; lane masks are not modelled.
+
+So, as far as the shaders can answer it, this corpus gives no evidence of a driver sampler table: no instruction
+lands in the other-base class, and the 2,420 undetermined ones are not shown to be free of it by the conservative
+reading, only by the one that assumes nothing samples on an exec-zero skip.
+What the census does not show: it reads the shaders, not what the driver writes at the addresses they load from;
+the graphics stages' user count is the translator's 32, not a measured one (question 3 in section 8.2); and it
+cannot say which S# is a root signature's static sampler. The literals are the candidates, since a static sampler
+is known when the shader is compiled and half of the sampling instructions build their S# from immediates, but
+that is a hypothesis until the root signatures are matched against them. Reproduce with
+`python -I tools/sampler_source_census.py <work>/shaders/dxbc/disasm --jobs 4 --expect-none other_base`, which
+exits 1 if an instruction lands in that class.
 
 **What the console's own D3D12 libraries show** (names only, read statically from a user's console system-file
 dump; nothing from those files is in this repository):
@@ -3638,7 +3691,7 @@ nothing is copied from their trees.
 |---|---|---|
 | 1 | The device entry point is now named `D3D12XboxCreateDevice(adapter, params, riid, out)`. What do its 24-word params and flag bits mean? | Public documentation and the executable's call sites. Log the words and accept any flag bits; do not treat a wrong params layout as fatal until the fields are understood. |
 | 2 | Which Xbox device/heap/queue/command-list slots differ? Prior art measured device slots 62 and 76 and descriptor-heap slots 9/10; slot 14 is the public `CreateDescriptorHeap`, with only the returned heap's start-handle return wrapped. **Partly measured** with the FSR DLL ([d3d12_command_objects.md §3.5a](d3d12_command_objects.md)): device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76 at their expected shapes (24 in the code, not called), slot 67 a console-only pipeline call; command-list slots 14, 15, 25 and 26 at their PC positions, then shifted (+4 from `SetDescriptorHeaps` at 32, +2 at `ExecuteIndirect` at 61), with console-only methods at 85 and 141. The BVH builder's call sites add the rest of the +4 root group (37, 39, 43, 45) and console slots 71, 73, 80, 146 (the GCL7 `Barrier`) and 148 (an upload allocator whose pointer is also the GPU address) ([d3d12_command_objects.md §3.3, §3.3a](d3d12_command_objects.md)). A second, retail-title measurement adds console slots 83 (`CopyTextureRegion`), 84 (`CopyResource`), 26 (barriers), 127 (direct mesh dispatch — not the PC position, GCL6 slot 79), 59 (a second indirect/mesh dispatch path) and 96 (an async-compute budget call) (section 7). Presentation, queue and fence slots remain unknown. | Trace every `QueryInterface` and every method slot with per-slot hit counters. A wrong slot shows as an immediate crash or wrong argument; compare against the SDK vtable. |
-| 3 | How does the console map a root signature to `s0..s31` (order, per-stage visibility, spills above 32 dwords, static samplers, direct-heap base)? | **Compute partly measured** by a sibling project's console-compiler output (section 7): parameters inline in user SGPRs from `s4` in root order while each fits whole; the first that does not fit, and all after it, go into a packed array addressed by a 40-bit pointer at `s[0:1]`; thread-group ids follow the user SGPRs. That matches this repo's CS census (lowest CS pointer SGPR `s4`). VS/PS/MS bases and static samplers remain open. Dump the game's root-signature blobs with the host deserializer; mask the `0x03000000` flag byte on a copy first; match against the per-shader user-SGPR read sets. If a signature exceeds 32 dwords, reverse the spill pointer from the shader. |
+| 3 | How does the console map a root signature to `s0..s31` (order, per-stage visibility, spills above 32 dwords, static samplers, direct-heap base)? | **Compute partly measured** by a sibling project's console-compiler output (section 7): parameters inline in user SGPRs from `s4` in root order while each fits whole; the first that does not fit, and all after it, go into a packed array addressed by a 40-bit pointer at `s[0:1]`; thread-group ids follow the user SGPRs. That matches this repo's CS census (lowest CS pointer SGPR `s4`). VS/PS/MS bases remain open. Static samplers: no sampling instruction was found reading one from a driver table (SHADER-735, section 3.5; 0.66% undetermined); which S# is a static sampler remains open. Dump the game's root-signature blobs with the host deserializer; mask the `0x03000000` flag byte on a copy first; match against the per-shader user-SGPR read sets. If a signature exceeds 32 dwords, reverse the spill pointer from the shader. |
 | 4 | Are Xbox descriptor bytes GFX10 T#/S#, and what are the heap increments? Does the game use `Create*View` or build descriptors itself? | Dump a shader-visible heap after the first `CreateShaderResourceView` and after the first draw; compare the bytes the shader loads with the T# parser. The start-handle return ABI is known (RAX); the increment values still need measuring. |
 | 5 | What is the buffer/descriptor/code VA range, and what arena capacity is needed? | Log every `GetGPUVirtualAddress` and every descriptor base; track the high-water mark. Choose a capacity; grow at a frame boundary if needed. |
 | 6 | Which swapchain/present path is used: DXGI, `PresentX`, or both? | **Partly answered from public samples (§4.5):** GDKX samples use `PresentX` + frame events and no DXGI swapchain (DXGI only for `IDXGIDevice1`→adapter→output). Hypothesis for the game, not observed: same. Still open: vtable slots, `D3D12XBOX_*` layouts, and whether the game also creates a swapchain. Check imports and the first present call. Implement the `PresentX` + frame-event presenter first; keep DXGI swapchain as fallback. |
