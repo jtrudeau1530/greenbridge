@@ -960,6 +960,8 @@ def main(argv=None) -> int:
         help="list VS/PS names in the carve index and exit",
     )
     a = ap.parse_args(argv)
+    if a.width < 1 or a.height < 1:
+        ap.error("--width and --height must be at least 1")
     if a.min_coverage is not None and not 0.0 <= a.min_coverage <= 1.0:
         ap.error("--min-coverage must be between 0 and 1")
     if a.camera:
