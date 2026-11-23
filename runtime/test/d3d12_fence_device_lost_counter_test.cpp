@@ -91,7 +91,18 @@ bool native_warp_control() {
         FAILED(fence->Signal(2)) || !event.ready(2000) ||
         fence->GetCompletedValue() != 2 || device->GetDeviceRemovedReason() != S_OK)
         return false;
-    std::printf("native WARP: normal fence query/signal/event completed value 2\n");
+    Ref<ID3D12Device1> device1;
+    Ref<ID3D12Fence> second;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&second.p))))
+        return false;
+    ID3D12Fence* const fences[] = {fence.p, second.p};
+    const UINT64 values[] = {2, 3};
+    if (FAILED(second->Signal(3)) ||
+        FAILED(device1->SetEventOnMultipleFenceCompletion(fences, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, nullptr)) ||
+        FAILED(device1->SetEventOnMultipleFenceCompletion(fences, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, nullptr)))
+        return false;
+    std::printf("native WARP: normal fence query/signal/event completed value 2 and two-fence ALL/ANY blocking waits\n");
     return true;
 }
 }  // namespace
@@ -187,6 +198,43 @@ int main() {
                     unsigned(blocking), unsigned(removed), driver::failed_wait_count.load());
         if (blocking == S_OK || removed != DXGI_ERROR_DEVICE_REMOVED ||
             driver::failed_wait_count.load() != 1 || driver::fail_next_wait.load() != VK_SUCCESS)
+            ++failures;
+    }
+    // ID3D12Device1::SetEventOnMultipleFenceCompletion has a separate direct blocking Vulkan wait,
+    // not the single-fence VulkanFence::wait path. Both ALL and ANY must report device loss to the
+    // shared context; a transient OOM error must return failure without falsely removing the device.
+    for (const auto flags : {D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY}) {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = driver::get_instance;
+        info.instance = vk.instance;
+        info.physical = vk.physical;
+        info.device = vk.device;
+        info.queue = vk.queue;
+        info.queue_family = vk.family;
+        Ref<ID3D12Device> device;
+        Ref<ID3D12Device1> device1;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))) ||
+            FAILED(device->QueryInterface(IID_PPV_ARGS(&device1.p)))) return 1;
+        Ref<ID3D12Fence> fence_a, fence_b;
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_a.p))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_b.p)))) return 1;
+        ID3D12Fence* const fences[] = {fence_a.p, fence_b.p};
+        const UINT64 values[] = {7, 9};
+        const unsigned previous_wait_faults = driver::failed_wait_count.load();
+        driver::fail_next_wait.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+        const HRESULT oom = device1->SetEventOnMultipleFenceCompletion(fences, values, 2, flags, nullptr);
+        const HRESULT still_alive = device->GetDeviceRemovedReason();
+        driver::fail_next_wait.store(VK_ERROR_DEVICE_LOST);
+        const HRESULT lost = device1->SetEventOnMultipleFenceCompletion(fences, values, 2, flags, nullptr);
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        const unsigned delta = driver::failed_wait_count.load() - previous_wait_faults;
+        std::printf("Leonida Vulkan: multi-fence blocking %s: transient=%08x, nonfatal_reason=%08x, "
+                    "lost_wait=%08x, removed=%08x, interceptions=%u\n",
+                    flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY ? "ANY" : "ALL",
+                    unsigned(oom), unsigned(still_alive), unsigned(lost), unsigned(removed), delta);
+        if (oom == S_OK || still_alive != S_OK || lost == S_OK ||
+            removed != DXGI_ERROR_DEVICE_REMOVED || delta != 2 ||
+            driver::fail_next_wait.load() != VK_SUCCESS)
             ++failures;
     }
     const unsigned errors = vk.validation_errors();
