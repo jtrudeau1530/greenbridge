@@ -12,9 +12,14 @@ using NTSTATUS = LONG;
 
 #include "shims.h"
 
+namespace rt::bcrypt_rng {
+void set_host_rng_enabled_for_test(bool enabled);
+}  // namespace rt::bcrypt_rng
+
 namespace {
 
 constexpr NTSTATUS kStatusSuccess = 0x00000000L;
+constexpr NTSTATUS kStatusUnsuccessful = static_cast<NTSTATUS>(0xC0000001L);
 constexpr NTSTATUS kStatusInvalidHandle = static_cast<NTSTATUS>(0xC0000008L);
 constexpr NTSTATUS kStatusInvalidParameter = static_cast<NTSTATUS>(0xC000000DL);
 constexpr NTSTATUS kStatusNotFound = static_cast<NTSTATUS>(0xC0000225L);
@@ -93,6 +98,41 @@ void test_provider_handles_and_validation() {
           "BCryptGenRandom rejects closed handle safely");
 }
 
+void test_fail_closed_when_host_rng_unavailable(bool seeded) {
+    if (seeded) return;
+    auto open_alg = resolve<OpenAlgFn>("BCryptOpenAlgorithmProvider");
+    auto gen_random = resolve<GenRandomFn>("BCryptGenRandom");
+    auto close_alg = resolve<CloseAlgFn>("BCryptCloseAlgorithmProvider");
+
+    BCRYPT_ALG_HANDLE h = nullptr;
+    check(open_alg(&h, BCRYPT_RNG_ALGORITHM, nullptr, 0) == kStatusSuccess && h != nullptr,
+          "fail-closed setup opens RNG handle");
+
+    rt::bcrypt_rng::set_host_rng_enabled_for_test(false);
+    uint8_t handle_buf[16]{};
+    std::memset(handle_buf, 0xAA, sizeof(handle_buf));
+    const NTSTATUS handle_st = gen_random(h, handle_buf, sizeof(handle_buf), 0);
+    bool handle_untouched = true;
+    for (uint8_t b : handle_buf) {
+        if (b != 0xAA) handle_untouched = false;
+    }
+    check(handle_st == kStatusUnsuccessful && handle_untouched,
+          "BCryptGenRandom fails closed with STATUS_UNSUCCESSFUL without mutating buffer (handle path)");
+
+    uint8_t sys_buf[16]{};
+    std::memset(sys_buf, 0x55, sizeof(sys_buf));
+    const NTSTATUS sys_st = gen_random(nullptr, sys_buf, sizeof(sys_buf), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    bool sys_untouched = true;
+    for (uint8_t b : sys_buf) {
+        if (b != 0x55) sys_untouched = false;
+    }
+    check(sys_st == kStatusUnsuccessful && sys_untouched,
+          "BCryptGenRandom fails closed with STATUS_UNSUCCESSFUL without mutating buffer (system RNG path)");
+
+    rt::bcrypt_rng::set_host_rng_enabled_for_test(true);
+    close_alg(h, 0);
+}
+
 void test_seeded_determinism(bool seeded) {
     if (!seeded) return;
     auto open_alg = resolve<OpenAlgFn>("BCryptOpenAlgorithmProvider");
@@ -121,6 +161,7 @@ int main(int argc, char** argv) {
     }
     test_registry_coverage();
     test_provider_handles_and_validation();
+    test_fail_closed_when_host_rng_unavailable(seeded);
     test_seeded_determinism(seeded);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

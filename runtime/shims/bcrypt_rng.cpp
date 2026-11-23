@@ -52,6 +52,7 @@ GenRandomFn g_host_gen = nullptr;
 RtlGenRandomFn g_rtl_gen_random = nullptr;
 bool g_seeded_mode = false;
 uint64_t g_prng_state = 0;
+std::atomic<bool> g_disable_host_rng_for_test{false};
 
 SRWLOCK g_lock = SRWLOCK_INIT;
 AlgHandle* g_live_handles = nullptr;
@@ -202,15 +203,21 @@ NTSTATUS WINAPI gen_random(BCRYPT_ALG_HANDLE hAlgorithm, PUCHAR pbBuffer, ULONG 
         fill_seeded(pbBuffer, cbBuffer);
         return kStatusSuccess;
     }
-    if (g_host_gen) {
-        const NTSTATUS st = g_host_gen(use_system ? nullptr : host_handle, pbBuffer, cbBuffer, dwFlags);
-        if (st >= 0) return st;
+    if (!g_disable_host_rng_for_test.load(std::memory_order_acquire)) {
+        if (g_host_gen) {
+            const NTSTATUS st = g_host_gen(use_system ? nullptr : host_handle, pbBuffer, cbBuffer, dwFlags);
+            if (st >= 0) return st;
+        }
+        if (g_rtl_gen_random && g_rtl_gen_random(pbBuffer, cbBuffer)) return kStatusSuccess;
     }
-    if (g_rtl_gen_random && g_rtl_gen_random(pbBuffer, cbBuffer)) return kStatusSuccess;
     return kStatusUnsuccessful;
 }
 
 }  // namespace
+
+void set_host_rng_enabled_for_test(bool enabled) {
+    g_disable_host_rng_for_test.store(!enabled, std::memory_order_release);
+}
 }  // namespace rt::bcrypt_rng
 
 namespace {
