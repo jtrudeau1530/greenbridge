@@ -59,14 +59,34 @@ struct Handle {
     INTERNET_PORT port = 0;
 };
 
-// Intentionally immortal: a mapped DLL can close handles from DLL_PROCESS_DETACH, after normal statics are gone.
-std::mutex& live_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
-std::set<Handle*>& live() {
-    static auto* s = new std::set<Handle*>;
-    return *s;
+// Intentionally immortal and free of function-local static init guards (safe on guest threads when TLS slot 0 is
+// owned by the mapped executable or under Wine / static-CRT cross-builds, as in RT-488; late DLL_PROCESS_DETACH
+// handlers can also close handles after normal statics would have been destroyed).
+struct SrwLockGuard {
+    SRWLOCK* lock;
+    explicit SrwLockGuard(SRWLOCK& l) : lock(&l) { AcquireSRWLockExclusive(lock); }
+    ~SrwLockGuard() { ReleaseSRWLockExclusive(lock); }
+    SrwLockGuard(const SrwLockGuard&) = delete;
+    SrwLockGuard& operator=(const SrwLockGuard&) = delete;
+};
+
+SRWLOCK g_live_lock = SRWLOCK_INIT;
+std::set<Handle*>* g_live = nullptr;
+
+SRWLOCK g_log_lock = SRWLOCK_INIT;
+std::set<std::wstring>* g_logged = nullptr;
+
+std::atomic<bool> g_banner_logged{false};
+
+using CrackUrlFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
+INIT_ONCE g_crack_url_once = INIT_ONCE_STATIC_INIT;
+CrackUrlFn g_host_crack_url = nullptr;
+
+BOOL CALLBACK init_host_crack_url(PINIT_ONCE, PVOID, PVOID*) {
+    const HMODULE m = LoadLibraryExW(L"winhttp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    g_host_crack_url =
+        m ? reinterpret_cast<CrackUrlFn>(reinterpret_cast<void*>(GetProcAddress(m, "WinHttpCrackUrl"))) : nullptr;
+    return TRUE;
 }
 
 HINTERNET to_hinternet(Handle* h) { return reinterpret_cast<HINTERNET>(h); }
@@ -75,8 +95,8 @@ HINTERNET to_hinternet(Handle* h) { return reinterpret_cast<HINTERNET>(h); }
 // something that is not an open handle, ERROR_WINHTTP_INCORRECT_HANDLE_TYPE for the wrong kind.
 Handle* acquire(HINTERNET handle, bool session, bool connect, bool request, DWORD& error) {
     Handle* h = reinterpret_cast<Handle*>(handle);
-    std::lock_guard lock(live_mutex());
-    if (!handle || live().count(h) == 0) {
+    SrwLockGuard lock(g_live_lock);
+    if (!handle || !g_live || g_live->count(h) == 0) {
         error = ERROR_INVALID_HANDLE;
         return nullptr;
     }
@@ -138,8 +158,9 @@ HINTERNET make_handle(Kind kind, Handle* parent, bool async, LPCWSTR server = nu
         h->context = parent->context;
     }
     {
-        std::lock_guard lock(live_mutex());
-        live().insert(h);
+        SrwLockGuard lock(g_live_lock);
+        if (!g_live) g_live = new std::set<Handle*>;
+        g_live->insert(h);
     }
     if (parent) {
         h->refs.fetch_add(1);  // held while HANDLE_CREATED runs, so HANDLE_CLOSING comes after it
@@ -162,11 +183,14 @@ std::wstring server_of(const Handle* request) {
 }
 
 void log_refused(const Handle* request) {
-    static auto* logged = new std::set<std::wstring>;
-    static auto* mutex = new std::mutex;
     const std::wstring server = server_of(request);
-    std::lock_guard lock(*mutex);
-    if (logged->insert(server).second) std::fwprintf(stderr, L"[rt] winhttp: offline, refused %ls\n", server.c_str());
+    bool fresh = false;
+    {
+        SrwLockGuard lock(g_log_lock);
+        if (!g_logged) g_logged = new std::set<std::wstring>;
+        fresh = g_logged->insert(server).second;
+    }
+    if (fresh) std::fwprintf(stderr, L"[rt] winhttp: offline, refused %ls\n", server.c_str());
 }
 
 void CALLBACK send_failed(PTP_CALLBACK_INSTANCE, void* context) {
@@ -188,10 +212,9 @@ BOOL fail(DWORD error) {
 }  // namespace
 
 HINTERNET WINAPI open_session(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD flags) {
-    static std::once_flag once;
-    std::call_once(once, [] {
+    if (!g_banner_logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr, "[rt] winhttp: offline; requests fail with ERROR_WINHTTP_CANNOT_CONNECT\n");
-    });
+    }
     return make_handle(Kind::Session, nullptr, (flags & WINHTTP_FLAG_ASYNC) != 0);
 }
 
@@ -411,8 +434,8 @@ WINHTTP_STATUS_CALLBACK WINAPI set_status_callback(HINTERNET handle, WINHTTP_STA
 BOOL WINAPI close_handle(HINTERNET handle) {
     Handle* h = reinterpret_cast<Handle*>(handle);
     {
-        std::lock_guard lock(live_mutex());
-        if (!handle || live().erase(h) == 0) return fail(ERROR_INVALID_HANDLE);
+        SrwLockGuard lock(g_live_lock);
+        if (!handle || !g_live || g_live->erase(h) == 0) return fail(ERROR_INVALID_HANDLE);
     }
     h->closed.store(true);
     release(h);  // the handle's own reference; HANDLE_CLOSING follows when nothing else holds it
@@ -420,14 +443,11 @@ BOOL WINAPI close_handle(HINTERNET handle) {
 }
 
 BOOL WINAPI crack_url(LPCWSTR url, DWORD length, DWORD flags, LPURL_COMPONENTS components) {
-    // Parsing only: the host's, loaded on first use so the runtime does not depend on winhttp.dll otherwise.
-    using CrackUrlFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
-    static CrackUrlFn host = [] {
-        const HMODULE m = LoadLibraryExW(L"winhttp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        return m ? reinterpret_cast<CrackUrlFn>(GetProcAddress(m, "WinHttpCrackUrl")) : nullptr;
-    }();
-    if (!host) return fail(ERROR_PROC_NOT_FOUND);
-    return host(url, length, flags, components);
+    // Parsing only: the host's, loaded on first use via InitOnceExecuteOnce so the runtime does not depend on
+    // winhttp.dll otherwise and carries no function-local static init guard.
+    InitOnceExecuteOnce(&g_crack_url_once, init_host_crack_url, nullptr, nullptr);
+    if (!g_host_crack_url) return fail(ERROR_PROC_NOT_FOUND);
+    return g_host_crack_url(url, length, flags, components);
 }
 
 }  // namespace rt::winhttp

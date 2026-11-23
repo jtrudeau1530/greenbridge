@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "shims.h"
@@ -646,6 +647,51 @@ int main() {
         g_close_probe = nullptr;
         check(session_closed != FALSE && probe.closing_calls == 2 && probe.closing_handle == session,
               "closing session afterwards drops the last reference and reports HANDLE_CLOSING once");
+    }
+
+    // Concurrent multi-thread exercise of the constant-initialized handle table, refused-server log, and CrackUrl.
+    {
+        std::atomic<bool> mt_ok{true};
+        StderrCapture capture;
+        std::vector<std::thread> workers;
+        for (int t = 0; t < 4; ++t) {
+            workers.emplace_back([&]() {
+                for (int i = 0; i < 25; ++i) {
+                    const HINTERNET s = open(L"mt", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+                    if (!s) {
+                        mt_ok.store(false, std::memory_order_relaxed);
+                        return;
+                    }
+                    const HINTERNET c = connect(s, L"mt-concurrent.invalid", 443, 0);
+                    const HINTERNET r = c ? open_request(c, L"GET", L"/ping", nullptr, WINHTTP_NO_REFERER,
+                                                         WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
+                                          : nullptr;
+                    if (!c || !r || send(r, nullptr, 0, nullptr, 0, 0, 0) != FALSE ||
+                        GetLastError() != ERROR_WINHTTP_CANNOT_CONNECT) {
+                        mt_ok.store(false, std::memory_order_relaxed);
+                    }
+                    wchar_t host[64]{};
+                    URL_COMPONENTS uc{};
+                    uc.dwStructSize = sizeof(uc);
+                    uc.lpszHostName = host;
+                    uc.dwHostNameLength = 64;
+                    if (crack(L"https://mt-concurrent.invalid/ping", 0, 0, &uc) == FALSE ||
+                        std::wstring(host) != L"mt-concurrent.invalid") {
+                        mt_ok.store(false, std::memory_order_relaxed);
+                    }
+                    if (r && !close(r)) mt_ok.store(false, std::memory_order_relaxed);
+                    if (c && !close(c)) mt_ok.store(false, std::memory_order_relaxed);
+                    if (!close(s)) mt_ok.store(false, std::memory_order_relaxed);
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        const std::string logged = capture.stop();
+        const std::string needle = "[rt] winhttp: offline, refused mt-concurrent.invalid:443";
+        size_t hits = 0;
+        for (size_t pos = 0; (pos = logged.find(needle, pos)) != std::string::npos; pos += needle.size()) ++hits;
+        check(mt_ok.load() && hits == 1,
+              "concurrent WinHTTP sessions, CrackUrl, and refused-server deduplication stay consistent");
     }
 
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
