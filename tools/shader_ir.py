@@ -210,6 +210,9 @@ def parse_file(path):
     m = HDR.match(lines[0]) if lines else None
     pc = int(m.group(2), 16) if m else 0
     info["code_start"] = pc
+    # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
+    # between the last printed instruction and it
+    info["code_end"] = int(m.group(3), 16) if m else None
     start = 1 if (lines and not lines[0].startswith("\t")) else 0
     for ln in lines[start:]:
         if ln.startswith("; ---"):

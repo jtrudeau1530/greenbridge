@@ -237,6 +237,13 @@ With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 program
 - **The other 2** (both use dot4) stop at a reachable `v_dot4_i32_i8` VOP3P word with `op_sel` 2 that `llvm-mc` does
   not decode (the VOP3P words above).
 
+These counts predate SHADER-813. A program whose reachable code falls through into those undecodable VOP3P words used
+to translate with the path cut at the gap, so its later stores were missing from a module that passed `spirv-val`;
+it is now refused (`fall-through into undecodable words`): programs 04, 05, 06, 09, 12 and 15 of package 1.0.2.1
+(found by @aslan2142). Recount by @CuteBooty with LLVM 23.1.5 (gfx1030 listings, `spirv-val --target-env vulkan1.2`):
+26 of 29 translated and passed before the change, **20 of 29** after it; the 20 kept give byte-identical SPIR-V, and
+8 of the 9 refused stop at a fall-through into undecodable words.
+
 ## Unknown
 
 - Kind 0 words 0 and 1.
