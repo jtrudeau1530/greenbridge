@@ -25,11 +25,39 @@
 
 namespace {
 
+// Static INIT_ONCE helpers avoid MSVC thread-safe function-local static guards (_Init_thread_header / _tls_index),
+// which must not touch module TLS when called from mapped guest threads.
+INIT_ONCE g_d3d12_mod_once = INIT_ONCE_STATIC_INIT;
+HMODULE g_d3d12_mod = nullptr;
+
+BOOL CALLBACK load_d3d12_once(PINIT_ONCE, PVOID, PVOID*) noexcept {
+    g_d3d12_mod = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return TRUE;
+}
+
 FARPROC host(const char* name) {
-    static HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    FARPROC p = d3d12 ? GetProcAddress(d3d12, name) : nullptr;
+    InitOnceExecuteOnce(&g_d3d12_mod_once, &load_d3d12_once, nullptr, nullptr);
+    FARPROC p = g_d3d12_mod ? GetProcAddress(g_d3d12_mod, name) : nullptr;
     if (!p) std::fprintf(stderr, "[rt] d3d12_xs: host d3d12.dll has no %s\n", name);
     return p;
+}
+
+struct ResolveCtx {
+    const char* name;
+    FARPROC* out;
+};
+
+BOOL CALLBACK resolve_proc_once(PINIT_ONCE, PVOID param, PVOID*) noexcept {
+    auto* ctx = static_cast<ResolveCtx*>(param);
+    *ctx->out = host(ctx->name);
+    return TRUE;
+}
+
+template <class Fn>
+Fn resolve_host_once(INIT_ONCE& once, FARPROC& slot, const char* name) {
+    ResolveCtx ctx{name, &slot};
+    InitOnceExecuteOnce(&once, &resolve_proc_once, &ctx, nullptr);
+    return reinterpret_cast<Fn>(slot);
 }
 
 using SerializeFn = decltype(&::D3D12SerializeVersionedRootSignature);
@@ -37,25 +65,47 @@ using DeserializerFn = decltype(&::D3D12CreateRootSignatureDeserializer);
 using LegacySerializeFn = decltype(&::D3D12SerializeRootSignature);
 using CreateDeviceFn = decltype(&::D3D12CreateDevice);
 
+INIT_ONCE g_serialize_once = INIT_ONCE_STATIC_INIT;
+FARPROC g_serialize_proc = nullptr;
+INIT_ONCE g_serialize_legacy_once = INIT_ONCE_STATIC_INIT;
+FARPROC g_serialize_legacy_proc = nullptr;
+INIT_ONCE g_deserializer_once = INIT_ONCE_STATIC_INIT;
+FARPROC g_deserializer_proc = nullptr;
+INIT_ONCE g_create_device_once = INIT_ONCE_STATIC_INIT;
+FARPROC g_create_device_proc = nullptr;
+
+INIT_ONCE g_v12_once = INIT_ONCE_STATIC_INIT;
+bool g_v12_supported = false;
+
+struct Probe12Ctx {
+    SerializeFn fn;
+};
+
+BOOL CALLBACK probe_host_1_2_once(PINIT_ONCE, PVOID param, PVOID*) noexcept {
+    const auto fn = static_cast<const Probe12Ctx*>(param)->fn;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty{};
+    empty.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* error = nullptr;
+    const HRESULT hr = fn(&empty, &blob, &error);
+    if (blob) blob->Release();
+    if (error) error->Release();
+    g_v12_supported = SUCCEEDED(hr);
+    return TRUE;
+}
+
 // Asked once: does the host serializer take version 1.2 at all? An empty 1.2 description is valid everywhere 1.2 is
 // supported; Windows 10's built-in d3d12.dll rejects it with E_INVALIDARG.
 bool host_serializes_1_2(SerializeFn fn) {
-    static const bool supported = [fn] {
-        D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty{};
-        empty.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
-        ID3DBlob* blob = nullptr;
-        ID3DBlob* error = nullptr;
-        const HRESULT hr = fn(&empty, &blob, &error);
-        if (blob) blob->Release();
-        if (error) error->Release();
-        return SUCCEEDED(hr);
-    }();
-    return supported;
+    Probe12Ctx ctx{fn};
+    InitOnceExecuteOnce(&g_v12_once, &probe_host_1_2_once, &ctx, nullptr);
+    return g_v12_supported;
 }
 
 HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc,
                                         ID3DBlob** blob, ID3DBlob** error) {
-    static auto fn = reinterpret_cast<SerializeFn>(host("D3D12SerializeVersionedRootSignature"));
+    const auto fn = resolve_host_once<SerializeFn>(g_serialize_once, g_serialize_proc,
+                                                   "D3D12SerializeVersionedRootSignature");
     if (!fn) return E_NOTIMPL;
     if (!desc) return fn(desc, blob, error);
 
@@ -94,7 +144,8 @@ HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DES
 HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* desc,
                                                D3D_ROOT_SIGNATURE_VERSION version, ID3DBlob** blob,
                                                ID3DBlob** error) {
-    static auto fn = reinterpret_cast<LegacySerializeFn>(host("D3D12SerializeRootSignature"));
+    const auto fn = resolve_host_once<LegacySerializeFn>(g_serialize_legacy_once, g_serialize_legacy_proc,
+                                                         "D3D12SerializeRootSignature");
     if (!fn) return E_NOTIMPL;
     if (!desc) return fn(desc, version, blob, error);
 
@@ -104,7 +155,8 @@ HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* 
 }
 
 HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
-    static auto fn = reinterpret_cast<DeserializerFn>(host("D3D12CreateRootSignatureDeserializer"));
+    const auto fn = resolve_host_once<DeserializerFn>(g_deserializer_once, g_deserializer_proc,
+                                                      "D3D12CreateRootSignatureDeserializer");
     if (!fn) return E_NOTIMPL;
 
     // The host deserializer rejects a blob whose RTS0 flags carry the Xbox high
@@ -186,7 +238,8 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     }
 #endif
 
-    static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
+    const auto create = resolve_host_once<CreateDeviceFn>(g_create_device_once, g_create_device_proc,
+                                                          "D3D12CreateDevice");
     if (!create) return result(method, E_NOTIMPL);
 
     ID3D12Device* real = nullptr;

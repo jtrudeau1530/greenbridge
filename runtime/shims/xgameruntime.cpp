@@ -187,14 +187,37 @@ HRESULT STDMETHODCALLTYPE begin_alloc_not_provided(void*) {
 }
 
 // XThreadSetTimeSensitive / XThreadIsTimeSensitive / XThreadAssertNotTimeSensitive. The flag is per thread, as in
-// the GDK; nothing is enforced offline (a time-sensitive thread may still block).
-thread_local bool t_time_sensitive = false;
+// the GDK; nothing is enforced offline (a time-sensitive thread may still block). Stored in a Win32 TlsAlloc slot
+// rather than thread_local so this shim emits no static module TLS (_tls_index) reads on guest threads.
+INIT_ONCE g_time_sensitive_tls_once = INIT_ONCE_STATIC_INIT;
+DWORD g_time_sensitive_tls_slot = TLS_OUT_OF_INDEXES;
+
+BOOL CALLBACK init_time_sensitive_tls(PINIT_ONCE, PVOID, PVOID*) noexcept {
+    g_time_sensitive_tls_slot = TlsAlloc();
+    return TRUE;
+}
+
+DWORD time_sensitive_tls_slot() noexcept {
+    InitOnceExecuteOnce(&g_time_sensitive_tls_once, &init_time_sensitive_tls, nullptr, nullptr);
+    return g_time_sensitive_tls_slot;
+}
+
 HRESULT STDMETHODCALLTYPE thread_set_time_sensitive(void*, bool value) {
-    t_time_sensitive = value;
+    const DWORD saved_error = GetLastError();
+    const DWORD slot = time_sensitive_tls_slot();
+    if (slot != TLS_OUT_OF_INDEXES)
+        TlsSetValue(slot, value ? reinterpret_cast<void*>(static_cast<uintptr_t>(1)) : nullptr);
+    SetLastError(saved_error);
     return S_OK;
 }
 void STDMETHODCALLTYPE thread_assert_not_time_sensitive(void*) {}
-bool STDMETHODCALLTYPE thread_is_time_sensitive(void*) { return t_time_sensitive; }
+bool STDMETHODCALLTYPE thread_is_time_sensitive(void*) {
+    const DWORD saved_error = GetLastError();
+    const DWORD slot = time_sensitive_tls_slot();
+    const bool value = slot != TLS_OUT_OF_INDEXES && TlsGetValue(slot) != nullptr;
+    SetLastError(saved_error);
+    return value;
+}
 
 #define XM(fn) reinterpret_cast<const void*>(&Method<&fn>::call)
 const void* const kThreadingVtable[] = {

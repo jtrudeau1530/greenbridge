@@ -16,6 +16,7 @@
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -393,6 +394,31 @@ void check_run_time_load() {
                   reinterpret_cast<SetSensitive>(slot(t, 27))(t, false) == S_OK &&
                   !reinterpret_cast<IsSensitive>(slot(t, 30))(t),
               "slots 27 and 30 set and read this thread's time-sensitive flag");
+        // Verify per-thread isolation and LastError preservation across the Win32 TlsAlloc slot.
+        {
+            auto set_ts = reinterpret_cast<SetSensitive>(slot(t, 27));
+            auto is_ts = reinterpret_cast<IsSensitive>(slot(t, 30));
+            SetLastError(ERROR_INVALID_DATA);
+            const HRESULT set_hr = set_ts(t, true);
+            const DWORD err_after_set = GetLastError();
+            const bool main_ts = is_ts(t);
+            const DWORD err_after_get = GetLastError();
+            bool worker_initial = true;
+            bool worker_after_set = false;
+            std::thread worker([&] {
+                worker_initial = is_ts(t);
+                set_ts(t, true);
+                worker_after_set = is_ts(t);
+                set_ts(t, false);
+            });
+            worker.join();
+            const bool main_still_true = is_ts(t);
+            set_ts(t, false);
+            check(set_hr == S_OK && main_ts && main_still_true && !worker_initial && worker_after_set,
+                  "slots 27 and 30 keep the time-sensitive flag isolated per thread");
+            check(err_after_set == ERROR_INVALID_DATA && err_after_get == ERROR_INVALID_DATA,
+                  "slots 27 and 30 preserve Win32 LastError across TlsGetValue/TlsSetValue");
+        }
         // Slot 8 (XAsyncBeginAlloc, private, signature not measured) must not report a begun call whose provider
         // never received XAsyncOp::Begin: either it refuses, or the provider saw Begin exactly once.
         static std::atomic<int> s_begins{0};

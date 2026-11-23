@@ -403,9 +403,22 @@ Target write_target(const std::wstring& path, bool copy_up) {
     const std::filesystem::path package_path = join(r.game, parts);
     // One copy-up at a time: a second thread writing the same file waits here and then finds the first one's copy, so
     // it neither fails on the taken name nor collides with that file's open through a rename of its own.
-    static std::mutex s_copy_mutex;
-    std::unique_lock copy_lock(s_copy_mutex, std::defer_lock);
-    if (copy_up) copy_lock.lock();
+    static SRWLOCK s_copy_lock = SRWLOCK_INIT;
+    struct DeferredSrwLock {
+        SRWLOCK* lock;
+        bool held = false;
+        explicit DeferredSrwLock(SRWLOCK& l) noexcept : lock(&l) {}
+        void acquire() noexcept {
+            AcquireSRWLockExclusive(lock);
+            held = true;
+        }
+        ~DeferredSrwLock() {
+            if (held) ReleaseSRWLockExclusive(lock);
+        }
+        DeferredSrwLock(const DeferredSrwLock&) = delete;
+        DeferredSrwLock& operator=(const DeferredSrwLock&) = delete;
+    } copy_lock(s_copy_lock);
+    if (copy_up) copy_lock.acquire();
     if (copy_up && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
         std::filesystem::is_regular_file(package_path, ec)) {
         // Copied to a private name, then renamed into place: a process killed mid-copy leaves only a hidden leftover,
@@ -1224,16 +1237,23 @@ namespace {
 // reason. GetProcAddress returns null there instead, and the fallback below runs.
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
 std::atomic<bool> g_force_copy_file2_fallback{false};
+INIT_ONCE g_host_copy_file2_once = INIT_ONCE_STATIC_INIT;
+CopyFile2Fn g_host_copy_file2_fn = nullptr;
+
+BOOL CALLBACK resolve_copy_file2_once(PINIT_ONCE, PVOID, PVOID*) noexcept {
+    for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"}) {
+        if (const HMODULE module = GetModuleHandleW(dll))
+            if (const FARPROC p = GetProcAddress(module, "CopyFile2")) {
+                g_host_copy_file2_fn = reinterpret_cast<CopyFile2Fn>(p);
+                return TRUE;
+            }
+    }
+    return TRUE;
+}
 
 CopyFile2Fn host_copy_file2() {
-    static const CopyFile2Fn fn = [] {
-        for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"}) {
-            if (const HMODULE module = GetModuleHandleW(dll))
-                if (const FARPROC p = GetProcAddress(module, "CopyFile2")) return reinterpret_cast<CopyFile2Fn>(p);
-        }
-        return CopyFile2Fn{};
-    }();
-    return g_force_copy_file2_fallback.load(std::memory_order_relaxed) ? CopyFile2Fn{} : fn;
+    InitOnceExecuteOnce(&g_host_copy_file2_once, &resolve_copy_file2_once, nullptr, nullptr);
+    return g_force_copy_file2_fallback.load(std::memory_order_relaxed) ? CopyFile2Fn{} : g_host_copy_file2_fn;
 }
 
 // The fallback's flags, by what CopyFileExW can do with them (values from the SDK's WinBase.h, spelled out because

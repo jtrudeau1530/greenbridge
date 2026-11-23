@@ -480,7 +480,33 @@ const char kInitIdentity = 0, kQuotaIdentity = 0, kDeleteIdentity = 0, kReadIden
            kFolderIdentity = 0;
 
 // The blob count of the last ReadBlobDataAsync result collected on this thread (GetResult runs on the caller's).
-thread_local uint32_t t_read_count = 0;
+// Stored in a Win32 TlsAlloc slot rather than thread_local so this shim emits no static module TLS (_tls_index) reads.
+INIT_ONCE g_read_count_tls_once = INIT_ONCE_STATIC_INIT;
+DWORD g_read_count_tls_slot = TLS_OUT_OF_INDEXES;
+
+BOOL CALLBACK init_read_count_tls(PINIT_ONCE, PVOID, PVOID*) noexcept {
+    g_read_count_tls_slot = TlsAlloc();
+    return TRUE;
+}
+
+uint32_t get_thread_read_count() noexcept {
+    const DWORD saved_error = GetLastError();
+    InitOnceExecuteOnce(&g_read_count_tls_once, &init_read_count_tls, nullptr, nullptr);
+    const uint32_t count =
+        g_read_count_tls_slot != TLS_OUT_OF_INDEXES
+            ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(TlsGetValue(g_read_count_tls_slot)))
+            : 0;
+    SetLastError(saved_error);
+    return count;
+}
+
+void set_thread_read_count(uint32_t count) noexcept {
+    const DWORD saved_error = GetLastError();
+    InitOnceExecuteOnce(&g_read_count_tls_once, &init_read_count_tls, nullptr, nullptr);
+    if (g_read_count_tls_slot != TLS_OUT_OF_INDEXES)
+        TlsSetValue(g_read_count_tls_slot, reinterpret_cast<void*>(static_cast<uintptr_t>(count)));
+    SetLastError(saved_error);
+}
 
 HRESULT do_work(Job& job, size_t& size) {
     size = 0;
@@ -560,7 +586,7 @@ HRESULT CALLBACK job_provider(XAsyncOp op, const XAsyncProviderData* data) {
         if (job->identity == &kReadIdentity) {
             if (data->bufferSize < packed_size(job->blobs)) return E_GS_PROVIDED_BUFFER_TOO_SMALL;
             pack(job->blobs, data->buffer);
-            t_read_count = static_cast<uint32_t>(job->blobs.size());
+            set_thread_read_count(static_cast<uint32_t>(job->blobs.size()));
             return S_OK;
         }
         if (job->identity == &kFolderIdentity) {
@@ -785,11 +811,11 @@ HRESULT STDMETHODCALLTYPE save_read_async(void*, XGameSaveContainerHandle c, con
 HRESULT STDMETHODCALLTYPE save_read_result(void*, XAsyncBlock* async, size_t size, XGameSaveBlob* out, uint32_t* count) {
     if (!out || !count) return E_POINTER;
     *count = 0;
-    t_read_count = 0;
+    set_thread_read_count(0);
     HRESULT hr = XAsyncGetResult(async, &kReadIdentity, size, out, nullptr);
     if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) || hr == E_NOT_SUFFICIENT_BUFFER)
         hr = E_GS_PROVIDED_BUFFER_TOO_SMALL;
-    if (SUCCEEDED(hr)) *count = t_read_count;
+    if (SUCCEEDED(hr)) *count = get_thread_read_count();
     return hr;
 }
 
