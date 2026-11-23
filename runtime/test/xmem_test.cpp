@@ -431,6 +431,21 @@ void test_physical_pages(const PhysicalApi& api) {
     const uint64_t bogus = 0x1fffff0;  // the highest page number, far above the few this test allocates
     check(api.map(window, 1, &bogus) == nullptr, "mapping a page number that was never allocated fails");
 
+    // A window with a cache modifier, as the retail title reserves one (PAGE_READWRITE | PAGE_WRITECOMBINE plus a
+    // graphics bit). The view gets plain read-write: MapViewOfFile3 refuses the modifier on Wine.
+    auto* const combined = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x27,
+        PAGE_READWRITE | PAGE_WRITECOMBINE | PAGE_GRAPHICS_READWRITE));
+    check(combined != nullptr, "XMemVirtualAlloc reserves a write-combined window");
+    if (combined) {
+        check(api.map(combined, 1, &pages[1]) == combined, "a page maps into a write-combined window");
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(combined, &info, sizeof(info));
+        check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE && page_holds(combined, 0x2000u),
+              "the write-combined window's view is plain read-write and shows the page");
+        check(api.map(combined, 1, nullptr) == combined, "unmap the write-combined window");
+    }
+
     check(api.map(second, kPages, nullptr) == second, "unmap the second window");
     check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees the pages");
     check(api.free_pages(1, pages) == FALSE, "freeing a page twice fails");
