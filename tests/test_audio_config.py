@@ -14,6 +14,7 @@ TOOL = os.path.join(ROOT, "tools", "audio_config.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import audio_config as A  # noqa: E402
+import hashdict  # noqa: E402
 
 
 def make_record(config_id, duration_ms, hash_a=0x11111111, hash_b=0x22222222, tail=b"\x00" * 22):
@@ -266,6 +267,17 @@ class TestCli(unittest.TestCase):
             self.assertEqual(doc["summary"]["named"], 1)
             self.assertEqual(doc["records"][0]["name"], name)
             self.assertEqual(doc["records"][0]["stream_id"], hb & A.STREAM_MASK)
+
+    def test_name_pool_is_read_as_latin_1_like_hashdict(self):
+        # A pool string is a name's bytes; hashdict.py and awc_names.py read them as latin-1 and the joaat rule is
+        # the lowercased latin-1 byte hash (docs/audio_config.md), so one name has to hash alike in every tool.
+        # "CAFÉ" is one byte 0xC9 for É, not its UTF-8 pair, and no record can carry a hash this tool would not see.
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = os.path.join(tmp, "names.txt")
+            with open(pool, "wb") as f:
+                f.write(b"CAF\xc9\x00Other\x00")
+            names = A.load_names(pool)
+            self.assertEqual(names.get(hashdict.joaat(A.normalized_name("café"))), "CAFÉ")
 
     def test_invalid_ms_range_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

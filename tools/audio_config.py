@@ -187,7 +187,7 @@ def load_names(path):
     for item in pool.split(b"\x00"):
         if not item:
             continue
-        text = item.decode("utf-8", "replace")
+        text = item.decode("latin-1")    # a name's bytes, as hashdict.py and awc_names.py read them
         key = joaat(normalized_name(text))
         if key not in names:
             names[key] = text
