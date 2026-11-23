@@ -31,6 +31,7 @@
 #include "../src/debug_probe.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
+#include "title_textures.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
@@ -2767,8 +2768,9 @@ public:
         }();
         if (!on) return 0;
         std::call_once(shadow_once_, [this] {
-            const std::uint64_t bytes = (std::uint64_t(desc_.Width) * desc_.Height * (desc_.DepthOrArraySize ? desc_.DepthOrArraySize : 1) * 16 * 4 / 3 + 0xFFFF) & ~0xFFFFull;
+            const std::uint64_t bytes = title_layout().total + 0x10000;
             shadow_ = VirtualAlloc(nullptr, static_cast<std::size_t>(bytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (shadow_) rt::title_textures::register_shadow(reinterpret_cast<std::uint64_t>(shadow_), this);
             static std::atomic<int> n{0};
             if (n.fetch_add(1) < 12)
                 std::fprintf(stderr, "[title] texture %llux%u format %d asked for its address: shadow %p (%llu bytes)\n",
@@ -2776,6 +2778,29 @@ public:
                              static_cast<unsigned long long>(bytes));
         });
         return reinterpret_cast<std::uint64_t>(shadow_);
+    }
+    rt::title_textures::LinearLayout title_layout() const {
+        return rt::title_textures::linear_layout(static_cast<std::uint32_t>(desc_.Dimension), desc_.Width, desc_.Height,
+                                                 desc_.DepthOrArraySize, desc_.MipLevels, static_cast<std::uint32_t>(desc_.Format));
+    }
+    // Unmap of a texture the title wrote through its shadow: every subresource the written range touches goes to the image.
+    void upload_shadow(const D3D12_RANGE* written) {
+        if (!shadow_) return;
+        const auto l = title_layout();
+        const auto* bytes = static_cast<const std::uint8_t*>(shadow_);
+        for (std::uint32_t layer = 0; layer < l.layers; ++layer) {
+            for (std::uint32_t m = 0; m < l.mips.size(); ++m) {
+                const auto& k = l.mips[m];
+                const std::uint64_t at = layer * l.slice_size + k.offset;
+                if (written && written->Begin < written->End && (written->End <= at || written->Begin >= at + k.size)) continue;
+                const HRESULT hr = WriteToSubresource(layer * static_cast<std::uint32_t>(l.mips.size()) + m, nullptr, bytes + at, k.pitch,
+                                                      static_cast<UINT>(k.slice2d));
+                static std::atomic<int> n{0};
+                if (n.fetch_add(1) < 16)
+                    std::fprintf(stderr, "[title] Unmap wrote %ux%u format %d -> 0x%08lx\n", k.width, k.height, int(desc_.Format),
+                                 static_cast<unsigned long>(hr));
+            }
+        }
     }
     std::once_flag shadow_once_;
     void* shadow_ = nullptr;
@@ -2836,7 +2861,9 @@ public:
         if (data) *data = mapped_;
         return S_OK;
     }
-    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE* written) override {
+        if (image_ && boot_lenient()) upload_shadow(written);
+    }
     static bool boot_lenient() {
         static const bool on = [] {
             const char* v = std::getenv("LEONIDA_PLACEHOLDER_PSO");

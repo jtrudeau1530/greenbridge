@@ -35,6 +35,8 @@ std::map<std::uint64_t, std::map<std::uint32_t, Linear>> g_linear;
 std::map<std::uint64_t, Texture> g_textures;
 std::map<std::pair<std::uint64_t, std::uint64_t>, Buffer> g_buffers;
 bool g_any_dirty = false;
+std::map<std::uint64_t, ID3D12Resource*> g_shadows;
+std::map<std::uint64_t, std::map<std::uint32_t, Linear>> g_shadow_dirty;
 
 bool readable(std::uint64_t p, std::uint64_t n) {
     MEMORY_BASIC_INFORMATION mbi{};
@@ -166,6 +168,13 @@ void note_linear_upload(std::uint64_t base, std::uint32_t subresource, const voi
     const std::uint64_t n = depth * slice_pitch;
     if (!data || !n || n > (256ull << 20) || !readable(reinterpret_cast<std::uint64_t>(data), n)) return;
     const std::lock_guard lock(g_mutex);
+    if (g_shadows.count(base)) {
+        Linear& w = g_shadow_dirty[base][subresource];
+        w.bytes.assign(static_cast<const std::uint8_t*>(data), static_cast<const std::uint8_t*>(data) + n);
+        w.row = row_pitch;
+        w.slice = slice_pitch;
+        return;
+    }
     Linear& l = g_linear[base][subresource];
     l.bytes.assign(static_cast<const std::uint8_t*>(data), static_cast<const std::uint8_t*>(data) + n);
     l.row = row_pitch;
@@ -174,6 +183,11 @@ void note_linear_upload(std::uint64_t base, std::uint32_t subresource, const voi
         it->second.dirty = true;
         g_any_dirty = true;
     }
+}
+
+void register_shadow(std::uint64_t base, ID3D12Resource* resource) {
+    const std::lock_guard lock(g_mutex);
+    g_shadows[base] = resource;
 }
 
 bool create_view(ID3D12Device* device, std::uint64_t resource_desc, std::uint64_t view_desc, std::uint64_t destination) {
@@ -227,6 +241,16 @@ void refresh(ID3D12Device* device) {
     for (auto& [key, b] : g_buffers)
         if (b.mapped && readable(key.first, b.size))
             std::memcpy(b.mapped, reinterpret_cast<const void*>(key.first), static_cast<std::size_t>(b.size));
+    for (auto& [base, subs] : g_shadow_dirty) {
+        const auto it = g_shadows.find(base);
+        if (it == g_shadows.end()) continue;
+        for (auto& [sub, w] : subs) {
+            const HRESULT hr = it->second->WriteToSubresource(sub, nullptr, w.bytes.data(), w.row, w.slice);
+            static std::atomic<int> k{0};
+            if (log_first(k, 12)) std::fprintf(stderr, "[title] CopyIntoSubresource %u of a texture -> 0x%08lx\n", sub, static_cast<unsigned long>(hr));
+        }
+    }
+    g_shadow_dirty.clear();
     if (!g_any_dirty) return;
     g_any_dirty = false;
     for (auto& [va, t] : g_textures) {

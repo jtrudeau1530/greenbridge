@@ -199,17 +199,81 @@ void resource_tiling(const std::uint32_t* words, std::uint64_t total, std::uint6
                      standard, packed_mips);
 }
 
+rt::title_textures::LinearLayout layout_of(const std::uint32_t* words) {
+    const Shape s = shape_of(words);
+    return rt::title_textures::linear_layout(s.dimension, s.width, s.height, s.depth, s.mips, s.format);
+}
+// XG_RESOURCE_LAYOUT: {size, alignment, mip levels, planes} then 0x6C8 bytes per plane: {.., size +0x08, slice size +0x10,
+// bytes per element +0x18} and 15 mips of 0x70 bytes from +0x38 (size, offset, slice size, pitch in pixels, pitch in bytes,
+// alignment, padded and real dimensions, samples). The offsets the title reads are measured; the rest follow the public xg.h.
+std::uint64_t resource_layout(const std::uint32_t* words, std::uint64_t out) {
+    if (!out) return static_cast<std::uint32_t>(E_INVALIDARG);
+    const Shape s = shape_of(words);
+    const auto l = layout_of(words);
+    auto* o = reinterpret_cast<std::uint8_t*>(out);
+    const auto u64 = [](std::uint8_t* p, std::uint64_t v) { std::memcpy(p, &v, 8); };
+    const auto u32 = [](std::uint8_t* p, std::uint32_t v) { std::memcpy(p, &v, 4); };
+    std::memset(o, 0, 0x18 + 0x6C8);
+    u64(o, l.total);
+    u64(o + 8, 0x10000);
+    u32(o + 0x10, s.mips);
+    u32(o + 0x14, 1);
+    std::uint8_t* plane = o + 0x18;
+    u64(plane + 0x08, l.total);
+    u64(plane + 0x10, l.slice_size);
+    u32(plane + 0x18, l.mips[0].bytes_per_element);
+    for (std::size_t m = 0; m < l.mips.size() && m < 15; ++m) {
+        const auto& k = l.mips[m];
+        std::uint8_t* p = plane + 0x38 + m * 0x70;
+        u64(p, k.size);
+        u64(p + 8, k.offset);
+        u64(p + 0x10, k.slice2d);
+        u32(p + 0x18, k.pitch / k.bytes_per_element * k.block);
+        u32(p + 0x1C, k.pitch);
+        u32(p + 0x20, 256);
+        u32(p + 0x24, k.pitch / k.bytes_per_element);
+        u32(p + 0x28, k.rows);
+        u32(p + 0x2C, s.dimension == 4 ? k.depth : l.layers);
+        u32(p + 0x30, k.elements_wide);
+        u32(p + 0x34, k.rows);
+        u32(p + 0x38, s.dimension == 4 ? k.depth : l.layers);
+        u32(p + 0x3C, 1);
+    }
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 8)
+        std::fprintf(stderr, "[xg] layout dim %u %llux%ux%u mips %u format %u: %llu bytes, pitch %u\n", s.dimension,
+                     static_cast<unsigned long long>(s.width), s.height, s.depth, s.mips, s.format,
+                     static_cast<unsigned long long>(l.total), l.mips[0].pitch);
+    return 0;
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, std::uint64_t a6) {
-    if constexpr (Slot == 0) {  // QueryInterface: itself for anything
-        if (!a2) return E_POINTER;
-        *reinterpret_cast<void**>(a2) = self;
-        self->refs.fetch_add(1);
-        return S_OK;
-    } else if constexpr (Slot == 1) {
+    // Not COM: AddRef, Release, GetResourceLayout, GetResourceSizeBytes, GetResourceBaseAlignmentBytes,
+    // GetMipLevelOffsetBytes, GetTexelElementOffsetBytes, ..., CopyIntoSubresource (8), CopyFromSubresource (9),
+    // GetResourceTiling (10). Measured at the retail title's call sites: slot 2 fills a layout, slot 1 releases.
+    if constexpr (Slot == 0) {
         return self->refs.fetch_add(1) + 1;
+    } else if constexpr (Slot == 1) {
+        return self->refs.fetch_sub(1) - 1;  // never freed: some are cached by the title
     } else if constexpr (Slot == 2) {
-        return self->refs.fetch_sub(1) - 1;  // never freed: a handful exist at most
+        return resource_layout(self->desc, a1);
+    } else if constexpr (Slot == 3) {
+        return layout_of(self->desc).total;
+    } else if constexpr (Slot == 4) {
+        return 0x10000;
+    } else if constexpr (Slot == 5) {  // (plane, mip)
+        const auto l = layout_of(self->desc);
+        const auto mip = static_cast<std::uint32_t>(a2);
+        return mip < l.mips.size() ? l.mips[mip].offset : 0;
+    } else if constexpr (Slot == 6) {  // (plane, mip, x, y, array slice or z, sample, bit position*)
+        const auto l = layout_of(self->desc);
+        const auto mip = static_cast<std::uint32_t>(a2);
+        if (mip >= l.mips.size()) return 0;
+        const auto& k = l.mips[mip];
+        const std::uint64_t z = static_cast<std::uint32_t>(a5);
+        return k.offset + (self->desc[0] == 4 ? z * k.slice2d : z * l.slice_size) + static_cast<std::uint32_t>(a4) * std::uint64_t(k.pitch) +
+               static_cast<std::uint32_t>(a3) * std::uint64_t(k.bytes_per_element);
     } else {
         if constexpr (Slot == 10) resource_tiling(self->desc, a1, a2, a3, a4, static_cast<std::uint32_t>(a5), a6);
         // CopyIntoSubresource(base, offset, subresource, source, row pitch, slice pitch)
