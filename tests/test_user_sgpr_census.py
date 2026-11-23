@@ -271,6 +271,16 @@ def test_entries_without_stage_or_reads_are_still_counted(tmp_path, capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_load_index_accepts_utf8_bom(tmp_path):
+    index = tmp_path / "index.json"
+    index.write_bytes(b"\xef\xbb\xbf" + json.dumps(INDEX).encode("utf-8"))
+    assert usc.load_index(index) == INDEX
+    report = tmp_path / "report.json"
+    result = run_cli(index, "--json", report)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(report.read_text(encoding="utf-8"))["ps"]["lowest_pointer_sgpr"] == {"s8": 2, "s9": 1}
+
+
 @pytest.mark.parametrize("kind", ["missing-folder", "folder", "under-a-file"])
 def test_cli_unwritable_report_is_one_error_line(tmp_path, kind):
     index = tmp_path / "index.json"
