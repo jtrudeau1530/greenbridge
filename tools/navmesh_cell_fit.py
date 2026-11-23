@@ -184,6 +184,10 @@ def main():
     ap.add_argument("--min-fraction", type=float, default=0.9)
     ap.add_argument("--static-every", type=int, default=0, help="also measure every Nth static tile as a control")
     a = ap.parse_args()
+    if not 0 <= a.min_fraction <= 1:
+        ap.error("--min-fraction must be between 0 and 1")
+    if a.static_every < 0:
+        ap.error("--static-every must be non-negative")
     if a.out and same_report_path(a.out, a.archive):
         ap.error("--out would overwrite the archive")
     if not os.path.exists(a.archive):
