@@ -935,15 +935,28 @@ vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
 *Results on RDNA4 (RX 9070, gfx1201, RADV/Mesa 26.2.6, the Linux DRM launcher, AMD clang 23.1.5, `main` + this
 change).* The hardware gate is per family now: `f16` also runs on gfx1170 and gfx12xx (its kernels assemble clean
 for gfx1150, gfx1170 and gfx1201 — 300 programs per wave size each, 0 rejected; the generator's op_sel lines are
-respelled by `asm.opsel16_spelling` there, as the runner always has), and `mem` still runs on gfx1150 and gfx1170
-(300 programs per wave size, every op kind, 0 rejected) but is refused on gfx12xx with the two rejects AMD clang
-gives there: GFX12 has no `s_waitcnt_vscnt` ("instruction not supported on this GPU") and takes none of the
-`buffer_load/store_b32/b64/b96/b128` forms the generator writes ("operands are not valid for this GPU or mode"), so
-`--family mem --oracle hw` exits 77 naming both (300 of 300 mem kernels per wave size rejected for gfx1201).
+respelled by `asm.opsel16_spelling` there, as the runner always has), and `mem` runs on gfx1150 and gfx1170
+(300 programs per wave size, every op kind, 0 rejected) and, in GFX12 spelling, on gfx12xx (below).
 `f16` numbers: `--programs 500` (1,000 kernels, wave32 and native wave64) 1,000/1,000 match, 0 mismatches,
 0 assembler rejections; the negative control caught every perturbation (100/87/85/42/31/90 of 100 programs for
 hi_zero, opsel_dst_ignored, pk_swapped, min_is_max, pack_swapped, i16_opsel_ignored). gfx1201 is not RDNA2: the
 match supports the model and settles nothing about the console.
+
+*`mem` on RDNA4 (RX 9060 XT, gfx1200, AMD Windows driver 26.11.2, the HIP launcher, AMD clang from rocm-sdk-core
+10.0.0).* The generator's GFX10/GFX11 text is respelled for gfx12 (`gfx12_lines`): a MUBUF soffset is `null`, not the
+literal `0`, which is what "operands are not valid for this GPU or mode" rejected on every `buffer_load/store_b*`;
+`s_waitcnt_vscnt` becomes `s_wait_storecnt`, and the legacy `s_waitcnt vmcnt(0)` / `lgkmcnt(0)`, which still
+assemble but to the old encoding, become `s_wait_loadcnt` / `s_wait_kmcnt`; `buffer_gl0_inv` and `buffer_gl1_inv`
+become `global_inv scope:SCOPE_DEV`. The V#s are unchanged: Mesa's `gfx12-rsrc.json` keeps word 1
+(BASE_ADDRESS_HI, STRIDE) and word 3's DST_SEL, FORMAT (the GFX11 table, 32_FLOAT = 22) and OOB_SELECT bits, adding
+STRIDE_SCALE and compression fields that stay 0. The gfx10, gfx11 and translator text is byte-identical to before.
+Seeds 2, 3 and 4 × 2,000 programs × wave32 and native wave64: **12,000 of 12,000 match, 0 mismatches, 0 assembler
+rejections**, so the four OOB_SELECT bounds rules of "Buffer bounds checking" hold on gfx1200 as measured on RDNA2
+and gfx1150. Negative control (`--programs 300`): unperturbed 0 of 600; caught 312, 33, 211, 39, 19, 353, 129 and 53
+(oob_ignore_mode, mode0_no_stride, idx_unchecked, soffset_unchecked, whole_access, oob_load_keeps, sbuf_no_bound,
+sbuf_stride_ignored). `--hw-sync` at seed 5 (500 programs, both wave sizes): `scalar` (the default) and `full`
+1,000 of 1,000, `sinv` 964, `min` 955, `none` 935, so on gfx1200 a scalar load after vector stores needs both the
+store wait and the scalar-cache invalidation, as on the earlier families.
 
 *Findings.* The OOB_SELECT per-mode rules, the per-dword straddle rule and the `s_buffer_load` bound of design.md hold
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
