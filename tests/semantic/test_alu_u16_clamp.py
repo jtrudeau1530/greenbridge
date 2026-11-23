@@ -1,7 +1,7 @@
 """Semantic interpreter tests for the VOP3 clamp bit on the 16-bit unsigned add/sub (GFX10).
 
-v_add_nc_u16 / v_sub_nc_u16 (and the v_add_u16_e64 / v_sub_u16_e64 / v_subrev_u16_e64 names the translator also
-takes): D.u16 = S0.u16 + S1.u16 / S0.u16 - S1.u16, wrapping at 16 bits. With the clamp bit the result saturates to
+v_add_nc_u16 / v_sub_nc_u16 (and the v_add_u16_e64 / v_sub_u16_e64 names the translator also takes; v_subrev_u16 is
+a GFX9 spelling the translator no longer accepts, #3677): D.u16 = S0.u16 + S1.u16 / S0.u16 - S1.u16, wrapping at 16 bits. With the clamp bit the result saturates to
 [0, 0xFFFF], as for the 32-bit ops in test_alu_add_nc_clamp.py (llvm-mc gfx1030 encodes the clamp bit on
 these ops, and LLVM selects i16 uaddsat/usubsat to them). The VOP3 form keeps the high half
 of the destination. D leaves through exp as two 16-bit halves ORed into 0x40000000.
@@ -40,7 +40,7 @@ def ref(op: str, x: int, y: int, clamp: bool, old: int) -> int:
     return (old & 0xFFFF0000) | (r & 0xFFFF)
 
 
-OPS = ["v_add_nc_u16", "v_sub_nc_u16", "v_add_u16_e64", "v_sub_u16_e64", "v_subrev_u16_e64"]
+OPS = ["v_add_nc_u16", "v_sub_nc_u16", "v_add_u16_e64", "v_sub_u16_e64"]
 VALUES = [0, 1, 2, 0x7FFF, 0x8000, 0xFFFE, 0xFFFF, 0x1234FFFF, 0xABCD0001]
 OLD = 0x5A5A0000
 
@@ -91,7 +91,6 @@ class U16ClampTests(unittest.TestCase):
         self.assertEqual(ref("v_add_nc_u16", 0xFFFF, 1, False, 0), 0)
         self.assertEqual(ref("v_add_nc_u16", 0xFFFF, 1, True, 0), 0xFFFF)
         self.assertEqual(ref("v_sub_nc_u16", 1, 2, True, 0), 0)
-        self.assertEqual(ref("v_subrev_u16_e64", 2, 1, True, 0), 0)
 
     def test_values(self):
         for op in OPS:
