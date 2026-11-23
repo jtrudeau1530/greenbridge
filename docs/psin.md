@@ -426,6 +426,22 @@ field table. `--refs` writes one row per resolved value: file, struct, field, ty
 so keep them in your local work folder; only the counts belong in git, issues or pull requests. On the data above the
 run takes about 50 s. `tests/test_psin_names.py` builds containers from invented names.
 
+#### Vehicle names in the navmesh PSIN map
+
+The version 256 PSIN at `navmeshes.rpf` offset `0x1749fe000` has a root map of type `0x73`. Its pointer
+resolves to an anonymous `0x100` block of 28,672 bytes. The schema gives a `0x4a` key at slot offset
+`+0x00` and a 48-byte struct value at `+0x08`, for a stride of 56 bytes. The map declares 512 slots and
+209 entries. Counting distinct nonzero keys gives 209.
+
+On the 1.0.2.1 package, compare the lower-case joaat hashes of `ModelName` and the nonempty
+`ModDefs/Item` names in the 32 `CVehiclePoints` documents in `common.rpf` with every occupied slot.
+Of 31 distinct model names, 25 match the map key. Of 55 distinct part names, 20 match `0x4a` members
+in the value: 6 at slot `+0x18`, 2 at `+0x1c`, 4 at `+0x28`, and 8 at `+0x34`. Appending `#zq`
+to the model names gives zero key matches. All the original matches lie in the instance block before
+the first section. The container's 493 `LSNS` records have zero matches for either set of hashes.
+The map identifies vehicles and parts in the container. Which entry refers to each of the 161
+local-space navmeshes remains open.
+
 ## What it does not give
 
 - No plaintext script code, function names or string table. `LSNS` has a decoded block layout, but its
