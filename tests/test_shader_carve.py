@@ -10,6 +10,7 @@ Validates tools/shader_carve.py without touching game files or proprietary asset
 - End-to-end archive carving, duplicate variant naming, filename character sanitization, and index.json output
 """
 import contextlib
+import hashlib
 import io
 import json
 import mmap
@@ -570,6 +571,74 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertEqual(res.returncode, 2, res.stderr)
         self.assertIn("required", res.stderr)
         self.assertNotIn("Traceback", res.stderr)
+
+    def test_carve_skips_deflate_payload_ending_in_printable_ascii(self):
+        # Find a deterministic compressed DXBC whose raw deflate stream ends with a printable ASCII byte (0x21..0x7E).
+        # Back-to-back with entry2, a scan that does not skip the payload attaches those bytes to entry2's name.
+        comp1 = dxbc1 = None
+        for seed in range(64):
+            payload = b"".join(hashlib.sha256(f"{seed}-{i}".encode()).digest() for i in range(12))
+            cand = make_dxbc([(b"PRIV", payload)])
+            c = compress_raw_deflate(cand)
+            if 0x21 <= c[-1] <= 0x7E:
+                dxbc1, comp1 = cand, c
+                break
+        self.assertIsNotNone(comp1, "expected a raw deflate stream ending in printable ASCII")
+        dxbc2 = make_dxbc([(b"PRIV", b"SECOND_SHADER_PAYLOAD_BYTES_123456")])
+        entry1 = make_rpf_entry("first_shader", 1, dxbc1, entry_id=1, compressed_override=comp1)
+        entry2 = make_rpf_entry("second_shader", 1, dxbc2, entry_id=2)
+        entry3 = make_rpf_entry("second_shader", 1, dxbc2, entry_id=3)
+        with open(self.archive, "wb") as f:
+            f.write(entry1 + entry2 + entry3)
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("3 shaders carved, 0 candidates rejected", res.stdout)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        self.assertEqual([(r["name"], r["file"], r["offset"]) for r in index], [
+            ("first_shader", "first_shader.dxbc", 0),
+            ("second_shader", "second_shader.dxbc", len(entry1)),
+            ("second_shader", "second_shader~1.dxbc", len(entry1) + len(entry2)),
+        ])
+
+    def test_carve_ignores_entry_pattern_inside_deflate_payload(self):
+        # RFC 1951 raw deflate stored block (BFINAL=1, BTYPE=00) embeds raw bytes verbatim, including an
+        # ENTRY-matching decoy whose 17-byte header crosses the boundary into the real next entry's name.
+        dxbc2 = make_dxbc([(b"PRIV", b"FOLLOWING_SHADER_PAYLOAD_0123456789")])
+        decoy_trailer = b"decoy\x00\x01" + struct.pack("<IIII", 20, 7, 20, 40)
+        dxbc1 = make_dxbc([(b"PRIV", b"P" * 32 + decoy_trailer + b"TAIL")])
+        stored_block = b"\x01" + struct.pack("<HH", len(dxbc1), (~len(dxbc1)) & 0xFFFF) + dxbc1
+        entry1 = make_rpf_entry("outer_shader", 1, dxbc1, entry_id=1, compressed_override=stored_block)
+        entry2 = make_rpf_entry("next_shader", 1, dxbc2, entry_id=2)
+        with open(self.archive, "wb") as f:
+            f.write(entry1 + entry2)
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("2 shaders carved, 0 candidates rejected", res.stdout)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        self.assertEqual([(r["name"], r["file"], r["offset"]) for r in index], [
+            ("outer_shader", "outer_shader.dxbc", 0),
+            ("next_shader", "next_shader.dxbc", len(entry1)),
+        ])
+
+    def test_rejected_candidate_trailer_does_not_swallow_following_entry(self):
+        # A bogus match whose 17-byte trailer overlaps the start of a real entry's name must not skip that entry.
+        dxbc = make_dxbc([(b"PRIV", b"REAL_SHADER_AFTER_BOGUS_MATCH_123456")])
+        real_entry = make_rpf_entry("real_shader", 1, dxbc, entry_id=1)
+        # Craft "bogus\x00" + kind + stored + id + stored, so the match's 4-byte size field is "real", the start of
+        # the real entry's name. The size bound rejects it; the real entry must still be carved under its own name.
+        bogus = b"bogus\x00\x00" + struct.pack("<III", 32, 0, 32)
+        with open(self.archive, "wb") as f:
+            f.write(bogus + real_entry)
+
+        res = self.run_carve(self.archive, self.out)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        self.assertEqual([(r["name"], r["offset"]) for r in index], [("real_shader", len(bogus))])
 
 
 if __name__ == "__main__":

@@ -213,6 +213,11 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
+        if (rt::d3d12::device_push_constants_need_fallback(inner)) {
+            std::printf("d3d12_fspx_compute_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
+                        rt::d3d12::device_max_push_constants_size(inner));
+            return 77;
+        }
 
         // Root signature: [0] two constants (s0, s1), [1] a root UAV (s2:s3), [2] a one-CBV table (s4:s5).
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};

@@ -21,6 +21,7 @@
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/conservative_raster.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/vulkan_present.h"
@@ -47,6 +48,7 @@
 #include <set>
 #include <string>
 #include <type_traits>
+#include <cwchar>
 #include <vector>
 
 namespace rt::d3d12 {
@@ -429,6 +431,7 @@ struct DeviceState {
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
     float max_sampler_lod_bias = 0;
+    bool conservative_raster_tier1 = false;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
     VkResolveModeFlags stencil_resolve_modes = 0;
@@ -456,6 +459,14 @@ struct DeviceState {
         std::uint32_t memory_type = 0;
         std::mutex mutex;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+
+        // The high-water mark (D3D-55, open question 5): the arena's size is a guess until a run measures it.
+        // `peak_end` is the highest end offset ever handed out, the size the arena must have; `peak_in_use` is the
+        // most bytes live at once, which differs from it by fragmentation.
+        bool log = false;  // LEONIDA_ARENA_LOG=1: one line per VA handed out
+        VkDeviceSize in_use = 0, peak_in_use = 0, peak_end = 0;
+        VkDeviceSize use_in_use[4] = {}, use_peak[4] = {};
+        std::uint64_t allocations = 0, failures = 0;
     } arena;
 
     std::uint32_t sparse_buffer_memory_types = 0;
@@ -475,9 +486,13 @@ struct DeviceState {
         return result;
     }
 
+    // What an arena range holds, for the high-water report (D3D-55).
+    enum ArenaUse { arena_buffer, arena_descriptor_heap, arena_shader, arena_heap };
+    static constexpr const char* kArenaUseNames[4] = {"buffer", "descriptor heap", "shader", "heap"};
+
     // A zero-size range is refused: it would share its offset with the next range, and its release would collide
     // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
-    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out) {
+    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
         if (!bytes || bytes > arena.size) return false;
         std::lock_guard lock(arena.mutex);
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
@@ -489,14 +504,51 @@ struct DeviceState {
             if (start > block) arena.free[block] = start - block;
             if (start + bytes < end) arena.free[start + bytes] = end - (start + bytes);
             out = start;
+            ++arena.allocations;
+            arena.in_use += bytes;
+            arena.peak_in_use = std::max(arena.peak_in_use, arena.in_use);
+            arena.peak_end = std::max(arena.peak_end, start + bytes);
+            arena.use_in_use[use] += bytes;
+            arena.use_peak[use] = std::max(arena.use_peak[use], arena.use_in_use[use]);
+            if (arena.log)
+                std::fprintf(stderr, "[rt] d3d12: arena %s VA 0x%llx + 0x%llx\n", kArenaUseNames[use],
+                             (unsigned long long)start, (unsigned long long)bytes);
             return true;
         }
+        ++arena.failures;
+        if (arena.log)
+            std::fprintf(stderr, "[rt] d3d12: arena %s: no room for 0x%llx bytes\n", kArenaUseNames[use],
+                         (unsigned long long)bytes);
         return false;
     }
 
-    void arena_release(VkDeviceSize offset, VkDeviceSize bytes) {
+    // A console VA outside the arena (an upload or readback buffer: its device address minus heap_base).
+    void log_va(const char* what, std::uint64_t va, VkDeviceSize bytes) {
+        if (arena.log)
+            std::fprintf(stderr, "[rt] d3d12: %s VA 0x%llx + 0x%llx (outside the arena)\n", what,
+                         (unsigned long long)va, (unsigned long long)bytes);
+    }
+
+    // Printed once at device release, so a run reports the size the arena needs.
+    void report_arena() {
+        std::lock_guard lock(arena.mutex);
+        if (!arena.size) return;
+        const double mib = 1.0 / (1 << 20);
+        std::fprintf(stderr,
+                     "[rt] d3d12: GPU address arena: peak end %.1f of %.1f MiB (%.1f%%), peak live %.1f MiB "
+                     "(buffers %.1f, descriptor heaps %.1f, shaders %.1f, heaps %.1f), %llu allocations, %llu refused\n",
+                     arena.peak_end * mib, arena.size * mib, 100.0 * double(arena.peak_end) / double(arena.size),
+                     arena.peak_in_use * mib, arena.use_peak[arena_buffer] * mib,
+                     arena.use_peak[arena_descriptor_heap] * mib, arena.use_peak[arena_shader] * mib,
+                     arena.use_peak[arena_heap] * mib,
+                     (unsigned long long)arena.allocations, (unsigned long long)arena.failures);
+    }
+
+    void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         if (!bytes) return;
         std::lock_guard lock(arena.mutex);
+        arena.in_use -= bytes;
+        arena.use_in_use[use] -= bytes;
         auto it = arena.free.emplace(offset, bytes).first;
         if (auto next = std::next(it); next != arena.free.end() && it->first + it->second == next->first) {
             it->second += next->second;
@@ -1340,7 +1392,7 @@ public:
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
         if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
-            if (!device.arena_allocate(bytes, 256, arena_offset_)) {
+            if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
                          int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
                 return;
@@ -1355,7 +1407,8 @@ public:
     }
 
     ~DescriptorHeap() override {
-        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize);
+        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
+                                            DeviceState::arena_descriptor_heap);
     }
 
     bool ok() const { return cpu_ != nullptr; }
@@ -1408,7 +1461,7 @@ public:
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
-        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width);
+        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
@@ -1423,6 +1476,14 @@ public:
     bool allows_view_format(VkFormat format) const {
         return view_formats_.empty() || format == format_ ||
                std::find(view_formats_.begin(), view_formats_.end(), format) != view_formats_.end();
+    }
+    // The castable-format list in DXGI formats, which the Vulkan list can't tell apart where two families share a
+    // VkFormat: B8G8R8X8 and B8G8R8A8 are both BGRA8 images.
+    void keep_castable_formats(UINT32 count, const DXGI_FORMAT* formats) {
+        if (count && formats) castable_formats_.assign(formats, formats + count);
+    }
+    bool lists_castable_format(DXGI_FORMAT format) const {
+        return std::find(castable_formats_.begin(), castable_formats_.end(), format) != castable_formats_.end();
     }
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
     VkImageAspectFlags aspects() const { return aspects_; }
@@ -1442,7 +1503,8 @@ public:
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
         if (!host && device_.arena.mapped) {
-            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_)) {
+            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
+                                        DeviceState::arena_buffer)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
                          int(desc_.Width / 1024));
                 return E_OUTOFMEMORY;
@@ -1507,6 +1569,8 @@ public:
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = buffer_;
             va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+            device_.log_va(heap_.Type == D3D12_HEAP_TYPE_READBACK ? "readback buffer" : "upload buffer", va_,
+                           desc_.Width);
         }
         if (host) {
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
@@ -2003,6 +2067,7 @@ private:
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
+    std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     bool r9g9b9e5_as_r32_uint_ = false;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
@@ -2176,12 +2241,13 @@ public:
     Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
         VkDeviceSize offset = 0;
         if (device_.arena.mapped &&
-            device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset)) {
+            device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset,
+                                   DeviceState::arena_heap)) {
             allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
                 new leonida::TileHeapAllocation{device_.arena.memory, offset, desc_.SizeInBytes,
                                                 device_.arena.memory_type},
                 [&device](const leonida::TileHeapAllocation* allocation) {
-                    device.arena_release(allocation->offset, allocation->size);
+                    device.arena_release(allocation->offset, allocation->size, DeviceState::arena_heap);
                     delete allocation;
                 });
         }
@@ -2427,7 +2493,7 @@ public:
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
-        if (code_bytes_) device_.arena_release(code_base_, code_bytes_);
+        if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
     }
 
     // Pipeline layouts declare the whole 144-byte block as one push-constant range. A device whose
@@ -2619,6 +2685,8 @@ public:
         // Input layout -> vertex input, by semantic.
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
+        std::uint32_t divisor_slots = 0;
         UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
         for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
             const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
@@ -2644,8 +2712,17 @@ public:
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
             // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
             if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
-            if (instance && element.InstanceDataStepRate > 1)
-                log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
+            if (instance && element.InstanceDataStepRate > 1) {
+                if (!device_.info.vertex_attribute_divisor) {
+                    log_once("instance step rates above 1 need vertexAttributeInstanceRateDivisor; rate",
+                             int(element.InstanceDataStepRate));
+                    return E_NOTIMPL;
+                }
+                if (!(divisor_slots & (1u << element.InputSlot))) {
+                    divisor_slots |= 1u << element.InputSlot;
+                    divisors.push_back({element.InputSlot, element.InstanceDataStepRate});
+                }
+            }
             if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
                 graphics_.vertex_slots |= 1u << element.InputSlot;
                 bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
@@ -2680,6 +2757,18 @@ public:
         graphics_.strip_cut = desc.IBStripCutValue;
 
         const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
+        if (r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF &&
+            r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) return E_INVALIDARG;
+        if (r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) {
+            if (!device_.conservative_raster_tier1) {
+                log_once("conservative rasterization needs enabled VK_EXT_conservative_rasterization and Tier 1 precision", 1);
+                return E_INVALIDARG;
+            }
+            if (r.FillMode != D3D12_FILL_MODE_SOLID ||
+                desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
+            // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
+            if (r.ForcedSampleCount) return E_NOTIMPL;
+        }
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         raster.polygonMode = r.FillMode == D3D12_FILL_MODE_WIREFRAME ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
         raster.cullMode = r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
@@ -2869,8 +2958,10 @@ public:
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
+        recipe_.divisors = std::move(divisors);
         recipe_.assembly = assembly;
         recipe_.raster = raster;
+        recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
         recipe_.multisample = multisample;
         graphics_.samples = samples;
         recipe_.sample_mask = sample_mask;
@@ -2883,7 +2974,7 @@ public:
 
         if (code_stage) {
             VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset)) return E_OUTOFMEMORY;
+            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
             std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
             code_bytes_ = code_stage->fssm.size();
             code_base_ = offset;
@@ -2995,7 +3086,7 @@ public:
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
         const std::vector<std::uint8_t>& code = program.bytes;
         VkDeviceSize offset = 0;
-        if (!device_.arena_allocate(code.size(), 256, offset)) return E_OUTOFMEMORY;
+        if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
         std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
         code_bytes_ = code.size();
         code_base_ = offset;
@@ -3013,8 +3104,10 @@ private:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
+        bool conservative = false;
         VkPipelineMultisampleStateCreateInfo multisample{};
         VkSampleMask sample_mask = ~0u;
         VkPipelineDepthStencilStateCreateInfo depth{};
@@ -3046,6 +3139,13 @@ private:
             rendering.stencilAttachmentFormat = graphics_.depth_format;
 
         VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT};
+        if (!r.divisors.empty()) {
+            divisor_state.vertexBindingDivisorCount = std::uint32_t(r.divisors.size());
+            divisor_state.pVertexBindingDivisors = r.divisors.data();
+            vertex_input.pNext = &divisor_state;
+        }
         vertex_input.vertexBindingDescriptionCount = std::uint32_t(r.bindings.size());
         vertex_input.pVertexBindingDescriptions = r.bindings.data();
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
@@ -3054,6 +3154,15 @@ private:
         viewport.viewportCount = 1;
         viewport.scissorCount = 1;
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
+        VkPipelineRasterizationStateCreateInfo raster = r.raster;
+        VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
+        if (r.conservative) {
+            conservative.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
+            conservative.extraPrimitiveOverestimationSize = 0.0f;
+            conservative.pNext = raster.pNext;
+            raster.pNext = &conservative;
+        }
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
         blend.attachmentCount = std::uint32_t(r.blends.size());
@@ -3068,7 +3177,7 @@ private:
         info.pVertexInputState = &vertex_input;
         info.pInputAssemblyState = &r.assembly;
         info.pViewportState = &viewport;
-        info.pRasterizationState = &r.raster;
+        info.pRasterizationState = &raster;
         info.pMultisampleState = &multisample;
         info.pDepthStencilState = &r.depth;
         info.pColorBlendState = &blend;
@@ -3228,54 +3337,82 @@ private:
 };
 
 // Process-wide backing for ID3D12Device9::CreateShaderCacheSession and ID3D12ShaderCacheSession (D3D-34).
-// Sessions in the same process sharing (Identifier, Mode, Version, disk_path) share their entries; MODE_DISK
-// persists entries to a versioned binary file so data survives device/process teardown; SetDeleteOnDestroy
-// removes the backing store (and disk file, if any) once the last live session referencing it is released.
+// Sessions in the same process sharing (Identifier, Mode, disk_path) share their entries; a live session with a
+// different Version returns DXGI_ERROR_ALREADY_EXISTS, while reopening after all sessions close clears and recreates
+// the cache. MODE_MEMORY discards its entries when the final session is released; MODE_DISK persists entries to a
+// versioned binary file via unique per-writer temp files and atomic replacement.
 struct ShaderCacheKey {
     GUID identifier{};
     D3D12_SHADER_CACHE_MODE mode = D3D12_SHADER_CACHE_MODE_MEMORY;
-    UINT64 version = 0;
     std::wstring disk_path;  // empty for MODE_MEMORY
 
     bool operator<(const ShaderCacheKey& other) const {
         const int cmp = std::memcmp(&identifier, &other.identifier, sizeof(GUID));
         if (cmp != 0) return cmp < 0;
         if (mode != other.mode) return mode < other.mode;
-        if (version != other.version) return version < other.version;
         return disk_path < other.disk_path;
     }
 };
 
 struct ShaderCacheStore {
     static constexpr std::uint32_t kDiskMagic = 0x3143534Cu;  // "LSC1"
-    static constexpr std::uint32_t kDiskVersion = 1;
+    static constexpr std::uint32_t kDiskFormatVersion = 2;
+    static constexpr UINT kDefaultMaxMemoryBytes = 1024u;
+    static constexpr UINT kDefaultMaxMemoryEntries = 128u;
+    static constexpr UINT kDefaultMaxValueFileBytes = 128u * 1024u * 1024u;
+
+    struct DiskHeader {
+        std::uint32_t magic;
+        std::uint32_t format_version;
+        std::uint32_t entry_count;
+        std::uint32_t reserved;
+        std::uint64_t cache_version;
+    };
 
     std::mutex mutex;
     std::map<std::string, std::vector<std::uint8_t>> entries;
     std::size_t total_bytes = 0;
     std::uint32_t live_sessions = 0;
+    UINT64 version = 0;
     bool delete_on_destroy = false;
     std::filesystem::path disk_path;
 
-    void load_from_disk_locked() {
+    void load_from_disk_locked(UINT64 expected_version, UINT max_file_bytes) {
         if (disk_path.empty()) return;
+        std::error_code ec;
+        const std::uintmax_t file_size = std::filesystem::file_size(disk_path, ec);
+        if (ec || file_size < sizeof(DiskHeader)) return;
         std::ifstream in(disk_path, std::ios::binary);
         if (!in) return;
-        std::uint32_t header[3]{};
-        if (!in.read(reinterpret_cast<char*>(header), sizeof(header))) return;
-        if (header[0] != kDiskMagic || header[1] != kDiskVersion) return;
-        const std::uint32_t count = header[2];
+        DiskHeader header{};
+        if (!in.read(reinterpret_cast<char*>(&header), sizeof(header))) return;
+        if (header.magic != kDiskMagic || header.format_version != kDiskFormatVersion || header.reserved != 0) return;
+        if (header.cache_version != expected_version) {
+            in.close();
+            std::filesystem::remove(disk_path, ec);
+            return;
+        }
+        std::uint64_t remaining = static_cast<std::uint64_t>(file_size) - sizeof(DiskHeader);
+        if (header.entry_count > remaining / 8u) return;
         std::map<std::string, std::vector<std::uint8_t>> loaded;
         std::size_t bytes = 0;
-        for (std::uint32_t i = 0; i < count; ++i) {
+        for (std::uint32_t i = 0; i < header.entry_count; ++i) {
+            if (remaining < 8u) return;
             std::uint32_t lens[2]{};
             if (!in.read(reinterpret_cast<char*>(lens), sizeof(lens))) return;
-            if (!lens[0] || !lens[1]) return;
-            std::string k(lens[0], '\0');
-            std::vector<std::uint8_t> v(lens[1]);
-            if (!in.read(k.data(), lens[0]) || !in.read(reinterpret_cast<char*>(v.data()), lens[1])) return;
+            remaining -= 8u;
+            const std::uint64_t key_len = lens[0];
+            const std::uint64_t val_len = lens[1];
+            if (!key_len || !val_len || key_len > remaining || val_len > remaining - key_len) return;
+            if (val_len > max_file_bytes || bytes > max_file_bytes - val_len) return;
+            std::string k(static_cast<std::size_t>(key_len), '\0');
+            std::vector<std::uint8_t> v(static_cast<std::size_t>(val_len));
+            if (!in.read(k.data(), static_cast<std::streamsize>(key_len)) ||
+                !in.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(val_len)))
+                return;
+            remaining -= key_len + val_len;
             loaded.emplace(std::move(k), std::move(v));
-            bytes += lens[1];
+            bytes += static_cast<std::size_t>(val_len);
         }
         entries = std::move(loaded);
         total_bytes = bytes;
@@ -3285,13 +3422,20 @@ struct ShaderCacheStore {
         if (disk_path.empty()) return true;
         std::error_code ec;
         std::filesystem::create_directories(disk_path.parent_path(), ec);
+        static std::atomic<std::uint64_t> write_seq{0};
+        const std::uint64_t seq = write_seq.fetch_add(1, std::memory_order_relaxed);
+        wchar_t suffix[64]{};
+        std::swprintf(suffix, std::size(suffix), L".%lu.%lu.%llu.tmp",
+                      static_cast<unsigned long>(GetCurrentProcessId()),
+                      static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(seq));
         std::filesystem::path tmp = disk_path;
-        tmp += L".tmp";
+        tmp += suffix;
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
             if (!out) return false;
-            const std::uint32_t header[3] = {kDiskMagic, kDiskVersion, static_cast<std::uint32_t>(entries.size())};
-            out.write(reinterpret_cast<const char*>(header), sizeof(header));
+            const DiskHeader header{kDiskMagic, kDiskFormatVersion, static_cast<std::uint32_t>(entries.size()), 0,
+                                    version};
+            out.write(reinterpret_cast<const char*>(&header), sizeof(header));
             for (const auto& [k, v] : entries) {
                 const std::uint32_t lens[2] = {static_cast<std::uint32_t>(k.size()),
                                                static_cast<std::uint32_t>(v.size())};
@@ -3319,24 +3463,41 @@ struct ShaderCacheStore {
     }
 };
 
+std::filesystem::path default_shader_cache_dir() {
+    std::error_code ec;
+    const auto tmp = std::filesystem::temp_directory_path(ec);
+    if (ec || tmp.empty()) return {};
+    return tmp / L"leonida_shader_cache";
+}
+
 struct ShaderCacheRegistry {
     std::mutex mutex;
     std::map<ShaderCacheKey, std::shared_ptr<ShaderCacheStore>> stores;
     std::atomic<bool> disabled{false};
 
-    std::shared_ptr<ShaderCacheStore> acquire(const ShaderCacheKey& key) {
+    HRESULT acquire(const ShaderCacheKey& key, UINT64 version, UINT max_file_bytes,
+                    std::shared_ptr<ShaderCacheStore>& out) {
+        if (disabled.load(std::memory_order_relaxed)) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
         std::lock_guard lock(mutex);
-        auto& slot = stores[key];
-        if (!slot) {
-            slot = std::make_shared<ShaderCacheStore>();
-            if (key.mode == D3D12_SHADER_CACHE_MODE_DISK && !key.disk_path.empty()) {
-                slot->disk_path = key.disk_path;
-                std::lock_guard store_lock(slot->mutex);
-                slot->load_from_disk_locked();
-            }
+        if (disabled.load(std::memory_order_relaxed)) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        auto it = stores.find(key);
+        if (it != stores.end()) {
+            if (it->second->version != version) return DXGI_ERROR_ALREADY_EXISTS;
+            ++it->second->live_sessions;
+            out = it->second;
+            return S_OK;
         }
-        ++slot->live_sessions;
-        return slot;
+        auto store = std::make_shared<ShaderCacheStore>();
+        store->version = version;
+        if (key.mode == D3D12_SHADER_CACHE_MODE_DISK && !key.disk_path.empty()) {
+            store->disk_path = key.disk_path;
+            std::lock_guard store_lock(store->mutex);
+            store->load_from_disk_locked(version, max_file_bytes);
+        }
+        store->live_sessions = 1;
+        stores.emplace(key, store);
+        out = std::move(store);
+        return S_OK;
     }
 
     void mark_delete_on_destroy(const std::shared_ptr<ShaderCacheStore>& store) {
@@ -3349,18 +3510,13 @@ struct ShaderCacheRegistry {
         if (!store) return;
         if (store->live_sessions > 0) --store->live_sessions;
         if (store->live_sessions == 0) {
-            if (store->delete_on_destroy) {
-                if (!store->disk_path.empty()) {
-                    std::error_code ec;
-                    std::filesystem::remove(store->disk_path, ec);
-                }
-                const auto it = stores.find(key);
-                if (it != stores.end() && it->second == store) stores.erase(it);
-            } else if (key.mode == D3D12_SHADER_CACHE_MODE_DISK) {
-                // Evict idle disk stores from memory so reopening reloads from disk.
-                const auto it = stores.find(key);
-                if (it != stores.end() && it->second == store) stores.erase(it);
+            if (store->delete_on_destroy && !store->disk_path.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(store->disk_path, ec);
             }
+            // Discard both idle MEMORY stores (per D3D12 spec) and idle DISK stores (so reopening reloads from disk).
+            const auto it = stores.find(key);
+            if (it != stores.end() && it->second == store) stores.erase(it);
         }
     }
 
@@ -3372,6 +3528,19 @@ struct ShaderCacheRegistry {
             for (const auto& [k, v] : stores) snapshot.push_back(v);
         }
         for (const auto& store : snapshot) store->clear();
+        // Also remove inactive and prior-run disk caches stored in the default cache directory (non-USE_WORKING_DIR).
+        const auto default_dir = default_shader_cache_dir();
+        if (!default_dir.empty()) {
+            std::error_code ec;
+            if (std::filesystem::exists(default_dir, ec)) {
+                for (const auto& entry : std::filesystem::directory_iterator(default_dir, ec)) {
+                    if (ec) break;
+                    if (!entry.is_regular_file(ec)) continue;
+                    const auto fname = entry.path().filename().wstring();
+                    if (fname.rfind(L"leonida_sc_", 0) == 0) std::filesystem::remove(entry.path(), ec);
+                }
+            }
+        }
     }
 };
 
@@ -3385,22 +3554,20 @@ std::filesystem::path shader_cache_disk_path(const D3D12_SHADER_CACHE_SESSION_DE
     std::error_code ec;
     std::filesystem::path dir = (desc.Flags & D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR)
                                     ? std::filesystem::current_path(ec)
-                                    : (std::filesystem::temp_directory_path(ec) / L"leonida_shader_cache");
+                                    : default_shader_cache_dir();
     if (ec || dir.empty()) return {};
     wchar_t name[160]{};
     const auto& g = desc.Identifier;
     if (desc.Flags & D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED) {
         std::swprintf(name, std::size(name),
-                      L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x_v%llu_d%04x_%04x_%08x.bin",
+                      L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x_d%04x_%04x_%08x.bin",
                       static_cast<unsigned long>(g.Data1), g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2],
-                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7],
-                      static_cast<unsigned long long>(desc.Version), gpu_props.vendorID, gpu_props.deviceID,
-                      gpu_props.driverVersion);
+                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7], gpu_props.vendorID,
+                      gpu_props.deviceID, gpu_props.driverVersion);
     } else {
-        std::swprintf(name, std::size(name), L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x_v%llu.bin",
+        std::swprintf(name, std::size(name), L"leonida_sc_%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x.bin",
                       static_cast<unsigned long>(g.Data1), g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2],
-                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7],
-                      static_cast<unsigned long long>(desc.Version));
+                      g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
     }
     return dir / name;
 }
@@ -3422,7 +3589,8 @@ public:
 
     HRESULT STDMETHODCALLTYPE FindValue(const void* key, UINT key_size, void* value, UINT* value_size) override {
         if (!key || !key_size || !value_size) return E_INVALIDARG;
-        if (registry_ && registry_->disabled.load(std::memory_order_relaxed)) return DXGI_ERROR_NOT_FOUND;
+        if (registry_ && registry_->disabled.load(std::memory_order_relaxed))
+            return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
         std::lock_guard lock(store_->mutex);
         const std::string k(static_cast<const char*>(key), key_size);
         const auto it = store_->entries.find(k);
@@ -3443,20 +3611,25 @@ public:
 
     HRESULT STDMETHODCALLTYPE StoreValue(const void* key, UINT key_size, const void* value, UINT value_size) override {
         if (!key || !key_size || !value || !value_size) return E_INVALIDARG;
-        if (registry_ && registry_->disabled.load(std::memory_order_relaxed)) return S_OK;
+        if (registry_ && registry_->disabled.load(std::memory_order_relaxed))
+            return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
         std::lock_guard lock(store_->mutex);
         const std::string k(static_cast<const char*>(key), key_size);
         if (store_->entries.find(k) != store_->entries.end()) return DXGI_ERROR_ALREADY_EXISTS;
-        if (desc_.MaximumInMemoryCacheEntries && store_->entries.size() >= desc_.MaximumInMemoryCacheEntries)
-            return E_OUTOFMEMORY;
-        if (desc_.MaximumInMemoryCacheSizeBytes &&
-            (value_size > desc_.MaximumInMemoryCacheSizeBytes ||
-             store_->total_bytes > desc_.MaximumInMemoryCacheSizeBytes - value_size))
-            return E_OUTOFMEMORY;
-        if (desc_.Mode == D3D12_SHADER_CACHE_MODE_DISK && desc_.MaximumValueFileSizeBytes &&
-            (value_size > desc_.MaximumValueFileSizeBytes ||
-             store_->total_bytes > desc_.MaximumValueFileSizeBytes - value_size))
-            return E_OUTOFMEMORY;
+        if (desc_.Mode == D3D12_SHADER_CACHE_MODE_MEMORY) {
+            const UINT max_entries = desc_.MaximumInMemoryCacheEntries ? desc_.MaximumInMemoryCacheEntries
+                                                                       : ShaderCacheStore::kDefaultMaxMemoryEntries;
+            const UINT max_bytes = desc_.MaximumInMemoryCacheSizeBytes ? desc_.MaximumInMemoryCacheSizeBytes
+                                                                       : ShaderCacheStore::kDefaultMaxMemoryBytes;
+            if (store_->entries.size() >= max_entries || value_size > max_bytes ||
+                store_->total_bytes > max_bytes - value_size)
+                return DXGI_ERROR_CACHE_FULL;
+        } else {
+            const UINT max_file_bytes = desc_.MaximumValueFileSizeBytes ? desc_.MaximumValueFileSizeBytes
+                                                                        : ShaderCacheStore::kDefaultMaxValueFileBytes;
+            if (value_size > max_file_bytes || store_->total_bytes > max_file_bytes - value_size)
+                return DXGI_ERROR_CACHE_FULL;
+        }
         const auto* bytes = static_cast<const std::uint8_t*>(value);
         auto [it, inserted] = store_->entries.emplace(k, std::vector<std::uint8_t>(bytes, bytes + value_size));
         store_->total_bytes += value_size;
@@ -3579,7 +3752,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             log_once("incompatible typed A8 view format:", int(view.format));
             return false;
         }
-        if (alpha_unused(view.format) != alpha_unused(desc.Format)) {
+        // Only a castable-format list that names the view's format lets a view cross the two families, as WARP and
+        // AMD's D3D12 driver accept (relaxed casting).
+        if (alpha_unused(view.format) != alpha_unused(desc.Format) && !resource.lists_castable_format(view.format)) {
             log_once("view format from another typeless family (B8G8R8X8 and B8G8R8A8):", int(view.format));
             return false;
         }
@@ -3654,11 +3829,17 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
     // A stencil view's format has its eight bits in G and no R, B or A of its own (0, 0, 1 when read).
-    // B8G8R8X8 has no alpha: it reads 1.
-    g::Swizzle channels = g::format_swizzle(view_format);
+    // B8G8R8X8 has no alpha: a view in its family reads 1, and a B8G8R8A8 view of a B8G8R8X8 texture (through a
+    // castable-format list) the stored byte. The view's format decides, as on WARP and AMD's D3D12 driver.
+    // The T#'s format code is the same for both channel orders of a colour format (R8G8B8A8 and B8G8R8A8 are one
+    // 8_8_8_8 code), and the image view keeps the image's format; a castable-format list may still ask for the other
+    // order, so then the view's own format places the channels. Depth images keep their own format's channels.
+    const bool other_order = view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane && !rgb96 &&
+                             named != view_format && !g::is_depth_stencil_format(view_format);
+    g::Swizzle channels = g::format_swizzle(other_order ? named : view_format);
     if (stencil) channels = {g::select_zero, g::select_x, g::select_zero, g::select_one};
     else if (desc.Format == DXGI_FORMAT_A8_UNORM) channels = {g::select_zero, g::select_zero, g::select_zero, g::select_x};
-    else if (alpha_unused(desc.Format)) channels[3] = g::select_one;
+    else if (alpha_unused(view.format != DXGI_FORMAT_UNKNOWN ? view.format : desc.Format)) channels[3] = g::select_one;
     for (UINT i = 0; i < 4; ++i) {
         const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, view.mapping);
         if (msaa && from > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) {
@@ -3888,8 +4069,14 @@ public:
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
                 VkPhysicalDeviceDepthStencilResolveProperties resolve{
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+                VkPhysicalDeviceConservativeRasterizationPropertiesEXT conservative{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
+                if (info.conservative_rasterization) resolve.pNext = &conservative;
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
                 get_props2(info.physical, &props);
+                state_.conservative_raster_tier1 = leonida::conservative_raster::tier1(
+                    info.conservative_rasterization, props.properties.limits.subPixelPrecisionBits,
+                    conservative.primitiveOverestimationSize);
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
             }
@@ -4160,6 +4347,10 @@ public:
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
         arena.free[kArenaReserved] = arena.size - kArenaReserved;
+        arena.peak_end = kArenaReserved;
+        char log[4] = {};
+        length = 0;
+        arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
         return true;
@@ -4183,6 +4374,7 @@ public:
             state_.sampler_entries.clear();
             state_.bindless.reset();
         }
+        state_.report_arena();
         if (state_.context && state_.arena.buffer) {
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
@@ -4776,9 +4968,13 @@ public:
             if (path.empty()) return d3d12_trace::result(method, E_FAIL);
             disk_path = path.wstring();
         }
-        const ShaderCacheKey key{desc->Identifier, desc->Mode, desc->Version, std::move(disk_path)};
+        const ShaderCacheKey key{desc->Identifier, desc->Mode, std::move(disk_path)};
         auto& registry = process_shader_cache_registry();
-        auto store = registry.acquire(key);
+        const UINT max_file_bytes = desc->MaximumValueFileSizeBytes ? desc->MaximumValueFileSizeBytes
+                                                                    : ShaderCacheStore::kDefaultMaxValueFileBytes;
+        std::shared_ptr<ShaderCacheStore> store;
+        if (const HRESULT hr = registry.acquire(key, desc->Version, max_file_bytes, store); FAILED(hr))
+            return d3d12_trace::result(method, hr);
         auto* session = new ShaderCacheSession(*desc, key, registry, std::move(store));
         session->attach_device(identity());
         return d3d12_trace::result(method, hand_out(session, riid, out));
@@ -5004,8 +5200,8 @@ public:
     }
 
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
-    // dwords through its descriptor table and finds the image by them. A slot left as zeros is a null descriptor:
-    // nothing is registered for it, so the shader gets the fallback image. Buffer views are not implemented.
+    // dwords through its descriptor table and finds the image by them. A buffer SRV writes a 16-byte GFX10 V# in the
+    // first half of the slot (raw, structured, or typed). A slot left as zeros is a null descriptor.
     void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
@@ -5018,9 +5214,80 @@ public:
             if (resource) stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
             return;
         }
-        if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
         if (r->desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
             log_once("shader-resource view denied by resource flags; format", int(r->desc().Format));
+            return;
+        }
+        if (!r->image()) {
+            if (!desc) {
+                log_once("buffer SRV requires a description; width", int(r->desc().Width));
+                return;
+            }
+            if (desc->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+                log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
+                return;
+            }
+            const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
+            const UINT64 width = r->desc().Width;
+            if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
+            leonida::gfx10::Buffer buffer{};
+            if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+                if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
+                if (desc->Buffer.FirstElement > width / 4) return;
+                const UINT64 byte_off = desc->Buffer.FirstElement * 4;
+                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
+                if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = 0;
+                buffer.num_records = std::uint32_t(byte_size);
+                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+                buffer.oob_select = leonida::gfx10::OobSelect::raw;
+            } else if (desc->Buffer.StructureByteStride != 0) {
+                if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return;
+                const UINT64 stride = desc->Buffer.StructureByteStride;
+                if (desc->Buffer.FirstElement > width / stride) return;
+                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+                if (byte_size > width - byte_off) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = std::uint32_t(stride);
+                buffer.num_records = desc->Buffer.NumElements;
+                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+                buffer.oob_select = leonida::gfx10::OobSelect::structured;
+            } else {
+                const Format fmt = vulkan_format(desc->Format, false);
+                if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+                    log_once("buffer SRV format not supported:", int(desc->Format));
+                    return;
+                }
+                const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
+                const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
+                const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
+                if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
+                    log_once("buffer SRV format not supported:", int(desc->Format));
+                    return;
+                }
+                const UINT64 stride = bf.bytes;
+                if (desc->Buffer.FirstElement > width / stride) return;
+                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+                if (byte_size > width - byte_off) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = std::uint32_t(stride);
+                buffer.num_records = desc->Buffer.NumElements;
+                buffer.format = code;
+                const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
+                for (unsigned i = 0; i < 4; ++i) {
+                    const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
+                    buffer.swizzle[i] = from < 4 ? channels[from]
+                                        : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
+                                            ? leonida::gfx10::select_zero
+                                            : leonida::gfx10::select_one;
+                }
+                buffer.oob_select = leonida::gfx10::OobSelect::structured;
+            }
+            const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+            std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
             return;
         }
         TextureView view{};
@@ -5648,6 +5915,7 @@ public:
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
         if (FAILED(hr)) {
@@ -5831,7 +6099,8 @@ public:
             opts->PSSpecifiedStencilRefSupported = TRUE;
             opts->TypedUAVLoadAdditionalFormats = TRUE;
             opts->ROVsSupported = TRUE;
-            opts->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+            opts->ConservativeRasterizationTier = state_.conservative_raster_tier1
+                ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_1 : D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
             opts->MaxGPUVirtualAddressBitsPerResource = 40;
             opts->StandardSwizzle64KBSupported = FALSE;
             opts->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
@@ -6137,7 +6406,10 @@ public:
                 return d3d12_trace::result(method, S_OK);
             }
 
-            if (buffer != 0) s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
+            // D3D12 disallows typed buffer views for the RGBA8 and BGRA8 sRGB formats (including BGRX8).
+            // Vulkan can still advertise buffer features for their backing formats.
+            if (buffer != 0 && vk_fmt != VK_FORMAT_R8G8B8A8_SRGB && vk_fmt != VK_FORMAT_B8G8R8A8_SRGB)
+                s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
             // Only what CreateGraphicsPipelineState's input layouts accept (vertex_format): R8/R16 SNORM and SINT
             // have Vulkan vertex support but no input-layout mapping yet.
             VkFormat vertex_vk = VK_FORMAT_UNDEFINED;
@@ -6363,7 +6635,10 @@ public:
         case D3D12_FEATURE_ROOT_SIGNATURE: {
             if (size != sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE)) return E_INVALIDARG;
             auto* root = static_cast<D3D12_FEATURE_DATA_ROOT_SIGNATURE*>(data);
-            if (root->HighestVersion < D3D_ROOT_SIGNATURE_VERSION_1_0) return E_INVALIDARG;
+            // 1.0 to 1.2 are defined (1.2 by number: not every SDK names it). The host refuses anything else and leaves
+            // the value alone (RTX 4070 Laptop 621.24 and WARP), so only 1.2 is clamped.
+            const UINT requested = static_cast<UINT>(root->HighestVersion);
+            if (requested < static_cast<UINT>(D3D_ROOT_SIGNATURE_VERSION_1_0) || requested > 0x3) return E_INVALIDARG;
             if (root->HighestVersion > kHighestRootSignatureVersion)
                 root->HighestVersion = kHighestRootSignatureVersion;
             return S_OK;
@@ -6665,6 +6940,7 @@ private:
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
+                if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
         if (FAILED(hr)) {
@@ -7132,6 +7408,45 @@ bool WindowPresenter::hdr_active() const { return presenter_->hdr_active(); }
 void WindowPresenter::force_hdr_encoding(bool on) { presenter_->force_hdr_encoding(on); }
 std::uint64_t WindowPresenter::composed_presents() const { return presenter_->composed_presents(); }
 
+// DISPLAYCONFIG_SDR_WHITE_LEVEL.SDRWhiteLevel is the white level in units of 80/1000 nits: 1000 is 80 nits (the scRGB 1.0),
+// 2500 is 200 nits (MS Learn, DISPLAYCONFIG_SDR_WHITE_LEVEL). Zero is not a level.
+float sdr_white_nits_from_level(unsigned long level) { return float(level) / 1000.0f * 80.0f; }
+
+float WindowPresenter::display_sdr_white_nits() const {
+    if (!window_) return 0.0f;
+    // The GDI name of the monitor the window is on, matched to a display path's source, whose target has the setting.
+    MONITORINFOEXW monitor{};
+    monitor.cbSize = sizeof(monitor);
+    if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor)) return 0.0f;
+    // The active configuration can change between the size query and the read (a hot-plug): ERROR_INSUFFICIENT_BUFFER asks
+    // for the sizes again (the pattern Microsoft documents for QueryDisplayConfig).
+    UINT32 path_count = 0, mode_count = 0;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    LONG status = ERROR_INSUFFICIENT_BUFFER;
+    for (int attempt = 0; attempt < 8 && status == ERROR_INSUFFICIENT_BUFFER; ++attempt) {
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) return 0.0f;
+        paths.assign(path_count, {});
+        modes.assign(mode_count, {});
+        status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr);
+    }
+    if (status != ERROR_SUCCESS) return 0.0f;  // the caller keeps the last good value
+    for (UINT32 i = 0; i < path_count; ++i) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, sizeof(source), paths[i].sourceInfo.adapterId,
+                        paths[i].sourceInfo.id};
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+            std::wcscmp(source.viewGdiDeviceName, monitor.szDevice) != 0)
+            continue;
+        DISPLAYCONFIG_SDR_WHITE_LEVEL level{};
+        level.header = {DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, sizeof(level), paths[i].targetInfo.adapterId,
+                        paths[i].targetInfo.id};
+        if (DisplayConfigGetDeviceInfo(&level.header) != ERROR_SUCCESS || level.SDRWhiteLevel == 0) return 0.0f;
+        return sdr_white_nits_from_level(level.SDRWhiteLevel);
+    }
+    return 0.0f;
+}
+
 bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
 
 void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
@@ -7192,7 +7507,9 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;
     }
-    return std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+    auto window_presenter = std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
+    window_presenter->set_window(window);
+    return window_presenter;
 }
 
 HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
@@ -7563,6 +7880,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
     std::vector<VkExtensionProperties> extensions(extension_count);
     vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
+    info.conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
+    });
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
@@ -7576,6 +7896,37 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         if (info.image_view_min_lod) {
             min_lod.pNext = *v13.next();
             *v13.next() = &min_lod;
+        }
+    }
+    const char* divisor_extension = nullptr;
+    for (const char* name :
+         {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
+        if (std::any_of(extensions.begin(), extensions.end(),
+                        [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+            divisor_extension = name;
+            break;
+        }
+    }
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_khr{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_ext{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+    if (divisor_extension) {
+        const bool is_khr = std::strcmp(divisor_extension, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) == 0;
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                        is_khr ? static_cast<void*>(&divisor_khr) : static_cast<void*>(&divisor_ext)};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.vertex_attribute_divisor =
+            (is_khr ? divisor_khr.vertexAttributeInstanceRateDivisor : divisor_ext.vertexAttributeInstanceRateDivisor) ==
+            VK_TRUE;
+        if (info.vertex_attribute_divisor) {
+            if (is_khr) {
+                divisor_khr.pNext = *v13.next();
+                *v13.next() = &divisor_khr;
+            } else {
+                divisor_ext.pNext = *v13.next();
+                *v13.next() = &divisor_ext;
+            }
         }
     }
     VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
@@ -7652,6 +8003,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
 #endif
+    VkPhysicalDeviceShaderClockFeaturesKHR shader_clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+    if (has_device_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &shader_clock};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.shader_subgroup_clock = shader_clock.shaderSubgroupClock == VK_TRUE;
+        info.shader_device_clock = shader_clock.shaderDeviceClock == VK_TRUE;
+        if (info.shader_subgroup_clock || info.shader_device_clock) {
+            shader_clock.pNext = *v13.next();
+            *v13.next() = &shader_clock;
+        }
+    }
     // What graphics PSOs may ask for: different blend state per render target, wireframe, a depth-bias clamp and
     // SRC1 blend factors. Enabled where the GPU has them; a PSO that needs a missing one is refused.
     enable.independentBlend = chosen_features.independentBlend;
@@ -7744,7 +8106,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.pEnabledFeatures = &enable;
     std::vector<const char*> device_extensions;
     v13.add_extensions(device_extensions);
+    if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
     if (info.fragment_shader_barycentric)
@@ -7756,6 +8120,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+    if (info.shader_subgroup_clock || info.shader_device_clock)
+        device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);

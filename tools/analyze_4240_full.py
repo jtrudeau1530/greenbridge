@@ -154,50 +154,6 @@ def parse_4240_block(data, at, stream_end):
     
     return record, at + HEADER_SIZE
 
-def walk_stream(data):
-    """Walk a decompressed stream and find all 4240 blocks."""
-    blocks = []
-    pos = 0
-    while pos < len(data):
-        pos = (pos + 15) & ~15
-        if pos >= len(data):
-            break
-        while pos + 4 <= len(data) and _u32(data, pos) == 0:
-            pos += 4
-        if pos >= len(data):
-            break
-        pos &= ~15
-        if pos + 4 > len(data):
-            break
-        word = _u32(data, pos)
-        
-        if word == OTHER_BLOCK_MAGIC:
-            try:
-                record, pos = parse_4240_block(data, pos, len(data))
-                record["kind"] = "4240_block"
-                blocks.append(record)
-            except ValueError as e:
-                blocks.append({"kind": "error", "offset": pos, "error": str(e)})
-                pos += 4
-        elif word == BLOCK_MAGIC:
-            pos += HEADER_SIZE
-        elif word & 0x80000000:
-            head = _u32(data, pos)
-            meshlets = head & 0x7FFFFFFF
-            triangles = _u32(data, pos + 4)
-            refs = _u32(data, pos + 8)
-            rec_at = pos + 12
-            tri_at = rec_at + 16 * meshlets
-            ref_at = tri_at + 4 * triangles
-            end = ref_at + 2 * refs
-            if end <= len(data):
-                pos = end
-            else:
-                pos += 4
-        else:
-            pos += 4
-    return blocks
-
 def process_archive(archive_path, limit=None):
     """Process an RPF9 archive and return stats on 4240 blocks."""
     stats = {
@@ -312,7 +268,6 @@ def main() -> int:
     parser.add_argument("inputs", nargs="+", help="RPF9 archive paths")
     parser.add_argument("--json", help="Write results to JSON file")
     parser.add_argument("--limit", type=positive_int, help="Limit streams per archive")
-    parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
     # Checked before the scan: the report is written after every archive has been read, so a --json naming one of
     # them replaced the archive with the report, and a folder only failed once the whole scan was done.

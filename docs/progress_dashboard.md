@@ -19,7 +19,7 @@ Each source is optional. A missing one is listed under "Sources" on the page; it
 
 | Panel | Source | Unit |
 |---|---|---|
-| Unit tests | `--run-tests` runs `tests/test_*.py` with the selection `ci.yml` uses (standard-library files with a `__main__` block), one process each; the outcome and the commit it ran on are kept in `<out>/unit_results.json` | test file |
+| Unit tests | `--run-tests` runs `tests/test_*.py` with the selection `ci.yml` uses (standard-library files with a `__main__` block), one process each; the outcome and the commit it ran on are kept in `<out>/unit_results.json`. That is CI's standard-library loop only: `tests/semantic` (the translator suite) and files that need pytest or numpy are not run, so the panel is not the whole test suite; feed those through `--junit` (`python -m pytest tests/semantic --junitxml <file>`) to see them in the runtime-tests panel | test file |
 | Runtime tests | `runtime/build/Testing/Temporary/LastTest.log` and any `--junit` file (CTest `--output-junit` or pytest `--junitxml`) | test |
 | GPU tests | `--gpu-log <file>[=<GPU, driver, OS>]`: the saved output of `runtime/test/shaders/check.py`, one group per GPU; a log older than the last commit touching `runtime/test/shaders` or `tools/rdna2spirv.py` counts as needing a re-run | test program |
 | Translator contract | the contract table in [design.md](design.md#translator-status-and-runtime-contract), each row classified by how it says it was confirmed | contract row |
@@ -59,4 +59,6 @@ panels count different things. The trend chart breaks a line where a metric's fo
 
 The page and the JSON carry counts, pass/fail, error classes and the project's own document text. The corpus panel
 stores per-stage numbers only: no shader name, carved file name or path into the game copy. One-line failure details
-are kept with the home folder and drive paths reduced to their last component.
+are kept with each absolute path replaced: a path inside the repository becomes its relative path, any other path
+(work folder, home folder, temp folder) becomes `<path>`, file name included, since a file name outside the
+repository can be a carved shader's name.

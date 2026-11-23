@@ -7,9 +7,10 @@ Vulkan implementation through ctypes (standard library only), so it works before
 On macOS it opens MoltenVK directly, using the same LEONIDA_VULKAN_LOADER override as the C++ test tools.
 
 Device choice follows the runtime (runtime/shims/d3d12_vulkan_device.cpp, runtime/src/vulkan_device_filter.h):
-LEONIDA_VK_DEVICE filters by deviceName substring case-insensitively (failing when nothing matches), then Vulkan 1.3
-devices with dynamicRendering, synchronization2, timelineSemaphore, separateDepthStencilLayouts and bufferDeviceAddress
-and a graphics queue family; among those the first of the highest rank wins: a native driver over Microsoft's Dozen
+LEONIDA_VK_DEVICE filters by deviceName substring case-insensitively (failing when nothing matches). Eligible devices
+need Vulkan 1.3 or Vulkan 1.2 with VK_KHR_dynamic_rendering and VK_KHR_synchronization2. They also need the corresponding
+feature bits, timelineSemaphore, separateDepthStencilLayouts, bufferDeviceAddress, and a graphics queue family. Among
+those the first of the highest rank wins: a native driver over Microsoft's Dozen
 (vendor 0x1414, which reports a discrete GPU, #915), then discrete > integrated > virtual > CPU (vulkan_device_rank, as
 vk_device_pick.h picks and, with #1799, the runtime). The runtime also needs the rest of its device setup (surface,
 extensions); that is not checked here. vk_pipeline_check (the pipelines stage) picks through vk_device_pick.h.
@@ -46,6 +47,8 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES = 1000094000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES = 51
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES = 53
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR = 1000044003
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR = 1000314007
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
@@ -66,8 +69,10 @@ VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
 VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU = 2
+VK_API_VERSION_1_2 = (1 << 22) | (2 << 12)
 VK_API_VERSION_1_3 = (1 << 22) | (3 << 12)
 VK_INCOMPLETE = 5
+VULKAN_12_REQUIRED_EXTENSIONS = frozenset((b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2"))
 
 PROPS_SIZE = 824            # sizeof(VkPhysicalDeviceProperties) on 64-bit
 FEATURES2_SIZE = 240        # sizeof(VkPhysicalDeviceFeatures2): 16 + 55 VkBool32, padded to 8
@@ -112,6 +117,10 @@ class SubgroupProperties(ctypes.Structure):
     _fields_ = [("sType", ctypes.c_uint32), ("pNext", ctypes.c_void_p), ("subgroupSize", ctypes.c_uint32),
                 ("supportedStages", ctypes.c_uint32), ("supportedOperations", ctypes.c_uint32),
                 ("quadOperationsInAllStages", ctypes.c_uint32)]
+
+
+class ExtensionProperties(ctypes.Structure):
+    _fields_ = [("extensionName", ctypes.c_char * 256), ("specVersion", ctypes.c_uint32)]
 
 
 def block(size: int, stype: int):
@@ -169,6 +178,22 @@ def physical_devices(vk, instance):
     raise RuntimeError("vkEnumeratePhysicalDevices repeatedly returned VK_INCOMPLETE")
 
 
+def device_extensions(vk: ctypes.CDLL, device: ctypes.c_void_p) -> set[bytes]:
+    """Read one device's extension names, retrying if the list changed between calls."""
+    for _ in range(3):
+        count = ctypes.c_uint32()
+        result = vk.vkEnumerateDeviceExtensionProperties(device, None, ctypes.byref(count), None)
+        if result != 0 or not count.value:
+            break
+        props = (ExtensionProperties * count.value)()
+        result = vk.vkEnumerateDeviceExtensionProperties(device, None, ctypes.byref(count), props)
+        if result == 0:
+            return {entry.extensionName for entry in props[:count.value]}
+        if result != VK_INCOMPLETE:
+            break
+    return set()
+
+
 MICROSOFT_VENDOR_ID = 0x1414   # Dozen and the Basic Render Driver; no native GPU driver uses it
 
 
@@ -188,6 +213,7 @@ def query() -> dict:
     vp = ctypes.c_void_p
     vk.vkCreateInstance.argtypes = [vp, vp, vp]
     vk.vkEnumeratePhysicalDevices.argtypes = [vp, vp, vp]
+    vk.vkEnumerateDeviceExtensionProperties.argtypes = [vp, vp, vp, vp]
     vk.vkGetPhysicalDeviceProperties2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceFeatures2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceQueueFamilyProperties.argtypes = [vp, vp, vp]
@@ -219,19 +245,30 @@ def query() -> dict:
             vk.vkGetPhysicalDeviceProperties2(d, props)
             raw = bytes(props)[16:]
             dev_name = raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace")
-            if int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little") < VK_API_VERSION_1_3:
+            version = int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little")
+            if version < VK_API_VERSION_1_2 or (wanted and wanted not in dev_name.lower()):
                 continue
-            if wanted and wanted not in dev_name.lower():
+            core13 = version >= VK_API_VERSION_1_3
+            if not core13 and not VULKAN_12_REQUIRED_EXTENSIONS.issubset(device_extensions(vk, d)):
                 continue
             f13 = block(F13_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
             f12 = block(F12_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
-            set_next(f12, f13)
             bary = block(BARY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
-            set_next(f13, bary)
+            if core13:
+                set_next(f12, f13)
+                set_next(f13, bary)
+            else:
+                rendering = block(24, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR)
+                sync2 = block(24, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR)
+                set_next(f12, rendering)
+                set_next(rendering, sync2)
+                set_next(sync2, bary)
             f2 = block(FEATURES2_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
             set_next(f2, f12)
             vk.vkGetPhysicalDeviceFeatures2(d, f2)
-            if not (u32(f13, F13_DYNAMIC_RENDERING) and u32(f13, F13_SYNCHRONIZATION2)
+            dynamic_rendering = u32(f13, F13_DYNAMIC_RENDERING) if core13 else u32(rendering, 16)
+            synchronization2 = u32(f13, F13_SYNCHRONIZATION2) if core13 else u32(sync2, 16)
+            if not (dynamic_rendering and synchronization2
                     and u32(f12, F12_TIMELINE_SEMAPHORE) and u32(f12, F12_SEPARATE_DEPTH_STENCIL_LAYOUTS)
                     and u32(f12, F12_BUFFER_DEVICE_ADDRESS)):
                 continue

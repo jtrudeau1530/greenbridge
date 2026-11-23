@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -125,5 +126,17 @@ class IsolateTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
 
 
+def main():
+    """unittest.main(), except that a file whose tests all skipped succeeds: unittest exits 5 for an empty run, and
+    CI runs each file as `python -I tests/test_*.py || exit 1`, so a runner without vk_pipeline_check or on Windows
+    would fail the job here. A file that has no tests at all (not even skips) is still a failure."""
+    result = unittest.main(exit=False).result
+    if result.failures or result.errors or result.unexpectedSuccesses:
+        return 1
+    if result.testsRun == 0 and not result.skipped:
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(main())

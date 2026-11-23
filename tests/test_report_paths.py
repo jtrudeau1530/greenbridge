@@ -8,6 +8,7 @@ case-insensitive-volume branch is exercised with patches, so it runs on every pl
 import ast
 import os
 import pathlib
+import posixpath
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ sys.path.insert(0, str(TOOLS))
 import report_paths  # noqa: E402
 
 # Tools that use report_paths and must not define their own copy again.
-SHARED = ("awc_manifest", "gamedata_index", "gamedata_xml", "navmesh_index", "rpf_probe", "tile_probe", "world_names")
+SHARED = ("awc_manifest", "gamedata_index", "gamedata_xml", "glb_inspect", "navmesh_index", "rpf_probe", "tile_probe", "world_names")
 # Tools that still carry their own copy (BUILD-589 follow-up: open pull requests edit them). Do not add to this list:
 # import report_paths instead.
 LEGACY_COPIES = {"anim_index", "navmesh_decode", "world_lights_paths"}
@@ -88,9 +89,10 @@ class MacVolumeTests(unittest.TestCase):
     """The macOS branch: pathconf says whether the volume folds case. Patched, so it runs anywhere."""
 
     def darwin(self, case_sensitive_result):
-        return mock.patch.multiple(
-            report_paths, sys=mock.Mock(platform="darwin"),
-            os=mock.Mock(wraps=os, pathconf=mock.Mock(return_value=case_sensitive_result)))
+        fake_os = mock.Mock(wraps=os, pathconf=mock.Mock(return_value=case_sensitive_result))
+        # macOS's normcase keeps case. The host's would fold it on Windows, before the volume check this class tests.
+        fake_os.path.normcase = posixpath.normcase
+        return mock.patch.multiple(report_paths, sys=mock.Mock(platform="darwin"), os=fake_os)
 
     def test_not_macos_is_never_case_insensitive(self):
         with mock.patch.object(report_paths, "sys", mock.Mock(platform="linux")):

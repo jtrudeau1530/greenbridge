@@ -94,6 +94,20 @@ def tri_prim():
 
 
 class InstancedGlbTest(unittest.TestCase):
+    def test_gpu_instance_bounds_follow_the_stored_translation_and_scale(self) -> None:
+        meshes = [{
+            "primitives": [tri_prim()],
+            "instances": [((16_777_219, 0, 0), (0, 0, 0, 1), (1, 1.00000003, 1))],
+        }]
+        data, stats = glb_writer.build_instanced_glb(meshes)
+        gltf, binary = twb.parse_and_validate_glb(data)
+        attrs = gltf["nodes"][0]["extensions"][EXT]["attributes"]
+        (translation,) = twb.read_accessor_floats(gltf, binary, attrs["TRANSLATION"])
+        (scale,) = twb.read_accessor_floats(gltf, binary, attrs["SCALE"])
+        self.assertEqual(translation, (16_777_220, 0, 0))
+        self.assertEqual(scale, (1, 1, 1))
+        self.assertEqual(stats["bounds"], [16_777_220, 0, 0, 16_777_221, 1, 0])
+
     def test_gpu_mode(self):
         meshes = [{"name": "a", "primitives": [tri_prim()],
                    "instances": [((0, 0, 0), (0, 0, 0, 1), (1, 1, 1)), ((5, 0, 0), (0, 0, 0, 1), (2, 2, 2))]},
@@ -337,6 +351,23 @@ class InstancedBuildTest(unittest.TestCase):
                 width, height, rgba = twb.parse_and_validate_png(bin_data[start:start + view["byteLength"]])
                 self.assertEqual((width, height), (expected, expected))
                 self.assertEqual(tuple(rgba[:4]), tuple(twb.ALBEDO_RGBA))
+
+    def test_rebuild_embeds_changed_texture_at_the_same_path(self) -> None:
+        assets = os.path.join(self.tmp, "tex_assets")
+        twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
+        ents = os.path.join(self.tmp, "tex.jsonl")
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0))])
+        out = os.path.join(self.tmp, "tex_world")
+        dds = os.path.join(assets, "models", "tri_tex", "001_albedo.dds")
+
+        for color in (tuple(twb.ALBEDO_RGBA), (25, 90, 175, 255)):
+            with self.subTest(color=color):
+                with open(dds, "wb") as texture:
+                    texture.write(twb._uniform_bgra_dds(color))
+                doc = world_build.build_world(assets, out, placements=ents, jobs=1)
+                glb = os.path.join(out, "chunks", doc["chunks"][0]["id"] + ".glb")
+                _, rgba = twb._glb_first_base_color_pixel(glb)
+                self.assertEqual(rgba, color)
 
     def test_cli_instancing_option(self):
         ents = os.path.join(self.tmp, "cli.jsonl")

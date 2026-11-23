@@ -11,7 +11,7 @@ Usage:
     python -I tools/mode_round_probe.py [--waves 32,64] [--json out.json]
     python -I tools/mode_round_probe.py --self-test        # pure-Python sanity checks, no GPU
 
-Exit 0 when every case matches (or --self-test passed), 1 on a mismatch, 2 on a harness error, 77 when
+Exit 0 when every case matches (or --self-test passed), 1 on a mismatch or --json write failure, 2 on a harness error or invalid CLI arguments, 77 when
 tools/hw_oracle is unavailable or the GPU is not GFX10. Standard library only; nothing here reads game files.
 """
 import argparse
@@ -148,15 +148,78 @@ def self_test():
     print("self-test OK")
 
 
-def main():
+def parse_waves(raw):
+    """Parse --waves comma-separated wave sizes; return (waves, error_message)."""
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return None, "--waves must not be empty"
+    waves = []
+    for tok in tokens:
+        try:
+            w = int(tok)
+        except ValueError:
+            return None, f"invalid wave size in --waves: {tok!r}"
+        if w not in (32, 64):
+            return None, f"unsupported wave size in --waves: {w} (expected 32 or 64)"
+        waves.append(w)
+    return waves, None
+
+
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, data):
+    """Create missing parent directories and write `data` as LF-terminated JSON, or return an error string."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            return f"cannot create directory for --json {path}: {exc.strerror or exc}"
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2)
+    except OSError as exc:
+        return f"cannot write --json {path}: {exc.strerror or exc}"
+    return None
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--waves", default="32,64", help="wave sizes to run (default: 32,64)")
     ap.add_argument("--json", dest="json_out", help="write full JSON report to this path")
     ap.add_argument("--self-test", action="store_true", help="check the case table without a GPU")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.self_test:
         self_test()
         return 0
+    waves, wave_err = parse_waves(args.waves)
+    if wave_err:
+        print(f"error: {wave_err}", file=sys.stderr)
+        return 2
+    if args.json_out is not None:
+        json_err = validate_json_path(args.json_out)
+        if json_err:
+            print(f"error: {json_err}", file=sys.stderr)
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle()
@@ -166,7 +229,6 @@ def main():
     if asm.family(oracle.arch) != "gfx10":
         print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
         return 77
-    waves = [int(w) for w in args.waves.split(",") if w.strip()]
     out = {"arch": oracle.arch, "waves": {}}
     mismatches = 0
     for wave in waves:
@@ -177,9 +239,11 @@ def main():
             mismatches += 1
         print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
               f"7/7 f16 transcendentals 0/65536 RNE/RTZ diffs")
-    if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(out, f, indent=2)
+    if args.json_out is not None:
+        write_err = write_json_report(args.json_out, out)
+        if write_err:
+            print(f"error: {write_err}", file=sys.stderr)
+            return 1
     return 1 if mismatches else 0
 
 

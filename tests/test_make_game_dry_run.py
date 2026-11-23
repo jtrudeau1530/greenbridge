@@ -331,13 +331,18 @@ class PipelineStageIsolationTest(unittest.TestCase):
             executed_cmds.append(args)
             return 0
 
+        # The usage probe (checker_supports) really launches the checker, so it is stubbed too: CreateProcess on a
+        # text file named .exe makes native Windows show a modal "Unsupported 16-Bit Application" dialog that blocks
+        # the run. A checker without --inflight-file is what the old dummy answered.
         with mock.patch("make_game.pipeline_check_exe", return_value=dummy_exe), \
+                mock.patch("make_game.checker_supports", return_value=False) as supports, \
                 mock.patch("make_game.run", side_effect=fake_run), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=AssertionError("launched the dummy")), \
                 mock.patch("make_game.log"):
             make_game.pipelines(self.work_dir, self.out_dir)
 
+        supports.assert_called_once()
         self.assertEqual(len(executed_cmds), 1)
-        # The dummy can't print a usage line, so it is treated as a checker without --inflight-file.
         self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache])
 
     def test_pipelines_stage_alone_invokes_no_asset_or_shader_compilers(self) -> None:
@@ -365,7 +370,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
             mock_assets.assert_not_called()
             mock_runtime.assert_not_called()
             mock_pipelines.assert_called_once_with(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir),
-                                                   mock.ANY)
+                                                   mock.ANY, runtime_build=None)
 
 
 class StageResumptionAndStepIsolationTest(unittest.TestCase):
@@ -461,6 +466,8 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                 os.makedirs(dest, exist_ok=True)
                 with open(os.path.join(dest, "manifest.json"), "w", encoding="utf-8") as f:
                     f.write("{}")
+                with open(os.path.join(dest, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                    f.write(make_game.decoder_digest())
 
         with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
             f.write("{}")

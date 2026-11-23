@@ -76,8 +76,32 @@ class PrintedEncodingTest(unittest.TestCase):
 
     def test_same_encoding_exceptions_still_apply(self):
         # LLVM 23 prints an unused VOP3 SRC2 as 0x80 where the compiler stored 0 (same_encoding's exception).
-        printed = with_byte(PROGRAM, 0, 7, 0x02)
-        self.assertIn("OpEntryPoint Fragment", self.translate(listing(printed), blob(PROGRAM)))
+        printed = listing(with_byte(PROGRAM, 0, 7, 0x02))
+        native = blob(PROGRAM)
+        self.assertIn("OpEntryPoint Fragment", self.translate(printed, native))
+        self.assertIn("OpEntryPoint Fragment", self.translate(
+            printed + b"; warning: invalid instruction encoding\n", native + b"\xff" * 4))
+
+    def test_inline_zero_does_not_match_a_used_sgpr(self):
+        # Hand-encoded gfx1013 instructions: SRC1 for the compare and SRC2 for the FMA both read s0.
+        cases = (
+            (("v_cmp_lt_f16_e64 s[4:5], v1, s0", "04 00 c9 d4 01 01 00 00"),
+             ("v_cmp_lt_f16_e64 s[4:5], v1, 0", "04 00 c9 d4 01 01 01 00")),
+            (("v_fma_f32 v0, v1, v2, s0", "00 00 4b d5 01 05 02 00"),
+             ("v_fma_f32 v0, v1, v2, 0", "00 00 4b d5 01 05 02 02")),
+        )
+        for raw, encoded in cases:
+            for reanchor in (False, True):
+                with self.subTest(op=raw[0].split()[0], reanchor=reanchor):
+                    native = blob([raw] + PROGRAM)
+                    printed = listing([encoded] + PROGRAM)
+                    error = "a field the disassembler dropped"
+                    if reanchor:
+                        native += b"\xff" * 4
+                        printed += b"; warning: invalid instruction encoding\n"
+                        error = "reachable instruction with normalized encoding"
+                    with self.assertRaisesRegex(rdna2spirv.Unsupported, error):
+                        self.translate(printed, native)
 
     def test_listings_without_their_bytes_are_not_checked(self):
         stored = with_byte(PROGRAM, 0, 1, 0x08)

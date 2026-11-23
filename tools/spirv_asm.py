@@ -501,8 +501,8 @@ def main(argv=None) -> int:
         data = assemble(text, target_env=args.target_env)
         with open(args.out, "wb") as f:
             f.write(data)
-    except (OSError, SpirvAsmError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+    except (OSError, ValueError, SpirvAsmError) as exc:    # ValueError: a source file that is not UTF-8
+        print(f"ERROR: {args.src}: {exc}" if isinstance(exc, UnicodeDecodeError) else f"ERROR: {exc}", file=sys.stderr)
         return 1
     return 0
 

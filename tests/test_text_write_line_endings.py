@@ -5,7 +5,7 @@ assembly listing is CRLF there and LF on Linux and macOS: the same input gives b
 (checksums and diffs differ). The CSV writers were fixed in #1573; this covers the other text writers. This test reads
 the source with `ast` (standard library, no game data, no GPU) and fails for any `open`, `io.open`, `Path.open`,
 `os.fdopen` or `tempfile.NamedTemporaryFile` (and `TemporaryFile`, `SpooledTemporaryFile`) in a text write mode (`w`,
-`a`, `x`), or any `Path.write_text`, under tools/, scripts/, make_game.py and runtime/test/shaders/ that has no
+`a`, `x`, `r+`), or any `Path.write_text`, under tools/, scripts/, make_game.py and runtime/test/shaders/ that has no
 `newline=` argument. `codecs.open` is left alone: it never translates line ends and takes no `newline=`. Pass `newline="\\n"` for LF output (or `newline=""` when the text carries its own line ends,
 like a csv writer).
 """
@@ -43,9 +43,9 @@ NOT_TEXT_OPENS = {"codecs", "os", "tarfile", "zipfile", "webbrowser"}
 
 
 def text_write_mode(mode) -> bool:
-    """True for a constant mode string that opens a text file for writing ("w", "a+", "xt", ...)."""
+    """True for a constant mode string that can write text ("w", "a+", "xt", "r+", ...)."""
     return (isinstance(mode, str) and bool(mode) and set(mode) <= MODE_CHARS and "b" not in mode
-            and any(c in mode for c in "wax"))
+            and (any(c in mode for c in "wax") or ("r" in mode and "+" in mode)))
 
 
 def call_mode(node: ast.Call, index: int):
@@ -123,6 +123,17 @@ class TextWriteLineEndings(unittest.TestCase):
             "os.open('a', os.O_WRONLY)\n"                          # flags, not a mode string
         )
         self.assertEqual(unpinned_text_writes(src), [1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17, 18])
+
+    def test_detector_finds_unpinned_text_update_modes(self):
+        src = (
+            "open('a', 'r+')\n"
+            "p.open(mode='rt+')\n"
+            "os.fdopen(3, 'r+t')\n"
+            "open('a', 'r+', newline='\\n')\n"
+            "open('a', 'rb+')\n"
+            "open('a', 'r')\n"
+        )
+        self.assertEqual(unpinned_text_writes(src), [1, 2, 3])
 
     def test_every_text_write_pins_its_newline(self):
         bad = []

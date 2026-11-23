@@ -201,8 +201,8 @@ reads vertex slots. It sizes all 99,184 slot words of the archive's `63 30` and 
 | 0x42 | 2 | 8 | `63 30` 3, 4; `42 40` 0 (13,545), 3, 4, 14, 15 | 2 × f32; in `42 40` slot 0 the packed position |
 | 0x26 | 6 | 4 | `63 30` 1, 12; `42 40` 1, 12, 13 | RGBA8 colour |
 | 0x28 | 8 | 4 | `42 40` 3, 4, 14, 15 | 2 × snorm16 UV × the +0x7C scale (rpf9-explorer) |
-| 0x21 | 1 | 4 | `42 40` 2 (13,119) | not decoded |
-| 0x27 | 7 | 4 | `42 40` 2, 11, 18 | not decoded |
+| 0x21 | 1 | 4 | `42 40` 2 (13,119) | octahedral normal, 10 + 10 bits (below) |
+| 0x27 | 7 | 4 | `42 40` 2, 11, 18 | 10:10:10 unit vector: the normal in slot 2, a tangent in slots 11 and 18 (below) |
 
 The slots used in `42 40` blocks are 0-4, 11-15 and 18; slot 15 occurs in 78 blocks and slot 18 in 770.
 `tools/meshlet_page.py` sizes slots with this rule (`tag_stride`), for the types above only, and reads the same
@@ -258,14 +258,33 @@ stream. 520 streams end inside a group that continues in the next one; 5 stop at
 doesn't fit. The `63 30` checks are unchanged on the 3 extra blocks: all positions finite and all normals of unit
 length.
 
+**Slot 2 is the vertex normal.** With tag 0x21 (type 1) it is octahedral: u = bits 0-9 and v = bits 10-19, each
+read as unorm `x / 511.5 − 1`, unfolded as usual (z = 1 − |u| − |v|, and where z < 0, x and y become
+(1 − |v|)·sign(u) and (1 − |u|)·sign(v)). Bits 20-31 are not decoded; their top two bits are mostly 2 or 3, which
+would fit a tangent angle and sign. With tag 0x27 (type 7, 363 blocks) it is x, y, z in bits 0-9, 10-19 and 20-29,
+in the same unorm. The normals are in world order whatever the +0x6C axis word says, which also confirms the
+position reorder above. `tools/meshlet_page.py --normals` compares each stored normal with the sum of its vertex's
+face normals:
+
+| Archive | Vertices | Within 8° | Within 25° | Opposed |
+|---|---:|---:|---:|---:|
+| `shared_minigame000.rpf` | 14,411,107 | 12,394,835 (86.0%) | 13,271,947 (92.1%) | 210,301 (1.5%) |
+| `core_restofworld.rpf` | 451,593 | 299,356 (66.3%) | 331,910 (73.5%) | 51,184 (11.3%) |
+
+On a sample of 79,157 minigame vertices, the readings tried before this one stay well below it, at a mean dot of
+0.56-0.8: plain 10:10:10, a smallest-three quaternion, and 15- or 16-bit octahedral. In `core_restofworld`, 70%
+of the 347 groups with a type-1 normal have fewer than 5% opposed, and 2% are mostly opposed (more than half),
+which fits mirrored parts. The rest may be groups that the span rule binds to the wrong block.
+
 **Meshlet record words +8/+12 hold the meshlet's centre.** Three 12-bit fields give x, y and z: w2 bits 0-11,
 w2 bits 12-23 and w3 bits 0-11. Each is in 1/16 m steps around 2047, so the centre is `(field − 2047) / 16`, over
-±128 m, and the default `0x007FF7FF / 0x7FF` is the origin. `tools/meshlet_page.py --centres` compares each stored
+±128 m, and the default `0x007FF7FF / 0x7FF` is the origin. When w2 bit 28 is set, the step is 1/8 m instead,
+`(field − 2047) / 8` over ±256 m (below). `tools/meshlet_page.py --centres` compares each stored
 centre with the centre of its meshlet's vertex box, using the `42 40` positions above. Over all 1,569 streams:
 
 | Meshlets | Default words | Axes | Same 1/16 m step | Within one step |
 |---:|---:|---:|---:|---:|
-| 142,613 | 68 | 427,839 | 213,052 (49.8%) | 305,545 (71.4%) |
+| 142,613 | 68 | 427,839 | 214,204 (50.1%) | 307,158 (71.8%) |
 
 The rest are further off. The stored centre may be a bounding-sphere centre rather than the box centre: the mean
 of the vertices fits worse (about 30% in the same step on the first 400 streams, against 51.8% for the box).
@@ -282,16 +301,82 @@ correlation 0.997 (x), 0.997 (y) and 0.983 (z) over 387 blocks. Readings that ar
 The earlier test on `63 30` blocks found no correlation, and the reason is that their records hardly vary: the
 groups matched to a `63 30` block keep the default words in 2,417 of 2,452 meshlets.
 
-The other bits are not decoded:
-- **w3 bits 12-31** are non-zero in 24% of the `42 40` meshlets of the first 400 streams (14,594 of 61,156), and
-  bits 12-13 are clear in every one of them. They follow how closely the meshlet's face normals agree (r ≈ 0.7 with the smallest dot product to the mean normal), which
-  suggests a normal cone.
-- **w2 bits 24-31** are 0 or 16. 16 is set on 1,225 of 61,156 meshlets of the first 400 streams, nearly always
-  together with non-zero w3 bits 12-31.
-- **w0 bits 14-31** are not decoded either; bits 14-15 are clear in all 61,170 records of those streams.
+**Word 0 bits 16-31 hold the meshlet's bounding-sphere radius, as an f16**, measured around the stored centre. Bits
+14-15 are clear in all 61,170 records of the first 400 streams. Against the radius from the box centre, the
+correlation is 0.999 on those streams. `--centres` checks the radius against the farthest vertex from the stored
+centre, three ways: it covers that vertex; it covers it once the centre's rounding of up to √3/32 m is allowed for;
+and it is tight, at most 1.25 × that distance plus the rounding:
 
-Still open: the +0x5C word, meshlet record bits 14-31 of word 0 and the cone-like bits above, and the
-`42 40 00 00` attribute encodings.
+| Archive | Meshlets | Covers | Covers within rounding | Tight |
+|---|---:|---:|---:|---:|
+| `shared_minigame000.rpf` | 142,613 | 137,626 (96.5%) | 140,724 (98.7%) | 142,518 (99.9%) |
+| `core_restofworld.rpf` | 4,899 | 4,771 (97.4%) | 4,895 (99.9%) | 4,883 (99.7%) |
+
+So the record carries a culling sphere (centre plus radius) for each meshlet.
+
+**Word +12 bits 14-30 hold the meshlet's normal cone.** The axis is octahedral, 6 + 6 bits: u = bits 14-19 and
+v = bits 20-25, each read as unorm `x / 31.5 − 1`, unfolded like the normals above. Bits 26-30 give the spread:
+sin(half-angle) = (31 − f) / 31. All-zero bits 12-31 (76% of records) is no cone. Bits 12-13 and bit 31 are always
+clear. On the first 400 streams, the median smallest dot between a face normal and the stored axis follows
+√(1 − ((31 − f)/31)²) within 0.033 on average; linear, square-root, squared and sine readings of the field miss by
+0.14-0.32. `--cones` counts:
+
+| Archive | Cones | Axis within 25° of the mean normal | Every face inside | … within 0.05 |
+|---|---:|---:|---:|---:|
+| `shared_minigame000.rpf` | 43,415 | 35,615 (82.0%) | 18,483 (42.6%) | 42,454 (97.8%) |
+| `core_restofworld.rpf` | 1,221 | 914 (74.9%) | 463 (37.9%) | 1,217 (99.7%) |
+
+So the cone is rounded to the nearest step, not widened to be conservative. With the centre and radius it completes
+a meshlet's culling data.
+
+**w2 bit 28 doubles the centre's step.** w2 bits 24-31 are 0 or 16, so bit 28 is the only one that varies. It is
+set on 1,732 meshlets of the minigame archive, and none in `core_restofworld`. Those meshlets are large (median
+radius 33 m), face upward, and sit 100 m or more from the origin. Read with 1/16 m steps, their radius covers the
+farthest vertex from the stored centre in 0 of 1,732. Read with 1/8 m steps, it covers it in 1,697 (98.0%), and in
+1,730 (99.9%) once the centre's rounding is allowed for. A least-squares fit of box centre against field on them
+gives slopes of 1/8.07, 1/8.05 and 1/8.08 per axis. `--centres` counts them as `coarse_steps`; the centre and
+radius tables above use the right step for each meshlet. Bit 28 may be the low bit of a scale exponent, but only
+0 and 1 occur.
+
+**Slots 11 and 18 are tangents.** Their type-7 words are unit vectors in the same 10:10:10 unorm, perpendicular to
+the vertex's stored normal. Bits 30-31 are always 3 or 0, which fits the bitangent sign +1 or −1. Over the minigame
+archive (`--normals`, counts only):
+- 7,520,441 tangent words, 7,435,001 (98.9%) of them within |dot| < 0.05 of perpendicular;
+- sign bits 6,457,714 × 3 and 1,062,727 × 0, and never 1 or 2.
+
+`core_restofworld.rpf` has no tangent slots.
+
+**The rules hold in a second archive.** `core_restofworld.rpf` with `--faces --centres --normals`:
+- all 151 mesh streams parse, with 502 `42 40` blocks, 488,265 positions (all finite, all within 300 m) and
+  6,564 meshlets;
+- 69.4% of 699,618 shared edges have neighbouring faces within ~25°, and 0.37% are opposed;
+- 10,555 of 14,697 centre axes (71.8%) are in the same 1/16 m step, and 87.6% within one.
+
+**And in `story000.rpf`, the main story archive.** All 7,577 mesh streams parse with every check on (`--faces
+--centres --normals --cones`, counts only). Six of them are 256 KiB pages where texture-like data follows the mesh
+chunks on a 256-byte boundary behind zero padding; the walk stops there (`stopped_at_other_data`). They hold:
+
+| `42 40` blocks | Positions | Meshlets | Triangles |
+|---:|---:|---:|---:|
+| 173,877 | 29,602,924 | 405,418 | 38,626,760 |
+
+| Check | Count |
+|---|---:|
+| positions finite | all |
+| positions within 300 m | 29,572,450 (99.9%) |
+| shared edges with neighbouring faces within ~25° | 33,342,470 of 36,707,506 (90.8%); 1.4% opposed |
+| normals within 8° / 25° of their faces | 76.5% / 94.6% of 20,801,089; 2.1% opposed |
+| tangents perpendicular to the normal | 30,473,135 of 30,569,246 (99.7%) |
+| radius covers the farthest vertex from the stored centre | 257,091 of 275,832 meshlets (93.2%); 94.8% within rounding |
+| cones: axis within 25° / every face inside within 0.05 | 89.5% / 94.2% of 228,244 |
+
+The stored centres match the box centre less often here: 25.7% of axes in the same step, 41.5% within one,
+against 50.1% / 71.8% in the minigame archive. 625 meshlets use the 1/8 m step. Since the radius still covers the
+farthest vertex from the stored centre in 93.2%, the decoding holds; these assets seem to store a centre other
+than the box midpoint (a sphere centre would fit).
+
+Still open: the +0x5C word, the type-1 normal's
+bits 20-31, and what the `42 40` colour and UV slots hold beyond rpf9-explorer's reading.
 
 ### `story000_script.rpf`, full
 

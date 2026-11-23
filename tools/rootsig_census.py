@@ -15,8 +15,10 @@ For each signature this reports two spans:
   * `table1`: one dword per table pointer, which is the model the corpus census in section 3.5 found in the reads
     (pointer SGPRs adjacent at distance 1, and no 64-bit pointer in any PS/VS/CS/MS).
 
-It does not pick between them. `--json` carries the numbers and the summary prints the spare dwords per model, so a
-reader can count how many signatures each model fits.
+`--json` carries the numbers and the summary prints the spare dwords per model, so a reader can count how many
+signatures each model fits. `--disasm DIR` adds the program's own reads, from a `tools/fspx_unpack.py --disasm`
+folder: which user SGPRs it reads, which one it zero-extends into an `s_load` base, and which 64-bit pairs it copies
+whole. That is where the tables and the root descriptors surface.
 
 What it does not measure: which parameter a shader reads. A read set needs `tools/shader_disasm.py` (LLVM_MC) and
 `tools/rdna2spirv.py` on the program, and the game's own shaders have no signature to compare it with.
@@ -29,6 +31,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import struct
 import sys
 from collections import Counter
@@ -147,10 +150,86 @@ def span(sig, table_dwords=2, visibility=None):
     return total
 
 
-def census(root):
-    """Rows for every container in `root`, joined with the program's measured USER_SGPR count."""
+NO_DEST = ("s_cmp", "s_cbranch", "s_endpgm", "s_waitcnt", "s_clause", "s_inst_prefetch", "s_nop",
+           "s_barrier", "s_sleep", "s_setpc", "s_ttracedata", "s_sendmsg", "s_atc")
+_REGISTER = re.compile(r"s\[(\d+):(\d+)\]|(?<![\w:])s(\d+)(?![\d\w])")
+
+
+def _registers(text):
+    """(lo, hi) for every register or register range in an operand list."""
+    out = []
+    for m in _REGISTER.finditer(text):
+        if m.group(1) is not None:
+            out.append((int(m.group(1)), int(m.group(2))))
+        else:
+            n = int(m.group(3))
+            out.append((n, n))
+    return out
+
+
+def instructions(asm):
+    """[(opcode, [operands])] from tools/shader_disasm.py output, comments dropped."""
+    out = []
+    for line in asm.splitlines():
+        code = line.split(";")[0].strip()
+        if not code:
+            continue
+        bits = code.split(None, 1)
+        out.append((bits[0], [o.strip() for o in bits[1].split(",")] if len(bits) > 1 else []))
+    return out
+
+
+def read_scan(asm, user_sgprs):
+    """The user SGPRs a program reads, the ones it zero-extends into a load base, and the pairs it copies whole.
+
+    A descriptor table is one dword the compiler copies into the low half of a pair, zeroes the high half of and
+    passes to `s_load` as the base; a root CBV is a 64-bit pair copied whole into an SRD (docs/d3d12_vulkan.md 3.5).
+    Registers at or above `user_sgprs` (from `fspx/<name>.json`) are scratch, not user data.
+    """
+    ins = instructions(asm)
+    read, bases, pairs = set(), set(), set()
+    for i, (op, ops) in enumerate(ins):
+        for lo, hi in _registers(",".join(ops if op.startswith(NO_DEST) else ops[1:])):
+            read.update(r for r in range(lo, hi + 1) if r < user_sgprs)
+        if op == "s_mov_b32" and len(ops) >= 2:
+            dst, src = _registers(ops[0]), _registers(ops[1])
+            if len(dst) == 1 and dst[0][0] == dst[0][1] and len(src) == 1 \
+                    and src[0][0] == src[0][1] and src[0][0] < user_sgprs:
+                low = dst[0][0]
+                window = ins[i + 1:i + 4]
+                zeroed = any(o == "s_mov_b32" and len(p) >= 2 and _registers(p[0]) == [(low + 1, low + 1)]
+                             and p[1] == "0" for o, p in window)
+                loaded = any(o.startswith("s_load") and len(p) >= 2 and _registers(p[1]) == [(low, low + 1)]
+                             for o, p in window)
+                if zeroed and loaded:
+                    bases.add(src[0][0])
+        elif op == "s_mov_b64" and len(ops) >= 2:
+            src = _registers(ops[1])
+            if src and src[0][1] == src[0][0] + 1 and src[0][0] < user_sgprs:
+                pairs.add(src[0][0])
+    return {"read": sorted(read), "table_bases": sorted(bases), "whole_pairs": sorted(pairs)}
+
+
+def _read_summary(rows):
+    """Counts over the rows that carry a read scan; {} when no row does."""
+    scans = [r["reads"] for r in rows if "reads" in r]
+    if not scans:
+        return {}
+    return {
+        "programs": len(scans),
+        "low_read": sum(1 for s in scans if set(range(4)) & set(s["read"])),
+        "table_bases": dict(sorted(Counter(b for s in scans for b in s["table_bases"]).items())),
+        "whole_pairs": dict(sorted(Counter(p for s in scans for p in s["whole_pairs"]).items())),
+    }
+
+
+def census(root, disasm=None):
+    """Rows for every container in `root`, joined with the program's measured USER_SGPR count.
+
+    With `disasm`, the `--disasm` folder of tools/fspx_unpack.py, each row also carries the program's reads.
+    """
     rows, errors = [], []
-    for path in sorted(glob.glob(os.path.join(root, "*.dxbc"))):
+    for path in sorted(glob.glob(os.path.join(glob.escape(root), "*.dxbc"))):
         name = os.path.basename(path)[:-5]
         with open(path, "rb") as fh:
             chunks = parts(fh.read())
@@ -175,6 +254,10 @@ def census(root):
         if user_sgprs is not None:
             row["spare_table2"] = user_sgprs - row["span_table2"]
             row["spare_table1"] = user_sgprs - row["span_table1"]
+            asm_path = os.path.join(disasm, name + ".s") if disasm else None
+            if asm_path and os.path.exists(asm_path):
+                with open(asm_path, encoding="utf-8") as fh:
+                    row["reads"] = read_scan(fh.read(), user_sgprs)
         rows.append(row)
     return rows, errors
 
@@ -196,6 +279,7 @@ def summarize(rows):
         "span_table1": dict(sorted(Counter(r["span_table1"] for r in ok).items())),
         "spare_table2": dict(sorted(Counter(r["spare_table2"] for r in ok if "spare_table2" in r).items())),
         "spare_table1": dict(sorted(Counter(r["spare_table1"] for r in ok if "spare_table1" in r).items())),
+        "read_scan": _read_summary(ok),
     }
 
 
@@ -203,6 +287,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("root", help="tools/fspx_unpack.py --out folder")
     ap.add_argument("--json", help="also write the rows and the summary here")
+    ap.add_argument("--disasm", help="a tools/fspx_unpack.py --disasm folder; adds each program's reads")
     a = ap.parse_args(argv)
     if a.json:
         try:
@@ -212,7 +297,9 @@ def main(argv=None):
             pass
     if not os.path.isdir(a.root):
         ap.error(f"not a folder: {a.root}")
-    rows, errors = census(a.root)
+    if a.disasm and not os.path.isdir(a.disasm):
+        ap.error(f"not a folder: {a.disasm}")
+    rows, errors = census(a.root, a.disasm)
     summary = summarize(rows)
     for row in rows:
         if "error" in row:
@@ -229,6 +316,10 @@ def main(argv=None):
     print(f"user_sgprs {summary['user_sgprs']}")
     print(f"span table2 {summary['span_table2']} table1 {summary['span_table1']}")
     print(f"spare table2 {summary['spare_table2']} table1 {summary['spare_table1']}")
+    if summary["read_scan"]:
+        rs = summary["read_scan"]
+        print(f"reads {rs['programs']} program(s): table bases {rs['table_bases']}, whole pairs {rs['whole_pairs']}, "
+              f"{rs['low_read']} read s0-s3")
     for line in errors:
         print(f"error: {line}", file=sys.stderr)
     if a.json:

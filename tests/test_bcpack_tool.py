@@ -120,5 +120,140 @@ class TestBcpackTool(unittest.TestCase):
             bcpack_tool.inspect_stream(self.compressed_stream, codec=1, out_size=33)
 
 
+class TestCliErrorPaths(unittest.TestCase):
+    """The CLI must report a failed input/output in one ERROR line with exit status 2,
+    never a raw traceback (bcpack.py library behavior is unchanged)."""
+
+    def setUp(self) -> None:
+        self.original_blocks = _synthetic_bc1_blocks(4)
+        self.compressed_stream = test_bcpack.encode_bc1_blocks(self.original_blocks)
+
+    def _cli(self, argv, tmp_dir, name):
+        from contextlib import redirect_stderr, redirect_stdout
+        err = io.StringIO()
+        out = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            rc = bcpack_tool.main(argv)
+        with open(os.path.join(tmp_dir, name + ".stderr"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(err.getvalue())
+        return rc, err.getvalue(), out.getvalue()
+
+    def _assert_one_error_line(self, rc, err, src):
+        self.assertEqual(rc, 2)
+        lines = err.splitlines()
+        self.assertEqual(len(lines), 1, err)
+        self.assertTrue(lines[0].startswith("ERROR: "), err)
+        self.assertIn(src, lines[0])
+        self.assertNotIn("Traceback", err)
+
+    def test_missing_input_inspect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing = os.path.join(tmp_dir, "absent.bcpack")
+            rc, err, _ = self._cli(
+                ["inspect", missing, "--codec", "1", "--size", "32"], tmp_dir, "inspect_missing"
+            )
+            self._assert_one_error_line(rc, err, "absent.bcpack")
+
+    def test_missing_input_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing = os.path.join(tmp_dir, "absent.bcpack")
+            rc, err, _ = self._cli(
+                ["profile", missing, "--codec", "1", "--size", "32"], tmp_dir, "profile_missing"
+            )
+            self._assert_one_error_line(rc, err, "absent.bcpack")
+
+    def test_missing_input_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing = os.path.join(tmp_dir, "absent.bcpack")
+            out_file = os.path.join(tmp_dir, "out.raw")
+            rc, err, _ = self._cli(
+                ["decode", missing, out_file, "--codec", "1", "--size", "32"],
+                tmp_dir, "decode_missing",
+            )
+            self._assert_one_error_line(rc, err, "absent.bcpack")
+            self.assertFalse(os.path.exists(out_file))
+
+    def test_empty_stream_inspect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "empty.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(b"")
+            rc, err, _ = self._cli(
+                ["inspect", in_file, "--codec", "1", "--size", "32"], tmp_dir, "inspect_empty"
+            )
+            self._assert_one_error_line(rc, err, "empty.bcpack")
+
+    def test_malformed_stream_inspect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "junk.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(bytes(range(256)))
+            rc, err, _ = self._cli(
+                ["inspect", in_file, "--codec", "1", "--size", "4096"], tmp_dir, "inspect_junk"
+            )
+            self._assert_one_error_line(rc, err, "junk.bcpack")
+
+    def test_malformed_stream_decode_writes_no_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "junk.bcpack")
+            out_file = os.path.join(tmp_dir, "out.raw")
+            with open(in_file, "wb") as f:
+                f.write(b"\x00" * 64)
+            rc, err, _ = self._cli(
+                ["decode", in_file, out_file, "--codec", "1", "--size", "32"],
+                tmp_dir, "decode_junk",
+            )
+            self._assert_one_error_line(rc, err, "junk.bcpack")
+            self.assertFalse(os.path.exists(out_file))
+
+    def test_decode_output_is_a_directory(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            out_dir = os.path.join(tmp_dir, "out_dir")
+            os.makedirs(out_dir)
+            with mock.patch.object(bcpack_tool.bcpack, "decode_with_info",
+                                   return_value=(self.original_blocks, frozenset())):
+                rc, err, _ = self._cli(
+                    ["decode", in_file, out_dir, "--codec", "1", "--size", "32"],
+                    tmp_dir, "decode_outdir",
+                )
+            self._assert_one_error_line(rc, err, "out_dir")
+
+    def test_malformed_history_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            history = os.path.join(tmp_dir, "hist.json")
+            with open(history, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{not json")
+            out_file = os.path.join(tmp_dir, "out.raw")
+            rc, err, _ = self._cli(
+                ["decode", in_file, out_file, "--codec", "1", "--size", "32",
+                 "--history", history],
+                tmp_dir, "decode_hist",
+            )
+            self._assert_one_error_line(rc, err, "hist.json")
+            self.assertFalse(os.path.exists(out_file))
+
+    def test_success_path_still_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            out_file = os.path.join(tmp_dir, "out.raw")
+            rc, err, _ = self._cli(
+                ["decode", in_file, out_file, "--codec", "1", "--size", "32"],
+                tmp_dir, "decode_ok",
+            )
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(err, "")
+            with open(out_file, "rb") as f:
+                self.assertEqual(f.read(), self.original_blocks)
+
+
 if __name__ == "__main__":
     unittest.main()

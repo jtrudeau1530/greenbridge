@@ -102,6 +102,7 @@ public:
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
     bool sampler_filter_minmax = false;
+    bool vertex_attribute_divisor = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
@@ -114,6 +115,7 @@ public:
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
+    bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -450,6 +452,36 @@ public:
                 *v13_.next() = &min_lod;
             }
         }
+        const char* divisor_extension = nullptr;
+        for (const char* name :
+             {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
+            if (std::any_of(extensions.begin(), extensions.end(),
+                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; })) {
+                divisor_extension = name;
+                break;
+            }
+        }
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_khr{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_ext{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+        if (divisor_extension) {
+            const bool is_khr = std::strcmp(divisor_extension, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) == 0;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                            is_khr ? static_cast<void*>(&divisor_khr) : static_cast<void*>(&divisor_ext)};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            vertex_attribute_divisor = (is_khr ? divisor_khr.vertexAttributeInstanceRateDivisor
+                                               : divisor_ext.vertexAttributeInstanceRateDivisor) == VK_TRUE;
+            if (vertex_attribute_divisor) {
+                if (is_khr) {
+                    divisor_khr.pNext = *v13_.next();
+                    *v13_.next() = &divisor_khr;
+                } else {
+                    divisor_ext.pNext = *v13_.next();
+                    *v13_.next() = &divisor_ext;
+                }
+            }
+        }
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
         for (const auto& extension : extensions) {
@@ -507,7 +539,12 @@ public:
         enabled = enable;
         std::vector<const char*> device_extensions;
         v13_.add_extensions(device_extensions);
+        conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
+        });
+        if (conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+        if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";

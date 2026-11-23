@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
@@ -102,6 +103,66 @@ class Conventions(unittest.TestCase):
         self.assertEqual(reader.read(b'<R><Item value="1"/><Item value="2"/></R>')[2], [1, 2])
         self.assertEqual(reader.read(b'<R>leaf</R>')[2], "leaf")
 
+    def test_vector_with_extra_attributes_and_non_vector_xyzw(self):
+        reader = R.Reader(root_handlers={}, type_handlers={})
+        self.assertEqual(
+            reader.read(b'<R><offset x="1.0" y="2.5" z="-3" name="head" userFlags="3"/></R>')[2],
+            {"offset": {"$value": (1.0, 2.5, -3.0), "@name": "head", "@userFlags": 3}},
+        )
+        self.assertEqual(reader.stats["vector"], 1)
+        self.assertEqual(reader.stats["extra attributes"], 1)
+
+        self.assertEqual(
+            reader.read(b'<R><node x="label" y="1.0"/></R>')[2],
+            {"node": {"@x": "label", "@y": 1.0}},
+        )
+        self.assertEqual(
+            reader.read(b'<R><node y="2.0" z="3.0"/></R>')[2],
+            {"node": {"@y": 2.0, "@z": 3.0}},
+        )
+        self.assertEqual(
+            reader.read(b'<R><s value="10" x="2"/></R>')[2],
+            {"s": {"$value": 10, "@x": 2}},
+        )
+
+    def test_streaming_drops_top_level_children_from_root(self):
+        orig_iterparse = ET.iterparse
+        roots_seen = []
+        max_children = 0
+
+        def spy_iterparse(*args, **kwargs):
+            nonlocal max_children
+            for event, el in orig_iterparse(*args, **kwargs):
+                if event == "start" and not roots_seen:
+                    roots_seen.append(el)
+                elif roots_seen:
+                    max_children = max(max_children, len(roots_seen[0]))
+                yield event, el
+
+        with mock.patch.object(ET, "iterparse", side_effect=spy_iterparse):
+            R.Reader(root_handlers={}, type_handlers={}).read(DOC)
+        self.assertEqual(len(roots_seen), 1)
+        self.assertEqual(len(roots_seen[0]), 0)
+
+        roots_seen.clear()
+        max_children = 0
+        count = 1000
+        large_xml = (
+            b"<CLargeRoot>"
+            + b"".join(f'<Item><idx value="{i}"/><pos x="{i}.0" y="1.0" z="2.0"/></Item>'.encode("ascii")
+                       for i in range(count))
+            + b"</CLargeRoot>"
+        )
+        reader = R.Reader(root_handlers={}, type_handlers={})
+        with mock.patch.object(ET, "iterparse", side_effect=spy_iterparse):
+            tag, _, items = reader.read(large_xml)
+        self.assertEqual(tag, "CLargeRoot")
+        self.assertEqual(len(items), count)
+        self.assertEqual([item["idx"] for item in items], list(range(count)))
+        self.assertEqual(reader.stats["list"], 1)
+        self.assertEqual(len(roots_seen[0]), 0)
+        self.assertLess(max_children, count)
+
 
 class Dispatch(unittest.TestCase):
     def test_type_handler(self):
@@ -117,6 +178,56 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(value["items"], [("thing", 2), None, {"size": 3}])
         self.assertEqual(calls, ["Item"])
         self.assertEqual(reader.stats["type handler"], 1)
+
+    def test_type_handler_does_not_double_count_types_or_extra_attributes(self):
+        def thing(el, reader):
+            generic = reader.convert(el, use_type_handler=False)
+            return ("thing", generic["size"])
+
+        reader = R.Reader(root_handlers={}, type_handlers={"CThing": thing})
+        _, _, value = reader.read(b'<Root><Item type="CThing" name="first"><size value="2"/></Item></Root>')
+        self.assertEqual(value, [{"$value": ("thing", 2), "@name": "first"}])
+        self.assertEqual(reader.types, {"CThing": 1})
+        self.assertEqual(reader.stats["type handler"], 1)
+        self.assertEqual(reader.stats["extra attributes"], 1)
+        self.assertEqual(reader.stats["object"], 1)
+
+        direct_reader = R.Reader(root_handlers={}, type_handlers={"CThing": thing})
+        direct_val = direct_reader.convert(
+            ET.fromstring(b'<Item type="CThing" name="direct"><size value="5"/></Item>'),
+            use_type_handler=False,
+        )
+        self.assertEqual(direct_val, {"$type": "CThing", "size": 5, "@name": "direct"})
+        self.assertEqual(direct_reader.types, {"CThing": 1})
+        self.assertEqual(direct_reader.stats["type handler"], 0)
+        self.assertEqual(direct_reader.stats["extra attributes"], 1)
+        self.assertEqual(direct_reader.stats["object"], 1)
+
+    def test_streaming_parity_on_typed_null_and_attribute_roots(self):
+        def thing(el, reader):
+            generic = reader.convert(el, use_type_handler=False)
+            return ("thing", generic["size"])
+
+        cases = (
+            (b'<R type="CRootType" version="1"><a value="1"/></R>', {}),
+            (b'<R type="CListRoot"><Item value="1"/><Item value="2"/></R>', {}),
+            (b'<R type="NULL" name="empty"><a value="1"/></R>', {}),
+            (b'<R type="CThing" id="7"><size value="2"/></R>', {"CThing": thing}),
+            (b'<R value="10" name="root"><a value="1"/></R>', {}),
+            (b'<R content="short_array" name="arr">1 2<a value="1"/></R>', {}),
+            (b'<R x="1.0" y="2.0" name="vec"><a value="1"/></R>', {}),
+            (b'<R ref="target" name="ref"><a value="1"/></R>', {}),
+            (b'<Item type="CThing" x="1.0" y="2.0"/>', {"CThing": lambda el, r: ("vec", r.convert(el, use_type_handler=False))}),
+        )
+        for raw, handlers in cases:
+            with self.subTest(raw=raw):
+                whole_reader = R.Reader(root_handlers={}, type_handlers=handlers)
+                stream_reader = R.Reader(root_handlers={}, type_handlers=handlers)
+                whole_val = whole_reader.convert(ET.fromstring(raw))
+                _, _, stream_val = stream_reader.read(raw)
+                self.assertEqual(stream_val, whole_val)
+                self.assertEqual(stream_reader.stats, whole_reader.stats)
+                self.assertEqual(stream_reader.types, whole_reader.types)
 
     def test_root_handler_gets_the_whole_root(self):
         def root(el, reader):
@@ -181,12 +292,61 @@ class Run(unittest.TestCase):
         with open(os.path.join(out, next(f for f in files if f.startswith("CSyntheticRoot"))), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["label"], "synthetic_name")
 
+    def test_exports_all_documents_with_the_same_basename(self):
+        targets = []
+        for index in range(1, 4):
+            folder = os.path.join(self.tmp.name, str(index))
+            os.mkdir(folder)
+            path = os.path.join(folder, "same.xml")
+            with open(path, "wb") as f:
+                f.write(f'<COther><x value="{index}"/></COther>'.encode("ascii"))
+            targets.append(path)
+        out = os.path.join(self.tmp.name, "json")
+        for _ in range(2):
+            summary = R.run(targets, out_dir=out)
+            self.assertEqual(summary["documents"], 3)
+            files = sorted(os.listdir(out))
+            self.assertEqual(len(files), 3)
+            values = []
+            for name in files:
+                with open(os.path.join(out, name), encoding="utf-8") as f:
+                    values.append(json.load(f)["x"])
+            self.assertEqual(sorted(values), [1, 2, 3])
+
     def test_cli_missing_target(self):
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"),
                             os.path.join(self.tmp.name, "nope")], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
         self.assertIn("does not exist", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
+
+    def _cli(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "gamedata_reader.py"), *args],
+                              capture_output=True, text=True)
+
+    def test_cli_bad_index_json_is_one_error_line(self):
+        for name, text in (("notjson", "{bad"), ("wrongshape", "[]"), ("nofiles", "{}")):
+            with self.subTest(name):
+                d = os.path.join(self.tmp.name, name)
+                os.makedirs(d)
+                with open(os.path.join(d, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                r = self._cli(d)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("ERROR: cannot read", r.stderr)
+                self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+
+    def test_cli_out_that_is_a_file_is_refused(self):
+        xml = os.path.join(self.tmp.name, "a.xml")
+        out = os.path.join(self.tmp.name, "afile")
+        for path, data in ((xml, b"<a/>"), (out, b"x")):
+            with open(path, "wb") as f:
+                f.write(data)
+        r = self._cli(xml, "--out", out)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("not a directory", r.stderr)
 
 
 if __name__ == "__main__":

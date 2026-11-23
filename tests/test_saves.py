@@ -316,6 +316,82 @@ class AtomicPackTest(unittest.TestCase):
         self.assertEqual(rd(self.out), self.new)
         self.assertEqual(os.stat(self.out).st_mode & 0o777, os.stat(self.source).st_mode & 0o777)
 
+    def test_hard_linked_destination_is_refused_without_splitting_aliases(self):
+        alias = os.path.join(self.root, "alias.jsav")
+        try:
+            os.link(self.out, alias)
+        except OSError as exc:
+            self.skipTest(f"cannot create hard links: {exc}")
+        before = sorted(os.listdir(self.root))
+        with self.assertRaisesRegex(ValueError, "hard link"):
+            quiet(saves.pack, self.extracted, self.out)
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, self.out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("hard link", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertTrue(os.path.samefile(self.out, alias))
+        self.assertEqual(rd(alias), self.old)
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    def symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"cannot create symbolic links: {exc}")
+
+    def test_destination_symlinks_update_the_target_and_remain_links(self):
+        probe = os.path.join(self.root, "symlink-probe")
+        self.symlink("missing-probe-target", probe)
+        os.unlink(probe)
+        for relative in (False, True):
+            for dangling in (False, True):
+                with self.subTest(relative=relative, dangling=dangling):
+                    label = f"{relative}-{dangling}"
+                    target_dir = os.path.join(self.root, "target-" + label)
+                    os.mkdir(target_dir)
+                    target = os.path.join(target_dir, "save.jsav")
+                    if not dangling:
+                        write(target, self.old)
+                    link = os.path.join(self.root, "link-" + label)
+                    spelling = os.path.relpath(target, self.root) if relative else target
+                    self.symlink(spelling, link)
+                    quiet(saves.pack, self.extracted, link)
+                    self.assertTrue(os.path.islink(link))
+                    self.assertEqual(os.readlink(link), spelling)
+                    self.assertEqual(rd(target), self.new)
+                    self.assertEqual(os.listdir(target_dir), ["save.jsav"])
+
+    def test_failed_publication_through_symlink_preserves_link_and_target(self):
+        link = os.path.join(self.root, "link.jsav")
+        self.symlink(os.path.basename(self.out), link)
+        before = sorted(os.listdir(self.root))
+        with mock.patch.object(saves.os, "replace", side_effect=PermissionError("destination locked")):
+            with self.assertRaises(PermissionError):
+                quiet(saves.pack, self.extracted, link)
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.readlink(link), os.path.basename(self.out))
+        self.assertEqual(rd(self.out), self.old)
+        self.assertEqual(sorted(os.listdir(self.root)), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory junction")
+    def test_destination_through_directory_junction_updates_the_target(self):
+        target_dir = os.path.join(self.root, "target")
+        os.mkdir(target_dir)
+        junction = os.path.join(self.root, "junction")
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", junction, target_dir],
+                                capture_output=True, text=True)
+        if result.returncode:
+            self.skipTest("cannot create junction: " + result.stderr)
+        self.addCleanup(os.rmdir, junction)
+        target = os.path.join(target_dir, "save.jsav")
+        write(target, self.old)
+        quiet(saves.pack, self.extracted, os.path.join(junction, "save.jsav"))
+        self.assertTrue(os.path.isdir(junction))
+        self.assertEqual(rd(target), self.new)
+        self.assertEqual(os.listdir(target_dir), ["save.jsav"])
+
     @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
     def test_replacement_preserves_existing_permission_bits(self):
         os.chmod(self.out, 0o640)
@@ -665,6 +741,95 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertIn("ERROR:", p.stderr)
         self.assertIn("declares 4 entries", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
+
+
+class PackIndexValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.source = os.path.join(self.tmp.name, "source.jsav")
+        self.extracted = os.path.join(self.tmp.name, "extracted")
+        self.index_path = os.path.join(self.extracted, "index.json")
+        self.original, _, _ = make_jsav(1, 1)
+        write(self.source, self.original)
+        quiet(saves.extract, self.source, self.extracted)
+        self.index = rd_json(self.index_path)
+
+    def invalid_indexes(self):
+        yield None, "object"
+        yield [], "object"
+        fields = [
+            (("header",), (None, [], 42), "header"),
+            (("entries",), (None, {}, 42), "entries"),
+            (("header", "version"), (None, "3", True, -1, 0x100000000), "header.version"),
+            (("header", "code_blocks"), (None, "1", True, -1, 3), "header.code_blocks"),
+            (("entries", 0), (None, [], 42), "entries[0]"),
+            (("entries", 0, "file"), (None, [], 42, ""), "entries[0].file"),
+            (("entries", 0, "hash"), (None, 1, True, "not-hex", "-1", "100000000"), "entries[0].hash"),
+            (("entries", 0, "flags"), (None, "1", True, -1, 0x100000000), "entries[0].flags"),
+        ]
+        for path, values, field in fields:
+            for value in values:
+                doc = json.loads(json.dumps(self.index))
+                node = doc
+                for key in path[:-1]:
+                    node = node[key]
+                node[path[-1]] = value
+                yield doc, field
+        for path, field in [(("header",), "header"), (("entries",), "entries"),
+                            (("header", "version"), "header.version"),
+                            (("header", "code_blocks"), "header.code_blocks"),
+                            (("entries", 0, "file"), "entries[0].file"),
+                            (("entries", 0, "hash"), "entries[0].hash"),
+                            (("entries", 0, "flags"), "entries[0].flags")]:
+            doc = json.loads(json.dumps(self.index))
+            node = doc
+            for key in path[:-1]:
+                node = node[key]
+            del node[path[-1]]
+            yield doc, field
+
+    def test_malformed_indexes_name_the_index_and_invalid_field(self):
+        for doc, field in self.invalid_indexes():
+            with self.subTest(field=field, doc=doc):
+                write(self.index_path, json.dumps(doc).encode("utf-8"))
+                with self.assertRaises(ValueError) as error:
+                    saves.pack_from_dir(self.extracted)
+                self.assertIn(self.index_path, str(error.exception))
+                self.assertIn(field, str(error.exception))
+
+    def test_cli_errors_leave_existing_output_untouched(self):
+        out = os.path.join(self.tmp.name, "packed.jsav")
+        write(out, b"previous complete output")
+        for doc in (None, {}, {"header": None, "entries": []},
+                    {"header": {"version": 3, "code_blocks": 0}, "entries": [None]}):
+            with self.subTest(doc=doc):
+                write(self.index_path, json.dumps(doc).encode("utf-8"))
+                result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertIn(self.index_path, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(rd(out), b"previous complete output")
+
+    def test_json_syntax_and_encoding_errors_name_the_index(self):
+        for data in (b"{", b"\xff"):
+            with self.subTest(data=data):
+                write(self.index_path, data)
+                with self.assertRaises(ValueError) as error:
+                    saves.pack_from_dir(self.extracted)
+                self.assertIn(self.index_path, str(error.exception))
+                self.assertIn("invalid JSON", str(error.exception))
+
+    def test_valid_editable_metadata_still_round_trips(self):
+        self.index["header"]["note"] = "extra metadata is ignored"
+        self.index["entries"][0]["hash"] = "0X" + self.index["entries"][0]["hash"]
+        write(self.index_path, json.dumps(self.index).encode("utf-8"))
+        self.assertEqual(saves.pack_from_dir(self.extracted), self.original)
+        write(self.index_path, json.dumps({"header": {"version": 3, "code_blocks": 0},
+                                         "entries": []}).encode("utf-8"))
+        self.assertEqual(saves.pack_from_dir(self.extracted), saves.build_jsav(3, 0, [], [], []))
 
 
 if __name__ == "__main__":

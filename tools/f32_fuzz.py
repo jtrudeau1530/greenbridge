@@ -450,7 +450,9 @@ ALL_OPS = {
     "v_fmac_f32": _op("ffd", fma),                       # D = S0 * S1 + D
     "v_mac_f32": _op("ffd", lambda x, y, z: add(mul(x, y), z)),
     "v_fmaak_f32": _op("ffk", fma, mods=False),
+    "v_fmamk_f32": _op("fkf", fma, mods=False),
     "v_madak_f32": _op("ffk", lambda x, y, z: add(mul(x, y), z), mods=False),
+    "v_madmk_f32": _op("fkf", lambda x, y, z: add(mul(x, y), z), mods=False),
     "v_cvt_f32_i32": _op("u", lambda x: cvt_int_to_f32(x - (1 << 32) if x >> 31 else x)),
     "v_cvt_f32_u32": _op("u", lambda x: cvt_int_to_f32(x)),
     "v_cvt_f32_ubyte0": _op("u", lambda x: cvt_int_to_f32(x & 0xFF)),
@@ -491,10 +493,11 @@ VOP3_ONLY = {"v_mad_legacy_f32", "v_mad_f32", "v_fma_f32", "v_cubeid_f32", "v_cu
              "v_cubema_f32", "v_cvt_pk_u8_f32", "v_cvt_pkrtz_f16_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32"}
 OPS = {k: v for k, v in ALL_OPS.items() if not v["hw_only"]}   # what the translator comparison covers
 HW_ONLY_OPS = tuple(k for k, v in ALL_OPS.items() if v["hw_only"])
+LITERAL_CONST_OPS = {"v_fmaak_f32", "v_fmamk_f32", "v_madak_f32", "v_madmk_f32"}
+
 # Ops the hardware gives an output modifier in their VOP3 form but whose float output is an integer or packed
 # value: no omod/clamp generated for them.
-NO_OUT_MODS = {"v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32", "v_cvt_pk_u8_f32", "v_cmp_class_f32", "v_fmaak_f32",
-               "v_madak_f32"}
+NO_OUT_MODS = {"v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32", "v_cvt_pk_u8_f32", "v_cmp_class_f32"} | LITERAL_CONST_OPS
 
 # ---- operand values ----
 
@@ -633,13 +636,13 @@ def model(op, vals, srcs, out_mods, denorm="skip", translator=True):
         r, vcc = vals[8], cmp_class(ins[0], ins[1])
     else:
         r = spec["fn"](*ins)
-        floaty = spec["mods"] or op in ("v_fmaak_f32", "v_madak_f32")
+        floaty = spec["mods"] or op in LITERAL_CONST_OPS
         if floaty and is_denorm(r):
             if denorm == "skip":
                 raise Denormal("result")
             if out_flush:
                 r = flush(r)
-        if op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_mad_legacy_f32"):
+        if op in ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_madmk_f32", "v_mad_legacy_f32"):
             prod = legacy_mul(ins[0], ins[1]) if op == "v_mad_legacy_f32" else mul(ins[0], ins[1])
             if is_denorm(prod) and denorm == "skip":
                 raise Denormal("intermediate product")
@@ -661,9 +664,9 @@ def line(op, vals, srcs, e64, out_mods):
     if op == "v_cmp_class_f32":
         name += "_e64" if e64 else "_e32"
         return f"{name} vcc_lo, " + ", ".join(parts) if e64 else f"{name} vcc_lo, " + ", ".join(parts)
-    if op not in VOP3_ONLY and op not in ("v_fmaak_f32", "v_madak_f32"):
+    if op not in VOP3_ONLY and op not in LITERAL_CONST_OPS:
         name += "_e64" if e64 else "_e32"
-    if not e64 and op not in ("v_fmaak_f32", "v_madak_f32"):
+    if not e64 and op not in LITERAL_CONST_OPS:
         # VOP1/VOP2: src1 must be a VGPR, already true; no modifiers
         pass
     del spec
@@ -913,10 +916,11 @@ def is_nan16(h):
 
 
 def hw_same(want, got, op=None):
-    """Model [v8, vcc] against the hardware's: NaN matches any NaN (an f16 NaN in a result half too), everything else
-    bit for bit."""
+    """Compare hardware v8 and VCC, requiring byte equality for packed u8 results."""
     if want[1] != got[1]:
         return False
+    if op == "v_cvt_pk_u8_f32":
+        return want[0] == got[0]
     halves = F16_HALVES.get(op)
     if halves is None:
         return same(want[0], got[0])
@@ -1140,8 +1144,8 @@ def clamp_label(case, got):
 FAMILIES = [
     ("add / sub / mul", ("v_add_f32", "v_sub_f32", "v_subrev_f32", "v_mul_f32")),
     ("DX9 legacy mul / mad", ("v_mul_legacy_f32", "v_mad_legacy_f32")),
-    ("mad / mac / madak", ("v_mad_f32", "v_mac_f32", "v_madak_f32")),
-    ("fma / fmac / fmaak", ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32")),
+    ("mad / mac / madak / madmk", ("v_mad_f32", "v_mac_f32", "v_madak_f32", "v_madmk_f32")),
+    ("fma / fmac / fmaak / fmamk", ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32", "v_fmamk_f32")),
     ("int -> f32 convert", ("v_cvt_f32_i32", "v_cvt_f32_u32", "v_cvt_f32_ubyte0", "v_cvt_f32_ubyte1",
                             "v_cvt_f32_ubyte2", "v_cvt_f32_ubyte3")),
     ("f16 convert", ("v_cvt_f32_f16", "v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32")),
@@ -1241,7 +1245,7 @@ def gen_probe(rng, op, kind):
         return case
     if kind == "cancel":
         # z = -round(x * y): a fused multiply-add keeps the rounding residue of the product, an unfused one gives 0
-        if op not in ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32"):
+        if op not in ("v_fma_f32", "v_fmac_f32", "v_fmaak_f32", "v_fmamk_f32"):
             return None
         x = (rng.getrandbits(1) << 31) | (rng.randrange(120, 135) << 23) | rng.getrandbits(23)
         y = (rng.getrandbits(1) << 31) | (rng.randrange(120, 135) << 23) | rng.getrandbits(23)

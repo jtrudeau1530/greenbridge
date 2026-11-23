@@ -48,10 +48,11 @@ def search(data, bpe, tile_bytes, widths, ntiles):
             if wb % tw:
                 continue
             tiles_x = wb // tw
-            rows = max(1, ntiles // tiles_x)
-            n = tiles_x * rows * tw * th
-            if n > len(raw):
+            blocks_per_row = tiles_x * tw * th
+            rows = min(max(1, ntiles // tiles_x), len(raw) // blocks_per_row)
+            if not rows:
                 continue
+            n = blocks_per_row * rows
             for xs in itertools.combinations(range(bits), xbits):
                 seq = ["x" if k in xs else "y" for k in range(bits)]
                 pos = positions(seq, n, tw, th, wb)
@@ -95,7 +96,7 @@ def main():
     ap.add_argument("--bpe", type=int, default=8)
     ap.add_argument("--tile", type=int, default=65536)
     ap.add_argument("--widths", default="1024,2048")
-    ap.add_argument("--tiles", type=int, default=48)
+    ap.add_argument("--tiles", type=int, default=48, help="target number of tiles to score (default: 48)")
     ap.add_argument("--out")
     a = ap.parse_args()
     if a.out and same_report_path(a.out, a.blob):

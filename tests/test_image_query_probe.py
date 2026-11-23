@@ -5,8 +5,9 @@ Standard library only."""
 import io
 import math
 import sys
+import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -138,6 +139,24 @@ class Comparison(unittest.TestCase):
             other.arch = "gfx1150"
             with mock.patch.object(runner, "open_oracle", return_value=other):
                 self.assertEqual(pr.main([]), 77)
+
+    def test_json_output_creates_its_parent_and_reports_write_errors(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner, "open_oracle", return_value=FakeOracle()):
+            report = Path(tmp) / "new" / "report.json"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 0)
+            self.assertTrue(report.is_file())
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner, "open_oracle", return_value=FakeOracle()):
+            report = Path(tmp) / "directory"
+            report.mkdir()
+            error = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(error):
+                self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 1)
+            self.assertIn(str(report), error.getvalue())
+            self.assertIn("cannot write", error.getvalue())
 
 
 class Hardware(unittest.TestCase):

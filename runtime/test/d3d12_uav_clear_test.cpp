@@ -531,6 +531,21 @@ int main() {
             buffers.push_back(narrow);
         }
         {
+            for (UINT offset = 0; offset < 8; ++offset) {
+                BufferCase short_ranges{"short typed buffer ranges", 256, {whole(64)}};
+                for (UINT count = 1; count <= 8; ++count)
+                    short_ranges.clears.push_back(typed(VK_FORMAT_R8_UINT, false, {offset * 17 + count, 0, 0, 0},
+                                                       offset, count));
+                buffers.push_back(short_ranges);
+            }
+            BufferCase short_ranges{"short typed buffer boundary and rectangles", 256, {whole(64)}};
+            short_ranges.clears.push_back(typed(VK_FORMAT_R16_UINT, false, {0xbeef, 0, 0, 0}, 254, 1));
+            short_ranges.clears.push_back(typed(VK_FORMAT_R8_UINT, false, {0x7b, 0, 0, 0}, 255, 1));
+            short_ranges.clears.push_back(typed(VK_FORMAT_R16_UNORM, true, floats(1.0f, 0, 0, 0), 50, 4,
+                                                {{-1, 0, 1, 1}, {0, 0, 2, 1}, {3, 0, 8, 1}}));
+            buffers.push_back(short_ranges);
+        }
+        {
             // 16-byte elements over more than vkCmdUpdateBuffer's 64 KiB: written once, then doubled by copies.
             BufferCase wide{"typed buffer, 8- and 16-byte elements", 1 << 17, {whole((1 << 17) / 4)}};
             wide.clears.push_back(typed(VK_FORMAT_R32G32B32A32_UINT, false, {1, 2, 3, 4}, 16, 8000));

@@ -452,5 +452,51 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
                         self.assertEqual(check.pixel_test("unused", tmp, name), want)
 
 
+class FmaFusedSuite(unittest.TestCase):
+    """run_gpu_tests.py runs cs_fma_fused under --filter, honoring LEONIDA_FMA=khr vs default glsl."""
+    RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
+
+    def run_fma(self, rc, msg, fma_env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="cs_fma_fused", build=tmp, llvm_mc="unused")
+
+            def fake_run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_compute_test":
+                    self.assertEqual((env or {}).get("VKC_SGPRS"), rgt.FMA_FUSED_ENV["VKC_SGPRS"])
+                    return rc, msg
+                (Path(tmp) / "spirv" / "cs_fma_fused.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            env_patch = {"LEONIDA_FMA": fma_env} if fma_env is not None else {}
+            with (patch.dict(rgt.os.environ, env_patch, clear=False),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=fake_run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                if fma_env is None:
+                    rgt.os.environ.pop("LEONIDA_FMA", None)
+                code = rgt.run_suite(args, tmp)
+            return code, output.getvalue()
+
+    def test_glsl_accepts_radv_split_and_khr_rejects_it(self):
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_env=None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_fma_fused", out)
+        self.assertIn("5/7 split", out)
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_env="khr")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL  cs_fma_fused", out)
+
+    def test_khr_fused_passes_and_exit_77_skips(self):
+        import check
+        rc, out = self.run_fma(0, dump(check.FMA_FUSED), fma_env="khr")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("8/8 fused exact (OpFmaKHR)", out)
+        rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
+
+
 if __name__ == "__main__":
     unittest.main()

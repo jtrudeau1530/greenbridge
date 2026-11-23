@@ -265,8 +265,7 @@ int main() {
         std::fprintf(stderr, "FAIL: cannot create the presentation window (Win32 error %lu)\n", GetLastError());
         return 1;
     }
-    ShowWindow(window, SW_SHOWNORMAL);
-    SetForegroundWindow(window);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
     UpdateWindow(window);
     pump();
 

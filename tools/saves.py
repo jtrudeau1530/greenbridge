@@ -10,6 +10,7 @@ Commands
   extract <file> <outdir>        JSAV  -> index.json + blocks/NNN_<group>_<hash>.json + save.pretty.json
                                  ASAV  -> header.json + payload.bin (+ payload.json if it is text)
   pack    <extracted dir> <out>  rebuild a JSAV from an `extract` folder (blocks are taken verbatim)
+                                 follows destination symlinks; destinations with multiple hard links are refused
   verify  <JSAV file>            extract + pack in memory and check the rebuild is byte-identical
   diff    <JSAV a> <JSAV b>      list blocks that were added, removed or changed between two saves
   import <save dir>... [--out DIR] [--map OLD=CONTAINER/BLOB]... [--with-packed] [--force] [--dry-run]
@@ -22,6 +23,7 @@ Commands
 """
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -264,7 +266,7 @@ def extract(p, out):
             e['file'] = f'blocks/{e["index"]:03d}_{e["group"]}_{e["hash"]}.json'
             with open(os.path.join(out, e['file']), 'wb') as f:
                 f.write(b)
-        with open(os.path.join(out, 'index.json'), 'w', newline="\n") as f:
+        with open(os.path.join(out, 'index.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump({'header': h, 'entries': es}, f, indent=1)
         body = d[h['body_offset']:h['body_end']].decode('utf-8')
         with open(os.path.join(out, 'save.pretty.json'), 'w', encoding='utf-8', newline="\n") as f:
@@ -273,7 +275,7 @@ def extract(p, out):
     elif k == 'ASAV':
         h = parse_asav(d)
         pl = asav_payload(d, h)
-        with open(os.path.join(out, 'header.json'), 'w', newline="\n") as f:
+        with open(os.path.join(out, 'header.json'), 'w', encoding='utf-8', newline="\n") as f:
             json.dump(h, f, indent=1)
         with open(os.path.join(out, 'header.bin'), 'wb') as f:
             f.write(d[:h['payload_offset']])
@@ -292,24 +294,72 @@ def extract(p, out):
 
 
 def pack_from_dir(src):
-    idx = json.loads(read(os.path.join(src, 'index.json')))
-    h, es = idx['header'], idx['entries']
+    index_path = os.path.join(src, 'index.json')
+
+    def invalid(field, expected):
+        raise ValueError(f'{index_path}: {field} must be {expected}')
+
+    try:
+        idx = json.loads(read(index_path))
+    except ValueError as exc:
+        raise ValueError(f'{index_path}: invalid JSON ({exc})') from None
+    if not isinstance(idx, dict):
+        invalid('index', 'an object')
+    h, es = idx.get('header'), idx.get('entries')
+    if not isinstance(h, dict):
+        invalid('header', 'an object')
+    if not isinstance(es, list):
+        invalid('entries', 'an array')
+    for field in ('version', 'code_blocks'):
+        value = h.get(field)
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            invalid('header.' + field, 'a uint32 integer')
+    if h['code_blocks'] > len(es):
+        invalid('header.code_blocks', f'between 0 and the entry count ({len(es)})')
+    hashes = []
+    for i, entry in enumerate(es):
+        prefix = f'entries[{i}]'
+        if not isinstance(entry, dict):
+            invalid(prefix, 'an object')
+        if not isinstance(entry.get('file'), str) or not entry['file']:
+            invalid(prefix + '.file', 'a nonempty path string')
+        flags = entry.get('flags')
+        if type(flags) is not int or not 0 <= flags <= 0xFFFFFFFF:
+            invalid(prefix + '.flags', 'a uint32 integer')
+        if not isinstance(entry.get('hash'), str):
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        try:
+            hashed = int(entry['hash'], 16)
+        except ValueError:
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        if not 0 <= hashed <= 0xFFFFFFFF:
+            invalid(prefix + '.hash', 'a hexadecimal uint32 string')
+        hashes.append(hashed)
     blocks = [read(os.path.join(src, e['file'])) for e in es]
-    return build_jsav(h['version'], h['code_blocks'], [int(e['hash'], 16) for e in es],
-                      [e['flags'] for e in es], blocks)
+    return build_jsav(h['version'], h['code_blocks'], hashes, [e['flags'] for e in es], blocks)
 
 
 def pack(src, out):
+    # Publish at the symlink's target, as open(out, 'wb') did, without replacing the link itself.
+    destination = os.path.realpath(out)
+    try:
+        existing = os.stat(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        # Replacing one hard-link name cannot update the other aliases atomically.
+        if stat.S_ISREG(existing.st_mode) and existing.st_nlink > 1:
+            raise ValueError(f'{out}: destination has multiple hard links; choose an unlinked output path')
     data = pack_from_dir(src)
-    parent = os.path.dirname(os.path.abspath(out))
+    parent = os.path.dirname(destination)
     tmp = None
     try:
         with tempfile.NamedTemporaryFile('wb', dir=parent, prefix='.saves-pack-', suffix='.tmp',
                                          delete=False) as f:
             tmp = f.name
             f.write(data)
-        os.chmod(tmp, published_mode(out))
-        os.replace(tmp, out)
+        os.chmod(tmp, published_mode(destination))
+        os.replace(tmp, destination)
     except BaseException:
         if tmp is not None:
             try:

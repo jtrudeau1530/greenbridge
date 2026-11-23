@@ -153,7 +153,7 @@ def detect_arch(clang):
         try:
             out = subprocess.run([tool], capture_output=True, text=True, timeout=60).stdout.split()
             if out:
-                return out[0]
+                return out[0].split(":")[0]   # amdgpu-arch prints 'gfx1010:xnack-': the kernels want the bare name
         except (OSError, subprocess.SubprocessError):
             pass
     return "gfx1150"

@@ -253,19 +253,37 @@ BOOL WINAPI query_headers(HINTERNET request, DWORD, LPCWSTR, LPVOID, LPDWORD, LP
     return receive_response(request, nullptr);
 }
 
-BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR, DWORD, DWORD) {
+// Headers WinHTTP would reject. Measured against the host's winhttp.dll (Windows 11 26300): a null or empty block, and
+// a block with no ':' in it (which includes one cut short by an explicit length), fail with ERROR_INVALID_PARAMETER;
+// a length of (DWORD)-1 means the text is NUL-terminated. Nothing is stored: no request is ever sent.
+bool header_block_valid(LPCWSTR headers, DWORD length) {
+    if (!headers) return false;
+    const size_t count = length == static_cast<DWORD>(-1) ? wcslen(headers) : static_cast<size_t>(length);
+    if (count == 0) return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (headers[i] == L'\0') return false;
+        if (headers[i] == L':') return true;
+    }
+    return false;
+}
+
+BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR headers, DWORD length, DWORD) {
     DWORD error = 0;
     Handle* r = acquire(request, false, false, true, error);
     if (!r) return fail(error);
     release(r);
+    if (!header_block_valid(headers, length)) return fail(ERROR_INVALID_PARAMETER);
     return TRUE;
 }
 
-BOOL WINAPI set_timeouts(HINTERNET handle, int, int, int, int) {
+// Measured the same way: 0 and -1 (infinite) are accepted; any other negative value, in any of the four, fails with
+// ERROR_INVALID_PARAMETER.
+BOOL WINAPI set_timeouts(HINTERNET handle, int resolve, int connect, int send, int receive) {
     DWORD error = 0;
     Handle* h = acquire(handle, true, true, true, error);
     if (!h) return fail(error);
     release(h);
+    if (resolve < -1 || connect < -1 || send < -1 || receive < -1) return fail(ERROR_INVALID_PARAMETER);
     return TRUE;
 }
 

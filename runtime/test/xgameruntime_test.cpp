@@ -12,11 +12,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "file_system.h"
 #include "shims.h"
 
 namespace {
@@ -279,6 +284,20 @@ void check_run_time_load() {
                   reinterpret_cast<SetSensitive>(slot(t, 27))(t, false) == S_OK &&
                   !reinterpret_cast<IsSensitive>(slot(t, 30))(t),
               "slots 27 and 30 set and read this thread's time-sensitive flag");
+        // Slot 8 (XAsyncBeginAlloc, private, signature not measured) must not report a begun call whose provider
+        // never received XAsyncOp::Begin: either it refuses, or the provider saw Begin exactly once.
+        static std::atomic<int> s_begins{0};
+        XAsyncProvider* provider = [](XAsyncOp op, const XAsyncProviderData*) -> HRESULT {
+            if (op == XAsyncOp::Begin) s_begins.fetch_add(1);
+            return S_OK;
+        };
+        XAsyncBlock alloc_block{};
+        using BeginAlloc = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, const void*, const char*, XAsyncProvider*,
+                                                        size_t, size_t, void*);
+        const HRESULT alloc_hr =
+            reinterpret_cast<BeginAlloc>(slot(t, 8))(t, &alloc_block, nullptr, "test", provider, 16, 0, nullptr);
+        check(FAILED(alloc_hr) || s_begins.load() == 1,
+              "slot 8 (XAsyncBeginAlloc) never reports success for a call whose provider did not begin");
         void* unk = nullptr;
         const GUID iunknown = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
         using QI = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
@@ -372,6 +391,79 @@ void check_run_time_load() {
               "slot 3 (preferred UDP port) has no answer offline; slot 20 (IXNetworkingImpl2) is E_NOTIMPL");
         release(n);
     }
+
+    // XPersistentLocalStorageImpl (RT-219): the class id with IXPersistentLocalStorageImpl3's interface id, over a
+    // temporary overlay. The storage folder is <overlay>\persistent.
+    const GUID pls_class = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
+    const GUID pls3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
+    const std::filesystem::path scratch =
+        std::filesystem::temp_directory_path() / (L"gta6rt_pls_test_" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code scratch_ec;
+    std::filesystem::remove_all(scratch, scratch_ec);
+    rt::fs::configure(scratch / L"game", scratch / L"overlay");
+    void* pls = nullptr;
+    check(query(&pls_class, pls3, &pls) == S_OK && pls, "QueryApiImpl hands out XPersistentLocalStorageImpl for IXPersistentLocalStorageImpl3");
+    if (pls) {
+        using GetPathSize = HRESULT(STDMETHODCALLTYPE*)(void*, size_t*);
+        using GetPath = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*, size_t*);
+        using GetSpaceInfo = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t*);
+        using PromptAsync = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, XAsyncBlock*);
+        using PromptResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*);
+        using Mount = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, void**);
+
+        size_t size = 0;
+        check(reinterpret_cast<GetPathSize>(slot(pls, 3))(pls, &size) == S_OK && size > 1,
+              "slot 3 (GetPathSize) reports the length of the path with its NUL");
+        std::string path(size, '\xA5');
+        size_t used = 0;
+        check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, size, path.data(), &used) == S_OK && used == size &&
+                  path[size - 1] == '\0',
+              "slot 4 (GetPath) fills the buffer and reports the bytes used");
+        const std::filesystem::path folder = std::filesystem::path(path.c_str());
+        check(folder == scratch / L"overlay" / L"persistent" && std::filesystem::is_directory(folder),
+              "the path is <overlay>\\persistent and the folder exists");
+        char tiny[2] = {'x', 'x'};
+        used = 99;
+        check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, 2, tiny, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+                  used == 0,
+              "slot 4 refuses a buffer that is too small");
+
+        {
+            std::ofstream cache_file(folder / L"cache.bin", std::ios::binary);
+            const std::string kilobyte(1024, 'z');
+            cache_file << kilobyte;
+        }
+        uint64_t info[4] = {9, 9, 9, 9};  // available free, total free, used, total
+        const HRESULT info_hr = reinterpret_cast<GetSpaceInfo>(slot(pls, 5))(pls, info);
+        check(info_hr == S_OK && info[3] == 2048ull * 1024 * 1024 && info[2] == 1024 && info[1] == info[3] - 1024 &&
+                  info[0] > 0 && info[0] <= info[1],
+              "slot 5 (GetSpaceInfo): the 2048 MB quota, the bytes used, and what is left");
+
+        XAsyncBlock fits{};
+        check(reinterpret_cast<PromptAsync>(slot(pls, 6))(pls, 1024, &fits) == S_OK &&
+                  XAsyncGetStatus(&fits, true) == S_OK && reinterpret_cast<PromptResult>(slot(pls, 7))(pls, &fits) == S_OK,
+              "slots 6/7: a prompt for space the quota can hold succeeds");
+        XAsyncBlock too_big{};
+        check(reinterpret_cast<PromptAsync>(slot(pls, 6))(pls, 4096ull * 1024 * 1024, &too_big) == S_OK &&
+                  XAsyncGetStatus(&too_big, true) == HRESULT_FROM_WIN32(ERROR_DISK_FULL) &&
+                  reinterpret_cast<PromptResult>(slot(pls, 7))(pls, &too_big) == HRESULT_FROM_WIN32(ERROR_DISK_FULL),
+              "slots 6/7: a prompt for more than the quota fails with ERROR_DISK_FULL");
+
+        void* handle = reinterpret_cast<void*>(1);
+        check(reinterpret_cast<Mount>(slot(pls, 8))(pls, "pkg", &handle) == E_NOTIMPL && handle == nullptr,
+              "slot 8 (MountForPackage) is E_NOTIMPL and leaves no handle");
+        release(pls);
+    }
+    rt::fs::configure({}, {});
+    check(query(&pls_class, pls_class, &pls) == S_OK, "the class answers with its own id too");
+    if (pls) {
+        using GetPathSize = HRESULT(STDMETHODCALLTYPE*)(void*, size_t*);
+        size_t size = 99;
+        check(reinterpret_cast<GetPathSize>(slot(pls, 3))(pls, &size) == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND) && size == 0,
+              "with no overlay configured the path size fails instead of answering S_OK with nothing");
+        release(pls);
+    }
+    std::filesystem::remove_all(scratch, scratch_ec);
 
     // XSystemImpl, asked for as libHttpClient.GDK.dll does: the class id with IXSystemImpl5's interface id.
     const GUID system_cls = {0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};

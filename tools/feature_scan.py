@@ -261,7 +261,7 @@ def scan_disasm(disasm_dir: str, stage_of: dict) -> dict:
     vperm_sext_shaders = vperm_sext_insns = 0
     vperm_classes = {"0_7": 0, "8_11": 0, "12": 0, "13_plus": 0}
     files = 0
-    for fn in os.listdir(disasm_dir):
+    for fn in sorted(os.listdir(disasm_dir)):
         if not fn.endswith(".s"):
             continue
         files += 1
@@ -604,10 +604,14 @@ def main() -> int:
         print(f"{d['unreadable']} .dxbc files could not be read")
     if a.out:
         folder = os.path.dirname(a.out)  # --out into a folder that does not exist yet, as awc_manifest.py does
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(result, f, indent=1)
+        try:
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(result, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 

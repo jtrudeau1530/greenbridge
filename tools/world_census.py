@@ -516,7 +516,7 @@ def classify_gaps(archive, intervals, raw_pages, raw_system, scan_start, scan_en
                 idx = bisect.bisect_right(max_end, cursor)
                 while idx < len(segments) and segments[idx][0] < a:
                     s0, s1, kind = segments[idx]
-                    if s1 <= pos:
+                    if s1 <= pos or (cursor > scan_start and s0 < cursor):
                         idx += 1
                         continue
                     start = max(pos, s0)

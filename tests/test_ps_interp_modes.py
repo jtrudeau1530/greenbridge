@@ -6,6 +6,9 @@ layout is the one dxc writes (lib/DxilContainer/DxilPipelineStateValidation.cpp)
 interpolation-mode numbers are DXIL::InterpolationMode ("must match D3D_INTERPOLATION_MODE")
 and the class names come from the SPI_PS_INPUT_ENA fields (Mesa gfx103.json).
 """
+import contextlib
+import errno
+import io
 import json
 import os
 import struct
@@ -13,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -368,6 +372,32 @@ class CliTest(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertEqual(len(json.loads(p.stdout)["files"]), 2)
+
+    def test_scan_io_failures_do_not_emit_a_partial_census(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_two_shaders(tmp)
+            failing_path = os.path.join(tmp, "ps2.dxbc")
+            error = PermissionError(errno.EACCES, "permission denied", failing_path)
+            original = ps_interp_modes.shader_row
+
+            def fail_second(path, fssm_path, disasm_path):
+                if path == failing_path:
+                    raise error
+                return original(path, fssm_path, disasm_path)
+
+            for target, options, path, diagnostic in (
+                ("files_of", {"side_effect": OSError(errno.EIO, "I/O error", tmp)}, tmp, "cannot list"),
+                ("shader_row", {"side_effect": fail_second}, failing_path, "cannot read"),
+            ):
+                with self.subTest(target=target):
+                    out, err = io.StringIO(), io.StringIO()
+                    with mock.patch.object(ps_interp_modes, target, **options), contextlib.redirect_stdout(out), \
+                            contextlib.redirect_stderr(err):
+                        self.assertEqual(ps_interp_modes.main([tmp, "--json"]), 2)
+                    self.assertEqual(out.getvalue(), "")
+                    self.assertEqual(len(err.getvalue().splitlines()), 1)
+                    self.assertIn(diagnostic, err.getvalue())
+                    self.assertIn(path, err.getvalue())
 
     def test_missing_path_is_an_error(self):
         out = subprocess.run([sys.executable, "-I", TOOL, "Z:/nope"],

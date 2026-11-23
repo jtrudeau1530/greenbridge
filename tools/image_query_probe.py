@@ -292,8 +292,13 @@ def main(argv=None):
     finally:
         oracle.close()
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+        except OSError as exc:
+            print(f"cannot write {a.json}: {exc.strerror or exc}", file=sys.stderr)
+            return 1
     total = len(report["resinfo"]) + len(report["lod"])
     print(f"{total - bad} of {total} results follow the rules, {bad} do not")
     return 1 if bad else 0

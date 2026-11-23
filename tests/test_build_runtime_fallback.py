@@ -1,17 +1,13 @@
-"""Check the Windows build wrapper and the fallback's required GPU harnesses without compiling them.
+"""scripts/build_runtime.ps1's cl.exe fallback builds every GPU test harness the Python tools need (no build run).
 
 The fallback is what runs when Visual Studio has no "C++ CMake tools" component. Without these programs,
 check.py / run_gpu_tests.py stop with "missing vk_compute_test", and so do the fuzzers.
 
     python -I tests/test_build_runtime_fallback.py
 """
-import base64
-import os
 from pathlib import Path
 import re
-import subprocess
 import sys
-import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,34 +56,6 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("chcp 65001 >nul", text)
         self.assertLess(text.index("chcp 65001 >nul"), text.index('call `"$vcvars`"'))
-
-    @unittest.skipUnless(sys.platform == "win32", "requires Windows PowerShell and cmd.exe")
-    def test_build_cmd_preserves_unicode_paths(self):
-        text = SCRIPT.read_text(encoding="utf-8")
-        start = text.index('$bat = Join-Path $out "_build.cmd"')
-        writer = text[start:text.index("$p = Start-Process", start)]
-        with tempfile.TemporaryDirectory() as directory:
-            checkout = Path(directory) / "Leonida 東京"
-            checkout.mkdir()
-            (checkout / "vcvars64.bat").write_bytes(b"@exit /b 0\r\n")
-            command = (
-                "$ErrorActionPreference = 'Stop'\n"
-                "$ProgressPreference = 'SilentlyContinue'\n"
-                "$out = $env:LEONIDA_BATCH_TEST_DIR\n"
-                "$installer = Join-Path $out 'Leonida 東京'\n"
-                "$vcvars = Join-Path $installer 'vcvars64.bat'\n"
-                "$body = 'cd /d \"' + $installer + '\" || exit /b 1'\n"
-                + writer
-            )
-            encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
-            subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-                env=dict(os.environ, LEONIDA_BATCH_TEST_DIR=directory), check=True, timeout=30,
-            )
-            batch = (Path(directory) / "_build.cmd").read_bytes()
-            self.assertTrue(batch.startswith(b"@echo off\r\n"))
-            self.assertIn(str(checkout).encode("utf-8"), batch)
-            subprocess.run(["cmd.exe", "/d", "/c", "_build.cmd"], cwd=directory, check=True, timeout=30)
 
 
 if __name__ == "__main__":

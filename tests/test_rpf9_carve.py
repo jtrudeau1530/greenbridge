@@ -1,4 +1,6 @@
 """Regression: rpf9_carve must not overrun a short final read and skip trailing streams."""
+import contextlib
+import io
 import json
 import os
 import struct
@@ -6,10 +8,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "rpf9_carve.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+import rpf9_carve  # noqa: E402
 
 
 def make_archive(path):
@@ -265,6 +271,59 @@ class AllZeroTest(unittest.TestCase):
 
         self.assertTrue(carve_tool.all_zero(Probe(bytes(1000)), 0, 1000, 64))
         self.assertEqual(Probe.largest, 64)
+
+
+class ResourceAndValidationTest(unittest.TestCase):
+    def test_mmap_is_closed_on_return(self):
+        real_mmap = rpf9_carve.mmap.mmap
+        created = []
+
+        def wrap(*args, **kwargs):
+            mapping = real_mmap(*args, **kwargs)
+            created.append(mapping)
+            return mapping
+
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            out = os.path.join(tmp, "out")
+            make_archive(arc)
+            try:
+                with mock.patch.object(rpf9_carve.mmap, "mmap", side_effect=wrap), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(rpf9_carve.main([arc, out, "--index-only"]), 0)
+                self.assertEqual(len(created), 1)
+                self.assertTrue(created[0].closed)
+                os.remove(arc)
+                self.assertFalse(os.path.exists(arc))
+            finally:
+                for mapping in created:
+                    if not mapping.closed:
+                        mapping.close()
+
+    def test_directory_input_is_rejected_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            p = subprocess.run([sys.executable, "-I", TOOL, tmp, out, "--index-only"],
+                               capture_output=True, text=True)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("is a directory", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_file_output_path_is_rejected_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            out_file = os.path.join(tmp, "existing.txt")
+            make_archive(arc)
+            with open(out_file, "w", encoding="utf-8") as f:
+                f.write("keep")
+            p = subprocess.run([sys.executable, "-I", TOOL, arc, out_file, "--index-only"],
+                               capture_output=True, text=True)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("not a directory", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            with open(out_file, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "keep")
 
 
 if __name__ == "__main__":

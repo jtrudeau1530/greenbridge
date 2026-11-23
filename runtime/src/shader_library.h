@@ -671,6 +671,9 @@ public:
 
     bool loaded() const { return !dir_.empty(); }
     std::size_t size() const { return count_; }
+    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
+    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    std::size_t fspx_size() const { return fspx_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -758,6 +761,7 @@ private:
             entries_.clear();
             fspx_entries_.clear();
             count_ = 0;
+            fspx_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -811,6 +815,7 @@ private:
             }
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+            if (by_fspx && prefix == "fspx/") ++fspx_count_;
             ++count_;
         }
         return true;
@@ -818,6 +823,7 @@ private:
 
     std::string dir_;
     std::size_t count_ = 0;
+    std::size_t fspx_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;

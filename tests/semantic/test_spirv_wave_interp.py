@@ -82,6 +82,51 @@ OpStore %out %v
             self.assertEqual(got[lane], (0xFF if lane < 8 else 0, 0xFFFFFFFF, 0xFFFFFFFF, lane))
 
 
+class SwitchLiterals(unittest.TestCase):
+    FRAGMENT = """OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %color
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %color Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%out_int = OpTypePointer Output %int
+%color = OpVariable %out_int Output
+%one = OpConstant %int 1
+%two = OpConstant %int 2
+%ten = OpConstant %int 10
+%zero = OpConstantNull %int
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%selector = OpISub %int %one %two
+OpSelectionMerge %merge None
+OpSwitch %selector %default -1 %selected
+%selected = OpLabel
+OpStore %color %ten
+OpBranch %merge
+%default = OpLabel
+OpStore %color %one
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+    WIDE_SELECTOR = (FRAGMENT.replace("OpCapability Shader", "OpCapability Shader\nOpCapability Int64")
+                     .replace("%int = OpTypeInt 32 1", "%int = OpTypeInt 32 1\n%long = OpTypeInt 64 1")
+                     .replace("%two = OpConstant %int 2", "%long_one = OpConstant %long 1\n%long_two = OpConstant %long 2")
+                     .replace("OpISub %int %one %two", "OpISub %long %long_one %long_two"))
+
+    def test_signed_literal_matches_the_selector_bits(self) -> None:
+        for width, text in ((32, self.FRAGMENT), (64, self.WIDE_SELECTOR)):
+            with self.subTest(width=width):
+                self.assertEqual(run_wave(text)["outputs"], [{"%color": (10,)}] * 32)
+
+    def test_constant_null_selector_still_matches_zero(self) -> None:
+        text = self.FRAGMENT.replace("OpSwitch %selector %default -1", "OpSwitch %zero %default 0")
+        self.assertEqual(run_wave(text)["outputs"], [{"%color": (10,)}] * 32)
+
+
 class LoopConvergence(unittest.TestCase):
     # Lane L runs (L & 3) + 1 iterations. Each iteration adds the number of lanes still in the loop, so with
     # 32 lanes: iteration 0 has 32, 1 has 24 (L & 3 >= 1), 2 has 16, 3 has 8.

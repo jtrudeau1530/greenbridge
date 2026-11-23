@@ -31,6 +31,20 @@ SCC_MASK_CASES = {
 }
 
 
+@pytest.mark.parametrize("count", ["0", "-1"])
+def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
+    def unexpected_suite(*args, **kwargs):
+        pytest.fail("started a suite with no programs")
+
+    monkeypatch.setattr(cf_diff, "run_suite", unexpected_suite)
+    with pytest.raises(SystemExit) as exc:
+        cf_diff.main(["--programs", count])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "--programs must be at least 1" in captured.err
+    assert captured.out == ""
+
+
 def test_generation_is_deterministic():
     assert cf_diff.program_for(5, 3, 32, 3) == cf_diff.program_for(5, 3, 32, 3)
     assert cf_diff.program_for(5, 3, 32, 3) != cf_diff.program_for(5, 4, 32, 3)
@@ -118,4 +132,13 @@ def test_generator_covers_every_shape():
                     walk(x)
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
-    assert {"if", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe"} <= kinds
+    assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
+            "irr", "sccmask", "csel", "probe"} <= kinds
+
+
+@pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))
+@pytest.mark.parametrize("wave", (32, 64))
+def test_saveexec_variants_match(op_name, wave):
+    body = [("saveexec", FEW_LANES, op_name, "s_cbranch_scc0", [("probe", 13), ("op", "v_add_nc_u32 v9, 1, v9")])]
+    status, detail = cf_diff.run_case(f"ps_saveexec_{op_name}", body, wave, structured=True)
+    assert status == "match", detail

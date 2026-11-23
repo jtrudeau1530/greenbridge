@@ -3,29 +3,80 @@
 name: Runtime
 
 on:
+  # What can break this build: the runtime and its vendored queue, the scripts the jobs run, this workflow, and
+  # everything the tools those scripts read depend on - their sibling imports, the data files they load by name
+  # (gfx10_formats.json is one a .py-only scan misses) and the hw_oracle directory. Any other file under tools/
+  # used to start a full Windows and Wine build it cannot break (BUILD-856); paths-ignore cannot say "everything
+  # under tools/ except these", so the event lists what triggers it.
   push:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
-      - "viewer/**"
-      - "tests/**"
-      - "assets/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/jactionlint.yml"
-      - ".github/workflows/no-game-data.yml"
+    paths:
+      - "runtime/**"
+      - "third_party/**"
+      - "scripts/**"
+      - ".github/workflows/runtime.yml"
+      - "tools/hw_oracle/**"
+      - "tools/bary_fallback_gs.py"
+      - "tools/cf_diff.py"
+      - "tools/cf_ref.py"
+      - "tools/cfg_structure.py"
+      - "tools/cpu_ref.py"
+      - "tools/f32_fuzz.py"
+      - "tools/first_light.py"
+      - "tools/fspx_unpack.py"
+      - "tools/fssm_header.py"
+      - "tools/fssm_unpack.py"
+      - "tools/gen_d3d12_stubs.py"
+      - "tools/gfx10_formats.json"
+      - "tools/lane_masks.py"
+      - "tools/mc_command.py"
+      - "tools/mesh_compute_vs.py"
+      - "tools/rdna2spirv.py"
+      - "tools/shader_carve.py"
+      - "tools/shader_disasm.py"
+      - "tools/shader_ir.py"
+      - "tools/shader_meta.py"
+      - "tools/shader_stage_manifest.py"
+      - "tools/spirv_asm.py"
+      - "tools/spirv_asm_tables.py"
+      - "tools/spirv_stubs.py"
+      - "tools/vk_subgroup_info.py"
+      - "tools/wave64_halves.py"
+      - "tools/xdxr_bvh.py"
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
-      - "viewer/**"
-      - "tests/**"
-      - "assets/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/jactionlint.yml"
-      - ".github/workflows/no-game-data.yml"
+    paths:
+      - "runtime/**"
+      - "third_party/**"
+      - "scripts/**"
+      - ".github/workflows/runtime.yml"
+      - "tools/hw_oracle/**"
+      - "tools/bary_fallback_gs.py"
+      - "tools/cf_diff.py"
+      - "tools/cf_ref.py"
+      - "tools/cfg_structure.py"
+      - "tools/cpu_ref.py"
+      - "tools/f32_fuzz.py"
+      - "tools/first_light.py"
+      - "tools/fspx_unpack.py"
+      - "tools/fssm_header.py"
+      - "tools/fssm_unpack.py"
+      - "tools/gen_d3d12_stubs.py"
+      - "tools/gfx10_formats.json"
+      - "tools/lane_masks.py"
+      - "tools/mc_command.py"
+      - "tools/mesh_compute_vs.py"
+      - "tools/rdna2spirv.py"
+      - "tools/shader_carve.py"
+      - "tools/shader_disasm.py"
+      - "tools/shader_ir.py"
+      - "tools/shader_meta.py"
+      - "tools/shader_stage_manifest.py"
+      - "tools/spirv_asm.py"
+      - "tools/spirv_asm_tables.py"
+      - "tools/spirv_stubs.py"
+      - "tools/vk_subgroup_info.py"
+      - "tools/wave64_halves.py"
+      - "tools/xdxr_bvh.py"
   workflow_dispatch:
 
 permissions:
@@ -296,3 +347,25 @@ jobs:
         env:
           LEONIDA_W64_EMULATE: "1"
         run: python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --work "$RUNNER_TEMP/gpu-w64" --filter cs_
+      - name: GPU tests on llvmpipe with the barycentric fallback
+        # llvmpipe has no VK_KHR_fragment_shader_barycentric, so the native run skips the pixel shaders that read raw
+        # barycentrics. Under --bary-fallback they read them from an input a pass-through geometry shader feeds
+        # (tools/bary_fallback_gs.py), the path for GPUs without the extension (NVIDIA Pascal). Every shader that
+        # got such a geometry shader has to pass here, not skip.
+        shell: bash
+        env:
+          LEONIDA_BARY_FALLBACK: "1"
+        run: |
+          log="$RUNNER_TEMP/gpu-bary.log"
+          python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --work "$RUNNER_TEMP/gpu-bary" | tee "$log"
+          names=$(sed -n 's/^bary fallback GS: \(.*\)\.bary_gs\.spv$/\1/p' "$log")
+          if [ -z "$names" ]; then
+            echo "::error::no barycentric fallback geometry shader was built"
+            exit 1
+          fi
+          while read -r name; do
+            if ! grep -Eq "^  PASS  ${name}( |\$)" "$log"; then
+              echo "::error::$name did not pass under the barycentric fallback"
+              exit 1
+            fi
+          done <<< "$names"

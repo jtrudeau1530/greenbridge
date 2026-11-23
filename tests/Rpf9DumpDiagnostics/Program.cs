@@ -114,10 +114,23 @@ Console.WriteLine("Mesh key tests passed.");
 }
 Console.WriteLine("Recovered segment tests passed.");
 
+// Only a full scan replaces rpf9dump's own: rpf9-explorer saves partial model indexes while indexing and on cancel.
+Check(!ScanCounts.IsFullScan(Index("Dictionary-aware model scan in progress \u00B7 1,001/183,801 containers validated.", false)), "GUI index saved while indexing");
+Check(!ScanCounts.IsFullScan(Index("Dictionary-aware model scan canceled. Validated models are retained; discovery will resume on reopen.", false)), "GUI index saved on cancel");
+Check(ScanCounts.IsFullScan(Index("Full 1,234,567-byte model-container scan \u00B7 149,811 supported models including drawable dictionary children.", true)), "GUI index marked complete");
+Check(ScanCounts.IsFullScan(Index(ScanCounts.Coverage(183801, 149811), true)), "rpf9dump index");
+Check(ScanCounts.IsFullScan(Index(ScanCounts.Coverage(183801, 149811), false)), "rpf9dump index saved without the complete mark");
+Check(ScanCounts.IsFullScan(Index(string.Format(System.Globalization.CultureInfo.GetCultureInfo("de-CH"), "rpf9dump full scan, {0:N0} candidates, {1:N0} recovered", 183801, 149811), false)), "culture-formatted rpf9dump index");
+Check(!ScanCounts.IsFullScan(null), "no cached index");
+Console.WriteLine("Cached index tests passed.");
+
 static void Check(bool ok, string what)
 {
     if (!ok) throw new Exception($"Failed: {what}");
 }
+
+static RecoveryIndexCache.CachedIndex Index(string coverage, bool complete) =>
+    new("rpfpreview-payload-index/models/4", "models", "levels.rpf", 0, 0, "", coverage, []) { IsComplete = complete };
 
 static void Expect(ReadOnlySpan<byte> system, int graphicsBytes, string expected)
 {

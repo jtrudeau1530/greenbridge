@@ -81,7 +81,8 @@ def test_tier_c_reference_rejects_changes_to_invariant_words(tmp_path, monkeypat
 
     stable = next(i for i, value in enumerate(expected) if value is not None)
     words[0] = tuple(value + (i == stable) for i, value in enumerate(words[0]))
-    assert "must not depend on the partition" in w64_graphics.check(None, tmp_path, name)
+    msg = w64_graphics.check(None, tmp_path, name)     # wording varies by which comparison caught it
+    assert "partition" in msg and "differs" in msg, msg
 
 
 @requires_tools

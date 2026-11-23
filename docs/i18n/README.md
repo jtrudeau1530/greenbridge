@@ -13,7 +13,7 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Language | File | Synced commit | Maintainer |
 |---|---|---|---|
 | Français (`fr`) | [`fr/quickstart.md`](fr/quickstart.md) | `e7584c52` | `@Urban225` |
-| Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `4eb6155d` | `@Andretuta` |
+| Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `16282101` | `@Andretuta` |
 | 简体中文 (`zh-CN`) | [`zh-CN/quickstart.md`](zh-CN/quickstart.md) | `003e7812` | `@liang-kai-shui` |
 | Polski (Polish) (`pl-PL`) | [`pl-PL/quickstart.md`](pl-PL/quickstart.md) | `c0ac5fd6` | `@Dom-in` |
 | Türkçe (`tr`) | [`tr/quickstart.md`](tr/quickstart.md) | `f85582e` | `@emirhan-karaca` |
@@ -22,3 +22,4 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Español (`es`) | [`es/quickstart.md`](es/quickstart.md) | `003e7812` | `@NolanCotter` |
 | Deutsch (`de`) | [`de/quickstart.md`](de/quickstart.md) | `4eb6155d` | `@zGLados` |
 | Italiano (`it`) | [`it/quickstart.md`](it/quickstart.md) | `49475796` | `@MeNoSkills` |
+| العربية (`ar`) | [`ar/quickstart.md`](ar/quickstart.md) | `ec8ec4c9` | `@Mohamed-Leo` |

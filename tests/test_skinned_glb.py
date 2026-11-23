@@ -49,18 +49,42 @@ def _section_word(offset, fmt):
     return ((offset // 2) << 8) | fmt
 
 
-def _skin_buffer(j0, j1, w0, w1, *, omit_slot=None):
-    """Graphics buffer with the measured 23-word section header and 4-byte rows."""
-    offsets = {6: 0x100, 7: 0x110, 8: 0x120, 9: 0x130}
-    formats = {6: 0x26, 7: 0x26, 8: 0x25, 9: 0x25}
+def _skin_buffer(j0, j1, w0, w1, *, omit_slot=None, formats=None, offsets=None, size=0x160):
+    """Graphics buffer with the measured 23-word section header and per-slot rows."""
+    formats = {6: 0x26, 7: 0x26, 8: 0x25, 9: 0x25, **(formats or {})}
+    offsets = {6: 0x100, 7: 0x110, 8: 0x120, 9: 0x130, **(offsets or {})}
     data = {6: w0, 7: w1, 8: j0, 9: j1}
-    blob = bytearray(0x160)
+    blob = bytearray(size)
     for slot in (6, 7, 8, 9):
         if slot == omit_slot:
             continue
         struct.pack_into("<I", blob, slot * 4, _section_word(offsets[slot], formats[slot]))
-        blob[offsets[slot]:offsets[slot] + len(data[slot])] = data[slot]
+        end = offsets[slot] + len(data[slot])
+        if end > len(blob):
+            raise ValueError("test skin stream does not fit its buffer")
+        blob[offsets[slot]:end] = data[slot]
     return bytes(blob)
+
+
+def _packed_indices(rows):
+    """Pack four u8 joint indices per vertex into the 0x8C four-u32 layout.
+
+    Bits 12-31 get a recognisable pattern, including bits 12-15, so a decoder
+    that masks 16 bits instead of 12 fails instead of passing.
+    """
+    return b"".join(
+        struct.pack("<4I", *(0xA5CFF000 | index for index in row)) for row in rows
+    )
+
+
+def _packed_buffer(j0_rows, j1_rows):
+    _j0, _j1, w0, w1 = _streams()
+    return _skin_buffer(
+        _packed_indices(j0_rows), _packed_indices(j1_rows), w0, w1,
+        formats={8: 0x8C, 9: 0x8C},
+        offsets={8: 0x120, 9: 0x160},
+        size=0x1A0,
+    )
 
 
 def _skeleton():
@@ -89,12 +113,14 @@ def _streams():
     return j0, j1, w0, w1
 
 
-def _component(root, *, own_skeleton=None, omit_slot=None):
+def _component(root, *, own_skeleton=None, omit_slot=None, buffer=None, mesh_blob=None):
     directory = os.path.join(root, "component")
     os.makedirs(os.path.join(directory, "buffers"))
-    j0, j1, w0, w1 = _streams()
+    if buffer is None:
+        j0, j1, w0, w1 = _streams()
+        buffer = _skin_buffer(j0, j1, w0, w1, omit_slot=omit_slot)
     with open(os.path.join(directory, "buffers", "01_0.bin"), "wb") as handle:
-        handle.write(_skin_buffer(j0, j1, w0, w1, omit_slot=omit_slot))
+        handle.write(buffer)
     _write_glb(os.path.join(directory, "model.glb"))
     model = {
         "buffer_files": ["buffers/01_0.bin"],
@@ -102,7 +128,7 @@ def _component(root, *, own_skeleton=None, omit_slot=None):
         "vertex_count": 3,
         "drawable": {
             "name": "synthetic",
-            "buffers": [{"bytes": 0x160, "gfx_off": 0}],
+            "buffers": [{"bytes": len(buffer), "gfx_off": 0}],
             "geometries": [{"vertex_buffer": 0, "index_buffer": 0}],
             "models": [{"bone_palette": _palette()}],
             "strings": ["GM_TEST_L_UpperArm01_O"],
@@ -118,8 +144,15 @@ def _component(root, *, own_skeleton=None, omit_slot=None):
     }
     if own_skeleton is not None:
         model["drawable"]["skeleton"] = own_skeleton
+    if mesh_blob is not None:
+        model["drawable"]["buffers"][0]["mesh_blob"] = mesh_blob
     _write_json(os.path.join(directory, "model.json"), model)
     return directory
+
+
+def _read_model(directory):
+    with open(os.path.join(directory, "model.json"), encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _skeleton_dir(root):
@@ -165,6 +198,20 @@ def _transform(matrix, point):
     ]
 
 
+class InterleavedAccessorTest(unittest.TestCase):
+    def test_last_attribute_can_end_at_the_last_bin_byte(self) -> None:
+        gltf = {
+            "bufferViews": [{"buffer": 0, "byteStride": 24, "byteLength": 48}],
+            "accessors": [{"bufferView": 0, "byteOffset": 12, "componentType": 5126,
+                           "count": 2, "type": "VEC3"}],
+        }
+        vertices = struct.pack("<12f", 1, 2, 3, 0, 1, 0, 4, 5, 6, 0, 0, 1)
+        normals, _ = skinned_glb.accessor_bytes(gltf, vertices, 0)
+        self.assertEqual(normals, struct.pack("<6f", 0, 1, 0, 0, 0, 1))
+        with self.assertRaisesRegex(skinned_glb.SkinError, "outside the BIN chunk"):
+            skinned_glb.accessor_bytes(gltf, vertices[:-1], 0)
+
+
 class SkinnedGlbTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -195,6 +242,35 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(stats["triangles"], 1)
         self.assertEqual(stats["source_weight_sum_min"], 255)
         self.assertEqual(stats["source_weight_sum_max"], 255)
+
+    def test_normalized_byte_uvs_have_aligned_output_rows(self) -> None:
+        from anim_glb import pack_glb
+
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        source_path = os.path.join(component, "model.glb")
+        source, source_bin = skinned_glb.read_glb(source_path)
+        uv_index = source["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_0"]
+        uv_accessor = source["accessors"][uv_index]
+        uv_view = source["bufferViews"][uv_accessor["bufferView"]]
+        uv_accessor.update(componentType=5121, normalized=True)
+        uv_view.update(byteStride=4, byteLength=12)
+        offset = uv_view["byteOffset"]
+        rows = bytes((0, 255, 0, 0, 64, 128, 0, 0, 255, 0, 0, 0))
+        source_bin = source_bin[:offset] + rows + source_bin[offset + len(rows):]
+        with open(source_path, "wb") as handle:
+            handle.write(pack_glb(source, source_bin))
+
+        payload, _ = skinned_glb.build_skinned_glb(skeleton, [component])
+        gltf, binary = skinned_glb.read_glb(self._write(payload))
+        index = gltf["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_0"]
+        accessor = gltf["accessors"][index]
+        view = gltf["bufferViews"][accessor["bufferView"]]
+        self.assertEqual((accessor["componentType"], accessor["normalized"]), (5121, True))
+        self.assertEqual((view.get("byteStride"), view["byteLength"]), (4, 12))
+        start = view["byteOffset"]
+        self.assertEqual(binary[start:start + view["byteLength"]], rows)
+        self.assertEqual(_accessor(gltf, binary, index)[0], bytes((0, 255, 64, 128, 255, 0)))
 
     def test_weight_sums_are_one(self):
         gltf, binary, _stats = self._build()
@@ -258,17 +334,73 @@ class SkinnedGlbTest(unittest.TestCase):
             for actual, wanted in zip(result, point):
                 self.assertAlmostEqual(actual, wanted, places=5)
 
-    def test_stdlib_weight_path_agrees_with_optional_numpy(self):
+    def test_numpy_and_stdlib_weight_paths_agree(self):
+        if skinned_glb._np is None:
+            self.skipTest("numpy is not importable, so the optional path cannot be compared")
         j0, j1, w0, w1 = _streams()
+        j0 = bytearray(j0)
+        j0[2] = 200  # zero-weight component outside the two-entry palette
+        j0 = bytes(j0)
+        with_numpy = skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [1, 3], 4)
         saved = skinned_glb._np
         try:
             skinned_glb._np = None
-            result = skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [1, 3], 4)
+            without_numpy = skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [1, 3], 4)
         finally:
             skinned_glb._np = saved
-        self.assertEqual(result["sum_min"], 1.0)
-        self.assertEqual(result["sum_max"], 1.0)
-        self.assertAlmostEqual(struct.unpack_from("<4f", result["w0"], 0)[0], 64 / 255, delta=1e-6)
+        for key in ("j0", "j1", "w0", "w1"):
+            self.assertEqual(with_numpy[key], without_numpy[key], key)
+        self.assertEqual(with_numpy["sum_min"], without_numpy["sum_min"])
+        self.assertEqual(with_numpy["sum_max"], without_numpy["sum_max"])
+        self.assertAlmostEqual(struct.unpack_from("<4f", with_numpy["w0"], 0)[0], 64 / 255, delta=1e-6)
+
+    def test_full_export_without_numpy(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        saved = skinned_glb._np
+        try:
+            skinned_glb._np = None
+            payload, stats = skinned_glb.build_skinned_glb(skeleton, [component])
+        finally:
+            skinned_glb._np = saved
+        gltf, binary = skinned_glb.read_glb(self._write(payload))
+        self.assertEqual(stats["joints"], 4)
+        primitive = gltf["meshes"][0]["primitives"][0]
+        w0, _ = _accessor(gltf, binary, primitive["attributes"]["WEIGHTS_0"])
+        for vertex in range(3):
+            self.assertAlmostEqual(sum(struct.unpack_from("<4f", w0, 16 * vertex)), 1.0, places=6)
+
+    def test_packed_joint_stream_decodes_to_four_u8_indices(self):
+        j0_rows = [(1, 2, 0, 0), (1, 2, 0, 0), (2, 1, 0, 0)]
+        j1_rows = [(3, 0, 0, 0)] * 3
+        component = _component(self.root, buffer=_packed_buffer(j0_rows, j1_rows))
+        model = _read_model(component)
+        streams = skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+        self.assertEqual(streams["j0"], bytes([1, 2, 0, 0, 1, 2, 0, 0, 2, 1, 0, 0]))
+        self.assertEqual(streams["j1"], bytes([3, 0, 0, 0] * 3))
+
+    def test_packed_joint_index_above_u8_is_rejected(self):
+        j0_rows = [(1, 2, 0, 0), (1, 2, 0, 0), (256, 0, 0, 0)]
+        j1_rows = [(3, 0, 0, 0)] * 3
+        component = _component(self.root, buffer=_packed_buffer(j0_rows, j1_rows))
+        model = _read_model(component)
+        with self.assertRaisesRegex(skinned_glb.SkinError, "does not fit u8"):
+            skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+
+    def test_short_packed_joint_stream_is_rejected(self):
+        j0 = _packed_indices([(1, 2, 0, 0)] * 3)[:47]
+        j1 = _packed_indices([(3, 0, 0, 0)] * 3)
+        _j0, _j1, w0, w1 = _streams()
+        buffer = _skin_buffer(
+            j0, j1, w0, w1,
+            formats={8: 0x8C, 9: 0x8C},
+            offsets={8: 0x150, 9: 0x120},
+            size=0x17F,
+        )
+        component = _component(self.root, buffer=buffer)
+        model = _read_model(component)
+        with self.assertRaisesRegex(skinned_glb.SkinError, "outside its graphics buffer"):
+            skinned_glb.read_skin_streams(component, model, model["meshes"][0])
 
     def test_full_export_without_numpy(self):
         skeleton = _skeleton_dir(self.root)
@@ -292,6 +424,26 @@ class SkinnedGlbTest(unittest.TestCase):
         with self.assertRaises(skinned_glb.SkinError):
             skinned_glb.build_skinned_glb(skeleton, [component])
 
+    def test_mesh_blob_sections_supply_the_stream_offsets(self):
+        j0, j1, w0, w1 = _streams()
+        buffer = bytearray(_skin_buffer(j0, j1, w0, w1))
+        for slot in (6, 7, 8, 9):
+            struct.pack_into("<I", buffer, slot * 4, 0)  # no usable header words
+        sections = [[6, 0x100, 0x26], [7, 0x110, 0x26], [8, 0x120, 0x25], [9, 0x130, 0x25]]
+        component = _component(self.root, buffer=bytes(buffer),
+                               mesh_blob={"sections": sections})
+        model = _read_model(component)
+        streams = skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+        self.assertEqual(streams["sections"], {6: (0x100, 0x26), 7: (0x110, 0x26),
+                                               8: (0x120, 0x25), 9: (0x130, 0x25)})
+        self.assertEqual(streams["j0"], j0)
+        self.assertEqual(streams["j1"], j1)
+
+    def test_empty_component_list_is_rejected(self):
+        skeleton = _skeleton_dir(self.root)
+        with self.assertRaisesRegex(skinned_glb.SkinError, "at least one --component"):
+            skinned_glb.build_skinned_glb(skeleton, [])
+
     def test_zero_weight_vertex_is_rejected(self):
         j0, j1, w0, w1 = _streams()
         broken = bytearray(w0)
@@ -305,6 +457,123 @@ class SkinnedGlbTest(unittest.TestCase):
         broken[0] = 2  # local palette has two entries; this weighted index is invalid
         with self.assertRaises(skinned_glb.SkinError):
             skinned_glb.normalise_weights(bytes(broken), j1, w0, w1, 3, 2, [1, 3], 4)
+
+    def test_zero_weight_padding_joint_index_outside_local_palette_is_zeroed(self):
+        j0, j1, w0, w1 = _streams()
+        padded_j1 = bytearray(j1)
+        padded_j1[0] = 255  # w1[0] is 0, so this unused slot must be ignored and zeroed in both paths
+        got_default = skinned_glb.normalise_weights(j0, bytes(padded_j1), w0, w1, 3, 2, [1, 3], 4)
+        self.assertEqual(struct.unpack_from("<4H", got_default["j1"], 0)[0], 0)
+
+        class _FakeArray:
+            def __init__(self, rows):
+                self.rows = [list(r) for r in rows]
+
+            def astype(self, _dtype):
+                return _FakeArray(self.rows)
+
+            def sum(self, axis=1):
+                assert axis == 1
+                return _FakeVec([sum(r) for r in self.rows])
+
+            def __gt__(self, other):
+                return _FakeMask([[v > other for v in r] for r in self.rows])
+
+            def __eq__(self, other):
+                return _FakeMask([[v == other for v in r] for r in self.rows])
+
+            def __ge__(self, other):
+                return _FakeMask([[v >= other for v in r] for r in self.rows])
+
+            def __itruediv__(self, col):
+                for r, d in zip(self.rows, col.vals):
+                    for i in range(len(r)):
+                        r[i] = r[i] / d
+                return self
+
+            def __getitem__(self, key):
+                if isinstance(key, _FakeMask):
+                    return _FakeVec([v for r, mr in zip(self.rows, key.rows) for v, m in zip(r, mr) if m])
+                if isinstance(key, tuple) and len(key) == 2 and key[0] == slice(None):
+                    return _FakeArray([r[key[1]] for r in self.rows])
+                raise TypeError(key)
+
+            def __setitem__(self, key, value):
+                assert isinstance(key, _FakeMask)
+                for r, mr in zip(self.rows, key.rows):
+                    for i, m in enumerate(mr):
+                        if m:
+                            r[i] = value
+
+            def tobytes(self):
+                if self.rows and isinstance(self.rows[0][0], float):
+                    return b"".join(struct.pack("<f", v) for r in self.rows for v in r)
+                return b"".join(struct.pack("<H", int(v)) for r in self.rows for v in r)
+
+        class _FakeMask:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def any(self):
+                return any(any(r) for r in self.rows)
+
+        class _FakeVec:
+            def __init__(self, vals):
+                self.vals = list(vals)
+
+            def __le__(self, other):
+                return _FakeMask([[v <= other for v in self.vals]])
+
+            def __getitem__(self, key):
+                if isinstance(key, _FakeArray):
+                    return _FakeArray([[self.vals[int(idx)] for idx in r] for r in key.rows])
+                return self
+
+            def max(self):
+                return max(self.vals)
+
+            def min(self):
+                return min(self.vals)
+
+        class _FakeNp:
+            uint8 = "u1"
+            uint16 = "u2"
+            int64 = "i8"
+            float64 = "f8"
+
+            @staticmethod
+            def frombuffer(buf, dtype):
+                class _Buf:
+                    def reshape(self_inner, n, k):
+                        return _FakeArray([list(buf[i * k:(i + 1) * k]) for i in range(n)])
+                return _Buf()
+
+            @staticmethod
+            def concatenate(parts, axis=1):
+                assert axis == 1
+                return _FakeArray([r0 + r1 for r0, r1 in zip(parts[0].rows, parts[1].rows)])
+
+            @staticmethod
+            def asarray(seq, dtype):
+                return _FakeVec(seq)
+
+        saved = skinned_glb._np
+        try:
+            skinned_glb._np = _FakeNp
+            got_np = skinned_glb.normalise_weights(j0, bytes(padded_j1), w0, w1, 3, 2, [1, 3], 4)
+        finally:
+            skinned_glb._np = saved
+        self.assertEqual(got_np["j0"], got_default["j0"])
+        self.assertEqual(got_np["j1"], got_default["j1"])
+
+    def test_infer_ped_parent_matches_suffixed_ped_bone_via_prefix_fallback(self):
+        ped = {
+            "SKEL_ROOT": {"name": "SKEL_ROOT", "index": 0},
+            "SKEL_L_UpperArm01": {"name": "SKEL_L_UpperArm01", "index": 1},
+            "SKEL_R_UpperArm01": {"name": "SKEL_R_UpperArm01", "index": 2},
+        }
+        self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_L_UpperArm_O", ped), 1)
+        self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_R_UpperArm_O", ped), 2)
 
     def test_cli_returns_nonzero_for_bad_input(self):
         result = subprocess.run(

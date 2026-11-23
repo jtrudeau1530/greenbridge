@@ -8,9 +8,9 @@ Usage:
     python -I tools/ds_permute_probe.py [--waves 32,64] [--json out.json]
     python -I tools/ds_permute_probe.py --self-test        # pure-Python model checks, no GPU
 
-Exit 0 when every case matches the RDNA2 model (or --self-test passed), 1 on a mismatch, 2 on a harness error,
-77 when tools/hw_oracle is unavailable or the GPU is not GFX10. Standard library only; nothing here reads game
-files.
+Exit 0 when every case matches the RDNA2 model (or --self-test passed), 1 on a mismatch or report write error,
+2 on a harness or CLI error, 77 when tools/hw_oracle is unavailable or the GPU is not GFX10. Standard library only;
+nothing here reads game files.
 """
 import argparse
 import json
@@ -154,15 +154,79 @@ def self_test():
     print("self-test OK")
 
 
-def main():
+def parse_waves(text):
+    """Parse --waves comma-separated list into [32|64, ...], or raise ValueError."""
+    tokens = [t.strip() for t in text.split(",") if t.strip()]
+    if not tokens:
+        raise ValueError("--waves must not be empty")
+    waves = []
+    for tok in tokens:
+        try:
+            w = int(tok)
+        except ValueError:
+            raise ValueError(f"invalid wave size {tok!r}; expected 32 or 64") from None
+        if w not in (32, 64):
+            raise ValueError(f"unsupported wave size {w}; expected 32 or 64")
+        waves.append(w)
+    return waves
+
+
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, data):
+    """Create missing parent directories and write `data` as LF-terminated JSON, or return an error string."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"cannot create directory for --json {path}: {e.strerror or e}"
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2)
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    return None
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--waves", default="32,64", help="wave sizes to run (default: 32,64)")
     ap.add_argument("--json", dest="json_out", help="write full JSON report to this path")
     ap.add_argument("--self-test", action="store_true", help="check the Python model without a GPU")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.self_test:
         self_test()
         return 0
+    try:
+        waves = parse_waves(args.waves)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.json_out is not None:
+        err = validate_json_path(args.json_out)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle()
@@ -172,7 +236,6 @@ def main():
     if asm.family(oracle.arch) != "gfx10":
         print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
         return 77
-    waves = [int(w) for w in args.waves.split(",") if w.strip()]
     out = {"arch": oracle.arch, "waves": {}}
     mismatches = 0
     for wave in waves:
@@ -181,9 +244,11 @@ def main():
         if res["cases_ok"] != res["cases_total"]:
             mismatches += 1
         print(f"wave{wave} ({oracle.arch}): {res['cases_ok']}/{res['cases_total']} ds_permute_b32 cases exact")
-    if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(out, f, indent=2)
+    if args.json_out is not None:
+        err = write_json_report(args.json_out, out)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 1
     return 1 if mismatches else 0
 
 

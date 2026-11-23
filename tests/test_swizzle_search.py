@@ -365,6 +365,26 @@ class TestSwizzleSearchPermutationMatching(unittest.TestCase):
 
 
 class TestSwizzleSearchCliAndRender(unittest.TestCase):
+    @unittest.skipUnless(HAVE_NUMPY and HAVE_PIL, "numpy and PIL required")
+    def test_default_tile_target_previews_a_short_complete_row(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            blob = Path(td) / "two_tiles.bin"
+            preview = Path(td) / "preview.png"
+            red_block = bytes.fromhex("00 f8 00 00 00 00 00 00")
+            green_block = bytes.fromhex("e0 07 00 00 00 00 00 00")
+            blob.write_bytes(red_block * 64 + green_block * 64)
+
+            result = subprocess.run(
+                [sys.executable, "-I", str(TOOL), str(blob), "--tile", "512", "--widths", "64",
+                 "--out", str(preview)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with Image.open(preview) as image:
+                self.assertEqual(image.size, (64, 32))
+                expected_row = bytes((255, 0, 0)) * 32 + bytes((0, 255, 0)) * 32
+                self.assertEqual(image.tobytes(), expected_row * 32)
+
     @unittest.skipUnless(HAVE_NUMPY, "numpy required")   # the tool imports numpy before it parses arguments
     def test_cli_bad_numeric_arguments_are_usage_errors(self):
         """Bad --bpe/--tile/--widths/--tiles must be usage errors, not arithmetic tracebacks."""

@@ -26,6 +26,9 @@ from __future__ import annotations
 import argparse
 import array
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import functools
+import hashlib
 import json
 import math
 import os
@@ -33,6 +36,16 @@ import re
 import shutil
 import statistics
 import sys
+import tempfile
+
+try:
+    import fcntl
+except ImportError:                       # Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:                       # POSIX
+    msvcrt = None
 import tempfile
 import threading
 
@@ -447,13 +460,13 @@ def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
     }
 
 
-_PNG_CACHE: dict[tuple[str, int], bytes | None] = {}
+_PNG_CACHE: dict[tuple[str, str, int], bytes | None] = {}
 _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 
 
-def _png_for(dds_path: str, max_tex_size: int) -> bytes | None:
-    """Decode a DDS to PNG once per worker, keeping at most about 256 MB of PNGs (oldest dropped first)."""
-    key = (os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
+def _png_for(staging_dir: str, dds_path: str, max_tex_size: int) -> bytes | None:
+    """Decode once per worker per build, keeping at most about 256 MB of PNGs (oldest dropped first)."""
+    key = (staging_dir, os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
     if key in _PNG_CACHE:
         return _PNG_CACHE[key]
     dds_mod = _get_dds_png()
@@ -491,7 +504,7 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
         keys = sorted({p["material"] for m in meshes for p in m["primitives"] if p["material"]})
         for key in keys:
             dds = mat_to_dds.get(key)
-            png = _png_for(dds, max_tex_size) if dds else None
+            png = _png_for(staging_dir, dds, max_tex_size) if dds else None
             if png is None:
                 skipped += 1
                 continue
@@ -1244,6 +1257,63 @@ def _prune_stale_chunks(chunks_dir: str, keep_filenames: set[str]) -> None:
 # world.json is committed.
 CHUNK_STAGING_PREFIX = ".chunks-staging-"
 _STAGING_BACKUP = "previous"
+_WORLD_BUILD_LOCK = "leonida-world-build-"
+
+
+@contextmanager
+def _exclusive_output(out_dir: str):
+    """Hold one exclusive build lock for ``out_dir``.
+
+    Staging cleanup, publication and stale-chunk pruning all work on the shared output
+    directory, so two builds must not run there at once.  A killed process releases the
+    OS file lock automatically.
+    """
+    # Keep the lock outside the output: a failed build must still leave no output directory,
+    # and a successful one must contain only chunks/ and world.json.
+    key = hashlib.sha256(
+        os.path.normcase(os.path.abspath(out_dir)).encode("utf-8", "surrogatepass")
+    ).hexdigest()[:20]
+    lock_path = os.path.join(tempfile.gettempdir(), _WORLD_BUILD_LOCK + key)
+    with open(lock_path, "a+b") as fh:
+        fd = fh.fileno()
+        locked = False
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            elif msvcrt is not None:
+                if os.fstat(fd).st_size == 0:
+                    fh.write(b"\0")
+                    fh.flush()
+                fh.seek(0)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                locked = True
+            else:
+                raise RuntimeError("no file-lock implementation available")
+        except OSError as exc:
+            raise RuntimeError(f"another world_build is using {out_dir}") from exc
+        try:
+            yield
+        finally:
+            if locked:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                else:
+                    fh.seek(0)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+def _with_output_lock(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        out_dir = kwargs.get("out_dir")
+        if out_dir is None and len(args) > 1:
+            out_dir = args[1]
+        if out_dir is None:
+            raise TypeError("build_world requires an out_dir")
+        with _exclusive_output(os.path.abspath(out_dir)):
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 def _holds_unrestored_chunks(staging_dir: str) -> bool:
@@ -1338,6 +1408,7 @@ def _publish_world(
         raise
 
 
+@_with_output_lock
 def build_world(
     assets_dir: str,
     out_dir: str,
@@ -1373,6 +1444,8 @@ def build_world(
     those renames can see old and new chunks mixed, and a hard kill there leaves them mixed
     under the old world.json. A staging directory whose previous/ still holds chunks is kept
     by later builds as a recovery copy; other leftover staging is removed by the next build.
+    One build at a time may use an output directory: a second build refuses with a clear error
+    instead of removing the first build's staging.
     """
     if chunk_size <= 0 or not math.isfinite(chunk_size):
         raise ValueError(f"chunk_size must be positive, got {chunk_size!r}")

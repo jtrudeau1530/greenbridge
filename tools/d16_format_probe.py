@@ -185,11 +185,15 @@ def sweep(oracle, fmt, wave):
     kernels = [asm.Kernel(kernel_lines(inst, fmt, base), wave, THREADS, WORDS, raw=True, vgprs=8, sgprs=16)
                for inst, base in todo]
     got = oracle.run(kernels, words=WORDS)
+    # Every kernel must answer: zip() over a shorter list would drop the values of the missing ones and still
+    # succeed. hw_oracle's Oracle.run() returns one entry per kernel; this keeps that contract checked (BUILD-733).
+    if len(got) != len(todo):
+        raise RuntimeError(f"{fmt} wave{wave}: the oracle returned {len(got)} results for {len(todo)} kernels")
     out = {}
     for (inst, base), words in zip(todo, got):
-        if isinstance(words, str) or len(words) != WORDS:
-            raise RuntimeError(f"{fmt} {inst} wave{wave} base {base}: "
-                               f"{words if isinstance(words, str) else f'{len(words)} words'}")
+        if words is None or isinstance(words, str) or len(words) != WORDS:
+            why = "no result" if words is None else words if isinstance(words, str) else f"{len(words)} words"
+            raise RuntimeError(f"{fmt} {inst} wave{wave} base {base}: {why}")
         count = min(THREADS, (1 << n) - base)
         staged = words[:count]
         want = [(base + t) & ((1 << n) - 1) for t in range(count)]

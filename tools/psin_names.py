@@ -204,8 +204,20 @@ def main():
             print(f"ERROR: {path}: no such file or folder", file=sys.stderr)
             return 2
     try:
-        if a.refs and os.path.exists(a.refs) and any(os.path.samefile(path, a.refs) for path in inputs):
-            ap.error("--refs must not overwrite an input")
+        if a.refs:
+            if os.path.isdir(a.refs):
+                ap.error("--refs must be a file path, not a directory")
+            if os.path.exists(a.refs) and any(os.path.samefile(path, a.refs) for path in inputs):
+                ap.error("--refs must not overwrite an input")
+            if os.path.isdir(a.src):
+                src_real = os.path.realpath(a.src)
+                refs_real = os.path.realpath(a.refs)
+                try:
+                    inside_src = os.path.commonpath([src_real, refs_real]) == src_real
+                except ValueError:
+                    inside_src = False
+                if inside_src:
+                    ap.error("--refs must not overwrite an input")
         names = load_names(a.names)
         if a.refs:
             with open(a.refs, "w", encoding="utf-8", newline="\n") as refs:

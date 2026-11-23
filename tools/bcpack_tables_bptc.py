@@ -207,17 +207,21 @@ def _flatten_bc7_entry(val, expected_len):
     return tuple(out)
 
 
-def load_bc6h(history=None):
+def load_bc6h(history=None, *, with_confirmed_bits=False):
     """Return `(endpoint_history, index_history, endpoint_class, index_class)`.
 
     With `history=None`, returns empty/unknown tables (class `0` for all 256
     entries) so self-contained BC6H chunks still decode strictly without any
     external file. When `history` is a local JSON file, directory containing
     `bc6h.json`, or dict, populates the BC6H initial history tables from it.
+    With `with_confirmed_bits=True`, append endpoint `[256][3][4]` and index
+    `[256][16]` leading-bit confirmation depths. Legacy documents without the
+    optional depth tables retain full precision for class-3 entries.
     """
     sec = _read_history_section(history, "bc6h", "endpointHistory")
     if sec is None:
-        return _EMPTY_BC6H_EH, _EMPTY_BC6H_IH, _EMPTY_BC6H_CLS, _EMPTY_BC6H_CLS
+        result = (_EMPTY_BC6H_EH, _EMPTY_BC6H_IH, _EMPTY_BC6H_CLS, _EMPTY_BC6H_CLS)
+        return result + (_EMPTY_BC6H_EH, _EMPTY_BC6H_IH) if with_confirmed_bits else result
     eh = list(_EMPTY_BC6H_EH)
     ih = list(_EMPTY_BC6H_IH)
     ec = list(_EMPTY_BC6H_CLS)
@@ -234,7 +238,32 @@ def load_bc6h(history=None):
         ec[i] = int(cls)
     for i, cls in _iter_entries(sec.get("indexClass")):
         ic[i] = int(cls)
-    return tuple(eh), tuple(ih), tuple(ec), tuple(ic)
+    ep_cb = [tuple((16, 10, 6, 6) for _ in range(3)) if c == 3 else _EMPTY_BC6H_EH[0] for c in ec]
+    ix_cb = [(4,) * 16 if c == 3 else _EMPTY_BC6H_IH[0] for c in ic]
+    for key, target, empty, widths in (
+        ("endpointConfirmedBits", ep_cb, _EMPTY_BC6H_EH, (16, 10, 6, 6)),
+        ("indexConfirmedBits", ix_cb, _EMPTY_BC6H_IH, (4,) * 16),
+    ):
+        if key not in sec:
+            continue
+        # In an explicit sparse depth table, omitted rows confirm no bits.
+        target[:] = empty
+        for i, row in _iter_entries(sec[key]):
+            if key == "endpointConfirmedBits":
+                if len(row) != 3 or any(len(ch) != 4 for ch in row):
+                    raise ValueError(f"BC6H {key}[{i}] must be 3x4 integers")
+                value = tuple(tuple(int(v) for v in ch) for ch in row)
+                valid = all(0 <= v <= widths[q] for ch in value for q, v in enumerate(ch))
+            else:
+                if len(row) != 16:
+                    raise ValueError(f"BC6H {key}[{i}] must have 16 integers")
+                value = tuple(int(v) for v in row)
+                valid = all(0 <= v <= 4 for v in value)
+            if not valid:
+                raise ValueError(f"BC6H {key}[{i}] bit depth out of bounds")
+            target[i] = value
+    result = (tuple(eh), tuple(ih), tuple(ec), tuple(ic))
+    return result + (tuple(ep_cb), tuple(ix_cb)) if with_confirmed_bits else result
 
 
 def load_bc7(history=None):

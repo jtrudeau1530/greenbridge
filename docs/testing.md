@@ -126,7 +126,27 @@ python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
 ```
 
+For the standalone `v_mullit_f32` readback, build the full-screen triangle and the
+hand-written semantic fixture, then run 120 draws with runtime SGPR inputs.
+The driver checks every pixel against an integer product rounded to 24 bits.
+It reports the input words, pixel and channel on the first mismatch.
+
+```sh
+python -I runtime/test/shaders/build.py <out-dir> vs_ids ps_mullit
+python -I runtime/test/shaders/mullit_readback.py <out-dir> <harness-directory>
+```
+
 For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
+
+The shader test programs (`vk_harness`, `vk_compute_test`, `vk_store_test`, `vk_texture_test`, `vk_bindless_test`,
+`vk_sampler_test`, `vk_image_fuzz`) don't read `LEONIDA_VK_VALIDATION`. To check one, load the layer through the
+loader and run it by hand, for example
+`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_KHRONOS_VALIDATION_GPUAV_ENABLE=1 vk_compute_test x.spv 1 dump`.
+The layer prints its messages to stdout and the program's exit status doesn't change, and `run_gpu_tests.py` shows
+only each test's last line, so read the program's own output. GPU-assisted validation (`..._GPUAV_ENABLE=1`)
+instruments the translated shaders and reports what they actually do at run time: out-of-bounds buffer accesses, and
+an image read through a view whose numeric type doesn't match the shader's (a T# FORMAT that disagrees with the
+bound view). It runs on llvmpipe. `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=1` adds synchronization validation.
 
 ## The Windows runtime on Linux, under Wine or Proton
 
@@ -151,8 +171,8 @@ x86_64 headers for Win11SDK_10.0.26100".
 On a machine without a display (a server, a container, WSL without WSLg), Wine has no graphics driver to create a
 Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (VkResult -3)` and, with
 `WINEDEBUG=+vulkan`, "Failed to load Wine graphics driver supporting Vulkan". Run the tests under a virtual X server,
-as CI does: `xvfb-run -a ctest --test-dir runtime/build/windows` (package `xvfb`). With Mesa installed, the tests
-then run on llvmpipe.
+as CI does: `WINEPREFIX="$HOME/.local/share/leonida-wine" xvfb-run -a ctest --test-dir runtime/build/windows`
+(packages `xvfb` and `xauth`, which `xvfb-run` needs). With Mesa installed, the tests then run on llvmpipe.
 
 The build type defaults to `RelWithDebInfo`: xwin leaves out the debug CRT, so `Debug` needs `--include-debug-libs`.
 `make_game.py`'s `runtime` stage makes this same build on Linux when the tools and the SDK are there (`--runtime-build
@@ -178,6 +198,12 @@ To test the wave64 emulation that makes them exact on these GPUs, set `LEONIDA_W
 `build.py` and `check.py`**: `build.py` translates with emulation only when it's set. If you set it only for
 `check.py`, the shaders are checked against the emulated expectations without being emulated, and every wave64 test
 fails.
+
+`ps_bitmask_perm` is a wave32 pixel shader, and a pixel shader's width can't be requested on every device. Intel
+drivers report subgroups of 8..32 and may run it 8 or 16 wide; its second pattern reads lanes 16-31, which then
+don't run. The test skips when the frame shows that (#1318), and the translation gives 0 for a source lane that
+isn't running instead of an undefined value (#618). At 16 wide the first pattern stays inside the running lanes, so
+it is still checked before the skip.
 
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
@@ -232,6 +258,23 @@ only for `check.py`, the shaders read the tail from push constants the programs 
 (`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
 constants, so those tests skip.
 
+## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
+
+The translated shaders take 144 bytes of push constants: s0..s31, then the heap base and the code base. A device whose
+`maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
+`vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
+AMD's Windows driver reports 128 on RDNA2 iGPUs (Radeon 680M, 610M, the Ryzen 7000 iGPU); RADV reports more on the
+same chips.
+
+To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
+`run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
+and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
+block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
+`vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
+only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
+(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
+constants, so those tests skip.
+
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 
 Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
@@ -251,13 +294,17 @@ cmake -S runtime -B runtime/build/linux && cmake --build runtime/build/linux --p
 python -I scripts/run_gpu_tests.py --build runtime/build/linux --llvm-mc /usr/lib/llvm-18/bin/llvm-mc
 LEONIDA_W64_EMULATE=1 python -I scripts/run_gpu_tests.py --build runtime/build/linux \
     --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --filter cs_
+LEONIDA_BARY_FALLBACK=1 python -I scripts/run_gpu_tests.py --build runtime/build/linux \
+    --llvm-mc /usr/lib/llvm-18/bin/llvm-mc
 ```
 
 With Mesa 25.2 (llvmpipe, LLVM 20) the first run passes 52 of 88 and skips 36, the second passes 37 of 39 and
 skips 2. The skips are expected: llvmpipe has 8-wide subgroups (so every wave64 test skips without emulation, and
 the 32-lane tests `ps_bitmask_perm`, `cs_wqm_w32` and `cs_w32_lane_wrap` skip in both runs), no
 `VK_KHR_fragment_shader_barycentric` (`ps_bary`, `ps_uniform_branch`, `ps_scc_mask32`) and no
-`VK_KHR_maintenance8` (`ps_texoff`). With
+`VK_KHR_maintenance8` (`ps_texoff`). The third run draws those three barycentric tests through the fallback below
+(with Mesa 26.0.8 it passes 123 of 189, the first run 120), and CI fails it unless every shader that got a fallback
+geometry shader passes. With
 `LEONIDA_W64_EMULATE=1` the mesh tests abort inside llvmpipe's compiler ("LLVM ERROR: Cannot emit physreg copy
 instruction"), which is why the second run is limited to compute. llvmpipe is not a substitute for a result from a
 real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
@@ -266,13 +313,17 @@ differences.
 ## GPUs without fragment barycentrics (NVIDIA Volta, Pascal and older)
 
 `ps_bary`, `ps_uniform_branch` and `ps_scc_mask32` read raw barycentrics, which need
-`VK_KHR_fragment_shader_barycentric`; so do `ps_interp_f16_high` and `ms_f16_pack` (16-bit interpolants are
-`PerVertexKHR` inputs, and `--bary-fallback` cannot express them, so they skip under it). NVIDIA has it from Turing on; Volta (V100, Titan V) and older lack it, as do
-llvmpipe and some other drivers. Where the device lacks it they're skipped; that's expected, not a failure. To
-test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`** (or
-for `run_gpu_tests.py`). The shaders are then translated with `--bary-fallback` and drawn through a pass-through
-geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric fallback"), so the device needs
-geometry shaders instead.
+`VK_KHR_fragment_shader_barycentric`. NVIDIA has it from Turing on; Volta (V100, Titan V) and older lack it, as do
+llvmpipe and some other drivers. Where the device lacks it those three are skipped; that's expected, not a failure.
+To test the fallback that runs them anyway, set `LEONIDA_BARY_FALLBACK=1`, **for both `build.py` and `check.py`**
+(or for `run_gpu_tests.py`; CI does this on llvmpipe). The shaders are then translated with `--bary-fallback` and
+drawn through a pass-through geometry shader that supplies the barycentrics (`docs/design.md`, "Barycentric
+fallback"), so the device needs geometry shaders instead.
+
+`ps_interp_f16_high` and `ms_f16_pack` read 16-bit interpolants as `PerVertexKHR` inputs, which need the extension
+too and which `--bary-fallback` can't express. With `LEONIDA_F16_INTERP_FALLBACK=1` they read halves the producer
+exports decoded instead (see Macs, below) and run with or without the bary fallback; `run_gpu_tests.py` turns that
+on by itself where the device lacks the extension. Under the bary fallback without it they skip.
 
 ## Macs: 16-bit interpolation without PerVertexKHR
 
@@ -294,12 +345,16 @@ without it they're skipped, which is expected, not a failure. To test the fallba
 ## Fused multiply-add: GLSL Fma or OpFmaKHR
 
 `cs_fma_fused` checks that `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32` (and one `v_fma_f16`) round once, on
-operands taken from user SGPRs so the driver cannot fold them. It passes with the default translation (`--fma glsl`,
-GLSL.std.450 `Fma`) and with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
+operands taken from user SGPRs so the driver cannot fold them. Run it with default `--fma glsl` (GLSL.std.450 `Fma`) or
+with `LEONIDA_FMA=khr` **for `build.py`** (or for `run_gpu_tests.py`), which emits `OpFmaKHR`.
 That needs `VK_KHR_shader_fma` with `shaderFmaFloat32`; the test programs enable it when the device has it and exit
 77 (a SKIP) for a module that needs it on a device without it. The Vulkan specification allows a driver to split GLSL
-`Fma` into two roundings, which is why `khr` exists. Neither the AMD (26.11.2) nor the NVIDIA (617.42) driver we tried
-does, so `cs_fma_fused` passing with `glsl` is not evidence that every driver is safe.
+`Fma` into two roundings, which is why `khr` exists: on AMD Windows (26.11.2) and NVIDIA (617.42) GLSL `Fma` stayed
+fused, whereas **Mesa RADV (26.2.6-arch3.1, AMD Radeon RX 6800, Linux)** splits 5 of the 7 f32 ops under `--fma glsl`
+(reusing the live `a * a` product in `v3`) and returns 8/8 fused exact under `LEONIDA_FMA=khr`. Under default
+`--fma glsl`, `check.py` and `run_gpu_tests.py` therefore accept either the fused or the exact split word for each of
+the 7 f32 outputs while still requiring exact f16 round-to-odd (`0x00007351`); under `LEONIDA_FMA=khr`, all 8 words
+must be strictly fused.
 
 ## Hardware oracle (optional, AMD)
 
@@ -337,6 +392,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | Validation errors without a VUID, or messages from a layer you didn't ask for | An implicit Vulkan layer from other software (Rockstar Social Club, ReShade, MangoHud, an overlay) | Set `VK_LOADER_LAYERS_DISABLE=~implicit~`. Overlays that hook the swapchain (RivaTuner `VK_LAYER_RTSS`, OBS `VK_LAYER_OBS_HOOK`) can stay loaded: see the next row |
 | Validation errors that only your machine shows (e.g. `xbox_present`'s sRGB swapchain `STORAGE` message), with MSI Afterburner/RivaTuner or OBS installed | An overlay layer that hooks the swapchain: while RivaTuner Statistics Server is running, its `VK_LAYER_RTSS` adds `STORAGE` usage to it (OBS's `VK_LAYER_OBS_HOOK` injects `VK_IMAGE_USAGE_STORAGE_BIT` too). In an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE` (`VK_LOADER_DEBUG=all` says so), so `~implicit~` leaves the layer in | Run the tests from a normal terminal, close the overlay application, or set the layer's own switch, which works elevated too: `DISABLE_RTSS_LAYER=1`, `DISABLE_VULKAN_OBS_CAPTURE=1` (OBS). Any other layer's switch is the `disable_environment` entry in its manifest (the JSON listed under `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers` or `HKCU\...`). `VK_LOADER_DEBUG=layer` prints the layers that were actually inserted |
 | `vk_sync_validation` fails with `LEONIDA_VK_VALIDATION=1` ("the write-after-write hazard was not reported") | Synchronization validation is off although the tests ask for it: an older layer, or a layer setting such as `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=false` or a `vk_layer_settings.txt` that overrides it. Every other GPU test then reports "0 validation errors" without having been checked | Remove the override or update the Vulkan SDK, then rerun `ctest -R vk_sync_validation` until it passes |
+| On RADV with Mesa 25.2 (Ubuntu 24.04's default; 25.2.8 measured) or 25.3 (from the source, not run), `cs_w32_salu64` fails with word 2 = `0` (want `0xFFFFFFFF`) and `cs_signed_zero_nan` fails with word 5 = `0` (want `1`) | Two Mesa bugs, not translator bugs (#166). `cs_w32_salu64`: ACO's `combine_add_sub_b2i` reads a temporary without counting the use, so dead-code elimination removes it (`ACO ERROR: ... never defined` with `MESA_SHADER_CACHE_DISABLE=true`); `RADV_DEBUG=llvm` passes. `cs_signed_zero_nan`: NIR's range analysis (`fmul_is_a_number`) calls `0 * x` a number when `x` may be infinite, so the `x != x` check folds to false despite `SignedZeroInfNanPreserve`. The same NIR code is behind llvmpipe's word 5 (#664) | Expected with these Mesa versions. From the source, the ACO function is gone from Mesa 26.0 and the NIR code was replaced in 26.1 (neither run); RADV from Mesa 26.3.1 passes both on an 8060S (gfx1151) |
 | Every test crashes inside `libnvidia-eglcore.so` | NVIDIA's 535 server driver (Ubuntu 24.04's default) | Use driver 615 or newer |
 | `build.py`: 0 translated, reason `.text` | An old `build.py` with LLVM 19 | Update to current `main` |
 | `vk_harness` doesn't compile: `VK_KHR_maintenance8` names unknown | Vulkan headers older than the SDK the code was written against | Update to current `main` (the code now builds without it), or use current Khronos Vulkan-Headers; conda-forge's package is too old |
@@ -352,6 +408,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | `run_gpu_tests.py` fails on a `dict \| None` annotation | Python older than 3.10 | Use Python 3.11+ |
 | `vulkaninfo` lists `Microsoft Direct3D12 (<gpu>)` next to the real GPU and the tests run on it | The Windows "OpenCL™, OpenGL® and Vulkan® Compatibility Pack" installs Mesa's Dozen, a Vulkan-on-D3D12 layer that reports `DISCRETE_GPU` like the native card | Current `main` prefers a native ICD over Microsoft's vendor (`0x1414`) in the runtime and every harness; set `LEONIDA_VK_DEVICE=<part of the real GPU name>` to select explicitly. See #915. |
 | A GPU test that uses `image_load` (or lighting built from real shaders) reads zeros from its image; @Silliana saw every texel except pixel (0,0) come back zero in their own layer (#603, not reproduced here) | In this runtime the shader turns the T# words into an index through the descriptor hash table (`runtime/src/descriptor_table.h`: a miss gives index 0), and index 0 is a 1×1 image of zeros (`runtime/src/vulkan_bindless.h`), so a hand-built or zeroed T# that was never registered reads zeros even at (0,0). The translator does not compare coordinates with the T# size, and `cs_imgload.asm` only uses its T# words as a hash key | Register the descriptor through the runtime (for D3D12, create it with `CreateShaderResourceView`) so its T# hits the table, with the image's real width and height (stored as size − 1, see `runtime/src/gfx10_descriptors.h`) |
+| `cs_sample_lz_int_d16`, `ps_sample_implicit_sint`, `ps_ssharp`, `ps_tex`, `ps_texture_mip0`, `ps_texture_sample` and `ps_texture_sample_d16` crash (exit -11 or 139) on an Intel GPU on Linux, while NVIDIA and llvmpipe pass them (TEST-399) | A bug in Mesa ANV's shader compiler: compiling these texture-sampling shaders, `nir_opt_gcm` (`nir_opt_gcm.c:430`, `gcm_schedule_early_src`) dereferences a phi source an earlier pass has freed. The SPIR-V passes `spirv-val`. Seen with Mesa 26.1.6 (Arrow Lake) and 26.2.7 (Iris Xe, ADL GT2); Mesa 26.3.1 and `main` (bb98606) pass the whole suite on the same Iris Xe | Use Mesa 26.3.1 or newer. To check a newer Mesa without installing it, build its Intel Vulkan driver and point `VK_DRIVER_FILES` at its `src/intel/vulkan/intel_devenv_icd.x86_64.json` |
 
 ## Posting your result
 

@@ -118,6 +118,12 @@ int main() {
                !bad.p);
     }
 
+    if (rt::d3d12::device_push_constants_need_fallback(device.p)) {
+        std::printf("d3d12_pipeline_library_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
+                    rt::d3d12::device_max_push_constants_size(device.p));
+        return 77;
+    }
+
     // 2. Build one compute PSO and one graphics PSO.
     D3D12_DESCRIPTOR_RANGE uav_range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 0};
     D3D12_ROOT_PARAMETER cs_params[3]{};

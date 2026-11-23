@@ -1,4 +1,4 @@
-"""Semantic interpreter tests for AMD RDNA2 floating-point quotient fixup: v_div_fixup_f32 and v_div_fixup_f16.
+"""Standalone idealized IEEE-754 / ISA-PDF reference model tests for v_div_fixup_f32 and v_div_fixup_f16.
 
 RDNA2 VALU floating-point division fixup instructions:
   v_div_fixup_f32  vdst, s0, s1, s2
@@ -9,7 +9,21 @@ Arguments:
   s1: denominator (y in x / y)
   s2: numerator (x in x / y)
 
-Exact AMD RDNA2 fixup truth table:
+Scope note:
+  This file tests a self-contained textbook IEEE-754 / ISA-PDF model (IEEE=1, denorm32=3,
+  s1-before-s2 NaN priority, positive canonical +qNaN 0x7FC00000 / 0x7E00); it does NOT invoke
+  tools/rdna2spirv.py and does NOT match real RDNA2 silicon in the game's inferred MODE.
+  For the hardware-measured RDNA2 (gfx1036, IEEE=0, denorm32=0, DX10_CLAMP=1) translator contract,
+  see the ``v_div_fixup_f32`` row in docs/design.md and tests/semantic/test_alu_div_fixup_f32.py.
+  Key divergences measured natively on gfx1036 (wave32 and wave64):
+    - NaN priority: hardware prefers s2 (numerator) over s1 (denominator), even under IEEE=1/denorm32=3.
+    - 0/0 and +-inf/+-inf: hardware returns -qNaN (0xFFC00000), not +qNaN (0x7FC00000).
+    - sNaN quieting: hardware passes sNaN unchanged under IEEE=0 (quieting only when IEEE=1).
+    - Subnormals: under denorm32=0, s1/s2 subnormals flush to signed zero (s0 subnormals are kept);
+      hardware also applies exp(s2) - exp(s1) <= -151 -> +-0.0, NaN(s0) -> +-inf, and
+      copysign(s0, sign(s1) ^ sign(s2)).
+
+Idealized IEEE=1 / denorm32=3 model truth table tested in this file:
   1. If s1 is NaN, return quiet NaN (quiet_f32(s1) or quiet_f16(s1)).
   2. If s2 is NaN, return quiet NaN (quiet_f32(s2) or quiet_f16(s2)).
   3. If s1 == 0 and s2 == 0, return NaN (canonical QNaN: 0x7FC00000 for f32, 0x7E00 for f16).
@@ -128,7 +142,10 @@ def quiet_f32(bits: int) -> int:
 
 
 def ref_v_div_fixup_f32(s0: int, s1: int, s2: int) -> int:
-    """Exact IEEE single-precision division fixup reference oracle for RDNA2 v_div_fixup_f32.
+    """Idealized IEEE=1 / denorm32=3 reference model for v_div_fixup_f32 (not gfx1036 silicon).
+
+    For the hardware-measured RDNA2 (gfx1036, IEEE=0, denorm32=0) translator contract, see
+    ``docs/design.md`` and ``tests/semantic/test_alu_div_fixup_f32.py``.
 
     s0 = quotient estimate
     s1 = denominator
@@ -210,7 +227,7 @@ def quiet_f16(bits: int) -> int:
 
 
 def ref_v_div_fixup_f16(s0: int, s1: int, s2: int) -> int:
-    """Exact IEEE half-precision division fixup reference oracle for RDNA2 v_div_fixup_f16.
+    """Idealized IEEE=1 / subnormals-kept reference model for v_div_fixup_f16 (not silicon-measured).
 
     s0 = quotient estimate
     s1 = denominator

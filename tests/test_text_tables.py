@@ -4,6 +4,7 @@
 """
 import contextlib
 import csv
+import errno
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -176,6 +178,35 @@ class TestDialogue(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_unreadable_subdirectory_preserves_previous_tables_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            blocked = os.path.join(source, "blocked")
+            os.makedirs(blocked)
+            write(os.path.join(source, "visible.bin"), make_resource(EN))
+            write(os.path.join(blocked, "hidden.bin"), make_resource(DE))
+            report = os.path.join(tmp, "tables.csv")
+            previous = b"previous complete report\n"
+            write(report, previous)
+            scandir = os.scandir
+
+            def scan(path):
+                if path == blocked:
+                    raise PermissionError(errno.EACCES, "Permission denied", path)
+                return scandir(path)
+
+            with (patch.object(os, "scandir", side_effect=scan),
+                  contextlib.redirect_stderr(io.StringIO()) as error,
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(T.main([source, "--tables", report]), 2)
+
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(len(error.getvalue().splitlines()), 1)
+            self.assertIn("cannot read input", error.getvalue())
+            self.assertIn(repr(blocked), error.getvalue())
+            with open(report, "rb") as fh:
+                self.assertEqual(fh.read(), previous)
+
     def test_csv_exports_explicitly_empty_strings(self) -> None:
         strings = {"ZZ_SYNTHETIC_BLANK": "", "ZZ_SYNTHETIC_LINE": "This is the text you know"}
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,6 +338,31 @@ class TestCli(unittest.TestCase):
                 rc = T.main([src, "--labels", bad_labels])
             self.assertEqual(rc, 2)
             self.assertIn("cannot read input", err.getvalue())
+
+    def test_wrong_shape_labels_json_is_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
+            for text in ("[1, 2]", '"x"', "null"):
+                with self.subTest(text):
+                    labels = os.path.join(tmp, "labels.json")
+                    with open(labels, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(text)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = T.main([src, "--labels", labels])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("cannot read input", err.getvalue())
+
+    def test_carve_folder_with_wrong_shape_index_is_clean_error(self):
+        for name, text in (("list", "[]"), ("nofiles", "{}"), ("badrow", '{"files": [1]}')):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = T.main([tmp])
+                self.assertEqual(rc, 2)
+                self.assertIn("cannot read input", err.getvalue())
 
 
 UNDECIDED = {"ZZ_CODE_1": "qqq zzz", "ZZ_CODE_2": "xkcd 42"}        # no script, letter or word decides: xx

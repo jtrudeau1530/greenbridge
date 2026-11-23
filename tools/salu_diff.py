@@ -132,6 +132,41 @@ def wqm(x, width):
     return out
 
 
+def quadmask(x, width):
+    out = 0
+    for q in range(width // 4):
+        if (x >> (4 * q)) & 0xF:
+            out |= 1 << q
+    return out
+
+
+def bitreplicate(x):
+    out = 0
+    for i in range(32):
+        if (x >> i) & 1:
+            out |= 3 << (2 * i)
+    return out
+
+
+def flbit_signed(x, width):
+    mask = (1 << width) - 1
+    x &= mask
+    sign = (x >> (width - 1)) & 1
+    v = (~x & mask) if sign else x
+    return (width - v.bit_length()) if v else M32
+
+
+def bfe64(src, ctl, signed):
+    off, width = ctl & 63, (ctl >> 16) & 0x7F
+    width = min(width, 64 - off)
+    if width == 0:
+        return 0
+    field = (src >> off) & ((1 << width) - 1)
+    if signed and (field >> (width - 1)) & 1:
+        field -= 1 << width
+    return field & M64
+
+
 def bfe(src, ctl, signed):
     off, width = ctl & 31, (ctl >> 16) & 0x7F
     # A field that runs past bit 31 stops there: s_bfe_i32 sign-extends from the top bit that exists (LLVM
@@ -204,6 +239,8 @@ def _sop2_64():
     ops["s_lshl_b64"] = ("sop2_64s", lambda a, b, c: ((a << (b & 63)) & M64, int((a << (b & 63)) & M64 != 0)))
     ops["s_lshr_b64"] = ("sop2_64s", lambda a, b, c: (a >> (b & 63), int(a >> (b & 63) != 0)))
     ops["s_ashr_i64"] = ("sop2_64s", lambda a, b, c: ((s64(a) >> (b & 63)) & M64, int((s64(a) >> (b & 63)) & M64 != 0)))
+    ops["s_bfe_u64"] = ("sop2_64s", lambda a, b, c: (bfe64(a, b, False), int(bfe64(a, b, False) != 0)))
+    ops["s_bfe_i64"] = ("sop2_64s", lambda a, b, c: (bfe64(a, b, True), int(bfe64(a, b, True) != 0)))
     ops["s_bfm_b64"] = ("sop2_bfm64", lambda a, b, c: ((((1 << (a & 63)) - 1) << (b & 63)) & M64, None))
     return ops
 
@@ -221,18 +258,26 @@ def _sop1():
         "s_flbit_i32": ("sop1", lambda a, b, c: (flbit32(a), None)),
         "s_sext_i32_i8": ("sop1", lambda a, b, c: (sext8(a) & M32, None)),
         "s_sext_i32_i16": ("sop1", lambda a, b, c: (sext16(a) & M32, None)),
+        "s_quadmask_b32": ("sop1", lambda a, b, c: (quadmask(a, 32), int(quadmask(a, 32) != 0))),
         "s_abs_i32": ("sop1", lambda a, b, c: (abs(s32(a)) & M32, int(abs(s32(a)) & M32 != 0))),
         "s_wqm_b32": ("sop1", lambda a, b, c: (wqm(a, 32), int(wqm(a, 32) != 0))),
-        # D is read: bit S0[4:0] of the destination is cleared or set.
+        # D is read: bit S0[4:0] (or S0[5:0] for b64) of the destination is cleared or set.
         "s_bitset0_b32": ("sop1_rmw", lambda a, b, c, d: (d & ~(1 << (a & 31)) & M32, None)),
         "s_bitset1_b32": ("sop1_rmw", lambda a, b, c, d: (d | (1 << (a & 31)), None)),
+        "s_bitset0_b64": ("sop1_64_rmw", lambda a, b, c, d: (d & ~(1 << (a & 63)) & M64, None)),
+        "s_bitset1_b64": ("sop1_64_rmw", lambda a, b, c, d: (d | (1 << (a & 63)), None)),
         "s_mov_b64": ("sop1_64", lambda a, b, c: (a, None)),
         "s_not_b64": ("sop1_64", lambda a, b, c: (~a & M64, int(~a & M64 != 0))),
+        "s_brev_b64": ("sop1_64", lambda a, b, c: (int(f"{a:064b}"[::-1], 2), None)),
+        "s_quadmask_b64": ("sop1_64", lambda a, b, c: (quadmask(a, 64), int(quadmask(a, 64) != 0))),
         "s_wqm_b64": ("sop1_64", lambda a, b, c: (wqm(a, 64), int(wqm(a, 64) != 0))),
+        "s_bitreplicate_b64_b32": ("sop1_32to64", lambda a, b, c: (bitreplicate(a), None)),
         "s_bcnt0_i32_b64": ("sop1_64to32", lambda a, b, c: (64 - popcount(a), int(64 - popcount(a) != 0))),
         "s_bcnt1_i32_b64": ("sop1_64to32", lambda a, b, c: (popcount(a), int(popcount(a) != 0))),
         "s_ff0_i32_b64": ("sop1_64to32", lambda a, b, c: (first_set(~a & M64, 64), None)),
         "s_ff1_i32_b64": ("sop1_64to32", lambda a, b, c: (first_set(a, 64), None)),
+        "s_flbit_i32_b64": ("sop1_64to32", lambda a, b, c: (64 - a.bit_length() if a else M32, None)),
+        "s_flbit_i32_i64": ("sop1_64to32", lambda a, b, c: (flbit_signed(a, 64), None)),
     }
     return ops
 
@@ -266,7 +311,7 @@ SCC_BRANCHES = ("s_cbranch_scc0", "s_cbranch_scc1")
 def writes_scc(name):
     """Whether the opcode writes SCC (each one always does or never does)."""
     form, fn = OPS[name]
-    return (fn(1, 2, 0, 3) if form == "sop1_rmw" else fn(1, 2, 0))[1] is not None
+    return (fn(1, 2, 0, 3) if form in ("sop1_rmw", "sop1_64_rmw") else fn(1, 2, 0))[1] is not None
 
 
 def branch_skip(line):
@@ -311,26 +356,35 @@ def _bfe_ctl(rng):
     return f"0x{(width << 16) | off:x}"
 
 
+def _shared_literal_sources(src0: str, src1: str, register: int) -> str:
+    # A scalar instruction can carry only one literal dword. Equal literals can share it.
+    if src0 != src1 and _is_literal(src0) and _is_literal(src1):
+        src0 = f"s{register}"
+    return f"{src0}, {src1}"
+
+
 def emit(rng, name):
     form = OPS[name][0]
     d, p = rng.choice(REGS), rng.choice(PAIRS)
     if form == "sop2":
         b = _src32(rng) if name.startswith("s_bfe") and BFE_ANY and rng.random() < 0.3 else             _bfe_ctl(rng) if name.startswith("s_bfe") else _src32(rng)
-        return f"{name} s{d}, {_src32(rng)}, {b}"
+        return f"{name} s{d}, {_shared_literal_sources(_src32(rng), b, d)}"
     if form == "sop2_64":
         return f"{name} {_pair(p)}, {_src64(rng)}, {_src64(rng)}"
     if form == "sop2_64s":
         return f"{name} {_pair(p)}, {_src64(rng)}, {_src32(rng)}"
     if form == "sop2_bfm64":
-        return f"{name} {_pair(p)}, {_src32(rng)}, {_src32(rng)}"
+        return f"{name} {_pair(p)}, {_shared_literal_sources(_src32(rng), _src32(rng), d)}"
     if form in ("sop1", "sop1_rmw"):
         return f"{name} s{d}, {_src32(rng)}"
     if form == "sop1_64":
         return f"{name} {_pair(p)}, {_src64(rng)}"
+    if form in ("sop1_32to64", "sop1_64_rmw"):
+        return f"{name} {_pair(p)}, {_src32(rng)}"
     if form == "sop1_64to32":
         return f"{name} s{d}, {_src64(rng)}"
     if form == "sopc":
-        return f"{name} {_src32(rng)}, {_src32(rng)}"
+        return f"{name} {_shared_literal_sources(_src32(rng), _src32(rng), d)}"
     if form == "sopc_64":
         return f"{name} {_src64(rng)}, {_src64(rng)}"
     k = rng.choice((0, 1, 0x7FFF, 0x8000, 0xFFFF, 0xFFFE, rng.getrandbits(16)))
@@ -452,6 +506,12 @@ def reference(lines):
             _write(sgpr, args[0], r, 32)
         elif form == "sop1_64":
             r, c = fn(_parse_src(args[1], sgpr, 64), None, scc)
+            _write(sgpr, args[0], r, 64)
+        elif form == "sop1_64_rmw":
+            r, c = fn(_parse_src(args[1], sgpr, 32), None, scc, _parse_src(args[0], sgpr, 64))
+            _write(sgpr, args[0], r, 64)
+        elif form == "sop1_32to64":
+            r, c = fn(_parse_src(args[1], sgpr, 32), None, scc)
             _write(sgpr, args[0], r, 64)
         elif form == "sop1_64to32":
             r, c = fn(_parse_src(args[1], sgpr, 64), None, scc)

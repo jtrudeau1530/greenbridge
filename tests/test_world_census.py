@@ -629,20 +629,21 @@ class ClassifyGapsTest(unittest.TestCase):
         self.assertEqual(r["accounted"], r["span"])
 
     def test_straddling_raw_segment_is_not_skipped(self):
-        # A raw_graphics segment that starts before cursor and extends past it (even when a shorter
-        # nested segment sits between its start and cursor) must still account for [cursor, s1).
+        # A raw_graphics segment that straddles scan_start (or overlaps an earlier raw segment in the
+        # same gap) must account for [pos, s1), whereas a raw_pages candidate whose start was covered
+        # by a compressed stream [0x200..0x240) must not spill its uncompressed tail into [0x240..0x300).
         self.write(b"\x22" * 0x300)
         r = WC.classify_gaps(
             self.arc,
-            [[0x100, 0x180]],
-            [[0x080, 0x180], [0x0A0, 0x040]],  # [0x80..0x200) straddles cursor=0x180; [0xA0..0xE0) ends earlier
+            [[0x200, 0x240]],
+            [[0x080, 0x100], [0x0A0, 0x040], [0x200, 0x0C0]],
             [],
             0x100,
             0x300,
         )
-        self.assertEqual(r["covered"], 0x80)
+        self.assertEqual(r["covered"], 0x40)
         self.assertEqual(r["raw_graphics"], 0x80)
-        self.assertEqual(r["unread"], 0x100)
+        self.assertEqual(r["unread"], 0x140)
         self.assertEqual(r["accounted"], r["span"])
 
     def test_duplicates_handles_rows_without_map_name(self):

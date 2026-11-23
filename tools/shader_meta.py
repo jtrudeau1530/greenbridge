@@ -69,7 +69,10 @@ def _imm_u32(a):
     if a["k"] == "imm":
         v = a["v"] & 0xFFFFFFFF
     elif a["k"] == "fimm":
-        v = struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+        try:
+            v = struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+        except OverflowError:   # a double no float32 holds is not a constant this can name
+            return None
     else:
         return None
     if a.get("abs"):
@@ -315,7 +318,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 new_scale[d] = scale[s]
             if s in ptr_stride:
                 new_pstride[d] = ptr_stride[s]
-    elif op == "s_movk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+    elif op == "s_movk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1 and a[1]["k"] == "imm":
         v = a[1]["v"] & 0xFFFF
         if v & 0x8000:
             v -= 0x10000

@@ -265,6 +265,30 @@ class Cli(unittest.TestCase):
                 meta = json.load(f)
             self.assertEqual(meta["words"], [1, 2])
 
+    @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
+    def test_locked_input_is_counted_as_failed(self):
+        # An exclusively locked (share-none) existing file must be a counted failed input with a one-line
+        # message, not a raw PermissionError traceback after the os.path pass.
+        import ctypes
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "locked.dll")
+            with open(src, "wb") as f:
+                f.write(b"\x00" * 16)
+            out = os.path.join(t, "out")
+            k32 = ctypes.windll.kernel32
+            handle = k32.CreateFileW(src, 0x80000000, 0, None, 3, 0x80, None)
+            self.assertNotIn(handle, (0, -1), "could not lock the probe file")
+            try:
+                code, _, err = self.run_tool(src, "--out", out)
+            finally:
+                k32.CloseHandle(handle)
+            self.assertEqual(code, 1)
+            self.assertIn("cannot read input", err)
+            self.assertIn("Permission denied", err)
+            self.assertNotIn("Traceback", err)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f), [])
+
 
 class TranslatorSidecars(unittest.TestCase):
     """rdna2spirv reads an FSPX program's code and dispatch state from fspx/ when there is no FSSM blob."""

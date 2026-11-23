@@ -254,15 +254,15 @@ def rewrite(text):
             ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
             out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
             continue
-        m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)$", s)
+        m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)
             out.append(f"{m.group(1)} = OpBitcast {m.group(2)} {val}" if m.group(2) != uint
                        else f"{m.group(1)} = OpCopyObject {uint} {val}")
             continue
-        for v in list(in_slot) + list(out_vars):
+        for v in list(in_slot) + list(out_vars) + sorted(gone - set(in_slot) - set(out_vars)):
             if re.search(rf"{re.escape(v)}\b", s):
-                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)$", s)
+                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)(?:\s+.*)?$", s)
                 if v in out_vars and m2:
                     s = f"OpStore {out_vars[v]} {m2.group(1)}"
                     break
@@ -339,7 +339,7 @@ def main(argv):
     target = f"spv{ver.group(1)}.{ver.group(2)}" if ver else "vulkan1.2"
     subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
     if lay_path:
-        with open(lay_path, "w", newline="\n") as f:
+        with open(lay_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(lay, f, indent=1)
     print(json.dumps(lay))
     return 0

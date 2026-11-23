@@ -172,6 +172,14 @@ class Refusals(unittest.TestCase):
         doc["tree"]["attributes"][0]["descriptor"] = 40
         self.assertEqual(self.reason(doc=doc), "descriptor")
 
+    def test_reused_descriptor_with_conflicting_name_is_refused(self):
+        blob = Stream().open("r").int("x", 1).int("x", 2).close().bytes()
+        doc = rbf0_tree.parse_resource(blob)
+        doc["tree"]["content"][1]["name"] = "renamed"
+        self.assertEqual(self.reason(doc=doc), "descriptor")
+        doc.pop("descriptors", None)
+        self.assertEqual(self.reason(doc=doc), "descriptor")
+
     def test_length_mismatch(self):
         doc = rbf0_tree.parse_resource(every_record(True))
         doc["tree"]["attributes"][1]["value"] = "longer than recorded"

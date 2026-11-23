@@ -534,6 +534,45 @@ Slot usage (block counts): slot 0 tag `0x42` in all 60,442; slot 2 `0x21` in 57,
 (24,876), slot 8 `0x25` (21,519), slot 13 `0x26` (17,928), slot 11 `0x27` (11,120) and 21 rarer slot/tag
 pairs, including `0x84` and `0x4b` in slot 17 (5,452 and 3,714).
 
+**What the skinned mesh shaders read from slots 6, 8 and 17 (shader reading; slot 17 is only partly
+checked on the data).** The 363 mesh shaders that contain a `BUF_FMT_16_16_16_16_UINT` load take each
+stream's type from the low four bits of a per-slot descriptor word in a constant buffer (one dword per
+slot: `+0x18` is slot 6, `+0x20` slot 8, `+0x44` slot 17; stride `((w >> 3) & 60)` bytes). They choose
+the load from that type:
+
+| Slot | Type | Load |
+| --- | --- | --- |
+| 6 | 6 (tag `0x26`) | `tbuffer_load_format_xyzw ... BUF_FMT_8_8_8_8_UNORM` |
+| 6 | other | `buffer_load_dwordx4` (four raw dwords) |
+| 8 | 5 (tag `0x25`) | `tbuffer_load_format_xyzw ... BUF_FMT_8_8_8_8_UINT` |
+| 8 | other (type 11 is tag `0x4b`) | `tbuffer_load_format_xyzw ... BUF_FMT_16_16_16_16_UINT` |
+
+198 of the 363 also read slot 17 with `buffer_load_dwordx2` (the first 8 bytes):
+
+- u16 0 bit 15 set: that vertex skips the step.
+- Otherwise u16 0 is an element index, checked against a count from a table.
+- That element's entry holds eight u16 point indices.
+- u16 1-3 are three coordinates, each `v / 65535` (`v_mul_f32 0x37800080`).
+- The shader fetches the eight points and blends them with the trilinear weights `(1-a)(1-b)(1-c)` ... `abc`.
+
+That is a deformation-lattice binding.
+
+On the data (core_restofworld, first 500 streams), slot 17's width follows the skin influence count:
+
+- All 338 blocks with tag `0x84` (16 bytes) have two weight/index pairs (slots 6-9, eight influences).
+- All 121 blocks with `0x4b` (8 bytes) have one (slots 6 and 8, four influences).
+- Bit 15 of u16 0 is set on 20,898 of 186,727 `0x84` vertices (11.2%) and 5,973 of 12,336 `0x4b` vertices
+  (48.4%).
+- For `0x84`, bit 15 of the second 8 bytes' first u16 is set on 117,067 (62.7%). Those 8 bytes may be a
+  second binding, but no shader read of them was traced.
+
+Element indices are mostly unique per vertex (115,101 distinct non-flagged values over the 186,727 `0x84`
+vertices), so few elements are shared by enough vertices to test the coordinates. In the 39 elements with
+8 or more vertices, positions are an affine function of the three coordinates: the median rms residual is
+1.6% of the block extent, against 25% with the coordinates shuffled within the element. That is consistent
+with the reading, but too few elements to confirm it. In these samples no block puts tag `0x4b` in
+slot 8.
+
 **Tag `0x28` is two signed 16-bit values.** Over the triangle edges of the slot 3 stream, a difference of more
 than 0x8000 between neighbouring vertices occurs 1,597,530 times when the values are read as unsigned and
 18,791 times when they are read as signed (85 times fewer); slot 4 gives 1,680,055 against 5,570. Read as
@@ -571,13 +610,38 @@ levels: 200 streams, 187 blocks), each class matches the face normals only under
 Bit 31 is set on 48,046 of the 60,600 sampled core_restofworld vertices (79.3%). Model axis order is the one
 `+0x6C` gives for positions; the other five axis orders and sign flips of the decoded vector score 0.27 to
 0.36 there. Some core_restofworld blocks score lower under the matching decode than levels blocks do; this
-check does not say why. Not decoded: bits 20-30 of the 10-bit form (they vary
-within 142 of 143 blocks) and bytes 2-3 of the 8-bit form.
+check does not say why.
+
+**The rest of the `0x21` word is the tangent frame.** The same mesh shaders go on to build a tangent.
+With bit 31 set, bits 20-29 are an angle, `v * 2pi/1023 - pi` (`v_fma_f32` by 2pi/1023 and -pi, then
+`v_sin_f32`/`v_cos_f32`), that turns a basis made from the normal alone (`s` = sign of z,
+`a = 1/(s + z)`, `b1 = (s x^2 a - 1, s x y a, s x)`, `b2 = (x y a, y^2 a - s, y)`), giving
+`tangent = b1 cos - b2 sin`. With bit 31 clear, bits 16-22 and 23-29 are a 7-bit octahedral tangent
+(`v_bfe_u32 ..., 16, 7` and `23, 7`, each `v / 63.5 - 1`). Bit 30 (`v_lshrrev_b32 30` then `& 1`) is the
+bitangent sign. Of the 6,254 mesh shaders with the bit-31 branch, 5,196 read bits 20-29, 5,191 read the
+two 7-bit fields and 528 read bit 30. `tangent_0x21` in `tools/vertex_types.py` is that decode.
+
+The tool checks it against the first `0x28` stream (texture coordinates): per sampled triangle it projects
+`dP/du` into each vertex's tangent plane and counts tangents within `cos > 0.8` of it ("along u"), the same
+tangent turned by a random angle about the normal (chance level), and, of the along-u vertices, how often
+bit 30 matches the side of `dP/dv` that `cross(normal, tangent)` points to:
+
+| Archive sample | Form | Vertices checked | Along u | Random angle | Bit 30 = bitangent side |
+| --- | --- | --- | --- | --- | --- |
+| levels (187 blocks) | 10-bit | 59,448 | 98.0% | 23.2% | 99.4% |
+| levels | 8-bit | 411 | 83.2% | 22.6% | 98.8% |
+| core_restofworld (143 blocks) | 10-bit | 52,153 | 86.3% | 22.3% | 97.8% |
+| core_restofworld | 8-bit | 6,992 | 56.4% | 15.8% | 92.6% |
+
+Bit 30 set means `cross(normal, tangent)` runs along `+v`. The shaders turn a set bit 30 into the factor
+`-1.0` (`v_cndmask_b32 ..., 1.0, -1.0`), so their bitangent is that factor times their own cross product;
+which operand order they use was not traced here. The 8-bit form in core_restofworld fits least;
+this check does not say why.
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
-core graphics blocks, final-slot widths remain unresolved, and of the component types the non-normal
-bits of `0x21` (see above). The stride check
+core graphics blocks, final-slot widths remain unresolved (`0x21`, the last unread component type,
+is decoded above). The stride check
 also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
 "Unread" in the tables above is not a claim that those bytes are empty: in
 `story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and
