@@ -52,6 +52,11 @@ argument is null (explicit unload). A map-only load receives no detach notificat
 `--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
 print the usage and exit 2 before anything is mapped.
 
+`--init` and `--run` first check that the host can run the game's AVX code (CPUID.1 AVX and OSXSAVE, XCR0 YMM
+state; `src/host_cpu.h`). Without it they print one line naming what is missing and exit 4 before anything is
+mapped. In a virtual machine, pass the host CPU through (QEMU `-cpu host`); under Rosetta on macOS, set
+`ROSETTA_ADVERTISE_AVX=1`. `LEONIDA_SKIP_CPU_CHECK=1` skips the check; `--dry-run` never runs it.
+
 The report line is:
 
 ```

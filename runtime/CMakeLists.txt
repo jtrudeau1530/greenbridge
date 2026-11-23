@@ -73,6 +73,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(root_signature_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(root_signature_test PRIVATE /OPT:NOREF)
 
+  # Host CPU preflight of --init/--run (src/host_cpu.h): AVX, OSXSAVE and XCR0 YMM state. The test feeds synthetic
+  # CPUID/XCR0 words.
+  add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
+  target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_options(host_cpu_test PRIVATE /W4 /permissive- /utf-8)
+
   # XTaskQueue/XAsync from microsoft/libHttpClient (MIT), vendored in third_party/xtaskqueue; shims/xtaskqueue/pch.h
   # stands in for libHttpClient's pch.h so only the task queue builds. Used by the xgameruntime shim.
   set(XTASKQUEUE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/xtaskqueue)
@@ -103,6 +109,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   add_executable(gta6rt
     src/main.cpp
+    src/host_cpu.cpp
     src/pe_loader.cpp
     shims/registry.cpp
     shims/file_system.cpp
@@ -1234,6 +1241,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
+  endif()
+  if(WIN32 AND TARGET host_cpu_test)
+    add_test(NAME host_cpu COMMAND host_cpu_test)
   endif()
   if(WIN32 AND TARGET root_signature_oracle_test)
     add_test(NAME root_signature_oracle COMMAND root_signature_oracle_test)
