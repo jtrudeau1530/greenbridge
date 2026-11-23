@@ -29,6 +29,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <new>
 
 #include "shims.h"
 
@@ -187,8 +188,8 @@ struct AcpHal final {  // no virtual destructor: it would add a slot the title d
 
 HRESULT AcpHalCreate(AcpHal** out) {
     if (!out) return kEPointer;
-    *out = new AcpHal;
-    return S_OK;
+    *out = new (std::nothrow) AcpHal;
+    return *out ? S_OK : kEOutOfMemory;
 }
 
 }  // namespace
