@@ -36,7 +36,8 @@ RUNNER_SKIPS = {
         "test_depth",
     },
     "tests/test_feature_scan.py": {
-        # Top-level test_* functions not yet called by its __main__ runner on upstream/main.
+        # Its __main__ runner calls every test_* through run_tests([... for ... in globals().items() ...]), a
+        # comprehension dispatches_tests() does not follow, so each top-level test is listed here.
         "test_feature_scan",
         "test_short_signature",
         "test_part_payload_outside_container_is_unreadable",
@@ -46,6 +47,7 @@ RUNNER_SKIPS = {
         "test_v_perm_b32_selectors",
         "test_typed_buffers_and_psv0",
         "test_a_test_that_raises_fails_the_run_and_the_rest_still_run",
+        "test_a_failed_check_fails_only_its_own_test",
     },
 }
 

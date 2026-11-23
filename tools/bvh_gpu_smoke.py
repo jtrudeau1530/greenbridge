@@ -303,10 +303,14 @@ def main(argv=None):
     if a.json:
         Path(a.json).write_text(json.dumps({"max_shared_memory": a.max_shared_memory, "table_qword": a.table_qword,
                                             "heap_bytes": a.heap_bytes, "results": results, "checked": checked},
-                                           indent=1), encoding="utf-8")
+                                           indent=1), encoding="utf-8", newline="\n")
     ok = counts.get("pass", 0) == len(results) and all(r["status"] == "pass" for r in checked)
     return 0 if ok else 1
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

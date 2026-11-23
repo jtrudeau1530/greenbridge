@@ -31,7 +31,7 @@ LINKED_INTERFACE = re.compile(r"\[(I\w+)\]\(\w+\.md\)")
 METHOD = re.compile(r"\[(\w+)\]|(\w+)")
 
 
-def read_text(path: str) -> str:
+def read_utf8(path: str) -> str:
     with open(path, encoding="utf-8") as f:
         return f.read()
 
@@ -65,7 +65,7 @@ def parse_docs(root: str) -> tuple[dict, dict]:
         for name in sorted(os.listdir(folder)):
             if not name.endswith(".md"):
                 continue
-            text = read_text(os.path.join(folder, name))
+            text = read_utf8(os.path.join(folder, name))
             m = ID.search(text)
             if not m:
                 continue

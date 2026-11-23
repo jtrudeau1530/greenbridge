@@ -6277,8 +6277,9 @@ class Gen:
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
-        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32", "v_cmp_class_f16", "v_cmpx_class_f16",
-                    "v_cmp_class_f64", "v_cmpx_class_f64"):
+        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32", "v_cmp_class_f16", "v_cmpx_class_f16"):
+            # f64 goes to cmp_class_f64 below (the operand checks test_cmp_class_f64 pins); cmp_class's own f64
+            # branch, merged later, has no operand-form checks.
             self.cmp_class(a, exec_only=op.startswith("v_cmpx_"), ty=op.rsplit("_", 1)[1], mods=mods)
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
@@ -15731,8 +15732,11 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
             else:
                 result = subprocess.run(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
                                         input=source, capture_output=True, cwd=folder)
-                result.stdout = result.stdout.decode("utf-8", "replace")
-                result.stderr = result.stderr.decode("utf-8", "replace")
+                # stdin is bytes, so the output is too; a test double may already answer in text.
+                if isinstance(result.stdout, bytes):
+                    result.stdout = result.stdout.decode("utf-8", "replace")
+                if isinstance(result.stderr, bytes):
+                    result.stderr = result.stderr.decode("utf-8", "replace")
         if result.returncode == 0:
             # Offset on non-gather: VK_KHR_maintenance8
             result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",

@@ -61,7 +61,7 @@ class FirstLightMeshDrawTests(unittest.TestCase):
         self.draw.assert_not_called()
         manifest = json.loads((self.out / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual((manifest["vertex_count"], manifest["index_count"]), (0, 0))
-        self.assertTrue(self.mesh.is_file())
+        self.assertFalse(self.mesh.is_file())   # a run without an OBJ removes the previous run's mesh.bin (95ebfb8e9)
         with self.assertRaisesRegex(SystemExit, "requires an OBJ with faces"):
             first_light.main(["--check", "--out", str(self.out)])
         self.draw.assert_not_called()
@@ -70,7 +70,7 @@ class FirstLightMeshDrawTests(unittest.TestCase):
         vertices = [(0.0, 0.0, 0.5, 0.0, 0.0), (1.0, 0.0, 0.5, 1.0, 0.0), (0.0, 1.0, 0.5, 0.0, 1.0)]
         first_light.write_mesh(self.mesh, vertices, [0, 1, 2])
         (self.out / "manifest.json").write_text(
-            '{"width": 2, "height": 2, "vertex_count": 3, "index_count": 3}',
+            '{"width": 2, "height": 2, "vertex_count": 3, "index_count": 3, "files": {"mesh": "mesh.bin"}}',
             encoding="utf-8", newline="\n",
         )
         self.assertEqual(first_light.main(["--check", "--out", str(self.out)]), 0)

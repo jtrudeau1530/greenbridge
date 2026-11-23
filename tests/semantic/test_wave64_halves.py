@@ -1024,20 +1024,23 @@ def _run_ps_cut(asm, wave, push=None, memory=None):
             memory=memory,
         )
         for o in res["outputs"]:
+            if o is None:                 # a killed lane exports nothing; the attachment keeps its clear value
+                words.append(None)
+                continue
             mrt = o["%out_mrt0"]
             words.append(tuple(v.bits if isinstance(v, wi.F) else v for v in mrt))
     return words
 
 
 class PixelShaders(unittest.TestCase):
-    """TEST-722: run all 17 runtime/test/shaders/ps_w64_*.asm fixtures on spirv_wave_interp (wave 64 vs 2x32)."""
+    """TEST-722: run every runtime/test/shaders/ps_w64_*.asm fixture on spirv_wave_interp (wave 64 vs 2x32)."""
 
     def test_ps_w64_fixtures(self):
         sys.path.insert(0, os.path.join(HERE, "..", "..", "runtime", "test", "shaders"))
         import w64_graphics as wg
 
         ps_names = sorted(n for n in wg.FIXTURES if n.startswith("ps_w64_"))
-        self.assertEqual(len(ps_names), 17)
+        self.assertGreaterEqual(len(ps_names), 17)   # 17 when TEST-722 landed; new fixtures run here too
         for name in ps_names:
             with self.subTest(fixture=name):
                 ref_tier, ref_fn, env = wg.FIXTURES[name]
@@ -1050,6 +1053,9 @@ class PixelShaders(unittest.TestCase):
                 for lane in range(64):
                     x, y = _ps_xy(lane)
                     exp = ref_fn(y * 64 + x)
+                    if w64[lane] is None:
+                        self.assertEqual(exp, (wg.CLEAR,) * 4, f"{name} wave64 lane {lane} was killed")
+                        continue
                     for c in range(4):
                         if exp[c] is not None:
                             self.assertEqual(w64[lane][c], exp[c], f"{name} wave64 lane {lane} c{c}")

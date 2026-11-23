@@ -47,9 +47,9 @@ class SourceDiscovery(unittest.TestCase):
         def spirv_tool(cmd, **kwargs):
             tool = cmd[0]
             if tool == "spirv-as":
-                Path(cmd[3]).write_bytes(b"new module")
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
-                self.assertEqual(Path(cmd[-1]).read_bytes(), b"new module")
+                self.assertEqual(Path(kwargs.get("cwd", ""), cmd[-1]).read_bytes(), b"new module")
             else:
                 self.fail(f"unexpected tool: {tool}")
             return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -286,7 +286,7 @@ class OutputInsideInput(unittest.TestCase):
 
         def spirv_tool(cmd, **kwargs):
             if cmd[0] == "spirv-as":
-                Path(cmd[3]).write_bytes(b"new module")
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(out)]), \
@@ -312,9 +312,9 @@ class ValidatedOutput(unittest.TestCase):
         def spirv_tool(cmd, **kwargs):
             tool = cmd[0]
             if tool == "spirv-as":
-                Path(cmd[3]).write_bytes(b"new module")
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
             elif tool == "spirv-val":
-                self.assertEqual(Path(cmd[-1]).read_bytes(), b"new module")
+                self.assertEqual(Path(kwargs.get("cwd", ""), cmd[-1]).read_bytes(), b"new module")
                 if reject_at is None:
                     self.assertFalse(self.module.exists(), "the binary was published before validation")
             else:
@@ -348,9 +348,9 @@ class ValidatedOutput(unittest.TestCase):
         self.assertEqual(list(self.out.glob("*.tmp")), [])
 
     def test_missing_validator_does_not_publish_the_module(self):
-        def spirv_tool(cmd, **_kwargs):
+        def spirv_tool(cmd, **kwargs):
             if cmd[0] == "spirv-as":
-                Path(cmd[3]).write_bytes(b"new module")
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             raise FileNotFoundError(2, "No such file or directory", "spirv-val")
 

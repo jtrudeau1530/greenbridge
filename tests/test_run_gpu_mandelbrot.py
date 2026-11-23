@@ -52,7 +52,8 @@ class MandelbrotReadbackTest(unittest.TestCase):
                 result, output = self.run_frame(data)
                 self.assertEqual(result, 1, output)
                 self.assertIn("FAIL  ps_mandelbrot", output)
-                self.assertIn("expected 4096 pixels", output)
+                # a frame that was never written is reported as a missing readback (TEST-837) before its size is read
+                self.assertIn("missing readback" if data is None else "expected 4096 pixels", output)
 
     def test_complete_frame_still_compares_the_iteration_counts(self) -> None:
         correct = reference_frame(64)

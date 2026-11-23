@@ -540,7 +540,7 @@ def _total_ram_bytes():
             return st.ullTotalPhys
         if sys.platform == "darwin":
             return int(_run(["sysctl", "-n", "hw.memsize"]))
-        with open("/proc/meminfo") as f:
+        with open("/proc/meminfo", encoding="ascii") as f:
             return int(f.readline().split()[1]) * 1024
     except Exception:
         return None
