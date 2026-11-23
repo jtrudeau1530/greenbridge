@@ -504,8 +504,7 @@ Measured over the 630 clouds:
 - **`CoverageMinMax` is a distance range, not a fraction**: min <= max in all 630, values 0 to 30,000, medians 200
   (min) and 2,000 (max), so it reads as an inner/outer radius in world units.
 - `StrikeChance` and `BurstChance` are within 0..1 in all 630. `Rain` and `Fog` are within -1..1 (median 0),
-  `Density` within -100..100 (median 0.5) and `FogHeight` within -100..300: signed values, so these act as
-  offsets or overrides with a sign, not plain amounts.
+  `Density` within -100..100 (median 0.5) and `FogHeight` within -100..300.
 
 The cloud renderer's settings sit in one `STS_Config` document with 44 top-level sections: four cloud layers
 (`Nimbus`, `Cumulus`, `Stratus`, `Alto`) that share one set of 13 fields (noise weights and blends, erosion,
@@ -514,12 +513,33 @@ noise displacement); six media (`GlobalFog`, `LocalFog`, `Rain`, `Clouds`, `Clou
 share another set of 9; and 34 single-value or vector settings. Of the five cloud flags above, `Cumulus` and
 `Stratus` match a layer name, `Nimbus0`/`Nimbus1` would both fall on the one `Nimbus` layer, and
 `CirroStratus` has no layer of its own (`CloudsCirrus` is a medium, not a layer). The weather data's
-`CloudType` is fractional (14 distinct values from 0.01 to 0.67 over the 25 weathers), so it is a blend
-position rather than an index into these layers.
+`CloudType` has 14 distinct fractional values from 0.01 to 0.67 over the 25 weathers.
 
-Not measured here (hypothesis): how a cloud's radius range blends with the weather's `CloudType` and cloud maps,
-what a negative `Rain`/`Fog`/`Density` means (subtracting from the weather, or "unset"), and what the two
-`Nimbus` flags distinguish.
+### Custom-cloud map draw (ASSET-337)
+
+One atmospheric technique in the 1.0.2.1 shader dictionary lists a cloud-map compute pass, a custom-cloud
+vertex/pixel draw and a cloud-density compute pass in consecutive entries, in that order. The density
+program has two distinct resource rows whose compiled and authored name hashes match `CloudMapA` and
+`CloudMapB`. Across the resource and constant-buffer member rows of all 932 effects and 26,503 programs,
+neither hash column has an exact match for `Rain`, `Fog`, `Density`, `CoverageMinMax` or `CloudType`.
+
+The draw reads three consecutive words from a cloud record. They hold a half-precision coefficient and a
+16-bit selector, two half-precision radii, and a half-precision center pair. For distance `d` from that
+center in map coordinates and `outer > inner`, the pixel contribution before render-target blending is
+`coefficient * clamp((outer - d) / (outer - inner), 0, 1)`. Selectors 0 through 3 route it to R, G, B
+or A of the first target. Selector 4 writes it to both R and G of the second target.
+
+A Vulkan replay used the translated draw with synthetic records and blending disabled. Switching only the
+coefficient from +0.75 to -0.75 reversed all 1,804 nonzero pixels exactly. A coefficient of -1 also produced
+a negative contribution. Equal positive radii gave a hard edge at the sampled distances, all strictly inside
+or outside the radius. Across fifteen 64×64 readbacks, the largest absolute error against the expected
+pixel values was below 0.00048.
+
+The missing link is the producer that converts an XML cloud into these draw records. The world-to-map conversion
+for `CoverageMinMax`, the fields that supply the coefficient and selector (including the two `Nimbus` flags),
+and any handling of negative `Rain`, `Fog` or `Density` before the draw remain open. The replay also leaves
+the live target formats, overlap blending, and the relationship between the weather's `CloudType` and the
+two maps unmeasured.
 
 ## XML catalog
 
