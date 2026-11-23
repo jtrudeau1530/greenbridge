@@ -415,6 +415,17 @@ def check_image(data: bytes, manifest: dict) -> dict:
     tests/test_first_light.py imports this function, so the test and ``--check`` agree.
     """
     width, height = manifest["width"], manifest["height"]
+
+    def pixel_offset(point, field: str) -> int:
+        if (
+            not isinstance(point, (list, tuple)) or len(point) != 2
+            or any(type(coord) is not int for coord in point)
+            or not (0 <= point[0] < width and 0 <= point[1] < height)
+        ):
+            raise AssertionError(f"invalid {field} coordinates {point!r} for {width}x{height} image")
+        x, y = point
+        return (y * width + x) * 4
+
     if len(data) != width * height * 16:
         raise AssertionError(
             f"raw is {len(data)} bytes, expected {width * height * 16}"
@@ -432,15 +443,17 @@ def check_image(data: bytes, manifest: dict) -> dict:
             f"[{manifest.get('min_coverage', 0.0)}, {manifest.get('max_coverage', 1.0)}]"
         )
     if (clear := manifest.get("clear_pixel")) is not None:
-        i = (clear[1] * width + clear[0]) * 4
+        i = pixel_offset(clear, "clear_pixel")
         want = manifest.get("clear", CLEAR)
         if any(abs(pixels[i + c] - want) > 1e-5 for c in range(4)):
             raise AssertionError(
                 f"clear pixel {clear} is {pixels[i : i + 4]}, expected {want}"
             )
+    centre = manifest.get("centre_pixel")
+    if centre is None:
+        centre = [width // 2, height // 2]
     if (rgba := manifest.get("centre_rgba")) is not None:
-        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
-        i = (centre[1] * width + centre[0]) * 4
+        i = pixel_offset(centre, "centre_pixel")
         tol = manifest.get("rgba_tolerance", 0.02)
         for c, want in enumerate(rgba):
             if abs(pixels[i + c] - want) > tol:
@@ -448,8 +461,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
                     f"centre {centre} is {pixels[i : i + 4]}, expected {rgba} (tol {tol})"
                 )
     elif (uv := manifest.get("centre_uv")) is not None:
-        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
-        i = (centre[1] * width + centre[0]) * 4
+        i = pixel_offset(centre, "centre_pixel")
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
             if abs(pixels[i + c] - want) > 2e-3:
                 raise AssertionError(
@@ -458,8 +470,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
     if (rgba_probes := manifest.get("rgba_probes")) is not None:
         tol = manifest.get("rgba_tolerance", 0.02)
         for probe in rgba_probes:
-            px, py = probe["pixel"]
-            i = (py * width + px) * 4
+            i = pixel_offset(probe.get("pixel"), "rgba_probes pixel")
             want_rgba = probe["rgba"]
             for c, want in enumerate(want_rgba):
                 if abs(pixels[i + c] - want) > tol:
@@ -468,8 +479,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
                     )
     else:
         for probe in manifest.get("uv_probes", []):
-            px, py = probe["pixel"]
-            i = (py * width + px) * 4
+            i = pixel_offset(probe.get("pixel"), "uv_probes pixel")
             u, v = probe["uv"]
             for c, want in enumerate((u, v, 0.0, 1.0)):
                 if abs(pixels[i + c] - want) > 2e-3:
