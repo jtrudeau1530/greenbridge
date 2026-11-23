@@ -3,11 +3,19 @@
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
 render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears, and query heaps)
 runs behind the Xbox-ABI device proxy, and a presenter puts back buffers in a window (section 3.2). The M0
-milestone passes in a synthetic test (section 6). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
-set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the game's own present
-entry point (DXGI or PresentX) are not implemented.** This is the plan for replacing the console's
-`d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
-exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
+milestone passes in a synthetic test (section 6), M1 with stand-in shaders in `d3d12_draw_test`, M1.5 with
+hand-written RDNA2 run through the translator in `d3d12_translated_draw_test`, and the synthetic part of M2
+(descriptor heaps, SRVs, a sampler and a translated textured-quad draw, 4,096 exact pixels) in
+`d3d12_m2_textured_test`. `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
+set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
+PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
+and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
+pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
+mesh shaders are reported as not supported (stream PSOs and mesh shaders: D3D-29, #1712). The device reports
+`RaytracingTier` as `NOT_SUPPORTED`, yet `BuildRaytracingAccelerationStructure` builds XDXR BVH4 structures on the
+GPU (section 4.8).** This is the plan for
+replacing the console's `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on
+Vulkan, while producing exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see
 [design.md](design.md#translator-status-and-runtime-contract)).
 
 The document is deliberately conservative about what is known. Every claim is marked:
@@ -130,6 +138,11 @@ The design is therefore an **IR per command list**:
   returns `E_INVALIDARG`, so that call is not compared. Executing a list that is still open removes the PC device
   (`GetDeviceRemovedReason` gives `DXGI_ERROR_INVALID_CALL`), while this layer submits nothing and keeps the device:
   an invalid call does not remove it.
+  Creation answers as the host runtime too (`compare_invalid_arguments`, "command allocator:", "command list:" and
+  "command list1:", RTX 5070 / 621.14): a type past `VIDEO_ENCODE` and a node other than node 0 are `E_INVALIDARG`,
+  checked before the output; a null output is then `E_UNEXPECTED`. Video list types are created as graphics lists
+  here, while the host hands out a video list (`E_NOINTERFACE` for `ID3D12GraphicsCommandList`), so they are not
+  compared.
 - `Close` freezes the IR. `ExecuteBundle` is accepted only on a direct list, with an already-closed bundle as its callee; the bundle's recorded commands and calls are replayed at the call site, so the source can be reused or reset without changing the parent. Command-list creation and reset require an allocator of the same type. A bundle cannot be submitted directly to a command queue.
 - Bundle restrictions are checked while recording for the IR operations currently implemented here (barriers, clears, copies, resolves, `SetPredication`, `DiscardResource`, the atomic copies, `RSSetViewports`, `RSSetScissorRects`, `OMSetRenderTargets` and `ClearState`; `WriteBufferImmediate` is allowed in a bundle); those calls are not legal inside a D3D12 bundle and make `Close` return `E_INVALIDARG`. `d3d12_bundle_forbidden_test` measured the last four on the PC runtime without the debug layer: the bundle's `Close` fails (`E_FAIL`, where this layer gives `E_INVALIDARG`) on the default adapter and on WARP, and executing a bundle whose `Close` failed crashes the runtime, so the layer refuses it in `ExecuteBundle` instead. A bundle has no render targets, viewport or root signature of its own, so its state calls (pipeline state, root signature and arguments, vertex and index buffers, topology, blend factor, stencil references) and its draws and dispatches are kept as they were called, and `ExecuteBundle` plays them on the parent through the same members the application would have called. A draw then snapshots the parent's state plus what the bundle set, and what the bundle set stays on the parent afterwards. Commands that need no state (markers, immediate writes) are copied between them in order. `d3d12_bundle_test` measured the rule on the PC runtime, where the default adapter (an RTX 4060 Ti) and WARP drew the same picture in every case it ran. A bundle's draws see the parent's render targets, viewport and scissor, root signature and arguments (also when the bundle sets the same root signature first, so those arguments stay), and vertex and index buffers. A bundle starts with the pipeline state it was created or reset with, not the parent's. After `ExecuteBundle` the parent has that pipeline state and whatever else the bundle set: topology, root arguments, vertex and index buffers, and a different root signature with the bundle's arguments in place of the parent's. Topology: the default adapter takes the parent's when the bundle sets none. That is more lenient than Microsoft's stated rule (topology is undefined when a bundle begins), and WARP follows the rule by removing the device when a bundle draws or hands back without one, so a bundle should set it; the layer follows the default adapter. A bundle that sets a root argument before any root signature crashes the NVIDIA driver (the layer applies it to the parent's signature). The deferred calls are checked when they play, against the parent's root signature, so a bad one makes the parent's `Close` fail, not the bundle's. A per-list state setter must go through the deferred path (`defer()` in `d3d12_com.cpp`, replaying through a private member that does not trace) to work in a bundle. Not deferred yet: `ExecuteIndirect` in a bundle, and bundle `Dispatch` has no GPU test.
 - A queue's `ExecuteCommandLists` submits in order with one timeline semaphore signal. `Wait`/`Signal` become
@@ -184,6 +197,9 @@ What is implemented (all of it testable without the game):
   destination's. The box fits the source's padded mip, so the scratch holds every block the destination reads). Each
   range and buffer bound is checked before anything is written. A copy runs in `TRANSFER_SRC`/`TRANSFER_DST`, or
   in place in `GENERAL` when the texture is in `COMMON`: that is D3D12's implicit promotion to a copy state.
+  A same-subresource `CopyTextureRegion` uses `GENERAL` for both sides; preparation rejects overlapping regions.
+  Cross-format `CopyTextureRegion` from an uncompressed texture into a partial BC edge block also uses transfer
+  scratch. Each source texel supplies one block, and the destination's write extent stops at the actual mip edge.
   A 3D mip is one subresource. Boxed volume transfers preserve the full footprint's row and slice strides.
   Whole-resource depth/stencil copies issue one `vkCmdCopyImage` per aspect, with a transfer write-to-read/write
   dependency between them; all mips and layers stay batched within each aspect. This avoids stencil corruption
@@ -219,9 +235,18 @@ What is implemented (all of it testable without the game):
   lists this conversion as an exception to round-to-nearest-even without fixing ties. WARP and AMD's D3D12 driver
   were measured to round the float product to nearest even (2.5 gives 2, 0.5 gives 0), which the tolerance
   allows; NVIDIA's D3D12 driver (and a native D24 clear in its Vulkan driver) breaks some of those ties the other way;
-  the layer follows WARP and AMD there, a measurement and not a rule of the spec. Not covered: a depth test or
-  a depth write by the rasteriser works on D32 and may differ from D24 by up to the 24-bit step, and a depth
-  texture sampled in a shader sees the float; only copies, clears and readbacks are bit-exact.
+  the layer follows WARP and AMD there, a measurement and not a rule of the spec. **Draws** (D3D-309,
+  `src/depth24_fragment.h`): a single-sampled graphics pipeline with depth enabled and a D24 DSV stored as D32 has
+  its pixel stage write `FragDepth = quantise(z + bias)`, with D3D's bias in D24 units (`DepthBias / (2^24 - 1) +
+  SlopeScaledDepthBias * max(|dz/dx|, |dz/dy|)`, clamped by `DepthBiasClamp`) and the same quantisation as
+  `depth24_convert.comp`, so depth tests and stored depth match D24; the rasteriser's bias is off for these
+  pipelines (so a clamp needs no `depthBiasClamp` there). A pipeline without a pixel shader, with or without a
+  geometry shader, gets a built-in one; a shader that writes its own depth has it quantised, unbiased, as in D3D. The slope comes from the derivatives of the
+  interpolated depth, so a slope-scaled bias can land up to two 24-bit steps from D24 hardware's plane-exact one
+  (`d3d12_depth24_draw_test`). Not covered: multisampled targets (a `FragDepth` write is per pixel; they keep float
+  bias and precision, logged), pixel shaders with `EarlyFragmentTests` (which ignore a `FragDepth` write; logged), a
+  viewport depth range narrower than the biased depth (D3D clamps before quantising), and early depth testing, which
+  a `FragDepth` write turns off for these pipelines. A depth texture sampled in a shader still sees the float.
   `ResolveSubresource` becomes `vkCmdResolveImage` in the same layouts as a copy: a multisampled colour
   subresource into a single-sampled one of the same size and format. Integer colour formats in the requested
   format or either resource are refused at recording; `Close` fails. `ResolveSubresourceRegion` uses the same
@@ -404,6 +429,9 @@ What is implemented (all of it testable without the game):
   event or cookie, or an event that is already registered, is `DXGI_ERROR_INVALID_CALL`. Cookies start at 1 and
   are separate from the occlusion cookies, and an unknown cookie is `DXGI_ERROR_NOT_FOUND`. All of these were
   measured on the host's `dxgi.dll` (Windows 11, RTX 3070) and are checked in `dxgi_swapchain_test`.
+  explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path,
+  and exposing exactly the requested `BufferCount` even when Vulkan's native image count differs, in which case the
+  offscreen ring is the app-visible swapchain and each present blits the current slot into the acquired image).
 
     | Argument | Answer |
     |---|---|
@@ -460,11 +488,11 @@ What is implemented (all of it testable without the game):
   BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it, as it does
   `occlusionQueryPrecise` and `pipelineStatisticsQuery` for the query heaps.
 - **Presentation** (`leonida::VulkanPresenter` in `runtime/src/vulkan_present.h`, which
-  `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part every
-  present front end needs; DXGI or `PresentX` is still open (question 6). It takes a back buffer, an ordinary
-  texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image, scaling when the window
-  size differs. The blit goes on the same `VkQueue` after the application's work, so the frame contains everything
-  submitted before the present. Details:
+  `rt::d3d12::create_window_presenter` makes for a device and a window). This is the part the
+  `PresentX` front end uses; which of DXGI or `PresentX` the game uses is still open (question 6). It takes a back
+  buffer, an ordinary texture in the D3D12 `PRESENT` state, and blits it to an acquired `VkSwapchainKHR` image,
+  scaling when the window size differs. The blit goes on the same `VkQueue` after the application's work, so the
+  frame contains everything submitted before the present. Details:
   - two frames in flight, and a present semaphore per swapchain image;
   - FIFO when vsync is asked for, otherwise MAILBOX or IMMEDIATE; with `VK_KHR/EXT_swapchain_maintenance1` the FIFO
     swapchain can also present one frame in IMMEDIATE or FIFO_RELAXED (`present(..., tear)`, section 4.5);
@@ -611,8 +639,7 @@ descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
 aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
 the game writes itself, which need
-the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
-of root signatures, which are not registered yet; the literal S#s of shaders (`literal_samplers` in the index),
+the execute-time scan of section 3.4 (only descriptors made through the device are registered); the literal S#s of shaders (`literal_samplers` in the index),
 which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
 pipeline creation comes with the shader index, #291);
 custom border colours without VK_EXT_custom_border_color, and minimum/maximum filters, anisotropy or mirror-once addressing without the Vulkan
@@ -649,6 +676,10 @@ The compute path, end to end:
 - **GPU address arena** (section 3.3, when the device has `bufferDeviceAddress`): one host-visible,
   device-addressable buffer, 256 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
   table pointers).
+  - The device logs the arena's high-water mark when it is destroyed: the peak end offset against the size, the
+    most bytes live at once (by use: buffers, descriptor heaps, shaders, heaps), allocations and refusals (D3D-55).
+    `LEONIDA_ARENA_LOG=1` also logs one line per VA handed out, per refused allocation, and per upload or readback
+    buffer VA outside the arena.
   - Default-heap buffers are 64 KiB-aligned ranges in it, zeroed through its mapping; their console VA is the offset.
   - Shader-visible descriptor heaps also live in it: the CPU handle is its host mapping and the GPU handle is the VA,
     so descriptor bytes the application writes itself are what shaders load.
@@ -749,7 +780,9 @@ The compute path, end to end:
   - With `VK_EXT_conditional_rendering`, the arena is created with the conditional-rendering usage, and
     `SetPredication` on a default-heap buffer reads at the buffer's offset in the arena plus the call's offset.
   - `CreateHeap` reserves the requested size in the arena at 64 KiB, and a buffer placed in it gets the heap's
-    place plus the placed offset as its console VA. A placed texture keeps its own `VkDeviceMemory` and a null VA;
+    place plus the placed offset as its console VA. A placed texture keeps its own `VkDeviceMemory` and a null VA,
+    1D, 2D and 3D alike (arrays and mips included), and a dimension outside the enum is `E_INVALIDARG`, as on the
+    host (RTX 2080 Ti and WARP, `d3d12_placed_dimensions_test`);
     tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures are backed the same way with
     tile-multiple `GetResourceAllocationInfo`, `GetResourceTiling`, and host-matched `E_INVALIDARG` checks
     (D3D-191). `CreatePlacedResource2`'s castable-format list reaches the placed texture's image as the committed
@@ -1150,8 +1183,9 @@ and any validation error fails them.
   resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches
   to unsynchronised presents. The presenter's capture copies every presented image back, and the test checks
   that the whole image holds the clear colour at the swapchain's size (after the first 60 frames, after the
-  resize and at the end). Last, it reads the colour on screen with GDI when the window is in front and GDI can
-  read the screen. Under Wine's macOS driver it can't: `GetPixel` on the screen DC returns `CLR_INVALID` even
+  resize and at the end). Last, it reads the colour on screen with GDI when the window is in front, no other
+  window lies over its centre (an always-on-top one can, even over the foreground window) and GDI can read the
+  screen. Under Wine's macOS driver it can't: `GetPixel` on the screen DC returns `CLR_INVALID` even
   for a pixel GDI painted itself, and the window's own DC holds Wine's GDI surface (white), not the image
   presented through the Metal layer. There the capture checks are what confirms the colour.
   - The injected failures below make the runtime log `[rt] d3d12: present failed` three times (VkResult
@@ -1195,7 +1229,7 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 | Address space | Two ranges. A **BDA arena** holds buffers, descriptor heaps and shader code; its device address is `heap_base`. A separate **image key range** supplies unique console VAs for images; those keys are never added to `heap_base`. The arena's `VkBuffer` is created with all buffer usages the game can bind (uniform, storage, vertex, index, indirect, transfer) plus `SHADER_DEVICE_ADDRESS`, and its memory with `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`. |
 | Buffers | A buffer resource is a range in the arena's single `VkBuffer`: offset = its console VA, size = the resource size. Buffer commands bind the arena buffer with that offset, so its device address is exactly `arena_bda + offset`; no per-resource `VkBuffer` object is needed. |
 | Images | Each image gets a unique console VA key and lives in its own `VkDeviceMemory` (or a suballocated device-local image heap) with optimal tiling. Shader image access goes through the T#/hash table, so nothing dereferences the key. Keeping images out of the arena avoids forcing optimal-tiled images into the arena's memory type and keeps the arena sized by buffers, not textures. |
-| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. Reserved buffers can use heap tile mappings (section 4.2). |
+| Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture (1D, 2D or 3D) gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. Reserved buffers can use heap tile mappings (section 4.2). |
 | Descriptor heaps | Shader-visible CBV/SRV/UAV and sampler heaps are allocated in the low 4 GB of the arena. RTV/DSV heaps are host-side only. |
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
 | Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**Assumption**; **measured to fail for a V#**, see below). |
@@ -1273,6 +1307,10 @@ The runtime allocates image keys from `0x100000000` (4 GiB) in 256-byte steps, a
   upload buffer would share, so they stay in system memory. If VRAM is full, the allocation falls back to system
   memory. The device logs which one it uses (`[rt] d3d12: upload heaps in ...`), and `LEONIDA_UPLOAD_SYSMEM=1`
   keeps them in system memory to compare the two. Readback buffers keep preferring `HOST_CACHED`.
+- Textures and default-heap buffers outside the arena prefer `DEVICE_LOCAL` and need no host access. When VRAM is
+  full they still get memory, from the next type `memory_type_order` lists, which is system memory. The first one
+  that does is logged once (`[rt] d3d12: a N-byte allocation did not fit in device-local memory ...`, D3D-299,
+  `leonida::spilled_to_host`), so a run on a 4 GB GPU shows that it spilled (#2375).
 
 **Capacity.** The arena is sized by buffers, descriptor heaps and shader code, not by textures. The allocator
 tracks the high-water mark; start with a configurable capacity (for example 4 GiB for the loading/menu path) and
@@ -1560,6 +1598,10 @@ Things that can invalidate this simple model, all **Open**:
 - **Static samplers.** D3D12 static samplers do not consume root parameters. The console driver may place their
   S# values in a fixed table. The layer registers every static sampler's S# in the hash table, so a shader that
   loads it by value works; a shader that expects a driver table needs that table's location (**Open**).
+  `CreateRootSignature` does the registering, for 1.0, 1.1 and 1.2 blobs: each static sampler is encoded as
+  `CreateSampler2` encodes the same description (the five `D3D12_STATIC_BORDER_COLOR` values, two of them UINT, and
+  the 1.2 flags), and gets a sampler in set 0 and a key in the hash table without a heap slot. The entry outlives
+  the root signature. `d3d12_descriptor_test` checks the key before and after and samples with it.
 - **Descriptor-table high-dword truncation.** If a shader forces the high dword of a table pointer to zero, the
   table must be below 4 GB; the layer allocates all shader-visible heaps there. If a shader forces a resource VA's
   high dword to zero, the resource must also be low; that would constrain the arena layout. The disassembly shows
@@ -1614,8 +1656,9 @@ have; add the content hash to the index.
 
 Pipeline creation:
 
-- `D3D12_GRAPHICS_PIPELINE_STATE_DESC` and the `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects are both supported.
-  Parse the stream subobjects in order; unknown types are a hard error with the type number logged.
+- `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is supported today (`CreateGraphicsPipelineState`), as is the compute desc. The
+  `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects (`CreatePipelineState`) are not implemented yet. The plan: parse the
+  stream subobjects in order; unknown types are a hard error with the type number logged.
 - Build `VkPipelineShaderStageCreateInfo` from the translated module and the index entry. Mesh shaders use
   `VK_EXT_mesh_shader` (`AS`/`MS` subobjects → task/mesh stages); geometry uses the geometry stage; compute uses a
   compute pipeline.
@@ -1632,11 +1675,14 @@ Pipeline creation:
   buffer device address, storage image without format, maintenance8.
 - Request the subgroup size each shader was translated for (`requiredSubgroupSize` 64 or 32) where the device lists the stage
   in `requiredSubgroupSizeStages`, and say so in the log where it cannot (section 3.2, "Subgroup size").
-- Pipeline caches: use a `VkPipelineCache` keyed by driver/pipeline-cache UUID; the `pipelines` build stage already
-  produces one. The PSO is always rebuilt from its descriptors: `GetCachedBlob` returns a small blob that holds no
-  pipeline, only what the PC runtime checks before it accepts one in `CachedPSO` (`runtime/src/cached_pso.h`:
-  vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description without `Flags`, sealed by a
-  checksum). The answers are the host's, measured on an RTX 3060 and WARP: the same description is accepted; another
+- Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
+  the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
+  and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
+  The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
+  bindings and the standard 144-byte push-constant range.
+  `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
+  without `Flags`, sealed by a checksum (`runtime/src/cached_pso.h`). The answers are the host's, measured on an
+  RTX 3060 and WARP: the same description is accepted; another
   shader, root signature content or state, a changed byte, a truncated blob or a pointer with size 0 give
   `E_INVALIDARG`; a null pointer with a size is ignored; another adapter gives `D3D12_ERROR_ADAPTER_NOT_FOUND` and
   another driver `D3D12_ERROR_DRIVER_VERSION_MISMATCH`. `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan
@@ -1783,14 +1829,27 @@ The trace will enumerate them.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.
-  - `MakeResident` and `Evict` return `S_OK`, or `E_INVALIDARG` for a nonzero count with a null array. D3D12
-    documents `Evict` as a hint the runtime may defer, so dropping it is allowed.
-  - `SetResidencyPriority` (Device1): `S_OK`, or `E_INVALIDARG` for a nonzero count with a null object or priority
-    array. Priorities only order what the OS evicts first; any `UINT` is a valid priority.
+  The residency answers are the host runtime's: `d3d12_residency_test` runs the same 58 steps on both devices
+  with a committed buffer, a heap, a placed buffer, a descriptor heap, a query heap and a fence, and compares every
+  HRESULT, the device-removed reason after each step, and the value `EnqueueMakeResident` leaves the fence at
+  (110 values; RTX 3060, driver 610.88). Steps that leave the host runtime unusable run there in a child process with a
+  fresh device.
+  - `MakeResident` and `Evict` return `S_OK` for any count of this device's pageable objects, the same one twice,
+    an evicted one or a resident one. D3D12 documents `Evict` as a hint the runtime may defer, so dropping it is
+    allowed.
+  - `SetResidencyPriority` (Device1): only objects that own their memory take a priority, committed resources and
+    heaps; any `UINT` is a valid priority for them. A placed resource (a reserved one too, by the same rule; not measured), a descriptor heap, a query heap
+    or a fence is `E_INVALIDARG`, also inside a longer list. The host runtime then removes its device as well
+    (`DXGI_ERROR_INVALID_CALL`); the layer doesn't, since a console title that sets priorities on its placed
+    resources would lose its device over a hint.
   - `EnqueueMakeResident` (Device3) signals its fence from the CPU with the given value before returning, since
-    the work is already complete. A queue `Wait` on that fence must not hang, which is why the signal stays.
-    `E_INVALIDARG` for a null fence, a nonzero count with a null array, or flags other than `NONE` and
-    `DENY_OVERBUDGET`; a refused call does not signal.
+    the work is already complete. A queue `Wait` on that fence must not hang, which is why the signal stays. A null
+    fence is accepted and nothing is signalled. `E_INVALIDARG` for flags other than `NONE` and `DENY_OVERBUDGET`;
+    a refused call does not signal. A value below the fence's current one moves the host's fence back; the layer's
+    stays where it was (see the fence note above).
+  - Not compared: a nonzero count with a null array, and a null entry in an array, which the host runtime
+    dereferences (an access violation). The layer answers `E_INVALIDARG` for the null arrays, skips a null entry in
+    `MakeResident`, `Evict` and `EnqueueMakeResident`, and refuses one in `SetResidencyPriority`.
   - `SetStablePowerState` returns `S_OK`: Vulkan has no clock control, and the result of a frame does not depend
     on the clocks.
   - `SetBackgroundProcessingMode` (Device6): no Vulkan API steers driver background work, so nothing runs. The
@@ -1868,6 +1927,12 @@ The trace will enumerate them.
     `StandardSwizzle64KBSupported` as FALSE), and `GetHeapProperties` on a reserved resource is `E_INVALIDARG`.
     The description, initial-state and clear-value rules are a committed resource's on a default heap, and a null
     output is `E_UNEXPECTED` after them (`compare_placed_reserved`, RTX 3060 / 610.88).
+    `GetHeapProperties` answers as the host runtime's (`d3d12_heap_properties_test`: 561 values for committed
+    resources in every heap type, custom ones and SHARED / ALLOW_DISPLAY / CREATE_NOT_ZEROED / CREATE_NOT_RESIDENT
+    included, placed resources in heaps of each kind, reserved ones, and null arguments; RTX 3060, driver 610.88).
+    A committed resource's flags are the caller's without the two creation-only bits, plus the DENY bits of the
+    resource classes it isn't; a placed resource reports its heap's flags as they are, so one in an `ALLOW_ALL`
+    heap reads back 0.
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates
     committed resources instead. Buffer mappings alone do not implement a full tiled-resources tier.
     The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**Assumption**:
@@ -1993,11 +2058,28 @@ The trace will enumerate them.
   row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;
   depth and stencil resolves → a `vkCmdBeginRendering` scope with a resolve attachment (section 3.2).
   Partial resolve regions to another offset need a shader or a region copy.
+  - A placed footprint must have an `Offset` that is a multiple of 512 and a `RowPitch` that is a multiple of 256
+    (`D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`, `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`). Any other is refused when it is
+    recorded, so `Close` returns `E_INVALIDARG` (`CommandList::valid(const CopyLocation&)` in
+    `runtime/src/command_list.h`; `command_list_test` has both cases). That is D3D12's rule for a device that
+    reports `UnrestrictedBufferTextureCopyPitchSupported` as `FALSE` in `D3D12_FEATURE_D3D12_OPTIONS13`, which this
+    device does on purpose (`d3d12_vulkan_device_test` fails on a `TRUE`). The PC runtime answers differently: on an
+    RTX 4090 (driver 621.14) and on WARP it reports the capability as supported, and a list with `Offset` 16 and
+    `RowPitch` 260 for an `R8G8B8A8_UNORM` footprint closes with `S_OK` (measured with a stand-alone D3D12 program,
+    Windows 11 26200). The layer cannot simply say the same: Vulkan takes a copy's buffer offset as a multiple of
+    the texel block size and its row length in texels (VUID-vkCmdCopyBufferToImage-dstImage-07975), while the
+    capability lifts D3D12's two alignments and is not documented as keeping offsets and pitches texel multiples
+    (not tested here), so a footprint that is not texel-aligned would have to be repacked through scratch memory
+    the way a 96-bit one is (section 4.2). The replay already accepts any offset and pitch that are texel multiples
+    (`prepare_texture_copy` in `runtime/src/vulkan_replay.h`; anything else is `unsupported` there), so accepting
+    those needs only the record-time check changed; reporting the capability needs the repack as well. What the
+    console's runtime reports is not measured, and no title code that depends on it has been seen.
 - `WriteBufferImmediate` (D3D-26) → `vkCmdUpdateBuffer` of 4 bytes. The address is resolved when the list is
   executed, through `ReplayFunctions::buffer_at`: the buffer whose `ResourceBinding::va` range holds it, at
   `buffer_offset + (address - va)`. `VulkanContext` finds it by binary search over the buffers' VA ranges
   (`runtime/src/buffer_va_index.h`, kept in step with the registered resources); aliasing placed buffers can
-  overlap, and the one whose range starts closest below the address wins (`buffer_va_index_test`). These are the same fields and lookup as #291's arena, and the device fills
+  overlap: the one whose range starts closest below the address and also holds the bytes the view or write needs
+  wins, or, when none holds all of them, the one that starts closest below (`buffer_va_index_test`). These are the same fields and lookup as #291's arena, and the device fills
   `va` once `GetGPUVirtualAddress` lands (#157/#291); until then, a list with an immediate write is refused as
   `unresolved_resource`. `DEFAULT` adds no barrier: it is ordered like any copy, by the application's barriers.
   `MARKER_OUT` waits for every earlier command to finish and sees its writes (`ALL_COMMANDS`/`MEMORY_WRITE` →
@@ -2241,10 +2323,13 @@ That import must be shimmed. The shim provides:
   toggles borderless/fullscreen; `GetFrameStatistics` is a stub.
 - `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
 
-**What exists.** The back end of this path is `leonida::VulkanPresenter` (section 3.2): surface, swapchain,
-blit, present, resize. A DXGI shim's `Present` and a `PresentX` implementation would both end in its `present()`.
-`GetBuffer(i)` therefore does not need to wrap swapchain images: the buffers can be ordinary committed textures,
-blitted at present time, which also frees the game's buffer count and format from the surface's.
+**What exists.** The DXGI shim's `Present` (`runtime/shims/dxgi_com.cpp`) has its own surface, swapchain and
+blit (`leonida::VulkanSwapchain`, `runtime/shims/dxgi_swapchain.h`); `PresentX` (`runtime/shims/xbox_present.cpp`)
+is implemented over `leonida::VulkanPresenter` (section 3.2) instead. `PresentX` takes ordinary committed
+textures and blits them at present time, which frees the game's buffer count and format from the surface's. The
+DXGI shim's `GetBuffer(i)` returns the swapchain images themselves, and switches to offscreen images blitted at
+present only when the requested size or format differs from the surface's (`runtime/shims/dxgi_swapchain.h`); its
+buffer count is the swapchain's image count.
 
 **PresentX and frame events (GDKX).** Public Microsoft samples present on Xbox without a DXGI swapchain. Facts
 below come from MIT/zlib-licensed code and docs, read directly; none is from the game or the SDK. Sources:
@@ -2304,6 +2389,12 @@ queue's `PresentX` slot the game calls first; check the executable's `dxgi`/`d3d
 Layer plan:
 
 - Keep the DXGI factory, adapter and output enumeration (adapter `GetDesc`, `EnumOutputs`); no host DXGI.
+- Step 3 of the sequence is on the device proxy: it answers `IDXGIObject`, `IDXGIDevice` and `IDXGIDevice1` as one
+  COM object with the device (a PC `ID3D12Device` has no `IDXGIDevice`, so nothing is forwarded), and `GetAdapter`
+  and `GetParent` return the adapter of the device behind it: the layer's own on the Vulkan device, the host adapter
+  with the device's LUID on the host backend. The 14 slots are the public `dxgi.h` order, an assumption like the
+  queue's. `SetMaximumFrameLatency` and `SetGPUThreadPriority` are kept and read back only. `dxgi_device_test`
+  walks it on both backends; the output itself is `EnumOutputs` (D3D-313).
 - `ALLOW_DISPLAY` committed resources are normal `Resource`s that the presenter may blit to a Vulkan
   swapchain image; `PRESENT` state maps per the resource-state table (`PRESENT_SRC_KHR` only for swapchain images).
 - Presentation core: `PresentX` with 0-2 planes presents into the `VkSwapchainKHR` (one plain plane is a blit; scaling,
@@ -2548,11 +2639,20 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   `PIPELINE_STATISTICS` heaps count all eleven Vulkan statistics (`0x7ff`), whose result order is the field order
   of `D3D12_QUERY_DATA_PIPELINE_STATISTICS` (IA vertices, IA primitives, VS, GS invocations, GS primitives,
   clipper invocations and primitives, PS, HS, DS, CS), so one 88-byte result per query is copied as is. They need
-  `pipelineStatisticsQuery`. `SO_STATISTICS`, `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and
-  amplification counts) are logged and refused with `E_NOTIMPL`. Invalid descriptions are answered as the host runtime
-  answers them (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node
-  other than node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with
-  a null output is then `E_UNEXPECTED`, not `S_FALSE`.
+  `pipelineStatisticsQuery`. `VIDEO_DECODE_STATISTICS` and `PIPELINE_STATISTICS1` (mesh and amplification counts)
+  are logged and refused with `E_NOTIMPL`. Invalid descriptions are answered as the host runtime answers them
+  (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
+  node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
+  output is then `E_UNEXPECTED`, not `S_FALSE`.
+- **Stream-output statistics** (D3D-302). The layer has no stream output: a graphics PSO with `StreamOutput`
+  entries is refused and `SOSetTargets` is not implemented, so no primitive reaches a stream and every
+  `SO_STATISTICS_STREAM0..3` query counts 0 written and 0 needed. An `SO_STATISTICS` heap is therefore made without
+  a `VkQueryPool`: `BeginQuery`/`EndQuery` record nothing in Vulkan (D3D12's call rules are still kept, and the
+  heap's queries track ended or not as the others do), they overlap no other query, and `ResolveQueryData` writes
+  zeros (`vkCmdFillBuffer`, 16 bytes per query: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), with no
+  statistics split since nothing is dispatched. When stream output lands, the heap becomes a
+  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun with `vkCmdBeginQueryIndexedEXT` on the stream, whose two
+  results are in the same order.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and
@@ -2628,11 +2728,21 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   clear, copy, timestamp, resolve) and a resolve in the next execution with no wait between them. Under Wine
   (CrossOver 26.3, MoltenVK 1.4.3) the first case failed every run before this change (`t1` read 0).
 
+The single-list `replay()` helper replays overlapping occlusion kinds and statistics queries too (D3D-399) when
+the caller passes a `keep` vector and sets `ReplayFunctions::create_segment_pool` with the four sum helpers: it
+makes one occlusion and one pipeline-statistics segment pool sized to the list, plans them as the batched path does,
+and hands them to `keep`, which the caller holds until the command buffer has completed. Without them such a list is
+still refused with `ReplayResult::unsupported`. `replay_query_predication_test` case 14 checks both, on case 13's
+statistics list and case 10's occlusion pair (no GPU).
+
 Not implemented yet:
 
 - **Overlapping queries in the single-list `replay()` helper.** It has no segment pool, so a list whose occlusion
   kinds or statistics queries overlap each other is refused there with `ReplayResult::unsupported`; the batched
   path above replays them.
+- Mesh-shader statistics (`PIPELINE_STATISTICS1`, D3D-132), and stream-output statistics that count real
+  primitives (they wait for stream output itself). (`GetClockCalibration` is implemented: see section 4.4,
+  "Fences, queues and frames in flight".)
 - Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
   queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
@@ -3020,16 +3130,11 @@ M0–M2 do not need the executable.
 | **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/output, `ALLOW_DISPLAY` back buffers, frame events + `PresentX` (DXGI swapchain only if the game creates one), clear + present | COM interception, the known Xbox device entry point and ABI overrides, presentation (`PresentX` + frame events, or swapchain), frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced. **Synthetic part met** by `d3d12_present_test`: 60 frames through the proxy on Vulkan, validation clean, colour checked in the presented images and on screen where GDI can read it. Still open: the game's present front end (frame events + `PresentX`, or a DXGI swapchain) and the per-call trace |
 | **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0. **Met with stand-in shaders** by `d3d12_draw_test`: every pixel of two indexed draws and a culled triangle matches, through the proxy, validation clean. With translated game shaders most of them declare bindings, which M2 (pipelines bind set 0) lets through. **M1.5 (D3D-53) met with translator output** by `d3d12_translated_draw_test`: see below |
 | **M1.5** | The same, with real translator output: hand-written RDNA2 VS+PS, PSO found by FSSM hash, vertex fetch through a V# loaded from the user-data table, a root constant, a table in the arena, the code base | The push-constant, vertex-fetch and code-base contracts on translated code | Met by `d3d12_translated_draw_test`: three draws, every pixel off the triangle's edge exact in a float target, validation clean on the AMD Radeon 880M and the RTX 5070 Laptop. An upload buffer behind a V# is not supported (section 3.3) |
-| **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report. **Synthetic part met** by `d3d12_m3_frame_test`: through the proxy, D3D12 API only, six frames through a ring of three slots (three frames in flight; each slot has its own allocator, list, targets, depth buffer, query and fence, and a frame waits with `SetEventOnCompletion` + an event for the fence its slot signalled three frames earlier before reading back and recording the slot again). Pass 1 draws three rectangles from root constants with translator-output shaders (`vs_m3.asm`, `ps_m3.asm`, hand-written RDNA2) through `OMSetRenderTargets` into two render targets (R8G8B8A8_UNORM and R32_FLOAT) and a `D24_UNORM_S8_UINT` depth/stencil buffer (the layer substitutes D32_SFLOAT_S8_UINT on the Radeon; the RTX has it natively): depth LESS with write, stencil REPLACE with references 1 and 2, then a draw with no depth test whose stencil test is EQUAL; before the far rectangle, a single-output probe (`ps_m3_query.asm`) uses the same depth/stencil tests with color, depth and stencil writes disabled, inside `BeginQuery`/`EndQuery(OCCLUSION)`, and `ResolveQueryData` writes its sample count to a readback buffer. The actual far-rectangle draw still writes both render targets with depth/stencil writes enabled. Resource barriers move the first target RENDER_TARGET → PIXEL_SHADER_RESOURCE\|COPY_SOURCE and the second to COPY_SOURCE (and back at the next frame, from resources created in those states). Pass 2 samples the first target through an SRV in a descriptor table (the M2 path) with `ps_m3_post.asm` into a third target. Every pixel of all three targets (the float one bit for bit) matches the CPU reference with error 0 in each of the six frames, and the single-output probe's occlusion count equals the exact visible area of the far rectangle in each frame (3555 samples over the six frames). The original version was validation clean (including synchronization validation) on the AMD Radeon 880M and the RTX 5070 Laptop; current probe/isolation results are recorded below. @whattheflop's run on #1584 (GeForce RTX 3080 and a Ryzen 7 9800X3D Radeon iGPU) sampled the fences with nonblocking reads after each submit and saw 1, 2, 3, 1, 2, 3 slots still incomplete on NVIDIA and 1, 1, 1, 1, 1, 1 on AMD: up to three slots in flight on NVIDIA, one on AMD (sampled fence completion; GPU execution overlap was not measured). **Still open for M3:** render passes (`BeginRenderPass`, D3D-27) are not exercised, nor `BINARY_OCCLUSION`, occlusion during pipeline statistics (D3D-162), MSAA or depth/stencil copies and read-only DSV states in this test; the game's own first frames need the executable |
 | **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries. **Synthetic part met** by `d3d12_m2_textured_test`: through the proxy, D3D12 API only, a shader-visible CBV/SRV/UAV heap and a sampler heap (start handles from slots 9/10), two 8×8 textures uploaded with `Map` + `CopyTextureRegion`, `CreateShaderResourceView` and a POINT `CreateSampler`, a root signature of two descriptor tables, `SetDescriptorHeaps`, `SetGraphicsRootDescriptorTable` and `DrawIndexedInstanced` of a quad whose PS is translator output (`ps_m2.asm`: `s_load` of the T# and the S# from the tables, `image_sample`). Every one of the 4096 pixels matches the CPU-computed gradient (left half) and its point reflection (right half, second table) with error 0, and the hash table holds a distinct non-zero index for each of the two T#s and the S# and none for bytes nothing created; validation clean on the AMD Radeon 880M and the RTX 5070 Laptop. The layer change it needed: pipelines whose shader declares set-0 bindings (graphics and compute) were refused; their layout now holds the device's bindless set 0 and replay binds it at every draw and dispatch. Still open: shaders of the game itself (direct heap indexing, unbounded tables, static samplers, descriptors the game writes itself), no host D3D12/WARP byte comparison (the reference is computed on the CPU). Formats, mips and arrays through a PSO: `d3d12_m2_formats_test` samples an 8×8 BC1 and an 8×8 BC7 texture with 4 mips each and an R8G8B8A8 2D array of 3 slices through the same path (every subresource uploaded at its `GetCopyableFootprints` layout, POINT samplers with `MinLOD = MaxLOD` pinning each level, a view from mip 1, two array views read by `ps_m2_array.asm`); all 12 cases match the CPU with error 0, validation clean on the RTX 4070 Ti SUPER, with no layer change needed |
-| **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check. **Synthetic part met** by `d3d12_m4_compute_test`: through the proxy, D3D12 API only, with translator-output compute shaders (`cs_m4_fill.asm` and `cs_m4_indirect.asm`, hand-written RDNA2). A COPY queue streams an input buffer in (`CopyBufferRegion` from an UPLOAD buffer into a DEFAULT buffer created in COMMON), `Signal`; a COMPUTE queue `Wait`s on it and runs one list: a compute root signature (four root constants and a descriptor table of five UAVs: a structured buffer, three raw buffers and an `R32_UINT` `RWTexture2D`), a compute PSO and `Dispatch` (256 threads) that fills the structured buffer and the image from the input and writes the arguments of the next dispatch into a raw buffer; barriers (the argument buffer to `INDIRECT_ARGUMENT`, UAV barriers on the buffer and the image); `ExecuteIndirect` with a dispatch command signature running a second PSO for the 3 groups the first dispatch asked for, which reads the buffer and the image back (`image_load`) and writes a raw output; then everything to COMMON and `Signal`. A COPY queue `Wait`s on that fence, copies the five results (the image through `CopyTextureRegion`) to a readback buffer, and the CPU waits with `SetEventOnCompletion`. Each D3D12 queue has its own `VkQueue` where the family has two (both test GPUs); all 1,924 result words match the CPU reference with error 0; validation (with synchronization validation) clean on the AMD Radeon 880M and the RTX 5070 Laptop. Layer gaps this test found, closed with it: buffer UAVs (structured and raw) were not written (`CreateUnorderedAccessView` stubbed them, now a V# in the slot); `ExecuteIndirect` of a dispatch ran whatever pipeline and root arguments the command buffer had bound instead of the list's (now recorded with the command, as `Dispatch` does); an image created in `UNORDERED_ACCESS` and first used by a shader was zero-filled by the first barrier or copy that named it, losing the shader's writes (now moved to GENERAL, zeroed, by the first submission after its UAV view is created that is not on a copy queue and dispatches or draws; every other queue's next submission waits for that one). **Still open for M4:** the storage-image initialization is tied to the first shader-running submission, not to the list that uses the image, so a list that only reaches an image through a barrier or copy before any dispatch or draw is submitted still zero-fills it first (as before), and an image used by a shader only on a queue that never runs one of its own dispatches or draws first relies on another queue's submission; buffer SRVs and CBVs as V#s (typed buffer UAVs and UAV counters are done: `d3d12_buffer_uav_test`, section 3.4 "Buffer UAVs"), a queue submitted before the queue whose fence it waits on, when a resource's layout is handed over between them (the layout tracker follows submission order, so the copy list was replayed against the layout from before the compute list ran and the run stopped on a validation error; d3d12_queue_wait_test covers Wait-before-Signal without a resource), `ExecuteIndirect` signatures that change root arguments or use count buffers for dispatches, and async streaming itself and the world's streaming path, which need the game |
-| **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report. **Synthetic part met** by `d3d12_m3_frame_test`: through the proxy, D3D12 API only, six frames through a ring of three slots (three frames in flight; each slot has its own allocator, list, targets, depth buffer, query and fence, and a frame waits with `SetEventOnCompletion` + an event for the fence its slot signalled three frames earlier before reading back and recording the slot again). Pass 1 draws three rectangles from root constants with translator-output shaders (`vs_m3.asm`, `ps_m3.asm`, hand-written RDNA2) through `OMSetRenderTargets` into two render targets (R8G8B8A8_UNORM and R32_FLOAT) and a `D24_UNORM_S8_UINT` depth/stencil buffer (the layer substitutes D32_SFLOAT_S8_UINT on the Radeon; the RTX has it natively): depth LESS with write, stencil REPLACE with references 1 and 2, then a draw with no depth test whose stencil test is EQUAL; the far rectangle runs inside `BeginQuery`/`EndQuery(OCCLUSION)` and `ResolveQueryData` writes its sample count to a readback buffer. Resource barriers move the first target RENDER_TARGET → PIXEL_SHADER_RESOURCE\|COPY_SOURCE and the second to COPY_SOURCE (and back at the next frame, from resources created in those states). Pass 2 samples the first target through an SRV in a descriptor table (the M2 path) with `ps_m3_post.asm` into a third target. Every pixel of all three targets (the float one bit for bit) matches the CPU reference with error 0 in each of the six frames, and the occlusion count equals the exact visible area of the far rectangle in each frame (3555 samples over the six frames); validation (with synchronization validation) clean on the AMD Radeon 880M and the RTX 5070 Laptop. @whattheflop's run on #1584 (GeForce RTX 3080 and a Ryzen 7 9800X3D Radeon iGPU) sampled the fences with nonblocking reads after each submit and saw 1, 2, 3, 1, 2, 3 slots still incomplete on NVIDIA and 1, 1, 1, 1, 1, 1 on AMD: up to three slots in flight on NVIDIA, one on AMD (sampled fence completion; GPU execution overlap was not measured). **Still open for M3:** render passes (`BeginRenderPass`, D3D-27) are not exercised, nor `BINARY_OCCLUSION`, occlusion during pipeline statistics (D3D-162), MSAA or depth/stencil copies and read-only DSV states in this test; the game's own first frames need the executable |
+| **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report. **Synthetic part met** by `d3d12_m3_frame_test`: through the proxy, D3D12 API only, six frames through a ring of three slots (three frames in flight; each slot has its own allocator, list, targets, depth buffer, query and fence, and a frame waits with `SetEventOnCompletion` + an event for the fence its slot signalled three frames earlier before reading back and recording the slot again). Pass 1 draws three rectangles from root constants with translator-output shaders (`vs_m3.asm`, `ps_m3.asm`, hand-written RDNA2) through `OMSetRenderTargets` into two render targets (R8G8B8A8_UNORM and R32_FLOAT) and a `D24_UNORM_S8_UINT` depth/stencil buffer (the layer substitutes D32_SFLOAT_S8_UINT on the Radeon; the RTX has it natively): depth LESS with write, stencil REPLACE with references 1 and 2, then a draw with no depth test whose stencil test is EQUAL; before the far rectangle, a single-output probe (`ps_m3_query.asm`) uses the same depth/stencil tests with color, depth and stencil writes disabled, inside `BeginQuery`/`EndQuery(OCCLUSION)`, and `ResolveQueryData` writes its sample count to a readback buffer. The actual far-rectangle draw still writes both render targets with depth/stencil writes enabled. Resource barriers move the first target RENDER_TARGET → PIXEL_SHADER_RESOURCE\|COPY_SOURCE and the second to COPY_SOURCE (and back at the next frame, from resources created in those states). Pass 2 samples the first target through an SRV in a descriptor table (the M2 path) with `ps_m3_post.asm` into a third target. Every pixel of all three targets (the float one bit for bit) matches the CPU reference with error 0 in each of the six frames, and the single-output probe's occlusion count equals the exact visible area of the far rectangle in each frame (3555 samples over the six frames). The original version was validation clean (including synchronization validation) on the AMD Radeon 880M and the RTX 5070 Laptop; current probe/isolation results are recorded below. @whattheflop's run on #1584 (GeForce RTX 3080 and a Ryzen 7 9800X3D Radeon iGPU) sampled the fences with nonblocking reads after each submit and saw 1, 2, 3, 1, 2, 3 slots still incomplete on NVIDIA and 1, 1, 1, 1, 1, 1 on AMD: up to three slots in flight on NVIDIA, one on AMD (sampled fence completion; GPU execution overlap was not measured). **Still open for M3:** render passes (`BeginRenderPass`, D3D-27) are not exercised, nor `BINARY_OCCLUSION`, occlusion during pipeline statistics (D3D-162), MSAA or depth/stencil copies and read-only DSV states in this test; the game's own first frames need the executable |
 | **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check. **Synthetic part met** by `d3d12_m4_compute_test`: through the proxy, D3D12 API only, with translator-output compute shaders (`cs_m4_fill.asm` and `cs_m4_indirect.asm`, hand-written RDNA2). A COPY queue streams an input buffer in (`CopyBufferRegion` from an UPLOAD buffer into a DEFAULT buffer created in COMMON), `Signal`; a COMPUTE queue `Wait`s on it and runs one list: a compute root signature (four root constants and a descriptor table of five UAVs: a structured buffer, three raw buffers and an `R32_UINT` `RWTexture2D`), a compute PSO and `Dispatch` (256 threads) that fills the structured buffer and the image from the input and writes the arguments of the next dispatch into a raw buffer; barriers (the argument buffer to `INDIRECT_ARGUMENT`, UAV barriers on the buffer and the image); `ExecuteIndirect` with a dispatch command signature running a second PSO for the 3 groups the first dispatch asked for, which reads the buffer and the image back (`image_load`) and writes a raw output; then everything to COMMON and `Signal`. A COPY queue `Wait`s on that fence, copies the five results (the image through `CopyTextureRegion`) to a readback buffer, and the CPU waits with `SetEventOnCompletion`. Each D3D12 queue has its own `VkQueue` where the family has two (both test GPUs); all 1,924 result words match the CPU reference with error 0; validation (with synchronization validation) clean on the AMD Radeon 880M and the RTX 5070 Laptop. Layer gaps this test found, closed with it: buffer UAVs (structured and raw) were not written (`CreateUnorderedAccessView` stubbed them, now a V# in the slot); `ExecuteIndirect` of a dispatch ran whatever pipeline and root arguments the command buffer had bound instead of the list's (now recorded with the command, as `Dispatch` does); an image created in `UNORDERED_ACCESS` and first used by a shader was zero-filled by the first barrier or copy that named it, losing the shader's writes (now moved to GENERAL, zeroed, by the first submission after its UAV view is created that is not on a copy queue and dispatches or draws; every other queue's next submission waits for that one); and a queue submitted before the queue whose fence it waits on, when a resource's layout is handed over between them (the layout tracker followed submission order, so a copy list was replayed against the layout from before the compute list ran and the run stopped on a validation error): such a batch is now held on the CPU until a Signal that satisfies its Wait has been submitted, and recorded in dependency order (section 4.4, "Wait before Signal across queues"; `d3d12_queue_handover_test`, every queue-type and submission order, exact against the host runtime). **Still open for M4:** the storage-image initialization is tied to the first shader-running submission, not to the list that uses the image, so a list that only reaches an image through a barrier or copy before any dispatch or draw is submitted still zero-fills it first (as before), and an image used by a shader only on a queue that never runs one of its own dispatches or draws first relies on another queue's submission; buffer SRVs and CBVs as V#s (typed buffer UAVs and UAV counters are done: `d3d12_buffer_uav_test`, section 3.4 "Buffer UAVs"), `ExecuteIndirect` signatures that change root arguments or use count buffers for dispatches, and async streaming itself and the world's streaming path, which need the game |
 | **M5** | Mesh shaders, `ExecuteIndirect`, bindless-table pressure, multi-threaded command lists, pipeline cache | World rendering | A stable open-world frame at any frame rate; then profile and optimise |
-| **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; the builder's 52 console `FSSM` programs (42 pass `spirv-val`, four rules left: [embedded_shaders.md](embedded_shaders.md)) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the `FSSM` translator or a substitute; no unknown XDXR call remains |
-| **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). **Plane compose** (section 4.5): 1-2 planes scaled from a source rectangle to a destination placement, point or bilinear, plane 1 alpha-blended (premultiplied or straight), SDR and HDR10 (PQ) planes converted to the swapchain, checked against a CPU model on two GPUs with 0 VUIDs (exact for point filtering, within 1-2 levels for bilinear, alpha and PQ conversions); the layouts, flag values and alpha convention are ours, the console's plane semantics are unmeasured, and the public HDR sample's second plane is the GameDVR copy, not an overlay. HDR10 swapchain (ST.2084 surface): verified on an RTX 5080 with an HDR10 display by @JavierBlanco23 in #2069, not on AMD (our test displays list no ST.2084 surface); HDR10 on an SDR swapchain is clipped, not tone mapped. `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; VRS, alt-tab, an AMD HDR10 display run are open |
 | **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; the builder's 52 console `FSSM` programs (51 pass `spirv-val`, one rule left: [embedded_shaders.md](embedded_shaders.md)) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the `FSSM` translator or a substitute; no unknown XDXR call remains |
-| **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; HDR, VRS, plane compose, alt-tab are open |
 | **M7** | HDR, VRS, `PresentX` planes (2-plane HDR + GameDVR compose, `ImmediateThresholdPercent`), resize, alt-tab, `SuspendX`/`ResumeX`, frame pacing and `GetFrameStatisticsX` | Presentation polish | HDR and resize work on the target display; no validation errors over a long run. **Partly met:** `ImmediateThresholdPercent` (late frame flipped at once through `VK_KHR/EXT_swapchain_maintenance1` IMMEDIATE/FIFO_RELAXED, section 4.5; checked on the fake-clock decision and on the Vulkan present mode, 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1` on two GPUs, no tearing observed on a display; the console's real semantics are unmeasured). **Plane compose** (section 4.5): 1-2 planes scaled from a source rectangle to a destination placement, point or bilinear, plane 1 alpha-blended (premultiplied or straight), filtered and blended in linear light, SDR (sRGB or gamma 2.2) and HDR10 (PQ) planes converted to the swapchain, SDR white from Windows' setting when HDR10 is active (else 203 nits), checked against a CPU model on two GPUs with 0 VUIDs (exact for point filtering, within 1-2 levels for bilinear, alpha, tone map and PQ conversions); the layouts, flag values and alpha convention are ours, the console's plane semantics are unmeasured, and the public HDR sample's second plane is the GameDVR copy, not an overlay. HDR10 swapchain (ST.2084 surface): verified on an RTX 5080 with an HDR10 display by @JavierBlanco23 in #2069, not on AMD (our test displays list no ST.2084 surface); HDR10 on an SDR swapchain is tone mapped (identity below 0.8 of SDR white, Reinhard shoulder above, then clipped per channel). `SuspendX`/`ResumeX`, frame pacing and a minimal `GetFrameStatisticsX` exist; VRS, alt-tab, an AMD HDR10 display run are open |
 
 **M3 occlusion portability (D3D-209).** Vulkan's [occlusion query specification](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#queries-occlusion)
@@ -3228,6 +3333,7 @@ nothing is copied from their trees.
 | 17 | Do upload/readback resources ever reach shaders (as vertex/index buffers or descriptors), and does the `-heap_base` bias work for them? | Trace `CreateCommittedResource` heap types and every VB/IB/descriptor that points at an upload resource; test the bias with a synthetic draw. |
 | 18 | Does the game alias buffers/images in a heap, or use reserved/tiled resources? | Trace `CreatePlacedResource` ranges, aliasing barriers, `CreateReservedResource` and tile mappings. If yes, implement shared memory per heap range or fall back to linear allocations with a clear log. Shaders: 30 declare `TILED_RESOURCES` in SFI0 (`tools/feature_scan.py`), so reserved/tiled resources are likely used. Placed resources are D3D-16 and reserved resources D3D-20 (#313). |
 | 19 | What do the `0x03000000` root-signature flag bits mean? | Masking them on a copy works around the PC serializer; the semantics remain unknown. **Origin measured** (section "Root-signature flag quirk"): in the package only `XboxBvhBuilder.dll` sets them, in its 52 compiled `RTS0` parts and unconditionally at `0xc30e` before serialising; the FSR DLL's 29 `RTS0` parts carry 0. Compare against the public flag enum and observe the game's behaviour with and without the mask; check whether the executable's root signatures carry them. |
+| 20 | Which of the BVH builder's 52 `FSSM` programs does the game actually use, and do the translated programs match a reference? | Dump the slot-62 compute PSOs on the first RT frame and map each to its container by the `ILDN` name; 42/52 pass `spirv-val` today and the four missing rules are named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
 | 20 | Which of the BVH builder's 52 `FSSM` programs does the game actually use, and do the translated programs match a reference? | Dump the slot-62 compute PSOs on the first RT frame and map each to its container by the `ILDN` name; 51/52 pass `spirv-val` today and the one missing rule is named in [embedded_shaders.md](embedded_shaders.md); compare against the builder's CPU validation (`CpuValidateResultX`) or a captured reference. |
 | 21 | Which `Metadata` values and blob format does the console's PIX use for `SetMarker`/`BeginEvent`? The layer reads 0 and 1 as strings and labels 2 (the PC PIX3 blob) `PIX event` (section 4.10). | Log the `Metadata` values the game passes; if it is 2, decode the console blob from the executable's PIX calls rather than assuming the PC WinPixEventRuntime layout. |
 | 22 | Does the game ask `CheckFeatureSupport(D3D12_OPTIONS5)` for `RaytracingTier` and switch ray tracing off when it reads `NOT_SUPPORTED`? The layer answers `NOT_SUPPORTED` because full DXR (`CreateStateObject`, `DispatchRays`) is not implemented, even though the XDXR acceleration-structure path the game's own traversal shaders use is ([bvh.md](bvh.md) §7a). On the console, ray tracing is always present, so the game may never ask. | The first-boot trace (`--trace-d3d12`) logs every `CheckFeatureSupport` call and its answer. If the game asks and gates its RT on the tier, decide with the maintainer whether to report `TIER_1_0`/`1_1` for this game while `DispatchRays` stays unimplemented; until then, keep the conservative answer. |

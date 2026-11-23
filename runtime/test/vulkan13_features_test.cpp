@@ -248,11 +248,30 @@ int main() {
         EXPECT(types[2] == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
         EXPECT(types[3] == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
 
+        const auto* rendering = static_cast<const VkPhysicalDeviceDynamicRenderingFeaturesKHR*>(head);
+        const auto* sync2 = static_cast<const VkPhysicalDeviceSynchronization2FeaturesKHR*>(rendering->pNext);
+        EXPECT(rendering->dynamicRendering == VK_TRUE);
+        EXPECT(sync2->synchronization2 == VK_TRUE);
+
         std::vector<const char*> exts;
         v13.add_extensions(exts);
         EXPECT(exts.size() == 2);
         EXPECT(std::strcmp(exts[0], VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) == 0);
         EXPECT(std::strcmp(exts[1], VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) == 0);
+
+        // Extensions advertised, but each required feature bit cleared in turn after a successful query.
+        dev.features2_calls = 0;
+        dev.dynamic_rendering = VK_FALSE;
+        dev.synchronization2 = VK_TRUE;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(dev.features2_calls == 1);
+        EXPECT(!v13.core && !v13.dynamic_rendering && v13.synchronization2 && !v13.usable());
+
+        dev.dynamic_rendering = VK_TRUE;
+        dev.synchronization2 = VK_FALSE;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(dev.features2_calls == 2);
+        EXPECT(!v13.core && v13.dynamic_rendering && !v13.synchronization2 && !v13.usable());
     }
 
     // Vulkan 1.2 with only EDS1 (missing EDS2), or both extensions with one feature bit false: EDS stays off.
@@ -323,6 +342,15 @@ int main() {
         EXPECT(types[4] == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
         EXPECT(types[5] == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
 
+        const auto* rendering = static_cast<const VkPhysicalDeviceDynamicRenderingFeaturesKHR*>(head);
+        const auto* sync2 = static_cast<const VkPhysicalDeviceSynchronization2FeaturesKHR*>(rendering->pNext);
+        const auto* eds = static_cast<const VkPhysicalDeviceExtendedDynamicStateFeaturesEXT*>(sync2->pNext);
+        const auto* eds2 = static_cast<const VkPhysicalDeviceExtendedDynamicState2FeaturesEXT*>(eds->pNext);
+        EXPECT(rendering->dynamicRendering == VK_TRUE);
+        EXPECT(sync2->synchronization2 == VK_TRUE);
+        EXPECT(eds->extendedDynamicState == VK_TRUE);
+        EXPECT(eds2->extendedDynamicState2 == VK_TRUE);
+
         std::vector<const char*> exts;
         chosen.add_extensions(exts);
         EXPECT(exts.size() == 4);
@@ -330,6 +358,39 @@ int main() {
         EXPECT(std::strcmp(exts[1], VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) == 0);
         EXPECT(std::strcmp(exts[2], VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) == 0);
         EXPECT(std::strcmp(exts[3], VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME) == 0);
+    }
+
+    // choose() with a Vulkan 1.3 candidate preserves core=true and subgroup flags after source overwrite.
+    {
+        FakeDevice dev;
+        dev.dynamic_rendering = VK_TRUE;
+        dev.synchronization2 = VK_TRUE;
+        dev.subgroup_size_control = VK_TRUE;
+        dev.compute_full_subgroups = VK_TRUE;
+        g_device = &dev;
+
+        Vulkan13Features candidate;
+        candidate.query(VK_NULL_HANDLE, VK_API_VERSION_1_3, fake_get_features2, nullptr);
+        EXPECT(candidate.core && candidate.usable());
+
+        Vulkan13Features chosen;
+        chosen.choose(candidate);
+        candidate.query(VK_NULL_HANDLE, VK_API_VERSION_1_1, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!candidate.core && !candidate.usable());
+        EXPECT(chosen.core && chosen.usable() && chosen.extended_dynamic_state);
+        EXPECT(chosen.subgroup_size_control && chosen.compute_full_subgroups);
+
+        VkBaseOutStructure tail{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, nullptr};
+        void* head = chosen.enable(&tail);
+        const auto* enable13 = static_cast<const VkPhysicalDeviceVulkan13Features*>(head);
+        EXPECT(enable13->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
+        EXPECT(enable13->dynamicRendering == VK_TRUE && enable13->synchronization2 == VK_TRUE);
+        EXPECT(enable13->subgroupSizeControl == VK_TRUE && enable13->computeFullSubgroups == VK_TRUE);
+        EXPECT(enable13->pNext == &tail);
+
+        std::vector<const char*> exts;
+        chosen.add_extensions(exts);
+        EXPECT(exts.empty());
     }
 
     // device_proc_or_khr resolves core first, then KHR, then EXT, else null.

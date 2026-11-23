@@ -974,8 +974,11 @@ def negative_control(oracle, a, waves):
 def run_translator(progs, a):
     """The translator path: assemble for gfx1013, translate, run with vk_compute_test. Returns an exit code."""
     a.build = find_test_program(a.build, "vk_compute_test") or a.build   # a Visual Studio config subfolder
-    work = Path(a.work).resolve() if a.work else Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_"))
-    work.mkdir(parents=True, exist_ok=True)
+    parent = Path(a.work).resolve() if a.work else None
+    if parent is not None:
+        parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f"{a.family}_fuzz_", dir=parent))
+    print(f"work dir {work}")
     pc_tail = bool(getattr(a, "pc_tail_ubo", False))
     try:
         index, log = translate(progs, work, a.emulate, pc_tail=True) if pc_tail else translate(progs, work, a.emulate)
@@ -1043,7 +1046,7 @@ def main():
                     help="translate with --pc-tail-ubo and run vk_compute_test with LEONIDA_PC_TAIL_UBO=1 "
                          "(128-byte push constants; also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
-    ap.add_argument("--work", default=None, help="keep the generated .asm and SPIR-V here")
+    ap.add_argument("--work", default=None, help="keep each run's generated .asm and SPIR-V in a new subfolder here")
     ap.add_argument("--model-only", action="store_true")
     ap.add_argument("--show", default=None, metavar="SEED:INDEX[:WAVE]")
     ap.add_argument("--max-report", type=int, default=8)

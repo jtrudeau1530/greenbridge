@@ -4,6 +4,8 @@ Run with ``python -I tests/test_tex_headers_report_paths.py``. Set ``LEONIDA_TEX
 copy of the tool to use as a negative control (main's version writes the report over the .bin it just
 scanned). All inputs are hand-built; no game data is used.
 """
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -12,9 +14,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOOL = pathlib.Path(os.environ.get("LEONIDA_TEX_HEADERS", str(ROOT / "tools" / "tex_headers.py")))
+for folder in (str(ROOT), str(ROOT / "tools")):
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
+import tex_headers
 
 
 def make_carve(folder):
@@ -97,6 +104,71 @@ class ReportPathTest(unittest.TestCase):
                              (512, 256, "BC1_UNORM"))
             self.assertEqual(cpu_path.read_bytes(), cpu)
             self.assertEqual(gpu_path.read_bytes(), gpu)
+
+
+class PrefilterTest(unittest.TestCase):
+    def run_main(self, *args):
+        calls = []
+        real = tex_headers.same_output_path
+
+        def counting(first, second):
+            calls.append((first, second))
+            return real(first, second)
+
+        with mock.patch.object(tex_headers, "same_output_path", counting), \
+                mock.patch.object(sys, "argv", ["tex_headers.py", *map(str, args)]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                tex_headers.main()
+            except SystemExit as exc:
+                return calls, exc.code
+        return calls, None
+
+    def test_existing_report_json_skips_the_per_file_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, _, _ = make_carve(td)
+            out = pathlib.Path(td) / "report.json"
+            out.write_text("old report", encoding="utf-8")
+            calls, code = self.run_main(carve, "--out", out)
+            self.assertIsNone(code)
+            self.assertEqual(calls, [])
+            self.assertEqual(len(json.loads(out.read_text(encoding="utf-8"))), 1)
+
+    def test_hard_link_report_still_calls_the_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, cpu_path, _ = make_carve(td)
+            alias = pathlib.Path(td) / "report.json"
+            os.link(cpu_path, alias)
+            before = cpu_path.read_bytes()
+            calls, code = self.run_main(carve, "--out", alias)
+            self.assertEqual(code, 2)
+            self.assertGreater(len(calls), 0)
+            self.assertEqual(cpu_path.read_bytes(), before)
+
+    def test_input_named_report_still_calls_the_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, cpu_path, _ = make_carve(td)
+            before = cpu_path.read_bytes()
+            calls, code = self.run_main(carve, "--out", cpu_path)
+            self.assertEqual(code, 2)
+            self.assertGreater(len(calls), 0)
+            self.assertEqual(cpu_path.read_bytes(), before)
+
+    def test_symlinked_blob_report_still_calls_the_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            carve, cpu_path, _ = make_carve(td)
+            report = pathlib.Path(td) / "report.json"
+            report.write_text("old report", encoding="utf-8")
+            alias = cpu_path.parent / "ffffffffffff.bin"
+            try:
+                alias.symlink_to(report)
+            except OSError:
+                self.skipTest("symbolic links unavailable")
+            calls, code = self.run_main(carve, "--out", report)
+            self.assertEqual(code, 2)
+            self.assertGreater(len(calls), 0)
+            self.assertEqual(report.read_text(encoding="utf-8"), "old report")
 
 
 if __name__ == "__main__":

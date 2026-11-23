@@ -98,7 +98,8 @@ type is one of two checks, and neither reads past the `InfoType` field:
 
 - `0xe6a0`, which the batched export calls first (`0x216dc`), loops over every element's postbuild descs (count at
   `+0x30`, array at `+0x38`, stride 16) and compares `InfoType` (`+8`) with `0x10`. A match branches to the error
-  block at `0x106ba`, whose third message names the type, and the build ends with `E_INVALIDARG` before any work.
+  block at `0x106ba`, whose third message names the type, and the build throws `E_INVALIDARG` as a C++ exception
+  (`0x10702`) before any work; the export returns `void`.
 - The batched export's own postbuild loop (`0x2177b`..`0x217e9`) skips `0x10` explicitly, then sends 0 and 3 to
   `0x1d540` and 2 to `0x1d7c0`. Every other value falls through to the next desc.
 
@@ -108,6 +109,5 @@ None of the 15 other DLLs in the package names the type or an offline builder.
 
 - The names of the stream record types and of their values.
 - The offline statistics layout (§4). It is not in the package: the one DLL that knows the type only rejects or
-  skips it (RT-155). It needs the offline BVH builder, which is not in the package. A runtime doesn't need it,
-  because the shipped builder refuses the request.
+  skips it (RT-155). A runtime doesn't need it, because the shipped builder refuses the request.
 - Whether the game passes a non-empty stream desc at all. That needs the executable's call sites (RT-5).

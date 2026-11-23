@@ -820,6 +820,18 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
 
+    def test_stage_caps_preserve_graphics_stage_bits(self):
+        supported = 0x01 | 0x08 | 0x10 | 0x20
+        required = 0x10 | 0x20
+        device = FakeDevice(subgroup_supported_stages=supported, required_subgroup_size_stages=required,
+                            max_compute_workgroup_subgroups=17)
+        vk = FakeVulkan(devices=(device,))
+        with mock.patch.object(vk_info, "load_vulkan", return_value=vk):
+            result = vk_info.query(stage_caps=True)
+        self.assertEqual(result["supported_subgroup_stages"], supported)
+        self.assertEqual(result["required_subgroup_size_stages"], required)
+        self.assertEqual(result["max_compute_workgroup_subgroups"], 17)
+
     def test_rdna2_amd_windows(self):
         """#857: RDNA2 by PCI device ID, and only under AMD's proprietary driver (RADV takes the same modules)."""
         amd, radv = vk_info.VK_DRIVER_ID_AMD_PROPRIETARY, 3

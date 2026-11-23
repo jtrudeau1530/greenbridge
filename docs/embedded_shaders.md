@@ -82,6 +82,13 @@ order of section 3; `CopyAndCompactBVH` is #52, not the first):
 | #14-#29 | `BitonicPreSortCS`, `BitonicOuterSortCS`, `BitonicInnerSortCS`, `BitonicPreSort64CS`, `BitonicOuterSort64CS`, `BitonicInnerSort64CS`, `RadixReset`, `RadixCount`, `PrefixSum64`, `PrefixSum128`, `PrefixSum256`, `PrefixSum512`, `PrefixSum1024`, `PrefixSum2048`, `PrefixSum4096`, `RadixAlloc` |
 | #30-#46 | `RearrangeTriangles`, `RearrangeBVHs`, `LoadInstances`, `SplitInstances`, `LoadTriangles`, `LoadProceduralGeometry`, `ReloadTriangles`, `ReloadProcedurals`, `PT_ConstructBVH4`, `ConstructBVH4`, `RefitBVH4`, `BuildBVHSplits`, `BuildBVHSplits64`, `FindTreelets`, `ResetKDOP`, `BuildKDOP`, `BuildApexPointMap` |
 | #47-#53 | `GetBVHCompactedSize`, `DecompressHeader`, `LeafRehydration`, `Box16Rehydration`, `Box32Rehydration`, `CopyAndCompactBVH`, `GetBVHCompactedSize` (again) |
+container is created twice: **`GetBVHCompactedSize`** (RT-182). With `LEONIDA_BVH_RECORD62=1` the test prints each
+creation's container with its `ILDN` module name and the first bytes of its digest: creations 1 to 51 are 51
+distinct containers, `GetBVHCompactedSize` (5,284 bytes, 0x14a4) among them at 47; creation 52 is
+`CopyAndCompactBVH` (4,404 bytes, 0x1134); creation 53 is `GetBVHCompactedSize` again, with the same digest and
+size. So the 0x14a4-byte container `FUN_18001d400` passes for `XDXR PostBuildInfoQuery` is the
+`GetBVHCompactedSize` module, and the PSO for it is created twice. Measured on 1.0.2.1 with an RTX 5080 (driver
+621.01): all 53 creations return `S_OK`.
 
 ## 3. The 52 modules
 
@@ -121,7 +128,7 @@ When this page was first written, 42 translated and 10 stopped at four rules. Th
 | `PT_LoadInstances` | `global_atomic_fmin` | translates |
 | `Box32Rehydration`, `ReloadTriangles` | `buffer_load_ushort` | translate |
 | `LeafRehydration` | `tbuffer_load_format_x GFX10_FORMAT_8_UINT` | translates |
-| `Box16Rehydration` | `buffer_load_ushort` | stops at `buffer_store_short` (#1864, open) |
+| `Box16Rehydration` | `buffer_load_ushort` | stops at `buffer_store_short` (#1864) |
 
 The disassembly count is unchanged: the same 42 programs have no invalid word, and 10 have invalid words in the
 code. All 10 of those translate; `Box16Rehydration` is one of the 42 clean ones.
@@ -176,8 +183,42 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   output. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` metadata-only shape is consistent with reflection,
   but whether the builder consumes it has not been measured.
+* **They run on a GPU (TEST-594).** `tools/bvh_gpu_smoke.py` translates them from the package and runs each through
+  `vk_compute_test`. Each program reads its root arguments from a table at `s[0:1]`, the heap base there, which the
+  tool seeds with `VKC_HEAP_INIT`: every table word points past the table into zeros. **All 49 that aren't
+  rehydration programs pass**: exit 0, no Khronos validation error, and the same heap bytes on a second run (AMD
+  Radeon RX 9070, Windows 11, `--max-shared-memory 32768`, package 1.0.2.1). With these inputs only seven change any
+  heap word (`InitHeaders`, `InitPartitionedHeaders`, `LoadInstances`, `LoadProceduralGeometry`, `LoadTriangles`,
+  `PT_BeginPass`, `PT_WriteInstances`); the others leave early. So this alone shows that the translated programs
+  run cleanly, not that their output is right. **Six are checked byte for byte** (`--checked`), the ones whose effect
+  reads straight off their code. `RadixReset`, `ResetKDOP`, `ResetToIndexBuffer`, `CopyCounters` and
+  `ResetCounterValues` get their root-table fields (an output address, a count of 20, a value or a source), and the
+  tool compares all 20 entries they write and the bytes after them, which must stay untouched. `PrefixSum64` scans 64
+  words in place into their exclusive prefix sum through five `ds_swizzle_b32` broadcast steps and stores the group's
+  total; the input wraps past 2^32. All six match exactly. Negative controls: with the translator made to skip
+  `v_add_nc_u32`, `ResetToIndexBuffer` fails (entries hold `base+4i` and zeros); with it skipping `ds_swizzle_b32`,
+  `PrefixSum64` fails from element 2 on. So the check sees a wrong translation. Two things found on the way:
+  * the wave64 bitonic sorts (`BitonicPreSort64CS`, `BitonicInnerSort64CS`) declare 32,780 bytes of workgroup memory
+    with the translator's default cap, 12 over the 32 KiB AMD's Windows driver allows
+    (`VUID-RuntimeSpirv-Workgroup-06530`). Their highest LDS offset is 8192, and `--max-shared-memory 32768` shrinks
+    the array to what they use;
+  * with every table word 0 instead, the descriptors point at the table itself, and `RadixCount` then writes into the
+    table that other waves are reading, so its output differs between runs. That is the test input, not the
+    translator; the tool's default avoids it.
+* **What is still open.** The other programs' outputs (the sorts, prefix sums, builders, refit and loaders) are not
+  checked against a reference yet; the rehydration trio has one in TEST-376 (`tools/bvh_rehydrate.py`); `LeafRehydration` does not finish within 60 s with either table described
+  above. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
+  above comes from `ILDN`, not from a runtime trace. The `STAT` bitcode and the `0x07 NOBC` record are not
+  explained.
 
 ## 6. Tool and tests
+
+`tools/bvh_gpu_smoke.py --game-dir <package> [--max-shared-memory N] [--checked] [--json report.json]` reproduces the
+GPU run above: the extraction and translation of §4, then two dispatches per program, and with `--checked` the six
+byte-exact cases. Its report holds module names, statuses
+and counts only. `tests/test_bvh_gpu_smoke.py` checks the heap image, the word count and the judging of runs with a
+fake `vk_compute_test`, and the checked cases' inputs and judging (a fake that does what each case describes passes,
+one wrong byte fails), without a GPU or game files.
 
 `tools/pe_shader_containers.py` is standard library only and reads the file, never runs it. It accepts a
 container only when the chunk table is sorted, 4-byte aligned, entirely inside the declared total and its last

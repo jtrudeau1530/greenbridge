@@ -423,16 +423,38 @@ descriptor supplies meshlet, triangle and reference counts that must agree with 
 pointed-to group's header. This check also validates the packed triangles, vertex
 reference bounds and padded index-buffer length.
 
-All 311 target blocks have one distinct validated group address under this check.
-Geometry records reached through resource-root model lists account for 303. For
-the other eight, a search of aligned system records found the same pointer layout
-and a primary-LOD geometry list containing the record. The path from the resource
-root to that list is still unknown. The pointer search reproduced the addresses
-without selecting on the proposed vertex count. The layout count and the group's
-dense range subsequently agreed in all 311. This includes the six uniquely paired
-page walks and seven walks with a repeated target block count.
+The original check found one distinct validated group address for each of the
+311 target blocks. The regular drawable LOD lists reached 303. For the other
+eight, a search of aligned system records found the same pointer layout and a
+geometry list containing the record. The layout count and the group's dense range
+agreed in all 311. This includes the six uniquely paired page walks and seven
+walks with a repeated target block count.
 
-| Pointed-to group start relative to the target stream | Blocks |
+**The eight auxiliary root paths (ASSET-273).** An independent scan of all 22
+archives reproduced 311 outliers and verified all 311 draw bindings. The regular
+drawable lists reached 264 blocks through LOD 0 and another 39 through LODs 1–3.
+The eight records reached through auxiliary paths each have a verified geometry
+record and graphics-group address:
+
+- **Seven standalone drawables:** follow the root drawable's pointer at `+0xD0`.
+  In the auxiliary header, `+0x30` points to a table of system pointers and
+  `+0x38` holds its 16-bit count, which matched capacity in these cases. Each
+  relevant table entry points to a record whose `+0x68` field leads to the
+  structure with the geometry list at `+0x50`.
+- **One fragment:** start with the fragment root's pointer at `+0x90`, then
+  follow pointer fields at `+0x130`, `+0x20` and `+0x70`. In that table, entry 1
+  (zero-based) reaches the record whose `+0x68` pointer leads to the structure
+  with the geometry list at `+0x50`. These offsets are one measured route.
+
+One regular LOD 0 binding needs a compressed final system page that inflates to
+48 bytes. The diagnostic scan's 64-byte minimum excluded that page. When the
+first page's map declares the final system continuation, the archive diagnostic
+accepts a nonempty short page at the next 16-byte boundary with zero padding
+and a valid zlib checksum. That restores the normal draw binding. Both the
+diagnostic and the pinned model reader recover the containing dictionary's 11
+children.
+
+| Pointed-to group start relative to the target stream (original survey) | Blocks |
 |---|---:|
 | Preceding stream | 68 |
 | Same stream | 228 |
@@ -444,9 +466,10 @@ different group even with an exact match in hand.
 
 For an already separated system/graphics resource pair, the following command
 walks the primary LOD from the drawable offset reported by the model manifest.
-Use `--geometry-offset` for a known individual geometry record. Both offsets
-are relative to the start of the system segment. Unsupported or inconsistent
-bindings are reported as unresolved.
+Use `--lod 1`, `--lod 2` or `--lod 3` with the same drawable offset to select a
+lower LOD, or use `--geometry-offset` for a known individual geometry record.
+Both offsets are relative to the start of the system segment. Unsupported or
+inconsistent bindings are reported as unresolved.
 
 ```powershell
 python -I tools/meshlet_page.py <graphics-segment> --draw-system <system-segment> --drawable-offset <offset>
@@ -529,6 +552,31 @@ edges, so none of the conclusions below depend on it.
 | Position header (bias, scale) finite, scale >= 0 | 60,442 / 60,442 |
 | Every triangle edge no longer than the block extent | 48,150 / 60,442 |
 
+**Slots 6/7 (tag `0x26`) and 8/9 (tag `0x25`) are skin weights and joint indices.** Where slot 8 holds tag
+`0x25`, each `0x25` slot comes with a `0x26` slot two below it (slot 6 with 8, slot 7 with 9), and no block in
+the sample has one without the other. Read as four unorm8 weights per `0x26` slot and four joint indices per
+`0x25` slot, `skin_checks` in `tools/vertex_types.py` counts, per vertex over all weight slots
+(core_restofworld, first 500 streams: 612 blocks, 212,564 vertices; 454 blocks with two pairs, 158 with one):
+
+| Check | Vertices |
+| --- | --- |
+| Weights sum to 255 | 203,243 (95.6%) |
+| Weights sum to 247-255 | 204,758 (96.3%) |
+| Weights in descending order | 211,902 (99.7%) |
+| No joint repeated among the non-zero weights | 212,564 (100%) |
+| Every zero weight has joint index 0 | 156,808 (73.8%) |
+| Control: slot 1 colour bytes sum to 255 | 0 |
+
+The `0x25` bytes are small: the highest joint used by a non-zero weight is below 16 in 488 blocks, 16-31 in
+117 and 48-63 in 7. So the indices point into a short per-block (or per-mesh) joint list, not a whole
+skeleton; which list was not traced here.
+
+Of the 9,321 core_restofworld vertices whose weights do not sum to 255, the twelve most common sums (254
+down to 233) all come from one-pair blocks: a four-influence vertex whose weights fall short, as
+`tools/skin_streams.py` also finds for one packed four-influence population of the drawable skin streams.
+levels (first 400 streams) has 9 skinned blocks (3,910 vertices), all one pair, and every vertex there
+passes: one weight of 255 on joint 0. The colour control never sums to 255 in either sample.
+
 Slot usage (block counts): slot 0 tag `0x42` in all 60,442; slot 2 `0x21` in 57,925; slot 1 `0x26` in
 57,873; slot 3 `0x28` in 49,294 and slot 4 `0x28` in 29,379; then slot 12 `0x26` (25,239), slot 6 `0x26`
 (24,876), slot 8 `0x25` (21,519), slot 13 `0x26` (17,928), slot 11 `0x27` (11,120) and 21 rarer slot/tag
@@ -578,6 +626,28 @@ than 0x8000 between neighbouring vertices occurs 1,597,530 times when the values
 18,791 times when they are read as signed (85 times fewer); slot 4 gives 1,680,055 against 5,570. Read as
 half floats, 1,391,311 slot 3 values are NaN or infinite. So the stream is a pair of `int16`s, continuous across
 the surface, which fits the `x / 32767 * f32@0x7C` texture-coordinate reading.
+
+**Tag `0x27` is a second tangent frame: a unit tangent along `u` of another `0x28` stream, with a sign.**
+The mesh shaders fetch it with `tbuffer_load_format_xyzw ... BUF_FMT_2_10_10_10_UNORM` (one of the
+four typed vertex formats they use, in 2,162 of the 9,282 mesh shaders) and map every component by
+`v * 2 - 1`. They transform xyz by the same matrix as the normal and cross it with the normal, scaled by
+w. `tangent_0x27` in `tools/vertex_types.py` is that read: xyz = bits 0-9, 10-19, 20-29 over 1023, and
+w = bits 30-31 over 3. Per `0x27` slot, `tangent27_checks` counts unit length over all vertices; over
+the sampled triangles it counts vectors perpendicular to the face normal (`|cos| < 0.2`) and, for each
+`0x28` stream, vectors within `cos > 0.8` of `dP/du` and the w side:
+
+| Sample | Slot | Vertices | Unit | w = 3 / 0 | Perpendicular to face | Best `0x28` stream: along u | w > 0 exactly when `cross(face normal, xyz)` runs along `-v` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| levels (400 streams) | 11 | 637,604 | 100% | 634,431 / 3,173 | 86.1% | slot 4: 96.7% (slot 3: 69.5%) | 99.8% |
+| core_restofworld (500 streams) | 18 | 182,208 | 100% | 180,282 / 1,926 | 40.3% | slot 14: 79.3% (slot 4: 73.6%, slot 3: 21.0%) | 99.2% |
+| core_restofworld | 19 | 12,679 | 100% | 12,445 / 234 | 61.7% | slot 14: 69.0% (slot 3: 54.1%) | 98.5% |
+
+The w side is counted among the along-u vertices of that stream. The w field only ever holds 0 or 3 in
+these samples. Against the vertex normal of tag `0x21` (read as the mesh shaders read it) instead of the
+face normal, the slot-18 vectors are perpendicular (`|cos| < 0.1`) for 174,942 of 182,208 (96.0%) and the
+slot-19 and levels slot-11 vectors for all of them. Where the face-normal column is low, the face normals
+disagree with the vertex normals, as for tag `0x21`. The tangent matches the `0x21` tangent (`cos > 0.99`)
+for only 10-17% of vertices, so it is a different frame, the one for a second texture-coordinate stream.
 
 **Tag `0x26` (slot 1) is four bytes with an alpha-like byte 3.** Byte 3 is 255 on 62.4% of the 137.9 million
 vertices and 0 on 17.2%; each of bytes 0-2 is constant within a block in 36,544 to 38,854 blocks. The bytes
@@ -642,9 +712,15 @@ Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` rec
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
 core graphics blocks, final-slot widths remain unresolved (`0x21`, the last unread component type,
 is decoded above). The stride check
+Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the nested RPF9
+payloads, and the whole `appdata0` data area. The bodies of the nine `RSC8` headers are decoded in
+[rsc8_audio.md](rsc8_audio.md): facial/lip-sync clips. Across the 971
+core graphics blocks, final-slot widths remain unresolved, and of the component types the non-normal
+bits of `0x21` (see above). The stride check
 also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
 "Unread" in the tables above is not a claim that those bytes are empty: in
-`story000_restofworld` the 9.33 MB unread gap contains nine `RSC8` headers and nested RPF9 headers, and
+`story000_restofworld` the 9.33 MB unread gap contains 15 `ADAT` (AWC) banks (8,908,216 bytes), which hold the
+nine `RSC8` headers as tag `0x5c` clips, and nested RPF9 headers, and
 in `story000_script` the 53 MB unread region contains four nested RPF9 headers.
 
 ## Likely format family
@@ -663,10 +739,13 @@ The bytes support the existing **RPF9/RAGE family**, not a new container:
   big-endian length chain are measured; the `LSNS` block layout is decoded, its record contents are not.
 - `RBF0` records carry schema names (movie subtitles, VFX texture-atlas metadata); XML records carry
   content definitions.
-- `RSC8` appears only as raw headers in the story-rest unread gap. No `RSC7` was found.
+- `RSC8` appears only in the story-rest unread gap, as the tag `0x5c` facial/lip-sync clips of its 15
+  `ADAT` (AWC) banks ([rsc8_audio.md](rsc8_audio.md)). No `RSC7` was found.
 
 Models are present (37 decoded in core, plus 924 name-bearing pages), but the measured bytes do not
-support a claim that these archives hold map placement, compiled scripts, audio banks or UI layout.
+support a claim that these archives hold map placement, compiled scripts or UI layout. Their only audio banks
+are those 15 in story-rest, with 76 streams: 13 carry a streamed-music `0x48` tag and 9 are dialogue lines with
+a clip. A raw `tools/rsc8_audio.py` scan of the other five archives finds no `ADAT` bank.
 The only UI-adjacent evidence is content-manifest XML and text; there is no UI container signature.
 
 ## Content-definition reader (ASSET-149)
@@ -762,6 +841,51 @@ not raw stream-start images. Measured on the 1.0.2.1 package, they live in two p
    | `pack/core_restofworld/data/ttdb/ui/ttdb_ui.ttpf` | 4,729,600 | 43 | `BC1_UNORM` 37, `BC7_UNORM` 6 |
    | `pack/core_restofworld/data/ttdb/vfx/ttdb_vfx.ttpf` | 3,129,600 | 17 | `BC7_UNORM_SRGB` 5, `BC1_UNORM` 5, `BC5_UNORM` 5, `BC4_UNORM` 1, `BC3_UNORM_SRGB` 1 |
    | `pack/core_restofworld001/data/ttdb/ui/ttdb_ui.ttpf` | 38,656 | 5 | `BC7_UNORM` 3, `BC3_UNORM` 2 |
+
+### Which source the drawables' texture references reach
+
+The drawables name textures by the 64-bit texture IDs in their shader parameter records
+([textures.md](textures.md)). Measured over the 1,732 `.ydr`/`.yft`/`.ydd` entries of the two core archives in
+a local RPF9 index (all decoded; 17,208 texture references to 675 distinct IDs), against the ID tables of all 57
+`.ttpf` pools in the package and against the two sources above:
+
+| Where the ID is | Distinct IDs | References |
+|---|---:|---:|
+| a pool under `pack/core_restofworld*/data/ttdb/` | 285 | |
+| a shared pool under `data/ttdb/` | 258 | |
+| subtotal: in a pool | 543 | 6,403 |
+| a key of an embedded `pgDictionary`, or any u64 inside the 145 embedded-texture streams | 0 | 0 |
+| nowhere | 132 | 10,805 |
+
+The 144 embedded dictionaries hold 166 keys; 119 of them have a zero high half, and none equals a referenced ID
+or either 32-bit half of one. So these 64-bit IDs reach the pools only; how a drawable binds the embedded
+`0x980` textures was not traced here.
+
+The unresolved share is not spread over the materials. By shader texture slot (slots named by role where the
+material's own textures show it; the others are unnamed and listed by size):
+
+| Slot | References in a pool / nowhere | Distinct IDs in a pool / nowhere |
+|---|---:|---:|
+| colour | 1,818 / 136 | 166 / 15 |
+| normal | 1,758 / 223 | 145 / 14 |
+| specular | 1,675 / 306 | 149 / 19 |
+| a fourth material slot | 1,049 / 931 | 52 / 24 |
+| five slots with one fixed ID each | 0 / 1,463 to 1,568 each | 0 / 1 each |
+| a sixth such slot | 6 / 1,517 | 1 / 2 |
+| one slot that never resolves | 0 / 184 | 0 / 57 |
+
+The per-asset material textures resolve for about nine references in ten (colour 93%, normal 89%, specular 85%).
+Most unresolved references come from six slots that each use one fixed ID on 1,463 to 1,568 shaders: textures
+shared by the whole engine and bound at run time rather than stored with an asset (hypothesis: lookup tables,
+noise or environment maps).
+
+Pool entry formats of the 543 resolved IDs (DXGI numbers): 71/72 (BC1) 391, 98/99 (BC7) 120, 83 (BC5) 14,
+78 (BC3) 14, 80 (BC4) 3, 65 (A8) 1; 22 are 4 x 4 placeholders.
+
+Method: drawables decoded with a local RPF9 model decoder (the shader parameter layout of textures.md); pool ID
+tables read from each pool's `ETPF` section (count at +8, 16-byte records, then the sorted u64 IDs); embedded
+streams found with `tools/restofworld_index.py`'s `find_rage_textures` / `is_pg_tex_dictionary` (keys at the
+`+0x20` pointer, count at `+0x28`). Counts only; no IDs, names or texture data.
 
 ## What a future decoder needs
 

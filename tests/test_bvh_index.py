@@ -273,6 +273,21 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(archived["kind"], "bvh4-chunk")
         self.assertNotIn("fill", archived)
 
+    def test_folder_name_with_glob_characters_is_a_path(self):
+        # glob read "[v1]" as a character class, so a folder named like this indexed nothing and exited 0.
+        folder = os.path.join(self.dir, "carve [v1]")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        rows, summary = bvh_index.scan_dir(folder)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
+        archives = os.path.join(self.dir, "pack [1]")
+        os.makedirs(archives)
+        with open(os.path.join(archives, "a.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        rows, summary = bvh_index.scan_dir(archives)
+        self.assertEqual([r["kind"] for r in rows], ["bvh4"])
+
     def test_empty_and_short_archives_have_no_streams(self):
         for name, data in (("empty.rpf", b""), ("short.rpf", b"9FPR")):
             path = os.path.join(self.dir, name)

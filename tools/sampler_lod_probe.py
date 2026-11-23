@@ -1,7 +1,7 @@
 r"""SHADER-539: measure on an AMD GPU (tools/hw_oracle) which mip level image_sample_l and image_sample_lz read under the
 S#'s MIN_LOD / MAX_LOD / LOD_BIAS / MIP_FILTER and the T#'s MIN_LOD and BASE_LEVEL.
 
-    python -I tools/sampler_lod_probe.py                # the Vulkan rule's levels only (no GPU)
+    python -I tools/sampler_lod_probe.py                # each row's level under both rules below (no GPU)
     python -I tools/sampler_lod_probe.py --oracle hw    # native AMD GPU, wave32 and wave64, compared with the rule
 
 docs/d3d12_vulkan.md ("vk_sampler_test") says the S# LOD fields apply to an explicit LOD as Vulkan's minLod, maxLod and
@@ -12,14 +12,17 @@ dword offset of the texel it read: the start of the level it came from. The leve
 calibration row per level (image_sample_l at LOD n, no clamp) finds them, and every other row's result is named by
 that table.
 
-The rule the rows are compared with is Vulkan's (and the runtime's mapping in runtime/src/gfx10_descriptors.h):
-    lambda = LOD (0 for _lz) + S# LOD_BIAS, clamped to [S# MIN_LOD, S# MAX_LOD]
-    MIP_FILTER none: the view's base level; point: base + nearest level (ceil(lambda + 0.5) - 1), clamped to the view
-    T# MIN_LOD: the level is at least floor(MIN_LOD), counted from the resource's level 0 (VK_EXT_image_view_min_lod)
-A row the hardware answers differently is printed as DIFFERS; that is the measurement, not a harness failure.
+Two rules are computed for every row:
+  - rdna2_level, the rule the hardware rows are checked against: the model the gfx1036 measurement fits (see its
+    docstring; an exact half level rounds up, and the T#'s MIN_LOD clamps the fractional LOD before that rounding);
+  - vulkan_level, for comparison: Vulkan's rule for the sampler and view the runtime makes of the same S# and T#
+    (runtime/src/gfx10_descriptors.h): nearest is ceil(lambda + 0.5) - 1, and VK_EXT_image_view_min_lod raises the
+    integer level to floor(minLod). Rows where it differs are marked "Vulkan reads n"; that is not a failure.
+DIFFERS means the hardware disagrees with the RDNA2 model, not with Vulkan.
 Standard library only; the texture is built here, no game files.
 
-Exit codes: 0 every row matches the rule, 1 a row differs, 2 harness error, 77 no hardware oracle.
+Exit codes: 0 every row matches the RDNA2 model (not "the hardware equals Vulkan"), 1 a row differs, 2 harness
+error, 77 no hardware oracle.
 """
 import argparse
 import math
@@ -190,8 +193,9 @@ def main():
         return 0
     import asm
     import runner
+    import tsharp
     try:
-        oracle = runner.Oracle()
+        oracle = runner.open_oracle()
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
@@ -208,7 +212,7 @@ def main():
         if isinstance(res, str):
             print(f"wave{wave}: kernel rejected: {res}")
             return 2
-        got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] if w != 0xBAADF00D else None for w in res]
+        got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] if w != tsharp.POISON else None for w in res]
     if any(v is None for v in got[32] + got[64]):
         print("the texture did not land 256-byte aligned (POISON)")
         return 2

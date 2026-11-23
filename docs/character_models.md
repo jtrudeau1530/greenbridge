@@ -248,13 +248,26 @@ silhouette is geometry, not a painted-on atlas.
 
 ## What is not decoded
 
-- **Fragment children.** A raw child-array walk covers all 2,865 `packs.rpf` fragments: every one
-  has a single drawable and the flat 25-vertex / 32-triangle bounds grid, with **no child arrays**.
-  The four `gmt_mannequin*` fragments have no child arrays either; `ambient_femalebody` is a
-  596-bone skeleton plus the same grid, with no skin mesh. The path is alive on world fragments
+- **Fragment children.** A raw child-array walk (`tools/fragment_children.py`) covers every fragment
+  of `packs.rpf` and `levels.rpf`. The fragment header's u16 at `+0x30` is the number of drawables;
+  the records are 0x110 bytes apart, starting at the main drawable that `+0x18` points at, so
+  records 1 and up are the child drawables. All 2,865 `packs.rpf` fragments have a single drawable
+  and the flat 25-vertex / 32-triangle bounds grid, with **no child arrays**. The four
+  `gmt_mannequin*` fragments have no child arrays either; `ambient_femalebody` is a 596-bone
+  skeleton plus the same grid, with no skin mesh. The path is alive on world fragments
   (`bus2_frag_hi`: 14 model structs, 11 children, a 650 KB `model_parts.glb`), so the negative is
-  a property of the character files. The remaining 50,798 `levels.rpf` fragments are covered by
-  the main-drawable census but were not raw-walked for child arrays; that is the one bounded gap.
+  a property of the character files; those figures come from a different walk and were not
+  re-derived by this one. In `levels.rpf` the walk finds **50,802 fragments** (the exporter's
+  manifest counts 50,798): 50,068 have a single drawable and **734 have a child array**, 733 of
+  one child and 1 of two, **735 child drawables** in all. Every declared child record passes the
+  drawable-body test, and a scan of all other 16-byte offsets of those fragments' system pages
+  finds 0 further drawables. 10,097 of the 50,802 have a null `+0x10`, `+0x20` or `+0x28`, and 6
+  have a main drawable that fails the embedded-drawable header test. For comparison `data.rpf` has
+  1,758 fragments, all single-drawable. The other header counts are unrelated to children: the
+  `+0x28` array of 0x50-byte part records (the u16 at `+0x34`) has 153,028 records over
+  `levels.rpf` (13,871 fragments with more than one) and 27,778 over `packs.rpf` (2,605). The gap
+  is closed: every fragment in both archives was walked, and the only ones with child drawables
+  are 734 of the `levels.rpf` ones.
 - **A ped-variation table.** `common.rpf` contains `CPedVariationBodyTypeManager`
   (`0x226000`) and `CPedComponentSetManager` (`0x228000`), but neither maps a component variation
   index to a drawable plus texture. The first is height and body-shape presets
@@ -289,7 +302,12 @@ silhouette is geometry, not a painted-on atlas.
 
 ```powershell
 rpf9dump models <packs.rpf> <outdir>
+python -I tools/fragment_children.py <package>\levels.rpf --jobs 12 --json <work>\levels_fragments.json
 ```
+
+The second command prints the fragment and child-drawable totals quoted under "Fragment children"; it
+reads the archive in place (about 22 minutes for `levels.rpf` with 12 workers over a WSL mount of
+the dump) and writes nothing else.
 
 ```python
 import json

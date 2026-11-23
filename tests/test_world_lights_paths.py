@@ -540,5 +540,27 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(lines[4], "ERROR: --limit must be at least 1")
 
 
+class GraphStatsFirstLinkTest(unittest.TestCase):
+    @staticmethod
+    def _node(idx, first_link):
+        return {
+            "address": (0, idx), "key": 100 + idx, "first_link": first_link, "num_links": 0,
+            "flags": 0, "road_class": 0, "kind": 0, "density": 0,
+            "speed": 10.0, "street": "", "position": [0.0, 0.0, 0.0],
+        }
+
+    def test_graph_stats_handles_none_first_link_without_type_error(self):
+        # Integer followed by None used to crash with TypeError in firsts[i] <= firsts[i + 1].
+        s_mixed, _ = T.graph_stats([self._node(0, 0), self._node(1, None)], [], [])
+        self.assertEqual(s_mixed["first_link_monotonic"], 0)
+        # A single node with None first_link must not vacuously report monotonic=1.
+        s_single_none, _ = T.graph_stats([self._node(0, None)], [], [])
+        self.assertEqual(s_single_none["first_link_monotonic"], 0)
+        s_leading_none, _ = T.graph_stats([self._node(0, None), self._node(1, 0)], [], [])
+        self.assertEqual(s_leading_none["first_link_monotonic"], 0)
+        s_ok, _ = T.graph_stats([self._node(0, 0), self._node(1, 0), self._node(2, 2)], [], [])
+        self.assertEqual(s_ok["first_link_monotonic"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

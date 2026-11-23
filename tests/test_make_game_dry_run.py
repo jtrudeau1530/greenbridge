@@ -318,7 +318,7 @@ class PipelineStageIsolationTest(unittest.TestCase):
         os.makedirs(spirv_dir, exist_ok=True)
         index_path = os.path.join(spirv_dir, "index.json")
         with open(index_path, "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader_0": {}}')   # a finished translation is never empty
 
         dummy_exe = os.path.join(self.tmp.name, "vk_pipeline_check.exe")
         with open(dummy_exe, "w", encoding="utf-8") as f:

@@ -8,7 +8,8 @@
 //   LEONIDA_BVH_FLAG=1                (optional: pass true as the constructor's bool argument)
 //   LEONIDA_BVH_WARP=1                (optional: use the WARP adapter; the default on an NVIDIA adapter, RT-54)
 //   LEONIDA_BVH_HARDWARE=1            (optional: keep an NVIDIA adapter instead of switching to WARP)
-//   LEONIDA_BVH_RECORD62=1            (optional: print each CreateComputePipelineState's container shape)
+//   LEONIDA_BVH_RECORD62=1            (optional: print each CreateComputePipelineState's container shape, its ILDN
+//                                     module name and digest)
 //   LEONIDA_BVH_DXIL=1                (optional, with RECORD62: dx.op counts and validator error kinds, needs
 //                                      dxcompiler.dll and dxil.dll on PATH)
 //   LEONIDA_BVH_DEVICE=vulkan         (optional: the Vulkan-backed ID3D12Device from #119 instead of a PC device)
@@ -309,7 +310,8 @@ bool looks_like_iid(uint64_t p, const IID& iid) {
 uint64_t g_slot62_ok = 0, g_slot62_failed = 0;
 
 // The shape of a DXBC container, for the record: its parts (four-character code and size), the DXIL part's shader
-// model and DXIL version, the SFI0 feature flags, and whether the hash is zero (unsigned). Counts and flags only.
+// model and DXIL version, the SFI0 feature flags, whether the hash is zero (unsigned), the ILDN module name and the
+// first four bytes of the digest. Counts, flags and names only.
 std::string container_shape(const void* bytecode, size_t length) {
     const auto* b = static_cast<const uint8_t*>(bytecode);
     auto u32 = [&](size_t o) {
@@ -340,9 +342,23 @@ std::string container_shape(const void* bytecode, size_t length) {
             std::snprintf(item, sizeof(item), "(flags %#llx)",
                           static_cast<unsigned long long>(u32(data) | (uint64_t(u32(data + 4)) << 32)));
             out += item;
+        } else if (!std::strcmp(fourcc, "ILDN") && size >= 4) {
+            // ILDN: u16 flags, u16 name length, the debug name (NUL-padded): the module's PDB path, which names the
+            // container (docs/embedded_shaders.md section 3). Only the file name is printed.
+            const uint32_t name_length = u32(data) >> 16;
+            if (size_t(data) + 4 + name_length <= length && name_length > 0) {
+                std::string name(reinterpret_cast<const char*>(b + data + 4), name_length);
+                name.erase(name.find_last_not_of('\0') + 1);
+                name = name.substr(name.find_last_of("\\/") + 1);
+                out += "(" + name + ")";
+            }
         }
     }
-    return out;
+    // The first four bytes of the container digest (bytes 4..19 of the header), to tell two creations of the same
+    // container from two containers with the same module name.
+    char digest[24];
+    std::snprintf(digest, sizeof(digest), " digest %02x%02x%02x%02x", b[4], b[5], b[6], b[7]);
+    return out + digest;
 }
 
 // The module a container belongs to: the file name (without ".pdb") in its ILDN part, a DXIL debug-name record

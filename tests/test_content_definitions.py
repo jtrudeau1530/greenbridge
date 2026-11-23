@@ -121,15 +121,22 @@ class ContentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.make_carve(directory, [CHANGE, CONTENT, SETUP])
             cmd = [sys.executable, '-I', os.path.join(ROOT, 'tools', 'content_definitions.py'), directory]
-            for extra, failed in (([], 0), ([os.path.join(directory, 'private.xml')], 1)):
-                result = subprocess.run(cmd + extra, capture_output=True, text=True)
-                self.assertEqual(result.returncode, failed, result.stderr)
-                self.assertEqual(json.loads(result.stdout), dict(documents=3, change_sets=1, contents=1,
-                                 setups=1, files=2, included_changesets=1, included_sets=1, groups=1,
-                                 other_xml=0, failed_inputs=failed))
-                self.assertEqual(result.stderr, '')
-                self.assertNotIn('fixture', result.stdout)
-                self.assertNotIn(directory, result.stdout)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), dict(documents=3, change_sets=1, contents=1,
+                             setups=1, files=2, included_changesets=1, included_sets=1, groups=1,
+                             other_xml=0, failed_inputs=0))
+            self.assertEqual(result.stderr, '')
+            self.assertNotIn('fixture', result.stdout)
+            self.assertNotIn(directory, result.stdout)
+
+            missing = os.path.join(directory, 'private.xml')
+            result = subprocess.run(cmd + [missing], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(json.loads(result.stdout), dict(documents=3, change_sets=1, contents=1,
+                             setups=1, files=2, included_changesets=1, included_sets=1, groups=1,
+                             other_xml=0, failed_inputs=1))
+            self.assertEqual(result.stderr.strip().splitlines(), [f'ERROR: {missing}: does not exist'])
 
 
 if __name__ == '__main__':

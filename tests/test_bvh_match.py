@@ -78,6 +78,23 @@ class TestMatching(unittest.TestCase):
             status = M.main([path, manifest, *argv])
         return status, out.getvalue(), err.getvalue()
 
+    def test_a_manifest_that_is_not_an_object_is_one_error_line(self):
+        path = os.path.join(self.dir, "blas.bin")
+        with open(path, "wb") as f:
+            f.write(build(LEAVES, bounds=BOUNDS)[0])
+        for doc in ([1], [], "x", 3, None):
+            manifest = os.path.join(self.dir, "manifest.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                status = M.main([path, manifest])
+            self.assertEqual(status, 2, doc)
+            lines = err.getvalue().splitlines()
+            self.assertEqual(len(lines), 1, err.getvalue())
+            self.assertTrue(lines[0].startswith("error: "), lines[0])
+            self.assertNotIn("Traceback", err.getvalue())
+
     def test_the_right_geometry_is_found_and_consistent(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         status, out, _ = self.guide(src, [item(0x1000, "a.obj", [5, 2, 3])],

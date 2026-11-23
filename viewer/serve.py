@@ -109,6 +109,12 @@ def safe_world_path(world_dir: str, req_path: str) -> str | None:
     return real_target
 
 
+# Outside /world/ the viewer is one page. Serving only these two request paths, matched before any decoding,
+# keeps the guards of safe_world_path from being needed twice: a device name (/NUL), an alternate data stream
+# (/index.html::$DATA) or a trailing dot or space (/index.html.) never reaches the file system.
+_VIEWER_PAGES = frozenset({"/", "/index.html"})
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     world = None
     extensions_map = {
@@ -138,6 +144,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if safe_world_path(self.world, self.path) is None:
                 self.send_error(403, "Forbidden")
                 return None
+        elif clean not in _VIEWER_PAGES:
+            self.send_error(404, "File not found")
+            return None
         return super().send_head()
 
     def translate_path(self, path):
@@ -145,6 +154,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.world and clean.startswith("/world/"):
             resolved = safe_world_path(self.world, path)
             return resolved if resolved is not None else ""
+        if clean not in _VIEWER_PAGES:
+            return ""
         return super().translate_path(path)
 
     def end_headers(self):
@@ -163,6 +174,18 @@ def port_number(text: str) -> int:
     return value
 
 
+class ViewerServer(http.server.ThreadingHTTPServer):
+    """The viewer's server: a port another viewer is serving is an error on every OS.
+
+    `HTTPServer` sets SO_REUSEADDR so a restart can bind while the old connections are still in TIME_WAIT. On
+    POSIX that is all it does: a second listener on the same address still fails. On Windows SO_REUSEADDR lets
+    a second socket bind a port that is being listened on; that viewer printed its URL and then got no requests,
+    while the browser kept showing the first one's world. Windows needs no option for a restart either, so
+    the option is left off there.
+    """
+    allow_reuse_address = os.name != "nt"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--world", help="exported world directory (omit to show test terrain)")
@@ -173,7 +196,7 @@ def main():
         ap.error(f"--world is not a directory: {a.world}")
     Handler.world = a.world
     try:
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
+        srv = ViewerServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
     except OSError as e:
         # The usual cause is a viewer that is still running on the port; this ended in a traceback.
         ap.error(f"can't listen on port {a.port}: {e.strerror or e}. Is a viewer already running? "

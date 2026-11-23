@@ -109,6 +109,73 @@ class PageIndexTest(unittest.TestCase):
             self.assertEqual(rows[0]["target"], "0x60")
             self.assertEqual(rows[0]["target_stream"], "0")
 
+    def test_q28_null_pointer_record_is_kept_and_the_table_goes_on(self):
+        # The shape 3,511 anim.rpf pages have: a record with a null pointer and its other words set, then more.
+        page = header(0x200, q28=0x140, q38=0x100, counts=(3, 0, 1, 0))
+        put_q38(page, 0x100, [(0x1234, 0x40, 0x60)])
+        struct.pack_into("<IIQQII", page, 0x140, 0x1234, 0x11, 0x100, BASE + 0x60, 0x10, 0x10000)
+        struct.pack_into("<IIQQII", page, 0x160, 0x2222, 0x22, 0x200, 0, 0x08, 0x20000)
+        struct.pack_into("<IIQQII", page, 0x180, 0x3333, 0x33, 0x300, BASE + 0x80, 0x04, 0x30000)
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "null.rpf")
+            out = os.path.join(tmp, "pages.json")
+            make_rpf(arc, [page])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+        page_doc = doc["pages"][0]
+        self.assertEqual(page_doc["q28_error"], "")
+        self.assertEqual([(r["hash_a"], r["target"], r["count_or_size"]) for r in page_doc["q28_records"]],
+                         [(0x1234, 0x60, 0x10), (0x2222, None, 0x08), (0x3333, 0x80, 0x04)])
+        self.assertEqual(doc["summary"]["q28_records"], 3)
+        self.assertEqual(doc["summary"]["q28_declared"], 3)
+        self.assertEqual(doc["summary"]["q28_null_targets"], 1)
+        self.assertEqual(doc["summary"]["q28_tables_unread"], 0)
+
+    def test_q28_pointer_with_another_base_still_stops_the_table(self):
+        page = header(0x200, q28=0x140, q38=0x100, counts=(2, 0, 1, 0))
+        put_q38(page, 0x100, [(0x1234, 0x40, 0x60)])
+        struct.pack_into("<IIQQII", page, 0x140, 0x1234, 0x11, 0x100, 0x40000060, 0x10, 0x10000)
+        struct.pack_into("<IIQQII", page, 0x160, 0x2222, 0x22, 0x200, BASE + 0x60, 0x08, 0x20000)
+        parsed, complete = page_index.parse_page(bytes(page), [])
+        self.assertTrue(complete)
+        self.assertEqual(parsed["q28_records"], [])
+        self.assertEqual(parsed["q28_error"], "q28 entry 0 has a non-0x50000000 pointer")
+
+    def test_q28_declared_without_a_table_pointer_is_named(self):
+        # n28 = 2 but +0x28 holds no 0x50000000 pointer: the records are declared and cannot be read.
+        page = header(0x200, q28=0, q38=0x100, counts=(2, 0, 1, 0))
+        put_q38(page, 0x100, [(0x1234, 0x40, 0x60)])
+        parsed, complete = page_index.parse_page(bytes(page), [])
+        self.assertTrue(complete)
+        self.assertIsNone(parsed["tables"]["q28"])
+        self.assertEqual(parsed["q28_records"], [])
+        self.assertEqual(parsed["q28_error"], "q28 is not a 0x50000000 pointer")
+        # No records declared: nothing is missing, so nothing is reported.
+        page = header(0x200, q28=0, q38=0x100, counts=(0, 0, 1, 0))
+        put_q38(page, 0x100, [(0x1234, 0x40, 0x60)])
+        self.assertEqual(page_index.parse_page(bytes(page), [])[0]["q28_error"], "")
+
+    def test_q28_table_past_the_streams_read_is_named(self):
+        # q38 and its record fit in the directory stream, so no continuation is read; the q28 table is after it.
+        page = header(0x100, q28=0x100, q38=0xC0, counts=(2, 0, 1, 0))
+        put_q38(page, 0xC0, [(0x5678, 0x20, 0x60)])
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "late.rpf")
+            out = os.path.join(tmp, "pages.json")
+            make_rpf(arc, [page, b"\xcc" * 0x100])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+        page_doc = doc["pages"][0]
+        self.assertTrue(page_doc["complete"])
+        self.assertEqual(page_doc["continuations"], [])
+        self.assertEqual(page_doc["q28_records"], [])
+        self.assertEqual(page_doc["q28_error"], page_index.Q28_UNREAD)
+        self.assertEqual(doc["summary"]["q28_declared"], 2)
+        self.assertEqual(doc["summary"]["q28_records"], 0)
+        self.assertEqual(doc["summary"]["q28_tables_unread"], 1)
+
     def test_continuation_stream_is_appended(self):
         page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
         put_q38(page, 0xC0, [(0x5678, 0x80, 0x100)])
@@ -377,6 +444,40 @@ class PageIndexTest(unittest.TestCase):
                                   capture_output=True, text=True)
             self.assertEqual(proc.returncode, 2)
             self.assertIn("output would overwrite an input file", proc.stderr)
+
+    def test_page_counts_histogram_matches_naive_reference(self):
+        def page(count):
+            return {
+                "complete": True,
+                "counts": (0, 0, 0, 0),
+                "q38_records": [],
+                "q28_records": [],
+                "q28_error": "",
+                "continuations": [],
+                "span": 0,
+                "payload_at_0x60": False,
+                "resource": {"streams": [], "page_units": 1, "declared_matches_units": True},
+                "version": 122,
+                "page_count": count,
+            }
+
+        def naive(pages):
+            return {str(v): sum(1 for p in pages if p["page_count"] == v)
+                    for v in sorted({p["page_count"] for p in pages if p["page_count"] is not None})}
+
+        cases = {
+            "high-cardinality": [page(v) for v in range(1200)],
+            "mixed": [page(None if i % 3 == 0 else i % 97) for i in range(1500)],
+            "all-none": [page(None) for _ in range(50)],
+            "zero-count": [page(0) for _ in range(7)],
+            "no-pages": [],
+        }
+        for name, pages in cases.items():
+            with self.subTest(name):
+                actual = page_index.summarise(pages, "directory", "synthetic.rpf")["page_counts"]
+                expected = naive(pages)
+                self.assertEqual(actual, expected)
+                self.assertEqual(list(actual), list(expected))
 
 
 if __name__ == "__main__":

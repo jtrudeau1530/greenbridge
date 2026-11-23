@@ -5,12 +5,14 @@ llvm-mc).
 """
 import os
 import random
+import subprocess
 import sys
 import tempfile
 
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "cf_diff.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import cf_diff  # noqa: E402
@@ -119,6 +121,13 @@ def test_minimize_keeps_the_mismatch(monkeypatch):
 
 def test_self_test_passes():
     assert cf_diff.self_test() is True
+
+
+def test_no_arguments_prints_usage():
+    proc = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True, timeout=5)
+    assert proc.returncode == 2
+    assert "usage:" in proc.stderr
+    assert "Traceback" not in proc.stderr
 
 
 def test_generator_covers_every_shape():

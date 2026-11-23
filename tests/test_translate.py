@@ -327,6 +327,37 @@ def test_geometry_without_signatures_is_rejected(make_shader):
         shader.translate()
 
 
+def test_gs_packed_input_register_emits_one_variable(make_shader):
+    """Packed ISG1 elements sharing a register must emit one %gs_inN variable and pass spirv-val."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "gs_tri.asm"), encoding="utf-8") as f:
+        asm = f.read()
+    dxbc = make_dxbc([
+        signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0x3), (1, 0, 0xC)]),
+        signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)]),
+    ])
+    shader = make_shader(asm, "gs_tri_packed", dxbc=dxbc)
+    spvasm = shader.translate()
+    assert spvasm.count("%gs_in1 = OpVariable") == 1
+    assert spvasm.count("OpDecorate %gs_in1 Location 1") == 1
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert meta["gs_inputs"] == [0, 1]
+    assert meta["gs_input_locations"] == [1]
+    shader.validate(spvasm)
+
+
+def test_gs_conflicting_position_and_user_in_same_register_rejected(make_shader):
+    """Sharing one GS input register between SV_Position and a user varying cannot map to one variable."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "gs_tri.asm"), encoding="utf-8") as f:
+        asm = f.read()
+    dxbc = make_dxbc([
+        signature_chunk(b"ISG1", [(0, 1, 0x3), (0, 0, 0xC)]),
+        signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)]),
+    ])
+    shader = make_shader(asm, "gs_tri_conflict", dxbc=dxbc)
+    with pytest.raises(rdna2spirv.Unsupported):
+        shader.translate()
+
+
 @pytest.mark.parametrize("kw", [dict(topology=1), dict(threads=(2048, 1, 1)), dict(max_vertices=0)],
                          ids=["not-triangles", "over-1024-threads", "no-vertices"])
 def test_mesh_bad_psv0_is_rejected(make_shader, kw):

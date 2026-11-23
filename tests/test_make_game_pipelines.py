@@ -3,6 +3,7 @@
 Standard library only; no GPU, no Vulkan SDK, no game data: the checker is mocked.
 """
 import io
+import json
 import os
 import sys
 import tempfile
@@ -26,7 +27,7 @@ class PipelinesJobsTest(unittest.TestCase):
         os.makedirs(self.game)
         os.makedirs(spirv)
         with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader_0": {}}')   # a finished translation is never empty
 
     def checker_args(self, call):
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
@@ -120,6 +121,10 @@ class PipelinesCrashRetryTest(unittest.TestCase):
             args = [str(a) for a in args]
             self.calls.append(args)
             code = script(args, len(self.calls))
+            if code in (0, 1) and "--inflight-file" in args:
+                # A native checker that finishes its shader pass clears this report, even on validation failure.
+                with open(args[args.index("--inflight-file") + 1], "w", encoding="utf-8", newline="\n") as f:
+                    f.write("")
             if check and code != 0:   # as run() does
                 raise SystemExit(1)
             return code
@@ -142,8 +147,14 @@ class PipelinesCrashRetryTest(unittest.TestCase):
     def skipped(self, args):
         return args[args.index("--skip-file") + 1] if "--skip-file" in args else None
 
+    def is_probe(self, args):
+        return ("--count" in args and args[args.index("--count") + 1] == "1"
+                and "--jobs" in args and args[args.index("--jobs") + 1] == "1")
+
     def test_a_named_module_is_skipped_and_the_rest_checked(self):
         def script(args, n):
+            if self.is_probe(args):
+                return ABORT   # it must reproduce alone before it is added to the crash list
             if n == 1:
                 self.inflight_is("b_mod")
                 return ABORT
@@ -155,7 +166,7 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         with mock.patch("sys.stderr", err):
             failed, logs = self.stage(script)
         self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
         self.assertIn("--inflight-file", self.calls[0])
         self.assertIsNone(self.skipped(self.calls[0]))
         self.assertTrue(any("b_mod took vk_pipeline_check down" in m and "0x80000003" in m for m in logs), logs)
@@ -165,7 +176,7 @@ class PipelinesCrashRetryTest(unittest.TestCase):
 
     def test_several_in_flight_are_tried_alone_and_only_the_crasher_is_skipped(self):
         def script(args, n):
-            if "--start" in args:   # crashes_alone: the index is name-sorted, so a_mod=0, b_mod=1, c_mod=2
+            if self.is_probe(args):   # the global index is name-sorted, so a_mod=0, b_mod=1, c_mod=2
                 self.assertEqual(args[args.index("--count") + 1], "1")
                 return ABORT if args[args.index("--start") + 1] == "2" else 0
             if n == 1:
@@ -177,15 +188,15 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         with mock.patch("sys.stderr", io.StringIO()):
             failed, _ = self.stage(script)
         self.assertIsNotNone(failed)
-        starts = [c[c.index("--start") + 1] for c in self.calls if "--start" in c]
+        starts = [c[c.index("--start") + 1] for c in self.calls if self.is_probe(c)]
         self.assertEqual(starts, ["0", "2"])
 
-    def test_a_crash_with_nothing_in_flight_is_not_retried(self):
+    def test_a_crash_with_nothing_in_flight_stops_after_reaching_one_entry(self):
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
             failed, _ = self.stage(lambda args, n: ABORT)
         self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 2)   # range of 3, then its first single-entry subrange
         self.assertIn("no module could be named", err.getvalue())
 
     def test_ctrl_c_is_not_retried(self):
@@ -198,15 +209,20 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
 
     def test_the_retries_stop(self):
-        names = iter([f"m{i}" for i in range(20)])
+        all_names = [f"m{i}" for i in range(20)]
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({name: {} for name in all_names}, f)
+        names = iter(all_names)
         def script(args, n):
+            if self.is_probe(args):
+                return ABORT
             self.inflight_is(next(names))
             return ABORT
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
             failed, _ = self.stage(script)
         self.assertIsNotNone(failed)
-        self.assertEqual(len(self.calls), make_game.PIPELINE_CRASH_RETRIES + 1)
+        self.assertEqual(len([c for c in self.calls if not self.is_probe(c)]), make_game.PIPELINE_CRASH_RETRIES + 1)
         self.assertIn("still crashed after", err.getvalue())
 
     def test_a_clean_run_is_one_call_and_an_old_skip_list_is_dropped(self):

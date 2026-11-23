@@ -17,6 +17,7 @@
 #include "statistics_sum_spirv.h"
 #include "vulkan13_features.h"
 #include "vulkan_depth24.h"
+#include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
 #include "queue_families.h"
@@ -85,6 +86,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)                                      \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
@@ -866,7 +868,7 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit)) return false;
+            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return false;
             buffer = b->buffer;
@@ -953,6 +955,13 @@ public:
         std::unique_lock lock(resource_mutex_);
         predicated_copier_ = std::make_unique<PredicatedBufferCopier>(get, device_, limits);
     }
+    // Counts for DISPATCH-only ExecuteIndirect are read by a helper compute shader from GPU memory.
+    // Requires Vulkan bufferDeviceAddress, already enabled for the D3D12 address arena.
+    void configure_counted_dispatch(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
+                                    const VkPhysicalDeviceLimits& limits) {
+        std::unique_lock lock(resource_mutex_);
+        counted_dispatch_ = std::make_unique<IndirectDispatchCounter>(get, device_, memory, limits);
+    }
     VkDevice device() const { return device_; }
 
     // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
@@ -990,6 +999,14 @@ public:
         storage_pending_.insert(id);
     }
 
+    // A device-local buffer D3D12 says starts zeroed (D3D-71): the host cannot write it, so the next submission on
+    // any queue fills it with zeros ahead of its lists. That submission publishes the same initialisation semaphore as
+    // the storage images above, so a list on another queue that uses the buffer first waits for the fill.
+    void zero_on_next_submit(ResourceId id, VkBuffer buffer) {
+        std::lock_guard lock(storage_mutex_);
+        zero_pending_.push_back({id, buffer});
+    }
+
     void add_sparse_buffer(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseBuffer> buffer) {
         std::unique_lock lock(resource_mutex_);
         set_resource_locked(id, binding);
@@ -1006,6 +1023,10 @@ public:
             unindex_buffer(id, it->second);
             resources_.erase(it);
             sparse_buffers_.erase(id);
+        }
+        {
+            std::lock_guard lock(storage_mutex_);  // a buffer destroyed before any submission is not filled
+            std::erase_if(zero_pending_, [id](const PendingZero& zero) { return zero.id == id; });
         }
         if (img) {
             std::lock_guard vlock(views_mutex_);
@@ -1346,8 +1367,13 @@ private:
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
-    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ only
+    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
     std::unordered_set<ResourceId> storage_pending_;
+    struct PendingZero {
+        ResourceId id;
+        VkBuffer buffer;
+    };
+    std::vector<PendingZero> zero_pending_;  // zero_on_next_submit
     // The last submission that initialized storage images (its queue's progress semaphore and ticket) and a counter
     // that says which one: every other queue's next submission waits for it, so no queue uses such an image before
     // the zero-fill that put it in GENERAL has run.
@@ -1366,6 +1392,7 @@ private:
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
+    std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
@@ -1488,6 +1515,12 @@ public:
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
+        }
+        if (progress_) {
+            // This queue is idle, so whatever initialisation it published (storage images, zero-filled buffers) has
+            // finished: the next submission on another queue must not wait on a semaphore that is about to go.
+            std::lock_guard lock(context_.storage_mutex_);
+            if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -1690,6 +1723,7 @@ private:
                 if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
         std::unique_ptr<PredicateReducer::Batch> batch;
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
+        std::unique_ptr<IndirectDispatchCounter::Batch> counted_batch;
         if (captures) {
             if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
                 return ReplayResult::unsupported;
@@ -1725,6 +1759,19 @@ private:
                     scratch_guard.active = true;
                 }
                 return context_.scratch_->get(bytes, buffer, offset);
+            };
+        }
+        if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
+            replay.prepare_counted_dispatch = [this, &tracker_lock, &counted_batch](
+                VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
+                std::uint32_t stride, std::uint32_t maximum, CountedDispatch& out) {
+                // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!counted_batch) counted_batch = context_.counted_dispatch_->batch();
+                return counted_batch->prepare(args, args_offset, count, count_offset, stride, maximum, out);
+            };
+            replay.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
+                context_.counted_dispatch_->emit(cb, job);
             };
         }
         if (context_.depth24_ && !transfer_only) {
@@ -1871,6 +1918,7 @@ private:
                 runs_shaders |= std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
                                 std::holds_alternative<ExecuteIndirect>(command);
         std::vector<ResourceId> storage_images;
+        std::vector<VulkanContext::PendingZero> zero_buffers;
         {
             std::lock_guard lock(context_.storage_mutex_);
             if (context_.storage_init_semaphore_ && context_.storage_init_semaphore_ != progress_ &&
@@ -1882,6 +1930,16 @@ private:
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
+            zero_buffers.swap(context_.zero_pending_);  // any queue can fill a buffer
+        }
+        for (const auto& zero : zero_buffers)
+            context_.vk.vkCmdFillBuffer(command_buffer, zero.buffer, 0, VK_WHOLE_SIZE, 0);
+        if (!zero_buffers.empty()) {
+            VkMemoryBarrier filled{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            filled.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &filled, 0, nullptr, 0, nullptr);
         }
         for (const ResourceId id : storage_images) {
             const ResourceBinding* image = context_.resolve(id);
@@ -1937,11 +1995,13 @@ private:
             wait_values_.push_back(submitted_);
         }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
-        if (!submitted && !storage_images.empty()) {  // not initialized after all: try again with the next submission
+        if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
+            // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
+            context_.zero_pending_.insert(context_.zero_pending_.end(), zero_buffers.begin(), zero_buffers.end());
         }
-        if (submitted && !storage_images.empty()) {
+        if (submitted && (!storage_images.empty() || !zero_buffers.empty())) {
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_init_semaphore_ = progress_;
             context_.storage_init_value_ = submitted_;
@@ -1956,6 +2016,7 @@ private:
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
+            slot->counted_dispatch = std::move(counted_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
@@ -2110,6 +2171,7 @@ private:
         std::vector<std::shared_ptr<const OcclusionSegmentPool>> segments;
         std::vector<VkEvent> events;  // order_timestamp_copy's, reset and reused once the slot completes
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
+        std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
     };
 
@@ -2228,6 +2290,7 @@ private:
             if (context_.vk.vkResetCommandBuffer(reuse->buffer, 0) != VK_SUCCESS) return nullptr;
             reuse->predicate.reset();
             reuse->predicated_copy.reset();
+            reuse->counted_dispatch.reset();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }

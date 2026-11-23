@@ -401,10 +401,66 @@ The place names shown to the player come from one `GameShape__Data__LocationName
   sections.
 - **All 2,280 interior positions lie inside the world rectangle** shared by the `PAMH` heightmap and the region
   tint map (x -13,312..5,120, y -9,728..11,264); none is at the origin. Heights run from -78 to 821 (median 5).
-- None of the keys is an archive entry name or the joaat of a model archetype name in the local catalog, the two
-  texture-dictionary names match archive entries but not `.ytd` ones, so the keys are their own namespace (probably shape
-  or zone ids resolved elsewhere at runtime; not measured). The 46 textures match no texture-dictionary item
-  in the catalog either.
+- **Interior keys are interior archetype names.** 1,357 of the 1,358 `InteriorNames` keys, lower-cased, are the
+  joaat `name` of a `CMloArchetypeDef` in `levels.rpf`, and all 1,357 are confirmed by that archetype's 64-bit key
+  (MurmurHash3 x64 low 64 of the lower-cased key at +0x08, member `8bfb6095`). The remaining key names no interior
+  and its hash occurs in no hash member of `levels.rpf`. The earlier "own namespace" reading came from a 1 GiB
+  window holding 15 of the 1,706 interior archetypes and from the model catalog, which has no interiors. See
+  [Interior keys and interior placements](#interior-keys-and-interior-placements).
+- None of the location, river or road keys is an archive entry name or the joaat of a model archetype name in the
+  local catalog; the two texture-dictionary names match archive entries but not `.ytd` ones. The 46 textures
+  match no texture-dictionary item in the catalog either.
+
+### Interior keys and interior placements
+
+`tools/world_interior_names.py` reads every interior definition and every interior placement in `levels.rpf`
+and joins them with the `InteriorNames` section (full archive, `--jobs 15`, about 2 minutes):
+
+| Measured | Count |
+|---|---:|
+| `CMloArchetypeDef` definitions / distinct names | 1,706 / 1,706 |
+| `CMloInstanceDef` placements / distinct interiors placed | 2,590 / 1,704 |
+| keys naming an interior (confirmed by the 64-bit key) | 1,357 (1,357) |
+| keys whose interior is placed | 1,356 |
+| ... with as many positions as placements | 1,268 |
+| ... with more positions than placements | 64 |
+| ... with fewer positions than placements | 24 |
+
+So a key selects one interior archetype, and its inner items are, in most cases, one per placed copy of that
+interior: the `Name` of each item labels that copy.
+
+Interiors are not placed by `CEntityDef`: no entity in the 1,670,435 rows of `world_index.py --entities-out`
+uses an interior name. They are placed by `CMloInstanceDef` (`09cc28be`, 0x250 bytes), which carries the entity
+members `rotation` (+0x10), `position` (+0x38), `archetypeName` (+0x44), `scaleXY` (+0x54) and `scaleZ` (+0x58)
+plus interior-specific members. These 2,590 placements are separate from the 23,535 map / 1,670,442 entity
+census, which counts `CEntityDef` only.
+
+The positions sit at the edge of their own interior, not at its origin or centre. Distance from each of the 2,278
+positions to the nearest placed copy of its own interior's box (0 = inside):
+
+| Rotation | Inside | ≤ 1 m | ≤ 2 m | ≤ 5 m | ≤ 25 m | ≤ 100 m | Median | In a non-`limbo` room box |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| stored quaternion | 315 | 1,015 | 1,189 | 1,443 | 1,867 | 2,199 | 1.72 m | 213 |
+| conjugated | 571 | 950 | 1,121 | 1,416 | 1,863 | 2,199 | 2.10 m | 482 |
+
+The interior box's largest side has a median of 16.7 m. Most positions are therefore just outside or just inside
+the interior shell, which fits an entry or label point; that they are doors is a hypothesis (portals were not
+compared). The conjugated rotation puts more positions inside rooms, consistent with the entity rule in
+[Map placement records](#map-placement-records); it is not a separate proof of it. 79 positions are more than
+100 m from every copy of their interior.
+
+Interior rooms (`CMloRoomDef` `0b1811f1`, 0x70 bytes: `name` +0x00, `bbMin` +0x10, `bbMax` +0x20) are reached
+through the interior's array members, which use the `InstanceList` reference of
+[Instanced props and grass](#instanced-props-and-grass) (1-based block index, offset from bit 20, u16 count). Room
+names are lower-cased joaat; in all 908 resources that hold one interior, its first room is `limbo`. A room's hash member `a261e0a9` (+0x34)
+holds the hash of 267 interior keys.
+
+```powershell
+python -I tools\gamedata_reader.py <work>\common --root GameShape__Data__LocationNameLoopkup --out <work>\gamedata
+python -I tools\world_interior_names.py <game>\levels.rpf --names <work>\gamedata\GameShape__Data__LocationNameLoopkup_<offset>.json `
+    --jobs 15 --out <work>\world\interior_names.json
+python -I tests\test_world_interior_names.py
+```
 
 ## What a runtime needs
 

@@ -668,8 +668,6 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
             hint = " To prepare the loader without exporting assets, use --stages check,shaders,runtime."
         fail(f"{free_gb:.0f} GB free on the drive of {work}, about {need_gb} GB is needed. "
              "Free some space or choose another drive with --work." + hint)
-    if "assets" in stages:
-        ensure_submodule()
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
     if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
@@ -678,6 +676,8 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
             fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
                  "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
                  "runtime/build/linux and run the build again.")
+    if "assets" in stages:
+        ensure_submodule()
 
 
 def visual_cpp_tools_ok() -> bool:
@@ -787,15 +787,21 @@ def ensure_submodule() -> None:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if os.path.isdir(core) and os.listdir(core):
         return
+    clone = "git clone --recursive https://github.com/ItsNotRexed/Leonida"
     git = shutil.which("git")
-    if git and subprocess.run([git, "-C", ROOT, "rev-parse", "--resolve-git-dir", ".git"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        log("fetching third_party/rpf9-explorer")
-        r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
-        if r.returncode == 0 and os.path.isdir(core):
-            return
-    fail("third_party/rpf9-explorer is missing. Download the project with: "
-         "git clone --recursive <this repository's URL>")
+    if not git:
+        fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). Install Git "
+             f"(https://git-scm.com/downloads) and download the project with: {clone}")
+    if subprocess.run([git, "-C", ROOT, "rev-parse", "--resolve-git-dir", ".git"],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). "
+             f"Download the project with: {clone}")
+    log("fetching third_party/rpf9-explorer")
+    r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
+    if r.returncode == 0 and os.path.isdir(core):
+        return
+    fail("fetching third_party/rpf9-explorer failed. Check your network connection, then run "
+         "\"git submodule update --init --recursive\" in this folder and build again.")
 
 
 def check(game: str, full: bool) -> dict:
@@ -1160,6 +1166,25 @@ def fallback_flags(a) -> tuple[str, ...]:
     return tuple(flag for flag, attr in FALLBACK_FLAGS if getattr(a, attr, False))
 
 
+def recorded_fallback_flags(work: str) -> tuple[str, ...]:
+    """The fallback flags the translation in `work` was made with (spirv/translator_flags.txt), () when there is none."""
+    return tuple(read_shader_setting(os.path.join(work, "shaders", "spirv", "translator_flags.txt")).split())
+
+
+def keep_recorded_fallback(flag: str, work: str) -> bool:
+    """Whether an automatic fallback flag stays on when the GPU probe can't tell if the GPU needs it.
+
+    The probe answers differently from run to run (a GPU asleep or hidden, a missing Vulkan loader, its 60 s
+    timeout). Dropping the flag then would translate the whole corpus without it, and the next run that can ask
+    would translate it a third time. A flag the probe turned on was needed by the GPU it last reached, so a
+    translation made with it is kept, as wave64 emulation is; a probe that answers still decides."""
+    if flag not in recorded_fallback_flags(work):
+        return False
+    log(f"shaders: couldn't ask the GPU the runtime would use whether it needs {flag}; the shaders were translated "
+        "with it and it stays on instead of translating them all again (a run that can ask the GPU decides again)")
+    return True
+
+
 def smallest_max_subgroup(vulkaninfo_text: str):
     """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
@@ -1266,7 +1291,7 @@ def runtime_gpu_max_push_constants():
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
-                       "gfx10_formats.json")
+                       "spirv_opt.py", "report_paths.py", "gfx10_formats.json")
 
 
 def sources_digest(folder: str, names, lead: str = "") -> str:
@@ -1382,8 +1407,36 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         raise
     bad = [f"shard {i} exited with {r}" for i, r in zip(todo, codes) if r != 0]
     if bad:
+        # An older index describes the corpus from the run before: keeping it would make the next run take the
+        # failed translation as finished. The next successful --merge writes it again.
+        index = os.path.join(spirv, "index.json")
+        try:
+            os.remove(index)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log(f"  cannot remove the stale {index}: {e}")
         fail("rdna2spirv.py: " + ", ".join(bad))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
+    index = os.path.join(spirv, "index.json")
+    if os.path.isfile(index):
+        # Present but empty or unreadable: the merge published nothing, and the next run would read that as finished.
+        try:
+            with open(index, encoding="utf-8") as f:
+                merged = json.load(f)
+        except (OSError, ValueError) as e:
+            os.remove(index)
+            fail(f"rdna2spirv.py --merge wrote an unreadable {index}: {e}")
+        if not merged:
+            # A marker left behind would look like a finished translation to the next run; drop it with the failure.
+            os.remove(index)
+            # The plan would make the retry reuse the same empty parts even after the disassembly was repaired.
+            try:
+                os.remove(plan_path)
+            except OSError:
+                pass
+            fail("rdna2spirv.py translated 0 shaders, so the empty index is not kept. Run the shaders stage again; "
+                 "if it happens again, the disassembly logged above is why.")
 
 
 # ---------------------------------------------------------------- assets
@@ -1403,6 +1456,11 @@ def decoder_digest() -> str:
     if git and os.path.exists(os.path.join(sub, ".git")):
         r = subprocess.run([git, "-C", sub, "rev-parse", "HEAD"], capture_output=True, text=True)
         pin = r.stdout.strip() if r.returncode == 0 else ""
+        # An edit to a tracked submodule file that is not committed changes the decoder but not HEAD.
+        # shortcut: new untracked files in the submodule are not seen; hash them too if that comes up.
+        r = subprocess.run([git, "-C", sub, "diff", "HEAD"], capture_output=True)
+        if r.returncode == 0 and r.stdout:
+            pin += "+" + hashlib.sha256(r.stdout).hexdigest()
     folder = os.path.join(TOOLS, "rpf9dump")
     names = sorted(n for n in os.listdir(folder) if n.endswith((".cs", ".csproj", ".json")))
     return sources_digest(folder, names, pin)
@@ -1468,7 +1526,9 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
             folder = os.path.join(out, name, mode)
             record = os.path.join(folder, DECODER_RECORD)
             if os.path.isdir(folder) and read_shader_setting(record) != decoder:
-                # rpf9dump keeps the files it finds, so another decoder's output is removed first.
+                # rpf9dump keeps the files it finds, so another decoder's output is removed first. The exporter is
+                # built before that: a build that fails leaves the old export in place.
+                get_exporter(work)
                 log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
                 shutil.rmtree(folder)
             elif os.path.isfile(os.path.join(folder, "manifest.json")):
@@ -1715,8 +1775,17 @@ def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
 
 def require_translated_shaders(work: str) -> str:
     spirv = os.path.join(work, "shaders", "spirv")
-    if not os.path.isfile(os.path.join(spirv, "index.json")):
+    index = os.path.join(spirv, "index.json")
+    if not os.path.isfile(index):
         fail("No translated shaders yet: run the shaders stage first.")
+    try:
+        with open(index, encoding="utf-8") as f:
+            translated = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"The translated shader index {index} is unreadable ({e}): run the shaders stage again.")
+    if not translated:
+        # A build from before the shaders stage refused an empty merge can carry this marker.
+        fail(f"The translated shader index {index} is empty, so there is nothing to check. Run the shaders stage again.")
     return spirv
 
 
@@ -1746,28 +1815,65 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         log("pipelines: done")
         return
     base += ["--inflight-file", inflight]
+    # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
+    # exceed available memory, without starting the entire corpus again (BUILD-1030).
+    names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     crashed: "list[str]" = []
-    code = 0
-    for _ in range(PIPELINE_CRASH_RETRIES + 1):
-        code = run(base + (["--skip-file", skip] if crashed else []), check=False)
-        if code in (0, 1, 2) or interrupted(code):
-            break
-        # The driver took vk_pipeline_check down. Name the module it was compiling and check the rest without it:
-        # what was already compiled comes back from pipeline_cache.bin, saved every 10 minutes.
-        suspects = [n for n in read_names(inflight) if n not in crashed]
-        if len(suspects) > 1:   # several were compiling: keep the ones that also kill it on their own
-            suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n)]
-        if not suspects:
-            fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
-                 "run the pipelines stage again, and report it if it keeps happening")
-        for n in suspects:
-            log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
-        crashed += suspects
-        with open(skip, "w", encoding="utf-8", newline="\n") as f:
-            f.write("".join(n + "\n" for n in crashed))
-    else:
+
+    def check_range(start: int = 0, count: "int | None" = None) -> int:
+        selection = ["--start", str(start), "--count", str(count)] if count is not None else []
+        allowed = set(names[start:start + count]) if count is not None else None
+        for _ in range(PIPELINE_CRASH_RETRIES + 1):
+            drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
+            code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
+            # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
+            # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
+            if code == 1 and not os.path.isfile(inflight):
+                fail("vk_pipeline_check exited with 1 before writing its work report; check Vulkan initialization "
+                     "and report-file access in the output above")
+            if code in (0, 1, 2) or interrupted(code):
+                return code
+            suspects = list(dict.fromkeys(n for n in read_names(inflight)
+                                          if n not in crashed and (allowed is None or n in allowed)))
+            # Even the last in-flight module can be innocent after other heavy compiles in the batch.
+            if count is not None or len(suspects) > 1:
+                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
+            if not suspects:
+                if count is not None and count > 1:
+                    # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
+                    # range in smaller processes; completed earlier batches retain their cache checkpoints.
+                    log(f"pipelines: shaders {start + 1}-{start + count} exited with {exit_label(code)} without "
+                        "a reproducible module crash; retrying this range in smaller batches")
+                    half = count // 2
+                    first = check_range(start, half)
+                    if first == 2 or interrupted(first):
+                        return first
+                    second = check_range(start + half, count - half)
+                    return second or first
+                fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
+                     "the checker could not finish even this range in a fresh process; check available memory "
+                     "and report it if it keeps happening")
+            for n in suspects:
+                log(f"pipelines: {n} took vk_pipeline_check down ({exit_label(code)}); checking the rest without it")
+            crashed.extend(suspects)
+            with open(skip, "w", encoding="utf-8", newline="\n") as f:
+                f.write("".join(n + "\n" for n in crashed))
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
+
+    code = 0
+    ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
+              for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
+    for start, count in ranges:
+        if count is not None:
+            log(f"pipelines: checking shaders {start + 1}-{start + count} of {len(names)} in a fresh process")
+        result = check_range(start, count)
+        if result:
+            code = result   # a later successful batch must not erase an earlier validation failure
+        if result == 2 or interrupted(result):
+            break
+    if crashed and not code:
+        code = 1
     drop(inflight)
     if code != 0:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
@@ -1779,6 +1885,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
 # 10 minutes since the last cache checkpoint, plus loading the cache).
 PIPELINE_CRASH_RETRIES = 5
+PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
 
 
 def interrupted(code: int) -> bool:
@@ -1814,15 +1921,42 @@ def read_names(path: str) -> "list[str]":
         return []
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str) -> bool:
-    """Whether one module takes vk_pipeline_check down on its own: --start/--count select it in the checker's
-    name-sorted index (byte order, as its std::map)."""
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
-        names = sorted(json.load(f), key=lambda n: n.encode("utf-8"))
+def pipeline_names(spirv: str) -> "list[str]":
+    """The checker's name-sorted index (byte order, as its std::map); ranges and diagnostic probes share it."""
+    path = os.path.join(spirv, "index.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"pipelines: cannot read {path}: {e}")
+    if not isinstance(index, dict):
+        fail(f"pipelines: {path} must contain a JSON object")
+    return sorted(index, key=lambda n: n.encode("utf-8"))
+
+
+def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:
+    """Whether one module takes vk_pipeline_check down on its own, using its global index position."""
+    names = pipeline_names(spirv)
     if name not in names:
         return False
-    code = run([exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"], check=False)
+    args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
+    if inflight:
+        drop(inflight)
+        args += ["--inflight-file", inflight]
+    code = run(args, check=False)
+    if code == 1 and inflight and not os.path.isfile(inflight):
+        fail(f"pipelines: checking {name} alone exited with 1 before writing its work report; "
+             "check Vulkan initialization and report-file access in the output above")
+    if interrupted(code) or code == 2:
+        fail(f"pipelines: checking {name} alone stopped with {exit_label(code)}")
     return code not in (0, 1, 2) and not interrupted(code)
+
+
+def path_is_within(path: str, directory: str) -> bool:
+    try:
+        return os.path.commonpath([path, directory]) == directory
+    except ValueError:  # Different Windows drives or UNC shares have no common path.
+        return False
 
 
 def main() -> int:
@@ -1911,20 +2045,16 @@ def main() -> int:
         except OSError:
             game_entries = []
     for p in (out, work):
-        try:
-            # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
-            real_destination = os.path.normcase(os.path.realpath(p))
-            if is_game_drive_root:
-                # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
-                # inside the dump's existing top-level entries, but allow separate top-level folders.
-                inside = (real_destination == real_game) or any(
-                    os.path.commonpath([real_destination, entry]) == entry
-                    for entry in game_entries
-                )
-            else:
-                inside = os.path.commonpath([real_destination, real_game]) == real_game
-        except ValueError:          # different drives
-            inside = False
+        # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
+        real_destination = os.path.normcase(os.path.realpath(p))
+        if is_game_drive_root:
+            # If the game is at drive root (e.g. D:\), reject the drive root itself and anything
+            # inside the dump's existing top-level entries, but allow separate top-level folders.
+            inside = (real_destination == real_game) or any(
+                path_is_within(real_destination, entry) for entry in game_entries
+            )
+        else:
+            inside = path_is_within(real_destination, real_game)
         if inside:
             fail("--out and --work must be outside the game folder.")
     runtime_build = os.path.abspath(a.runtime_build) if a.runtime_build else None
@@ -1936,14 +2066,20 @@ def main() -> int:
                 "(or pass --runtime-build)")
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
-    if "shaders" in stages and not a.f16_interp_fallback and runtime_gpu_per_vertex() is False:
-        log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
-            "fragmentShaderBarycentric): translating with --f16-interp-fallback")
-        a.f16_interp_fallback = True
+    if "shaders" in stages and not a.f16_interp_fallback:
+        per_vertex = runtime_gpu_per_vertex()
+        if per_vertex is False:
+            log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
+                "fragmentShaderBarycentric): translating with --f16-interp-fallback")
+            a.f16_interp_fallback = True
+        elif per_vertex is None:
+            a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
         max_pc = runtime_gpu_max_push_constants()
-        if max_pc is not None and max_pc < need_pc:
+        if max_pc is None:
+            a.pc_tail_ubo = keep_recorded_fallback("--pc-tail-ubo", work)
+        elif max_pc < need_pc:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True

@@ -4,7 +4,9 @@ RDNA2 ISA: VCCZ/VCCNZ test the whole 64-bit register. A shader that writes vcc_l
 vcc_hi with s_mov_b32 is using VCC as ordinary scalar data, not as a lane mask: in the
 translation each lane holds the same low word in %vcc and the same high word in %vcc_hi.
 The old branch_condition() loaded only %vcc, so a high-only non-zero VCC looked zero.
-A VCC that was a lane mask earlier and is then overwritten with data is a separate
+Both SGPR-source and constant writes are covered: @ray3242's original reproducer uses
+`s_mov_b32 vcc_lo, 0` / `s_mov_b32 vcc_hi, 0x8000000a`. A VCC that was a lane mask
+earlier and is then overwritten with data is a separate
 dataflow limitation of #2544 and is not covered here.
 
 Each case is a synthetic 64-thread compute shader translated by tools/rdna2spirv.py and
@@ -93,6 +95,7 @@ CASES = [
     (0xA, 0x8000000A),
     (M32, M32),
 ]
+CONST_CASES = CASES  # @ray3242's reproducer uses constant writes, not SGPR sources
 
 
 class Wave64VccDataBranchTests(unittest.TestCase):
@@ -105,6 +108,11 @@ class Wave64VccDataBranchTests(unittest.TestCase):
                 "cs_w64_vcc_data_branch_" + suffix, WAVE64 + BUILD_DATA + observe(op))
             cls.progs[("mask", op)] = translate_cs(
                 "cs_w64_vcc_mask_branch_" + suffix, WAVE64 + BUILD_MASK + observe(op))
+            for lo, hi in CONST_CASES:
+                cls.progs[("const", lo, hi, op)] = translate_cs(
+                    f"cs_w64_vcc_const_branch_{suffix}_{lo:x}_{hi:x}",
+                    WAVE64 + [("s_mov_b32 vcc_lo, " + hex(lo), 4),
+                              ("s_mov_b32 vcc_hi, " + hex(hi), 4)] + observe(op))
 
     def test_vcc_data_branch_checks_both_halves(self):
         for lo, hi in CASES:
@@ -113,6 +121,15 @@ class Wave64VccDataBranchTests(unittest.TestCase):
                 self.assertEqual(run(self.progs[("data", "s_cbranch_vccz")], lo, hi),
                                  [9 if nz else 7] * 64)
                 self.assertEqual(run(self.progs[("data", "s_cbranch_vccnz")], lo, hi),
+                                 [7 if nz else 9] * 64)
+
+    def test_vcc_constant_writes_check_both_halves(self):
+        for lo, hi in CONST_CASES:
+            nz = bool((lo | hi) & M32)
+            with self.subTest(lo=hex(lo), hi=hex(hi)):
+                self.assertEqual(run(self.progs[("const", lo, hi, "s_cbranch_vccz")], 0, 0),
+                                 [9 if nz else 7] * 64)
+                self.assertEqual(run(self.progs[("const", lo, hi, "s_cbranch_vccnz")], 0, 0),
                                  [7 if nz else 9] * 64)
 
     def test_certified_vcc_lane_mask_keeps_whole_wave_vote(self):

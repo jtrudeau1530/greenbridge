@@ -71,20 +71,22 @@ RULES32 = ("f32_rte", "f32_rtz", "mul_f32")
 
 def round_frac(x, prec, emin, rtz=False):
     """x rounded to a binary float with prec significand bits (implicit bit included) and minimum normal exponent
-    emin, denormals kept; nearest even, or toward zero. No overflow: every value here is in [-1, 1]."""
-    if x == 0:
+    emin, denormals kept; nearest even, or toward zero. No overflow: every value here is in [-1, 1].
+    Exact, in integers: x = p/q, 2^e <= p/q < 2^(e+1), ulp = 2^k; the significand is p/q / 2^k rounded. Building
+    Fractions for 2^e and the quotient instead gave the same bits about 4x slower (minutes for a 16-bit sweep)."""
+    p, q = x.numerator, x.denominator
+    if p == 0:
         return Fraction(0)
-    sign = -1 if x < 0 else 1
-    a = abs(x)
-    e = a.numerator.bit_length() - a.denominator.bit_length()
-    if Fraction(2) ** e > a:
+    sign, p = (-1, -p) if p < 0 else (1, p)
+    e = p.bit_length() - q.bit_length()                   # floor(log2(p/q)) is e or e - 1
+    if (p << -e if e < 0 else p) < (q << e if e > 0 else q):
         e -= 1
-    if Fraction(2) ** (e + 1) <= a:
-        e += 1
-    ulp = Fraction(2) ** (max(e, emin) - prec + 1)
-    q = a / ulp
-    n = q.numerator // q.denominator if rtz else round(q)     # round() of a Fraction is half to even
-    return sign * n * ulp
+    k = max(e, emin) - prec + 1
+    num, den = (p, q << k) if k >= 0 else (p << -k, q)
+    n, r = divmod(num, den)
+    if not rtz and (2 * r > den or (2 * r == den and n & 1)):   # half to even
+        n += 1
+    return Fraction(sign * n << k) if k >= 0 else Fraction(sign * n, 1 << -k)
 
 
 def f16_bits(v):

@@ -443,6 +443,10 @@ that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, ea
 `s_waitcnt` and `s_barrier`, then stores all 16 result VGPRs of every thread and the whole LDS.
 `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP`.
 
+For the translator oracle, `lds_fuzz.py` and `valu_fuzz.py` create and retain a unique output folder per run. With
+`--work DIR`, that folder is a new child of `DIR` (the printed work directory), rather than `DIR` itself; files from
+older runs and other contents of `DIR` are left alone. Without `--work`, it is created in the system temporary folder.
+
 - **Instructions.** Every read width (`b32` to `b128`, `u8`/`i8`/`u16`/`i16`, `u16_d16[_hi]`, `u8_d16[_hi]`, `i8_d16[_hi]`), the
   byte and short writes (also `d16_hi`), `read2`/`write2` with and without `st64`, the add, sub,
   min, max, and, or and xor atomics with and without return, `wrxchg`, `cmpst`, `ds_swizzle_b32`
@@ -460,7 +464,9 @@ that starts from a known pattern. It runs 4 to 12 random `ds_*` instructions, ea
   `--no-exec KIND` drops one op kind's masks without changing the rest of the program, to separate
   a known finding from new ones.
 - **Subgroup size.** Wave32 programs, and wave64 ones built with `--emulate`, ask `vk_compute_test` for
-  32-lane subgroups (`VKC_SUBGROUP_SIZE=32`). Where the device can't pin that size, `vk_compute_test`
+  32-lane subgroups (`VKC_SUBGROUP_SIZE=32`). Where the device can't require it but 32 is its default
+  (MoltenVK), a probe shader checks the lanes first and the programs are compared (see `docs/testing.md`,
+  "GPUs with 32-wide subgroups"). Where the device can't pin that size at all, `vk_compute_test`
   prints `compute subgroup size: 32 not available` and runs at the driver's choice, and the wave32
   program is a skip, not a mismatch: its words come from another wave size. Mesa llvmpipe (8 lanes)
   is such a device. Emulated wave64 uses no subgroup operations, so it is still compared there.
@@ -671,6 +677,8 @@ c / 255. llvmpipe multiplies by an f32 1/255, which is one ulp above that for 12
 0x3dd8d8da, not 0x3dd8d8d9), and a run stops at its first mismatch, so on llvmpipe no case after the first
 `R8G8B8A8_UNORM` one ran. The translator oracle therefore accepts one ulp on a UNORM8 texel component, never on
 another format or on a sentinel, and the summary says how many components needed it. `--oracle hw` stays bit exact.
+Each run keeps its generated files in a unique output folder. With `--work DIR`, it is a new child of `DIR` and its
+path is printed; existing contents and other runs are left alone. Without `--work`, it is in the system temporary folder.
 
 ```sh
 cmake --build runtime/build --target vk_image_fuzz
@@ -927,6 +935,27 @@ every scalar. `vk_compute_test` reads them back with `VKC_OUT_WORDS` / `VKC_DUMP
   With `--dpp`: a DPP16 or DPP8 src0 on `v_mov`/`v_not`/`v_add_nc_u32`/`v_xor`, with every DPP16 control,
   `row_mask`, `bank_mask`, `bound_ctrl` and `fi`. Masks read as plain data (`v_mov_b32 v, s_mask`) belong to
   #293 and are left out with `--no-maskdata`.
+- **`--ext` (wave64 programs only).** Adds the ops the list above leaves out: carries (`v_add_co`, `v_sub_co`,
+  `v_subrev_co_u32` and the `_ci` forms) through SGPR pairs and VCC; `ds_bpermute_b32`, `ds_permute_b32` (address
+  permutations and colliding addresses) and `ds_swizzle_b32` (`QUAD_PERM`, `BITMASK_PERM`, `SWAP`, `REVERSE`,
+  `BROADCAST`); `v_readlane`/`v_writelane` with an SGPR lane select of 64 and up; `s_bcnt0/1` and `s_ff0/1` of a
+  mask, `s_and/or/xor/andn2_b64`, the ten `s_*_saveexec_b64` forms and `s_andn1/andn2_wrexec_b64`, `s_wqm_b64`,
+  `s_cmp_eq/lg_u64` and `s_bitcmp0/1_b64`, each followed by an `s_cselect_b32` so that its SCC is stored;
+  `s_cselect_b64` between masks, `s_mov_b64 exec, mask`, `s_bfm_b64` into a mask or EXEC; and a loop in LLVM's
+  SI_LOOP shape (per-lane trip counts of 1 to 8, a break mask, `s_andn2_b64 exec`, `s_cbranch_execnz` back to the
+  head) around one to four of the other ops. Without the flag, and for wave32 programs with it, a seed gives the
+  same program as before. The model of every op was checked on an AMD Radeon RDNA2 iGPU (gfx1036, Ryzen 9
+  9950X3D, raw wave64 kernels): `--ext --dpp --wave 64 --oracle hw --programs 100 --seed 21` matches 100/100,
+  with groups of one to three waves and partial waves. What that run settled where the ISA guide is terse: the
+  three DS ops need `s_waitcnt lgkmcnt(0)` before their result is used (without it a later VALU write to the same
+  VGPR is overwritten when the result arrives; the generator emits the wait); `ds_bpermute_b32` and
+  `ds_permute_b32` stay inside the lane's 32-lane half; with several senders `ds_permute_b32` keeps the highest
+  lane's value; an EXEC-off source reads 0 in `ds_bpermute_b32` and in `ds_swizzle_b32`. The translator matches
+  the same 100 programs on that GPU both natively (64-wide subgroup, `--w64-native`) and with
+  `--wave64-emulate`, apart from 15 that reach a known open case and are filed `hyp_only`: an EXEC-off
+  `v_permlane` source (#580) or `ds_swizzle_b32` source (#2780, tagged like the permlane case until it lands). An
+  RTX 5080 (driver 616.92) gives 46 matches and 14 `hyp_only` of 60 emulated programs (`--seed 23`). Not
+  generated: 32-bit ops on one half of a mask or of EXEC (#663, #3225) and carries with a DPP source (#3553).
 - **Reference.** A 64-lane model in the same file, written from the ISA (rules in its docstring). Its unit
   test, `tests/test_crosslane_fuzz.py`, needs no GPU.
 - **Defined behaviour only.** Lane selects, permlane and DPP never read a lane missing from a partial wave.
@@ -1658,11 +1687,9 @@ metadata to copy the conventions from. With the built-in `interp2` template on g
 the perspective I/J barycentrics are in v0/v1, M0 comes from s2 (`s_mov_b32 m0, s2`), and parameters 0 and 1 are
 the vertex shader's locations 0 = (u, v, 0, 1) and 1 = (u, v, 0, 0), u and v going 0..2 across the screen.
 
-```powershell
 $env:LEONIDA_VK_DEVICE = "radeon"
 python -I tools/ps_oracle.py --build <runtime build> --template interp2 --show-template
 python -I tools/ps_oracle.py --build <runtime build> --template interp2 --asm body.s --size 4 1 [--json out.json]
-```
 
 Checked on an AMD Radeon iGPU (gfx1036, Windows driver 26.10.1): the driver accepts a patched binary (there is no
 check over the code), the patched code runs as the pixel shader, and `v_interp_p1/p2_f32` of `attr0.x` at the four
@@ -1687,6 +1714,7 @@ limits: `--set` is refused (RADV keeps the SPI setup in its own structs, so a te
 needs), and only GFX10 (RDNA1/RDNA2) devices are taken, from the chip name RADV puts in the device name; GFX11 and
 later interpolate with `lds_param_load` instead of `v_interp_*`, so e.g. an RX 9070 XT (`RADV GFX1201`) gets
 `unsupported architecture` and exit 77.
+### Packed 16-bit integer operations on RDNA2 (SHADER-302)
 
 Mesa optimises varyings across stages, so a template's parameter layout can differ from the Windows driver's:
 RADV moves `interp2`'s `in0 + in1` into the vertex shader and the pixel shader reads one parameter, attr0 =
@@ -1700,6 +1728,53 @@ Checked on the Ryzen 7 9800X3D iGPU (`RADV RAPHAEL_MENDOCINO`, gfx1036, wave64 p
 the Windows check's `attr0.x` code (with `v40`, past the template's 8 VGPRs) gives u = 0.25, 0.75, 1.25, 1.75,
 P0 = 0 and P10 = 4.0 for the single parameter, and a second patch with another constant changes the result (nothing
 is cached).
+
+- **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
+- **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
+- **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
+#### Helper lanes at a triangle edge (`tools/ps_helper_probe.py`, SHADER-681)
+
+What a pixel wave does with the helper lanes of a partly covered 2x2 quad, which the translator's EXEC model and
+`s_wqm` lowering depend on (`docs/design.md` row "Whole-quad mode"). The probe draws one triangle, (-1, -1), (1.3, -1),
+(-1, 0.9), into a 16 x 16 target, so its edge cuts quads; the varying is the vertex position, so each lane's
+interpolated value is its own pixel centre. The template pixel shader takes a derivative, so the driver builds it as
+a shader that needs quads. Seven wave64 programs replace the pixel shader. A helper is never written to the target,
+so a covered lane of the same quad reads the helper's registers through DPP `quad_perm` and exports them.
+
+```sh
+LEONIDA_VK_DEVICE=raphael python -I tools/ps_helper_probe.py --build <runtime build> [--json out.json]
+```
+
+On the Ryzen 7 9800X3D iGPU (`RADV RAPHAEL_MENDOCINO`, gfx1036, Mesa 26.3.1): 137 covered pixels in three waves,
+25 (covered lane, helper neighbour) pairs, and all 10 checks hold in three runs, with identical words except an
+unwritten helper register:
+
+| check | gfx1036 |
+|---|---|
+| entry EXEC | exactly the covered pixels: helpers start off |
+| `s_wqm_b64 exec, exec` | turns on exactly the quads with a covered pixel |
+| wave layout | quads packed from lane 0; a quad with no covered pixel is not in the wave |
+| lane order in a quad | lane % 4 = (x & 1) + 2 (y & 1): top-left, top-right, bottom-left, bottom-right |
+| a helper's `v_interp_p1/p2_f32` after `s_wqm` | its own pixel centre, extrapolated (error 1.64e-4, as covered) |
+| a helper's v0/v1 without `s_wqm` | already its own pixel's I/J (to 7e-5; I + J > 1, outside the triangle) |
+| a helper's VGPR without `s_wqm` | not written (an unwritten register, different in every run) |
+| EXEC without `s_wqm` | stays the entry mask |
+| DPP without `fi` from an inactive lane | leaves the destination unchanged |
+| `exp mrt0 ... done vm` with helpers on in EXEC | writes no pixel outside the triangle |
+
+The last row is what the driver's own code relies on: RADV compiles the template as `s_wqm_b64 exec, exec` at entry,
+then the interpolation and an `exp mrt0 ... done vm` with the helpers still on. The programs are wave64; a wave32
+pixel stage (`RADV_PERFTEST=pswave32`) and GFX11+ exit 77. Not measured: wave32, RDNA1/gfx1013 and the Windows driver.
+
+### Packed 16-bit integer operations on RDNA2 (SHADER-302)
+
+*Measured on an RDNA2 iGPU (gfx1036), Windows 11, AMD Windows driver 32.0.21045.29003, HIP backend (`amdhip64_6.dll`), AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).*
+
+380 raw compute kernels covering all 11 packed 16-bit integer instructions (`v_pk_add_u16`, `v_pk_sub_u16`, `v_pk_add_i16`, `v_pk_sub_i16`, `v_pk_mul_lo_u16`, `v_pk_mad_u16`, `v_pk_mad_i16`, `v_pk_max_u16`, `v_pk_min_u16`, `v_pk_max_i16`, `v_pk_min_i16`), tested in both wave32 and wave64:
+
+- **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
+- **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
+- **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
 
 
 ## Coverage plan and cost
