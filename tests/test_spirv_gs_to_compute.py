@@ -309,3 +309,42 @@ def test_builtin_load_and_output_store_with_memory_operands():
     bad_gs = gs.replace("%pid = OpLoad %uint %prim_id Aligned 4", "OpCopyMemory %prim_id %inv_id")
     with pytest.raises(gsc.Unsupported, match="%prim_id"):
         gsc.rewrite(bad_gs)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize("before_first,before_second", [
+    ("", ""),
+    ("OpLine %source 1 1\n", ""),
+    ("", "OpNoLine\n"),
+    ("OpLine %source 1 1\n", "OpNoLine\n"),
+], ids=["no-debug", "line", "no-line", "mixed"])
+def test_entry_debug_lines_keep_locals_before_capture_setup(tmp_path: Path, before_first: str,
+                                                            before_second: str) -> None:
+    geometry = PHI_GS.replace(
+        "OpDecorate %in_pos", '%source = OpString "synthetic.glsl"\nOpDecorate %in_pos', 1,
+    ).replace(
+        "%out_pos = OpVariable", "%ptr_local = OpTypePointer Function %float\n%out_pos = OpVariable", 1,
+    ).replace(
+        "%entry = OpLabel",
+        f"%entry = OpLabel\n{before_first}%first = OpVariable %ptr_local Function\n"
+        f"{before_second}%second = OpVariable %ptr_local Function",
+    ).replace(
+        "OpStore %out_pos %v",
+        "%x_value = OpCompositeExtract %float %v 0\n"
+        "OpStore %first %x_value\n"
+        "%first_value = OpLoad %float %first\n"
+        "OpStore %second %first_value\n"
+        "%second_value = OpLoad %float %second\n"
+        "%position = OpCompositeInsert %v4float %second_value %v 0\n"
+        "OpStore %out_pos %position",
+    )
+
+    lowered, _ = gsc.rewrite(geometry)
+    for name, assembly in (("geometry", geometry), ("compute", lowered)):
+        module = tmp_path / f"{name}.spv"
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                       input=assembly, text=True, check=True)
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)], check=True)
+
+    assert lowered.index("%first = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
+    assert lowered.index("%second = OpVariable") < lowered.index("%gsc_gidv = OpLoad")

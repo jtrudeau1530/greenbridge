@@ -238,7 +238,8 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             cur_block = entry_label
             out.append(ln)
             continue
-        if state == "main_vars" and not re.match(r"%\w+ = OpVariable ", s):
+        # OpLine and OpNoLine can be intermixed with the entry block's local variables.
+        if state == "main_vars" and not re.match(r"(?:%\w+ = OpVariable |OpLine |OpNoLine$)", s):
             # after the entry block's variables: p = GlobalInvocationId.x; return when p >= primitive_count
             state = "main"
             out += [f"%gsc_gidv = OpLoad {v3u} %gsc_gid", f"%gsc_prim = OpCompositeExtract {uint} %gsc_gidv 0",
