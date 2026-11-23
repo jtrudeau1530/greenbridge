@@ -343,6 +343,45 @@ int wmain(int argc, wchar_t** argv) {
             }
             AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* info) -> LONG {
                 const auto at = reinterpret_cast<std::uint64_t>(info->ExceptionRecord->ExceptionAddress);
+                // LEONIDA_PROBE_WATCH=1: each probe hit re-arms itself and watches the qword at RSI for writes by its thread.
+                static const bool watch = std::getenv("LEONIDA_PROBE_WATCH") != nullptr;
+                static thread_local std::uint64_t rearm = 0;
+                if (watch && info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+                    CONTEXT& w = *info->ContextRecord;
+                    if (rearm) {
+                        auto* q = reinterpret_cast<unsigned char*>(rearm);
+                        rearm = 0;
+                        DWORD o = 0;
+                        VirtualProtect(q, 1, PAGE_EXECUTE_READWRITE, &o);
+                        *q = 0xCC;
+                        VirtualProtect(q, 1, o, &o);
+                        FlushInstructionCache(GetCurrentProcess(), q, 1);
+                        w.EFlags &= ~0x100u;
+                        if (!(w.Dr6 & 1)) return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    if (w.Dr6 & 1) {
+                        static std::atomic<int> n{0};
+                        if (n.fetch_add(1) < 60) {
+                            const auto value = *reinterpret_cast<const std::uint64_t*>(w.Dr0);
+                            std::fprintf(stderr, "[watch] write to 0x%llx by main+0x%llx: now 0x%llx; stack",
+                                         static_cast<unsigned long long>(w.Dr0), static_cast<unsigned long long>(w.Rip - probe_base),
+                                         static_cast<unsigned long long>(value));
+                            const auto* sp = reinterpret_cast<const std::uint64_t*>(w.Rsp);
+                            for (int i = 0, shown = 0; i < 160 && shown < 8; ++i)
+                                if (sp[i] > probe_base && sp[i] < probe_base + 0xA000000) {
+                                    std::fprintf(stderr, " +0x%llx", static_cast<unsigned long long>(sp[i] - probe_base));
+                                    ++shown;
+                                }
+                            std::fprintf(stderr, " rcx=0x%llx rdx=0x%llx r8=0x%llx rdi=0x%llx rsi=0x%llx\n",
+                                         static_cast<unsigned long long>(w.Rcx), static_cast<unsigned long long>(w.Rdx),
+                                         static_cast<unsigned long long>(w.R8), static_cast<unsigned long long>(w.Rdi),
+                                         static_cast<unsigned long long>(w.Rsi));
+                        }
+                        w.Dr6 = 0;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
                 if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return EXCEPTION_CONTINUE_SEARCH;
                 const auto it = originals.find(at);
                 if (it == originals.end()) return EXCEPTION_CONTINUE_SEARCH;
@@ -355,6 +394,16 @@ int wmain(int argc, wchar_t** argv) {
                              static_cast<unsigned long long>(at - probe_base), static_cast<unsigned long long>(c.Rax),
                              static_cast<unsigned long long>(c.Rsi), static_cast<unsigned long long>(c.Rdi), c.EFlags,
                              int((c.EFlags >> 6) & 1), int((c.EFlags >> 7) & 1));
+                std::fprintf(stderr, "[rt] probe main+0x%llx: r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n",
+                             static_cast<unsigned long long>(at - probe_base), static_cast<unsigned long long>(c.R12),
+                             static_cast<unsigned long long>(c.R13), static_cast<unsigned long long>(c.R14),
+                             static_cast<unsigned long long>(c.R15));
+                if (watch) {
+                    const auto* o = reinterpret_cast<const std::uint64_t*>(c.Rsi);
+                    std::fprintf(stderr, "[rt] probe object");
+                    for (int i = 0; i < 14; ++i) std::fprintf(stderr, " %llx", static_cast<unsigned long long>(o[i]));
+                    std::fprintf(stderr, "\n");
+                }
                 auto* p = reinterpret_cast<unsigned char*>(at);
                 DWORD old = 0;
                 VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &old);
@@ -362,6 +411,15 @@ int wmain(int argc, wchar_t** argv) {
                 VirtualProtect(p, 1, old, &old);
                 FlushInstructionCache(GetCurrentProcess(), p, 1);
                 info->ContextRecord->Rip = at;  // the original instruction runs now
+                if (watch) {
+                    CONTEXT& w = *info->ContextRecord;
+                    rearm = at;
+                    w.EFlags |= 0x100u;  // one step, then the int3 goes back
+                    w.Dr0 = w.Rsi & ~7ull;
+                    w.Dr6 = 0;
+                    w.Dr7 = (w.Dr7 & ~0xF0003ull) | 0x1ull | (0x9ull << 16);  // local 0: write, 8 bytes
+                    w.ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+                }
                 return EXCEPTION_CONTINUE_EXECUTION;
             });
             std::printf("LEONIDA_PROBES: %zu probe(s) set\n", originals.size());

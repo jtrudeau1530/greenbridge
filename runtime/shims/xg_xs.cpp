@@ -85,6 +85,120 @@ struct Computer {
     std::uint32_t desc[14]{};  // the resource description it was made for
 };
 std::atomic<bool> first[kSlots];
+// The resource description's words: D3D12_RESOURCE_DESC (dimension, alignment, width, height, depth | mips, format, ...).
+struct Shape {
+    std::uint32_t dimension, height, depth, mips, format;
+    std::uint64_t width;
+};
+Shape shape_of(const std::uint32_t* w) {
+    Shape s{};
+    s.dimension = w[0];
+    std::memcpy(&s.width, w + 4, 8);
+    s.height = w[6];
+    s.depth = w[7] & 0xFFFF;
+    s.mips = w[7] >> 16;
+    s.format = w[8];
+    if (!s.mips) s.mips = 1;
+    if (!s.depth) s.depth = 1;
+    if (!s.height) s.height = 1;
+    return s;
+}
+// Bytes per block and block edge of a DXGI format (the formats a title streams).
+void block_of(std::uint32_t f, std::uint32_t& bytes, std::uint32_t& edge) {
+    edge = 1;
+    if ((f >= 70 && f <= 72) || (f >= 79 && f <= 81)) { bytes = 8; edge = 4; return; }                      // BC1, BC4
+    if ((f >= 73 && f <= 78) || (f >= 82 && f <= 84) || (f >= 94 && f <= 99)) { bytes = 16; edge = 4; return; }  // others
+    if (f >= 1 && f <= 4) { bytes = 16; return; }
+    if (f >= 5 && f <= 8) { bytes = 12; return; }
+    if (f >= 9 && f <= 22) { bytes = 8; return; }
+    if ((f >= 48 && f <= 59) || f == 85 || f == 86 || f == 115) { bytes = 2; return; }
+    if (f >= 60 && f <= 66) { bytes = 1; return; }
+    bytes = 4;
+}
+// GetResourceTiling (method 10): total tiles, packed mips, standard 64 KiB tile shape, then one entry per subresource.
+void resource_tiling(const std::uint32_t* words, std::uint64_t total, std::uint64_t packed, std::uint64_t tile,
+                     std::uint64_t count, std::uint32_t first, std::uint64_t tilings) {
+    const Shape s = shape_of(words);
+    std::uint32_t bytes = 4, edge = 1;
+    block_of(s.format, bytes, edge);
+    std::uint32_t tw = 128, th = 128, td = 1;
+    if (s.dimension == 4) {
+        td = 16;
+        switch (bytes) {
+            case 1: tw = 64; th = 32; td = 32; break;
+            case 2: tw = 32; th = 32; td = 32; break;
+            case 4: tw = 32; th = 32; td = 16; break;
+            case 8: tw = 32; th = 16; td = 16; break;
+            default: tw = 16; th = 16; td = 16; break;
+        }
+    } else {
+        switch (bytes) {
+            case 1: tw = 256; th = 256; break;
+            case 2: tw = 256; th = 128; break;
+            case 4: tw = 128; th = 128; break;
+            case 8: tw = 128; th = 64; break;
+            default: tw = 64; th = 64; break;
+        }
+        tw *= edge;
+        th *= edge;
+    }
+    const std::uint32_t layers = s.dimension == 4 ? 1 : s.depth;
+    std::uint32_t standard = 0;
+    while (standard < s.mips && (s.width >> standard) >= tw && (s.height >> standard) >= th) ++standard;
+    const std::uint32_t packed_mips = s.mips - standard;
+    std::uint32_t capacity = 0;
+    if (count) capacity = *reinterpret_cast<std::uint32_t*>(count);
+    std::uint32_t next = 0, written = 0;
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        for (std::uint32_t mip = 0; mip < s.mips; ++mip) {
+            const std::uint32_t sub = layer * s.mips + mip;
+            std::uint32_t w = 0, h = 0, d = 0, start = 0xFFFFFFFFu;
+            if (mip < standard) {
+                const auto up = [](std::uint64_t v, std::uint32_t t) { return static_cast<std::uint32_t>(((v ? v : 1) + t - 1) / t); };
+                w = up(s.width >> mip, tw);
+                h = up(s.height >> mip, th);
+                d = s.dimension == 4 ? up(s.depth >> mip, td) : 1;
+                start = next;
+                next += w * h * d;
+            }
+            if (tilings && sub >= first && written < capacity) {
+                auto* t = reinterpret_cast<std::uint32_t*>(tilings + std::uint64_t(written) * 12);
+                t[0] = w;
+                t[1] = (h & 0xFFFF) | (d << 16);
+                t[2] = start;
+                ++written;
+            }
+        }
+        if (packed_mips && layer == 0 && packed) {
+            auto* b = reinterpret_cast<std::uint8_t*>(packed);
+            b[0] = static_cast<std::uint8_t>(standard);
+            b[1] = static_cast<std::uint8_t>(packed_mips);
+            const std::uint32_t tiles = 1, at = next;
+            std::memcpy(b + 4, &tiles, 4);
+            std::memcpy(b + 8, &at, 4);
+        }
+        if (packed_mips) next += 1;
+    }
+    if (!packed_mips && packed) {
+        auto* b = reinterpret_cast<std::uint8_t*>(packed);
+        std::memset(b, 0, 12);
+        b[0] = static_cast<std::uint8_t>(standard);
+    }
+    if (total) *reinterpret_cast<std::uint32_t*>(total) = next;
+    if (tile) {
+        auto* t = reinterpret_cast<std::uint32_t*>(tile);
+        t[0] = tw;
+        t[1] = th;
+        t[2] = td;
+    }
+    if (count) *reinterpret_cast<std::uint32_t*>(count) = written;
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 6)
+        std::fprintf(stderr, "[xg] tiling dim %u %llux%ux%u mips %u format %u: %u tiles of %ux%u, %u standard + %u packed mips\n",
+                     s.dimension, static_cast<unsigned long long>(s.width), s.height, s.depth, s.mips, s.format, next, tw, th,
+                     standard, packed_mips);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, std::uint64_t a6) {
     if constexpr (Slot == 0) {  // QueryInterface: itself for anything
@@ -97,6 +211,7 @@ std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, 
     } else if constexpr (Slot == 2) {
         return self->refs.fetch_sub(1) - 1;  // never freed: a handful exist at most
     } else {
+        if constexpr (Slot == 10) resource_tiling(self->desc, a1, a2, a3, a4, static_cast<std::uint32_t>(a5), a6);
         // CopyIntoSubresource(base, offset, subresource, source, row pitch, slice pitch)
         if constexpr (Slot == 8)
             rt::title_textures::note_linear_upload(a1, static_cast<std::uint32_t>(a3), reinterpret_cast<const void*>(a4),

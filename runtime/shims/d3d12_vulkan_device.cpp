@@ -2816,6 +2816,14 @@ public:
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
+        if (image_ && boot_lenient()) {  // console memory is always CPU-visible (boot stand-in)
+            static std::atomic<int> n{0};
+            if (n.fetch_add(1) < 24)
+                std::fprintf(stderr, "[title] Map of %llux%u format %d subresource %u (pointer %s)\n", static_cast<unsigned long long>(desc_.Width),
+                             desc_.Height, int(desc_.Format), subresource, data ? "asked" : "not asked");
+            if (data) *data = reinterpret_cast<void*>(title_shadow());
+            return S_OK;
+        }
         if (image_) {
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
@@ -2829,6 +2837,13 @@ public:
         return S_OK;
     }
     void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+    static bool boot_lenient() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_PLACEHOLDER_PSO");
+            return v && *v == '1';
+        }();
+        return on;
+    }
 
     // CPU copies into and out of a texture subresource. D3D12 completes them before returning and leaves it to
     // the application to keep the GPU off the subresource meanwhile, so a blocking copy is the whole contract.
@@ -2892,7 +2907,7 @@ private:
         if (!r.rows || !r.slices) return S_OK;  // an empty box: nothing to copy
         // The pitches are not checked, as on the host runtime: rows or slices that overlap (a pitch smaller than a
         // row, or 0) are copied in order, row by row and slice by slice, so on a read the last one wins.
-        if (!cpu_visible())
+        if (!cpu_visible() && !boot_lenient())
             log_once(write ? "WriteToSubresource on a texture outside a CPU-visible heap; heap type"
                            : "ReadFromSubresource on a texture outside a CPU-visible heap; heap type",
                      heap_.Type);
@@ -3865,6 +3880,25 @@ public:
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             static std::atomic<int> n{0};
             const int k = n.fetch_add(1) + 1;
+            {
+                const auto& g = lazy_->stream.graphics;
+                const auto& b = g.BlendState.RenderTarget[0];
+                const auto name = [](const D3D12_SHADER_BYTECODE& c) -> std::string {
+                    if (!c.pShaderBytecode) return "-";
+                    const auto f = leonida::fssm_program({static_cast<const std::uint8_t*>(c.pShaderBytecode), c.BytecodeLength});
+                    return f.empty() ? "?" : leonida::sha256_hex(f).substr(0, 16);
+                };
+                std::fprintf(stderr, "[lazy] %p vs %s ps %s gs %s ms %s cs %s blend %d src %d dst %d op %d asrc %d adst %d mask 0x%x logic %d depth %d write %d func %d stencil %d cull %d fill %d layout %u topo %d dsv %d samples %u mask 0x%x\n",
+                             static_cast<void*>(this), name(g.VS).c_str(), name(g.PS).c_str(), name(g.GS).c_str(),
+                             name(lazy_->stream.ms).c_str(), name(lazy_->stream.compute.CS).c_str(), b.BlendEnable, b.SrcBlend,
+                             b.DestBlend, b.BlendOp, b.SrcBlendAlpha, b.DestBlendAlpha, b.RenderTargetWriteMask, b.LogicOpEnable,
+                             g.DepthStencilState.DepthEnable, g.DepthStencilState.DepthWriteMask, g.DepthStencilState.DepthFunc,
+                             g.DepthStencilState.StencilEnable, g.RasterizerState.CullMode, g.RasterizerState.FillMode,
+                             g.InputLayout.NumElements, g.PrimitiveTopologyType, int(g.DSVFormat), g.SampleDesc.Count, g.SampleMask);
+                for (const auto& e : lazy_->elements)
+                    std::fprintf(stderr, "[lazy]   input %s%u format %d slot %u offset %u\n", e.SemanticName, e.SemanticIndex, int(e.Format),
+                                 e.InputSlot, e.AlignedByteOffset);
+            }
             if (k <= 200 || k % 100 == 0 || FAILED(hr))
                 std::fprintf(stderr, "[rt] lazy pipeline %d built in %.1f ms -> 0x%08lx (cs %d rts %u f0 %d)\n", k, ms,
                              static_cast<unsigned long>(hr), int(lazy_->stream.has_cs), lazy_->stream.graphics.NumRenderTargets,
@@ -6736,6 +6770,17 @@ public:
         if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, desc->CachedPSO); FAILED(hr)) return hr;
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
+        static const bool lazy = [] {
+            const char* v = std::getenv("LEONIDA_LAZY_PSO");
+            return v && *v == '1';
+        }();
+        if (lazy) {
+            PipelineStream stream;
+            stream.compute = *desc;
+            stream.has_cs = true;
+            pipeline->defer(stream);
+            return hand_out(pipeline, riid, out);
+        }
         if (const HRESULT hr = pipeline->create_compute(*desc); FAILED(hr)) {
             pipeline->Release();
             // LEONIDA_PLACEHOLDER_PSO=1 (a boot diagnostic): a compute program with no translation (the BVH builder's
