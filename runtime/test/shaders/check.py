@@ -1442,13 +1442,16 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
 def ij_computed_problem(px):
     """ps_ij_computed.asm: (snapped 0.5, zeroed pair 0.0, v/2 from (i, j/2), 0.5 control) per pixel; "" when right.
     Shared with scripts/run_gpu_tests.py."""
-    n = len(px)
-    if not n:
-        return "no pixels"
-    w = int(n ** 0.5)
-    f32 = lambda b: struct.unpack("<f", struct.pack("<I", b))[0]      # noqa: E731
-    wrong = sum((a != 0x3F000000 or b != 0 or d != 0x3F000000) for a, b, _, d in px)
-    err = max(abs(f32(c) - (i // w + 0.5) / (2 * w)) for i, (_, _, c, _) in enumerate(px))
+    w = 64
+    if len(px) != w * w:
+        return f"{len(px)} pixels, expected {w * w}"
+    wrong, err = 0, 0.0
+    for i, (a, b, c, d) in enumerate(px):
+        v_over_two = struct.unpack("<f", struct.pack("<I", c))[0]
+        if not math.isfinite(v_over_two):
+            return f"non-finite computed I/J result at ({i % w},{i // w}): {v_over_two}"
+        wrong += a != 0x3F000000 or b != 0 or d != 0x3F000000
+        err = max(err, abs(v_over_two - (i // w + 0.5) / (2 * w)))
     return "" if not wrong and err < 1e-6 else f"{wrong} pixels without the computed-pair words, v/2 off by {err:.3g}"
 
 
