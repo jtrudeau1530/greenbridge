@@ -64,6 +64,19 @@ The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetComm
 
 The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
+The UCRT argv configuration imports honor the executable's startup mode. Each run starts with `argc == 0` and
+null narrow/wide argument tables, while `GetCommandLineA/W` is already available to TLS and process-attach
+callbacks. Default startup publishes unexpanded arguments for its chosen width. `setargv.obj` / `wsetargv.obj`
+startup expands wildcard arguments against the host working directory, including quoted patterns; an unmatched
+pattern stays literal. Narrow expansion searches the ACP-converted pattern and converts matching names back to
+ACP, so its matches can differ from wide startup. The two widths retain independent tables, and the most recently
+configured width sets the shared `argc`. `noarg.obj` leaves the initial tables null; later no-argument
+configuration is a no-op that preserves existing pointers and counts. These are guest-owned tables, without
+changing the host CRT's argument globals. This does not add console-path wildcard routing or change the legacy
+`msvcrt!__getmainargs` wildcard policy. `run_argv_modes` compares the same six linker-selected MSVC fixtures
+natively and through the loader; `run_startup_cmdline` also checks native preconfiguration and command-line
+identity through attach and entry.
+
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
 
