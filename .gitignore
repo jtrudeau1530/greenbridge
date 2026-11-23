@@ -28,6 +28,7 @@ build-*/
 bin/
 obj/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.exe
 *.dll
