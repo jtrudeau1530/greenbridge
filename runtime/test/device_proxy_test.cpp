@@ -166,6 +166,15 @@ int main() {
     if (slots > 67) check(proxy_vtbl[67] != real_vtbl[67], "slot 67 thunk differs from PC CreateProtectedResourceSession1");
     if (slots > 76) check(proxy_vtbl[76] != real_vtbl[76], "slot 76 thunk differs from PC CreateCommittedResource3");
 
+    // The hit counters are for tests and count from the first read or reset, so that a title's calls write no
+    // shared counter. The QueryInterface of the creation above was before that: its flag is set, its hit is not.
+    check(rt::d3d12_xs::device_slot_first_call_seen(0), "slot 0 first-call flag is set by the creation");
+    check(rt::d3d12_xs::device_slot_hits(0) == 0, "slot 0 has no hit before the first read of a counter");
+    device->AddRef();
+    device->Release();
+    check(rt::d3d12_xs::device_slot_hits(1) == 1 && rt::d3d12_xs::device_slot_hits(2) == 1,
+          "slots 1 and 2 count the calls after the first read");
+
     rt::d3d12_xs::reset_device_proxy_stats();
 
     // QI/refcount behaviour: device interfaces resolve to the same proxy, non-device IIDs do not.
