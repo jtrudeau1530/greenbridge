@@ -62,7 +62,8 @@ bool command_signature_info(ID3D12CommandSignature* signature, leonida::Indirect
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.
 HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, ID3D12Fence* const* fences,
                                                const UINT64* values, UINT count,
-                                               D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event);
+                                               D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event,
+                                               IUnknown* device = nullptr);
 
 std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context,
                                                            bool image, std::uint32_t memory_types);
