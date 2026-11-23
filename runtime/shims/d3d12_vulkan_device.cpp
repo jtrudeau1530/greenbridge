@@ -7094,20 +7094,31 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
             *opts = {};
-            opts->DoublePrecisionFloatShaderOps = TRUE;
-            opts->OutputMergerLogicOp = TRUE;
+            // Answer what the layer will actually honour, not what the GPU offers: docs/d3d12_vulkan.md 4.1 says a
+            // false "supported" is worse than a false "unsupported" at boot, and the PSO paths refuse these same
+            // features when they are missing (logic ops, per the mapping vkd3d-proton's
+            // d3d12_device_caps_init_feature_options uses).
+            opts->DoublePrecisionFloatShaderOps = state_.info.features.shaderFloat64;
+            opts->OutputMergerLogicOp = state_.info.features.logicOp;
             opts->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
             opts->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
             opts->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;  // Bindless descriptor indexing supported
-            opts->PSSpecifiedStencilRefSupported = TRUE;
+            // No VK_EXT_shader_stencil_export is enabled and the translator emits no stencil-ref write, so a pixel
+            // shader that writes the stencil ref would be refused: answer unsupported, the direction 4.1 prefers.
+            opts->PSSpecifiedStencilRefSupported = FALSE;
             opts->TypedUAVLoadAdditionalFormats = TRUE;
-            opts->ROVsSupported = TRUE;
+            // POPS: the translator only declares PixelInterlockOrderedEXT, enabled exactly when the GPU offers
+            // VK_EXT_fragment_shader_interlock and its fragmentShaderPixelInterlock feature.
+            opts->ROVsSupported = state_.info.fragment_shader_interlock;
             opts->ConservativeRasterizationTier = state_.conservative_raster_tier;
             opts->MaxGPUVirtualAddressBitsPerResource = 40;
             opts->StandardSwizzle64KBSupported = FALSE;
             opts->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
             opts->CrossAdapterRowMajorTextureSupported = FALSE;
-            opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
+            // A translated vertex shader writing a layer or viewport index needs both Vulkan 1.2 features enabled
+            // (vkCreateShaderModule refuses the module without them, VUID-...-pCode-08740).
+            opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation =
+                state_.info.shader_output_layer && state_.info.shader_output_viewport_index;
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
             return d3d12_trace::result(method, S_OK);
         }

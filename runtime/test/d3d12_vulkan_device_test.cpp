@@ -7114,6 +7114,18 @@ int main() {
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
             EXPECT(made->maintenance8 == (m8.maintenance8 == VK_TRUE));
 #endif
+            // The OPTIONS booleans answer what the layer will honour, not what the GPU offers (docs 4.1: a false
+            // "supported" is worse at boot; the PSO paths refuse these same missing features). Stencil ref: the
+            // layer enables no stencil export and the translator emits no stencil-ref write, so always FALSE.
+            D3D12_FEATURE_DATA_D3D12_OPTIONS answers{};
+            EXPECT(SUCCEEDED(standalone->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &answers,
+                                                             sizeof(answers))));
+            EXPECT(answers.DoublePrecisionFloatShaderOps == BOOL(made->features.shaderFloat64));
+            EXPECT(answers.OutputMergerLogicOp == BOOL(made->features.logicOp));
+            EXPECT(answers.PSSpecifiedStencilRefSupported == FALSE);
+            EXPECT(answers.ROVsSupported == BOOL(made->fragment_shader_interlock));
+            EXPECT(answers.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation ==
+                   BOOL(made->shader_output_layer && made->shader_output_viewport_index));
         }
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
