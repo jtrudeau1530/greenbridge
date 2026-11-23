@@ -522,6 +522,7 @@ PERSP_ATTR = ((0.25, -0.5), (2.25, 0.75), (-1.0, 3.0))
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 SIGNED_MIP_TEST = "ps_sample_implicit_sint"
+UINT_MIP_TEST = "ps_sample_implicit_uint"
 GATHER_LOD_TEST = "ps_gather_sampler_lod"
 TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
 # Each pair of draws expects mip 0, then mip 1. S# word 1 is minLOD[11:0], maxLOD[23:12], unsigned 4.8.
@@ -529,7 +530,10 @@ MIP_TEST_PASSES = {
     TEXTURE_MIP_TEST: ((TEXTURE_MIP_TEST, "c00000"), ("ps_texture_sample", "c00000")),
     GATHER_LOD_TEST: ((GATHER_LOD_TEST, "40000"), (GATHER_LOD_TEST, "1000c0")),
     SIGNED_MIP_TEST: ((SIGNED_MIP_TEST, "0"), (SIGNED_MIP_TEST, "100000")),
+    UINT_MIP_TEST: ((UINT_MIP_TEST, "0"), (UINT_MIP_TEST, "100000")),
 }
+# The integer fixtures sample the same two-mip image through the signed or unsigned view the harness binds for them.
+MIP_TEST_MODES = {SIGNED_MIP_TEST: "--two-mip-sint", UINT_MIP_TEST: "--two-mip-uint"}
 
 # TEST-184: vk_store_test "words" fills the r32 uint image with 100 + i, the r32 sint image with -2i (texel
 # i = 8y + x) and the r32 uint volume with 200 + i (texel i = 16z + 4y + x), and prints the three after the dispatch.
@@ -1425,7 +1429,7 @@ def texture_mip_test(tools: str, spirv: str, test: str = TEXTURE_MIP_TEST) -> st
                 if not shader.is_file():
                     return f"missing {shader}"
             raw = Path(tmp) / f"mip{mip}.raw"
-            mode = "--two-mip-sint" if test == SIGNED_MIP_TEST else "--two-mip"
+            mode = MIP_TEST_MODES.get(test, "--two-mip")
             code, output = run(tool, vertex, fragment, raw, "0", "92", limits, "14500000", "0", mode)
             if code == UNSUPPORTED:
                 return Skip(f"SKIP (texture mip test: {output.strip() or 'unsupported device'})")

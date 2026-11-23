@@ -32,7 +32,7 @@ from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip field
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
-from check import SIGNED_MIP_TEST
+from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
@@ -610,7 +610,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
-              SIGNED_MIP_TEST: "vs_ids.asm",
+              SIGNED_MIP_TEST: "vs_ids.asm", UINT_MIP_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 

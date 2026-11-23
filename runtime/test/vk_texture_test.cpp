@@ -5,8 +5,9 @@
 // registers that T# -> image index 1 and the shader's literal S# -> sampler index 1, binds an 8x8 gradient at
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
-//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint]   (S# words as hex)
-//   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw.
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint|--two-mip-uint]   (S# words as hex)
+//   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw; the SINT and UINT
+//   forms bind the same image as a signed or unsigned integer view instead of the default UNORM one.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
 //   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
@@ -85,7 +86,8 @@ int main(int argc, char** argv) {
         return cube_alpha_self_test();
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
-    const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
+    const bool uint_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-uint") == 0;
+    const bool two_mip = signed_mips || uint_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
     const uint32_t texture_side = two_mip ? 2 * W : TW;
     const uint32_t levels = two_mip ? 2 : 1;
@@ -136,13 +138,14 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
     // at 0, as the views here start at level 0: image_get_resinfo minifies a 2D array's layers from BASE_LEVEL.
     const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
-        signed_mips ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
+        signed_mips ? VK_FORMAT_R8G8B8A8_SINT :
+        uint_mips ? VK_FORMAT_R8G8B8A8_UINT : VK_FORMAT_R8G8B8A8_UNORM;
     uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44440444,
                           0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const uint32_t tsharp_va = 256;
