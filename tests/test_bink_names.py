@@ -11,6 +11,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -282,6 +283,20 @@ class TestLoadPins(unittest.TestCase):
         self.assertEqual(rows[0]["confidence"], "verified")
         self.assertEqual(unmatched, ["f/c.bk2"])
 
+    def test_a_windows_source_from_before_slashes_still_matches(self):
+        # bink_index wrote "movies\x.bk2" on Windows before it used "/"; older pins and index files keep working.
+        with tempfile.TemporaryDirectory() as tmp:
+            pins_csv = os.path.join(tmp, "pins.csv")
+            index_csv = os.path.join(tmp, "index.csv")
+            with open(pins_csv, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("offset,path,source\n0,f/a.bk2,movies\\x.bk2\n")
+            with open(index_csv, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("source,offset,size,width,height,frames\nmovies\\x.bk2,0,64,16,16,1\n")
+            pins = names_mod.load_pins(pins_csv)
+            streams = names_mod.load_streams(index_csv)
+        self.assertEqual(pins, {("movies/x.bk2", 0): {"f/a.bk2"}})
+        self.assertEqual([s["source"] for s in streams], ["movies/x.bk2"])
+
     def test_rejects_empty_and_invalid_pin_rows(self):
         bad_rows = [
             "0,\n",
@@ -302,6 +317,30 @@ class TestLoadPins(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_unreadable_mount_directory_preserves_the_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "empty.bk2")
+            with open(source, "wb"):
+                pass
+            mount = os.path.join(tmp, "mount")
+            os.mkdir(mount)
+            blocked = os.path.join(mount, "blocked")
+            report = os.path.join(tmp, "names.json")
+            with open(report, "wb") as f:
+                f.write(b"previous report")
+
+            def walk(path, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "permission denied", blocked))
+                return iter(())
+
+            with mock.patch.object(names_mod.os, "walk", walk), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(names_mod.main([source, "--mount", mount, "--out", report]), 1)
+            self.assertIn(blocked, err.getvalue())
+            with open(report, "rb") as f:
+                self.assertEqual(f.read(), b"previous report")
+
     def test_rejects_negative_max_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml = os.path.join(tmp, "list.xml")
@@ -414,6 +453,14 @@ class TestCli(unittest.TestCase):
             xml_file = os.path.join(mount_dir, "list.xml")
             with open(xml_file, "w", encoding="utf-8") as fh:
                 fh.write(xml_text)
+            for folder in (src_dir, mount_dir):
+                reserved = os.path.join(folder, "index.json")
+                with self.subTest(folder=folder), contextlib.redirect_stderr(io.StringIO()) as err:
+                    with self.assertRaises(SystemExit) as cm:
+                        names_mod.main([src_dir, "--mount", mount_dir, "--out", reserved])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("carve manifest", err.getvalue())
+                    self.assertFalse(os.path.exists(reserved))
             for target in (stream_file, xml_file, src_dir):
                 with self.subTest(target=target):
                     with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:

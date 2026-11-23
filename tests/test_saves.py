@@ -128,6 +128,45 @@ class JsavTest(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", TOOL, "verify", p], capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
 
+    def test_verify_batch_reports_every_input_and_keeps_the_worst_status(self):
+        data, _, _ = make_jsav()
+        with tempfile.TemporaryDirectory() as tmp:
+            bad, missing, changed, good = (os.path.join(tmp, n) for n in
+                                           ("bad.jsav", "missing.jsav", "changed.jsav", "good.jsav"))
+            write(bad, b"JSAV")
+            write(changed, data + bytes(16))  # excess padding: parses but does not rebuild identically
+            write(good, data)
+            for paths, status in [([bad, missing, changed, good], 2), ([changed, good], 1)]:
+                with self.subTest(paths=paths):
+                    r = subprocess.run([sys.executable, "-I", TOOL, "verify", *paths],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, status, r.stderr)
+                    self.assertIn(f"{changed}: MISMATCH", r.stdout)
+                    self.assertIn(f"{good}: OK", r.stdout)
+                    errors = r.stderr.splitlines()
+                    self.assertEqual(len(errors), len(paths) - 2)
+                    for path, line in zip(paths[:-2], errors):
+                        self.assertIn(path, line)
+
+    def test_block_decoder_recursion_error_does_not_abort_verify_batch(self):
+        data, _, blocks = make_jsav(seed=1)
+        loads = json.loads
+
+        def decode(payload, *args, **kwargs):
+            if payload == blocks[1]:  # fail one block, not the whole-body parse or the next file
+                raise RecursionError("decoder nesting limit")
+            return loads(payload, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad, good = (os.path.join(tmp, n) for n in ("first.jsav", "next.jsav"))
+            write(bad, data)
+            write(good, make_jsav(seed=2)[0])
+            with mock.patch.object(saves.json, "loads", side_effect=decode), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(saves.main(["saves.py", "verify", bad, good]), 2)
+            self.assertIn(f"{good}: OK", out.getvalue())
+            self.assertEqual(err.getvalue().splitlines(), [f"ERROR: JSAV block 1 exceeds the JSON nesting limit ({bad})"])
+
     def test_extract_edit_pack(self):
         d, _, _ = make_jsav()
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,9 +396,12 @@ class AtomicPackTest(unittest.TestCase):
                     link = os.path.join(self.root, "link-" + label)
                     spelling = os.path.relpath(target, self.root) if relative else target
                     self.symlink(spelling, link)
+                    # What the link stores, read back before packing: on Windows an absolute target comes back
+                    # with a \\?\ prefix, so comparing with `spelling` failed there for a link pack() left alone.
+                    stored = os.readlink(link)
                     quiet(saves.pack, self.extracted, link)
                     self.assertTrue(os.path.islink(link))
-                    self.assertEqual(os.readlink(link), spelling)
+                    self.assertEqual(os.readlink(link), stored)
                     self.assertEqual(rd(target), self.new)
                     self.assertEqual(os.listdir(target_dir), ["save.jsav"])
 
@@ -421,6 +463,58 @@ class AsavTest(unittest.TestCase):
     def test_rejects_other_magic(self):
         with self.assertRaises(ValueError):
             saves.parse_asav(b"JSAV" + bytes(0x200))
+
+
+class ProfileRecordTest(unittest.TestCase):
+    def test_parse_synthetic_profile(self):
+        # 1644-byte profile record: first 112 bytes non-zero starting u32 10, u32 3
+        dwords = [10, 3, 1, 0x100, 0x12345678, 0x9abcdef0] + list(range(22))
+        payload = saves.build_profile(dwords=dwords, account_id=0x9abcdef012345678)
+        self.assertEqual(len(payload), 1644)
+        prof = saves.parse_profile(payload)
+        self.assertEqual(prof["version"], 10)
+        self.assertEqual(prof["kind"], 3)
+        self.assertEqual(prof["active_bytes"], 112)
+        self.assertEqual(prof["zero_padding_bytes"], 1532)
+        self.assertTrue(prof["zero_padding_clean"])
+        self.assertEqual(prof["account_id"], 0x9abcdef012345678)
+        self.assertEqual(prof["subversion"], 1)
+        self.assertEqual(prof["flags"], 0x100)
+        self.assertEqual(len(prof["dwords"]), 28)
+
+    def test_profile_extract_writes_profile_json(self):
+        payload = saves.build_profile(account_id=0xCAFEF00D)
+        d = make_asav(kind=3, title="Player", slot="Player", payload=payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = os.path.join(tmp, "prof_save"), os.path.join(tmp, "out")
+            write(src, d)
+            quiet(saves.extract, src, out)
+            self.assertTrue(os.path.isfile(os.path.join(out, "profile.json")))
+            pjson = rd_json(os.path.join(out, "profile.json"))
+            self.assertEqual(pjson["version"], 10)
+            self.assertEqual(pjson["kind"], 3)
+            self.assertEqual(pjson["account_id"], 0xCAFEF00D)
+            self.assertEqual(rd(os.path.join(out, "payload.bin")), payload)
+
+    def test_profile_info_output(self):
+        payload = saves.build_profile(account_id=0x11223344)
+        d = make_asav(kind=3, title="Player", slot="Player", payload=payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "prof_save")
+            write(src, d)
+            out = quiet(saves.info, [src])
+            self.assertIn("profile record", out)
+            self.assertIn("version=10", out)
+            self.assertIn("kind=3", out)
+            self.assertIn("active=112B", out)
+
+    def test_profile_rejects_invalid_version_or_kind(self):
+        with self.assertRaises(ValueError):
+            saves.parse_profile(struct.pack("<II", 9, 3) + bytes(1636))
+        with self.assertRaises(ValueError):
+            saves.parse_profile(struct.pack("<II", 10, 2) + bytes(1636))
+        with self.assertRaises(ValueError):
+            saves.parse_profile(b"\x0a\x00")
 
 
 class MalformedAsavTest(unittest.TestCase):
@@ -516,7 +610,7 @@ class MalformedSlayerTest(unittest.TestCase):
 
 class ImportTest(unittest.TestCase):
     def test_encoding_matches_the_shim(self):
-        # Same rule as encode_name() in runtime/shims/xgameruntime_services.cpp.
+        # Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp.
         self.assertEqual(saves.xgs_encode("slot 1/main"), "slot%201%2Fmain")
         self.assertEqual(saves.xgs_encode("world.dat"), "world.dat")
         self.assertEqual(saves.xgs_encode(".hidden"), "%2Ehidden")
@@ -544,6 +638,19 @@ class ImportTest(unittest.TestCase):
             self.assertIn("--out needs a value", result.stderr)
             self.assertFalse(os.path.exists(os.path.join(tmp, "--dry-run")))
 
+    def test_import_map_needs_old_equals_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            tool = os.path.join(ROOT, "tools", "saves.py")
+            result = subprocess.run(
+                [sys.executable, "-I", tool, "import", story, "--map", "SLOT3", "--dry-run"],
+                cwd=tmp, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("--map needs OLD=CONTAINER/BLOB", result.stderr)
+            self.assertIn("SLOT3", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     def test_import_layout_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             story, prof, jsav = self._folders(tmp)
@@ -570,6 +677,24 @@ class ImportTest(unittest.TestCase):
             with self.assertRaises(SystemExit):        # two payloads onto one blob (case-insensitive on Windows)
                 quiet(saves.import_saves, [story, prof, "--out", out, "--force",
                                            "--map", "SLOT3=Same/blob", "--map", "Player=same/BLOB"])
+
+    def test_container_names_follow_the_runtime_rule(self):
+        # The same rule as valid_container_name() in runtime/shims/xgameruntime_gamesave.cpp.
+        for good in ("SLOT3", "slots/SAVE_00.sav-1", "a/b/c"):
+            self.assertTrue(saves.valid_container_name(good), good)
+        for bad in ("slot 0", "a..b", "x.", "dir/", "a/b-c/d", "", "é", "a" * 257):
+            self.assertFalse(saves.valid_container_name(bad), bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", os.path.join(tmp, "o"), "--map", "SLOT3=slot 0/story",
+                                           "--dry-run"])
+            self.assertIn("'slot 0' breaks XGameSaveCreateContainer's naming rule", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", os.path.join(tmp, "o"), "--dry-run"])
+            self.assertEqual(err.getvalue(), "")
 
     def test_folder_with_two_payloads_is_refused(self):
         # A folder holding a save and an older backup with the same signature must not import either silently.
@@ -874,6 +999,29 @@ class PackIndexValidationTest(unittest.TestCase):
         self.assertIn("invalid JSON", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(rd(out), b"previous complete output")
+
+    def test_pack_refuses_an_out_that_names_a_source_file(self):
+        """pack reads the index and every block; an --out naming one of them replaced the file it had just read."""
+        block_path = os.path.join(self.extracted, self.index["entries"][0]["file"])
+        for target in (self.index_path, block_path):
+            with self.subTest(target=os.path.relpath(target, self.extracted)):
+                before = rd(target)
+                with self.assertRaises(ValueError) as error:
+                    saves.pack(self.extracted, target)
+                self.assertIn(target, str(error.exception))
+                self.assertIn("would replace it", str(error.exception))
+                self.assertNotIn("invalid JSON", str(error.exception))
+                self.assertEqual(rd(target), before, "the source file changed")
+
+    def test_cli_pack_refuses_an_out_that_names_the_index(self):
+        before = rd(self.index_path)
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, self.index_path],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn("would replace it", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(rd(self.index_path), before)
 
     def test_valid_editable_metadata_still_round_trips(self):
         self.index["header"]["note"] = "extra metadata is ignored"

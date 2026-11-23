@@ -454,6 +454,19 @@ and a valid zlib checksum. That restores the normal draw binding. Both the
 diagnostic and the pinned model reader recover the containing dictionary's 11
 children.
 
+`rpf9_carve.py` and the carved-folder model join use the same short final-system-page
+exception, so a carve retains that page and can reproduce the archive join. Unrelated
+streams still need at least 64 inflated bytes. When a carve has an `index.json`, the folder join uses its file list, offsets,
+compressed sizes and preceding bytes to check root alignment and zero padding just
+as the archive join does. An omitted stream between pages therefore interrupts the
+join. Extra files are ignored, and missing indexed files or size mismatches are errors.
+The index describes the original archive and cannot authenticate a same-size replacement
+payload. Without an index, folder mode still uses file order and inflated file sizes
+and can join across bytes the carver omitted.
+The folder reader follows the carver's file types: `.bin` contains an inflated zlib
+payload and `.bk2` contains raw video. A `KB2` prefix inside a `.bin` remains resource
+data, while a raw `.bk2` interrupts the model's continuation run.
+
 | Pointed-to group start relative to the target stream (original survey) | Blocks |
 |---|---:|
 | Preceding stream | 68 |
@@ -707,6 +720,19 @@ Bit 30 set means `cross(normal, tangent)` runs along `+v`. The shaders turn a se
 `-1.0` (`v_cndmask_b32 ..., 1.0, -1.0`), so their bitangent is that factor times their own cross product;
 which operand order they use was not traced here. The 8-bit form in core_restofworld fits least;
 this check does not say why.
+
+An independent `data.rpf` sample says the tangent decode itself is not the weak part. On one mesh with all
+809 triangles usable, the decoded 8-bit vector pointed toward increasing UV0 U on **1,992 of 1,992** eligible
+corner uses; its median |dot| with the U tangent was **0.999598** (0.000025 with V and 0.027633 with the face
+normal), and permuting the candidate vectors within the same mesh lowers the U median to 0.697877. Four
+bit-31-clear resources from the first 12 qualifying ones in archive order gave **114 of 114** positive U
+comparisons (median +0.987002). Bit 30 agreed with the side of `dP/dv` that `cross(normal, tangent)` points
+to on **101 of 104** corner uses. All three exceptions are one indexed vertex whose five adjoining triangles
+have three negative and two positive UV determinants while its stored bit stays set; a single per-vertex bit
+cannot represent that vertex, so a consumer reconstructing a tangent frame should take handedness per
+triangle or accept that documented exception. This does not by itself explain the lower core_restofworld
+8-bit score above, whose per-block UV coverage was not measured here; the mixed-determinant vertex is one
+candidate.
 
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971

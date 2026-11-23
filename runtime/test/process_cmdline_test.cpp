@@ -28,8 +28,23 @@ char** argv() {
     return *reinterpret_cast<Fn>(rt::shims::find("ucrtbase.dll", "__p___argv"))();
 }
 
+int configure(bool wide, int mode) {
+    using Fn = int(__cdecl*)(int);
+    const auto fn = reinterpret_cast<Fn>(rt::shims::find(
+        "ucrtbase.dll", wide ? "_configure_wide_argv" : "_configure_narrow_argv"));
+    if (fn) return fn(mode);
+    std::fprintf(stderr, "FAIL missing argv configuration shim\n");
+    ++failures;
+    return -1;
+}
+
 void round_trip(const std::vector<std::wstring>& args, const char* what) {
     rt::process::set_command_line(L"game.exe", args);
+    if (configure(false, 1) || configure(true, 1)) {
+        std::fprintf(stderr, "FAIL %s: unexpanded argv configuration\n", what);
+        ++failures;
+        return;
+    }
     using Fn = LPWSTR(WINAPI*)();
     const LPWSTR line = reinterpret_cast<Fn>(rt::shims::find("kernel32.dll", "GetCommandLineW"))();
     int count = 0;
@@ -41,6 +56,34 @@ void round_trip(const std::vector<std::wstring>& args, const char* what) {
         ++failures;
     }
     LocalFree(parsed);
+}
+
+void check_argv_reset() {
+    const int host_argc = __argc;
+    char** const host_argv = __argv;
+    wchar_t** const host_wargv = __wargv;
+    using Argc = int*(__cdecl*)();
+    const auto count = reinterpret_cast<Argc>(rt::shims::find("ucrtbase.dll", "__p___argc"));
+    auto check = [](bool ok, const char* what) {
+        if (!ok) { std::fprintf(stderr, "FAIL argv state: %s\n", what); ++failures; }
+    };
+    rt::process::set_command_line(L"first.exe", {L"one", L"two"});
+    check(*count() == 0 && !argv() && !wargv(), "new run starts unconfigured");
+    check(configure(false, 0) == 0 && configure(true, 0) == 0 && *count() == 0 && !argv() && !wargv(),
+          "no-argument startup leaves the initial state alone");
+    check(configure(false, 1) == 0 && *count() == 3 && argv() && !wargv(), "configure only narrow argv");
+    char** const narrow = argv();
+    check(configure(true, 1) == 0 && *count() == 3 && argv() == narrow && wargv(),
+          "wide configuration retains the narrow table");
+    wchar_t** const wide = wargv();
+    check(configure(false, 0) == 0 && configure(true, 0) == 0 && *count() == 3 && argv() == narrow && wargv() == wide,
+          "no-argument mode preserves configured counts and pointers");
+    rt::process::set_command_line(L"second.exe", {L"new"});
+    check(*count() == 0 && !argv() && !wargv(), "another run forgets both configured widths");
+    check(configure(true, 1) == 0 && *count() == 2 && !argv() && wargv() &&
+              std::wcscmp(wargv()[0], L"second.exe") == 0 && std::wcscmp(wargv()[1], L"new") == 0 && !wargv()[2],
+          "the new run configures its own program name and arguments");
+    check(__argc == host_argc && __argv == host_argv && __wargv == host_wargv, "host CRT argument globals are untouched");
 }
 
 // __wargv[1] must be `want` exactly, and the narrow argv[1] its ANSI code page text (the CRT's replacement for a
@@ -186,6 +229,7 @@ int main() {
     check_non_ascii(L"\u0394\u0416\u6F22 x", "an argument outside any single-byte code page");
 
     check_import_names();
+    check_argv_reset();
     check_getmainargs_environment();
     check_winmain(L"game.exe", {L"-foo", L"with space"}, L"-foo \"with space\"", "arguments after a plain name");
     check_winmain(L"C:\\My Games\\game.exe", {L"-x"}, L"-x", "a quoted program name with a space");
@@ -202,6 +246,27 @@ int main() {
             std::fprintf(stderr, "FAIL run_entry with ExitThread(42) returned %d, want 42\n", code);
             ++failures;
         }
+    }
+
+    // The game thread that ends a run must park, not ExitProcess, even when run_entry has already returned and
+    // cleared the run: main.cpp still prints "game exited with code N" and cleans up after it. On one CPU the
+    // host preempts the game thread right after SetEvent(g_done), and Sleep lets the game thread run again before
+    // the next run starts. A thread that exits the process here ends this test with code 77 before its last line.
+    {
+        auto returns_77 = +[](void*) -> DWORD { return 77; };
+        DWORD_PTR process_mask = 0, system_mask = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+        SetProcessAffinityMask(GetCurrentProcess(), process_mask & (~process_mask + 1));  // its lowest CPU
+        for (int i = 0; i < 50; ++i) {
+            const int code = rt::process::run_entry(reinterpret_cast<void*>(returns_77), 64 << 10);
+            if (code != 77) {
+                std::fprintf(stderr, "FAIL run %d of an entry point returning 77 returned %d\n", i, code);
+                ++failures;
+                break;
+            }
+            Sleep(1);
+        }
+        SetProcessAffinityMask(GetCurrentProcess(), process_mask);
     }
 
     if (failures) return 1;

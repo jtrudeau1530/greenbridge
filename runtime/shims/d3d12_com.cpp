@@ -26,20 +26,39 @@
 
 namespace rt::d3d12 {
 
-static std::uint64_t buffer_tiles(ID3D12Resource* buffer) {
-    if (!buffer) return 0;
-    const auto desc = buffer->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !desc.Width) return 0;
-    return 1 + (desc.Width - 1) / leonida::tile_size_in_bytes;
+struct TileGrid {
+    std::uint64_t columns = 0;
+    std::uint64_t rows = 0;
+};
+
+static TileGrid tile_grid(ID3D12Resource* resource) {
+    if (!resource) return {};
+    const auto desc = resource->GetDesc();
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width)
+        return {1 + (desc.Width - 1) / leonida::tile_size_in_bytes, 1};
+    if (!is_sparse_image(resource)) return {};
+    constexpr auto shape = leonida::element_tile_shape(false, 4);
+    return {1 + (desc.Width - 1) / shape.width, 1 + (desc.Height - 1) / shape.height};
 }
 
-static bool buffer_tile_region(const D3D12_TILED_RESOURCE_COORDINATE* start, const D3D12_TILE_REGION_SIZE* size,
-                               std::uint64_t tiles, leonida::BufferTileRegion& region) {
-    if (start && (start->Y || start->Z || start->Subresource)) return false;
-    if (size && size->UseBox && (size->Height != 1 || size->Depth != 1)) return false;
-    region.first = start ? start->X : 0;
-    region.count = size ? (size->UseBox ? size->Width : size->NumTiles) : (start ? 1 : tiles);
-    return region.count && region.first < tiles && region.count <= tiles - region.first;
+static bool append_tile_regions(const D3D12_TILED_RESOURCE_COORDINATE* start, const D3D12_TILE_REGION_SIZE* size,
+                                TileGrid grid, std::vector<leonida::TileRegion>& regions) {
+    const auto x = start ? start->X : 0;
+    const auto y = start ? start->Y : 0;
+    if ((start && (start->Z || start->Subresource)) || x >= grid.columns || y >= grid.rows) return false;
+    const auto first = y * grid.columns + x;
+    if (size && size->UseBox) {
+        if (size->Depth != 1 || !size->Width || !size->Height ||
+            size->Width > grid.columns - x || size->Height > grid.rows - y) return false;
+        for (UINT row = 0; row < size->Height; ++row)
+            regions.push_back({first + row * grid.columns, size->Width});
+        return true;
+    }
+    const auto tiles = grid.columns * grid.rows;
+    const auto count = size ? size->NumTiles : (start ? 1 : tiles);
+    if (!count || count > tiles - first) return false;
+    regions.push_back({first, count});
+    return true;
 }
 
 void stub(const char* method) {
@@ -71,6 +90,7 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_copy: return "invalid copy or resolve";
     case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
+    case leonida::ReplayResult::invalid_draw: return "draw kind does not match the pipeline (mesh or vertex)";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -178,14 +198,19 @@ public:
     }
 
     const leonida::CommandList& commands() const { return list_; }
+    // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
+    const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
+    D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base() const { return cbv_srv_uav_base_; }
+    D3D12_GPU_VIRTUAL_ADDRESS sampler_base() const { return sampler_base_; }
 
     D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override {
         d3d12_trace::record("ID3D12CommandList::GetType");
         return type_;
     }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
+    bool invalid() const { return invalid_; }
 
     // E_INVALIDARG when a call during recording was invalid, or a query was begun and not ended, as D3D12's Close
     // reports it.
@@ -226,6 +251,7 @@ public:
 
     void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* command_list) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ExecuteBundle");
+        if (list_.closed()) return;
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         GraphicsCommandList* bundle = from(command_list);
         if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ ||
@@ -257,13 +283,47 @@ public:
 
     void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.set_pipeline(state); })) return hold(state);
         set_pipeline(state);
     }
 
-    // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
-    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {
-        d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps", "ignored");
+    // Validates shader-visible descriptor heaps and tracks bound heap identities/bases (docs/d3d12_vulkan.md §3.2/§3.4).
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT num, ID3D12DescriptorHeap* const* heaps) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
+        if (num > 2 || (num && !heaps)) return check(false);
+
+        ID3D12DescriptorHeap* cbv = nullptr;
+        ID3D12DescriptorHeap* smp = nullptr;
+        D3D12_GPU_VIRTUAL_ADDRESS cbv_base = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS smp_base = 0;
+        IUnknown* const owner = this->attached_device();
+        for (UINT i = 0; i < num; ++i) {
+            ID3D12DescriptorHeap* raw = heaps[i];
+            if (!raw) return check(false);
+            if (ID3D12DescriptorHeap* real = d3d12_xs::heap_proxy_real_heap(raw)) raw = real;
+            D3D12_DESCRIPTOR_HEAP_DESC desc{};
+            D3D12_GPU_VIRTUAL_ADDRESS base = 0;
+            IUnknown* const heap_owner = descriptor_heap_info(raw, desc, base);
+            if (!heap_owner || (owner && heap_owner != owner)) return check(false);
+            if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return check(false);
+            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                if (cbv) return check(false);
+                cbv = raw;
+                cbv_base = base;
+            } else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+                if (smp) return check(false);
+                smp = raw;
+                smp_base = base;
+            } else {
+                return check(false);
+            }
+        }
+        hold(cbv);
+        hold(smp);
+        if (defer([=](GraphicsCommandList& l) { l.verify_bundle_descriptor_heaps(cbv, smp); })) return;
+        set_descriptor_heaps(cbv, cbv_base, smp, smp_base);
     }
 
     void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) override {
@@ -310,14 +370,18 @@ public:
         record_dispatch(x, y, z);
     }
 
-    // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
+    // ClearState returns every piece of list state to its default, as Reset does (stencil references and predication
+    // included).
     void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
+        if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (!list_.closed()) check(list_.set_predication({0, 0, 0}));
         reset_state(state);
     }
 
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.topology_ = u(topology); })) return;
         topology_ = u(topology);
     }
@@ -336,6 +400,7 @@ public:
     }
 
     void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
+        if (list_.closed()) return;
         const std::optional<D3D12_INDEX_BUFFER_VIEW> copy = view ? std::optional(*view) : std::nullopt;
         if (defer([=](GraphicsCommandList& l) { l.set_index_buffer(copy ? &*copy : nullptr); })) return;
         set_index_buffer(view);
@@ -356,7 +421,13 @@ public:
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        if (!count || !rects) return;
+        // A zero-count call disables all previously bound rectangles; it is not a no-op.
+        // With no scissor bound, the rasterizer clips every fragment, as on native D3D12.
+        if (!count) {
+            scissor_ = {};
+            return;
+        }
+        if (!rects) return;
         if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
         scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
     }
@@ -377,6 +448,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
+        if (list_.closed()) return;
         const std::array<float, 4> value = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
                                                   : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
         if (defer([=](GraphicsCommandList& l) { l.blend_factor_ = value; })) return;
@@ -384,6 +456,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.front_stencil_ref_ = l.back_stencil_ref_ = reference; })) return;
         front_stencil_ref_ = back_stencil_ref_ = reference;
     }
@@ -404,6 +477,20 @@ public:
             }, true))
             return;
         record_draw(true, indices, instances, first_index, base_vertex, first_instance);
+    }
+
+    // ID3D12GraphicsCommandList6: a mesh draw. The bound graphics pipeline must have a mesh shader (checked at
+    // execution, where the pipeline is resolved). D3D12 caps each count at 65535 and their product at 2^22
+    // (D3D12_MS_DISPATCH_MAX_THREAD_GROUPS_PER_GRID); a larger grid is a recording error.
+    void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
+        if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
+        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+        draw.mesh = true;
+        check(list_.draw(std::move(draw)));
     }
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
@@ -480,12 +567,41 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTiles");
         const auto direction = flags & ~D3D12_TILE_COPY_FLAG_NO_HAZARD;
         const bool to_linear = direction == D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
-        leonida::BufferTileRegion region;
+        const auto grid = tile_grid(tiled);
+        std::vector<leonida::TileRegion> regions;
         if (!start || !size || !linear || linear == tiled ||
-            !buffer_tile_region(start, size, buffer_tiles(tiled), region) ||
+            !append_tile_regions(start, size, grid, regions) ||
             (!to_linear && direction != D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE))
             return check(false);
         const auto tiled_id = resource_id(tiled), linear_id = resource_id(linear);
+        if (is_sparse_image(tiled)) {
+            const auto buffer = linear->GetDesc();
+            const auto desc = tiled->GetDesc();
+            const auto count = size->UseBox ? std::uint64_t(size->Width) * size->Height : size->NumTiles;
+            if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || buffer.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+                linear_offset > buffer.Width || count > (buffer.Width - linear_offset) / leonida::tile_size_in_bytes)
+                return check(false);
+            constexpr auto shape = leonida::element_tile_shape(false, 4);
+            const leonida::CopyLocation image{tiled_id, false, 0, 0, 0, 0, 0, 0};
+            for (const auto& region : regions) {
+                for (std::uint64_t tile = region.first; tile < region.first + region.count; ++tile) {
+                    const auto x = std::uint32_t(tile % grid.columns) * shape.width;
+                    const auto y = std::uint32_t(tile / grid.columns) * shape.height;
+                    const auto width = std::min(shape.width, std::uint32_t(desc.Width) - x);
+                    const auto height = std::min(shape.height, desc.Height - y);
+                    const leonida::CopyLocation footprint{
+                        linear_id, true, 0, linear_offset, shape.width, shape.height, 1, shape.width * 4};
+                    auto copy = to_linear
+                        ? leonida::CopyTexture{footprint, 0, 0, 0, image, true, {x, y, 0, x + width, y + height, 1}}
+                        : leonida::CopyTexture{image, x, y, 0, footprint, true, {0, 0, 0, width, height, 1}};
+                    copy.tile_footprint = true;
+                    check(list_.copy_texture(copy));
+                    linear_offset += leonida::tile_size_in_bytes;
+                }
+            }
+            return;
+        }
+        const auto& region = regions.front();
         const auto tiled_offset = region.first * leonida::tile_size_in_bytes;
         const auto bytes = region.count * leonida::tile_size_in_bytes;
         check(list_.copy_buffer(to_linear
@@ -506,6 +622,14 @@ public:
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyResource");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (dst && dst == src) {
+            // A self-copy on a DEFAULT heap is a no-op, but an UPLOAD/READBACK resource still cannot
+            // be both source and destination: native D3D12 rejects it at Close. Check this before
+            // the no-op is omitted from the recorded command list.
+            D3D12_HEAP_PROPERTIES properties{};
+            if (FAILED(dst->GetHeapProperties(&properties, nullptr)) ||
+                properties.Type != D3D12_HEAP_TYPE_DEFAULT) return check(false);
+        }
         check(list_.copy_resource({resource_id(dst), resource_id(src)}));
     }
 
@@ -548,10 +672,24 @@ public:
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
     }
 
-    // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.
+    // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles and copy lists may not set it.
+    // Recording-time checks match live Windows 11 WARP and RTX 5090 D3D12: null buffer requires offset 0 and
+    // EQUAL_ZERO; a non-null resource must be a non-READBACK buffer with an 8-byte aligned in-bounds range.
     void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buffer, UINT64 offset, D3D12_PREDICATION_OP op) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPredication");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
+        if (!buffer) {
+            if (offset != 0 || op != D3D12_PREDICATION_OP_EQUAL_ZERO) return check(false);
+            return check(list_.set_predication({0, 0, 0}));
+        }
+        const auto desc = buffer->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return check(false);
+        if (offset % leonida::predication_alignment != 0 || offset > desc.Width ||
+            desc.Width - offset < leonida::predication_alignment)
+            return check(false);
+        D3D12_HEAP_PROPERTIES heap{};
+        if (SUCCEEDED(buffer->GetHeapProperties(&heap, nullptr)) && heap.Type == D3D12_HEAP_TYPE_READBACK)
+            return check(false);
         check(list_.set_predication({resource_id(buffer), offset, u(op)}));
     }
 
@@ -685,6 +823,29 @@ public:
         UINT stride = 0;
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
             return check(false);
+        const auto arg_desc = argument_buffer->GetDesc();
+        if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
+            return check(false);
+        if (count_buffer) {
+            const auto count_desc = count_buffer->GetDesc();
+            if (count_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || count_buffer_offset % 4 != 0 ||
+                count_desc.Width < sizeof(UINT) || count_buffer_offset > count_desc.Width - sizeof(UINT))
+                return check(false);
+        } else if (count_buffer_offset != 0) {
+            return check(false);
+        }
+        if (max_command_count) {
+            const UINT64 record_size =
+                kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
+                : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
+                : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                : 0;
+            if (!record_size || stride < record_size || stride % 4 != 0)
+                return check(false);
+            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
+            if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
+                return check(false);
+        }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;
@@ -705,7 +866,17 @@ public:
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT postbuild_count,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* postbuild) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
+        if (postbuild_count && !postbuild) return check(false);
+        for (UINT i = 0; i < postbuild_count; ++i) {
+            if (!valid_postbuild_info_type(postbuild[i].InfoType)) return check(false);
+        }
         const auto& in = desc->Inputs;
+        if (in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+            in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
+            return check(false);
+        if (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY &&
+            in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+            return check(false);
         leonida::BuildAccelerationStructure cmd{};
         cmd.is_tlas = (in.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
         cmd.update = (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) != 0;
@@ -717,12 +888,15 @@ public:
             cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
         if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
             cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
+            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;   // XDXR: BOX16 nodes (BLAS)
         cmd.dst_va = desc->DestAccelerationStructureData;
         cmd.src_va = desc->SourceAccelerationStructureData;
         cmd.scratch_va = desc->ScratchAccelerationStructureData;
         if (cmd.is_tlas) {
             cmd.instances_va = in.InstanceDescs;
             cmd.instance_count = in.NumDescs;
+            cmd.instance_pointers = in.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
         } else {
             for (UINT i = 0; i < in.NumDescs; ++i) {
                 const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
@@ -777,6 +951,7 @@ public:
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* desc, UINT count,
         const D3D12_GPU_VIRTUAL_ADDRESS* sources) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc || !count || !sources) return check(false);
+        if (!valid_postbuild_info_type(desc->InfoType)) return check(false);
         leonida::AccelerationStructurePostbuild info{};
         info.dest_va = desc->DestBuffer;
         info.type = static_cast<std::uint32_t>(desc->InfoType);
@@ -788,12 +963,37 @@ public:
                                                                D3D12_GPU_VIRTUAL_ADDRESS source,
                                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (!valid_copy_mode(mode)) return check(false);
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
+    static bool valid_postbuild_info_type(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE type) {
+        switch (type) {
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TOOLS_VISUALIZATION:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static bool valid_copy_mode(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) {
+        switch (mode) {
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE:
+        case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE:
+            return true;
+        default:
+            return false;
+        }
+    }
     template<class E>
     static std::uint32_t u(E value) {
         return static_cast<std::uint32_t>(value);
@@ -826,14 +1026,67 @@ private:
         allocator_ = nullptr;
     }
 
+    static UINT subresource_count(const D3D12_RESOURCE_DESC& desc) {
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return 1;
+        const UINT mips = desc.MipLevels ? desc.MipLevels : 1u;
+        const UINT layers = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                ? 1u
+                                : (desc.DepthOrArraySize ? desc.DepthOrArraySize : 1u);
+        UINT planes = 1;
+        switch (desc.Format) {
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        case DXGI_FORMAT_NV12:
+        case DXGI_FORMAT_P010:
+        case DXGI_FORMAT_P016:
+            planes = 2;
+            break;
+        default:
+            break;
+        }
+        return mips * layers * planes;
+    }
+
     void atomic_copy(std::uint32_t bytes, ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
                      UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
                      const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || (count && (!resources || !ranges))) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !dst || !src || (count && (!resources || !ranges)))
+            return check(false);
+        const auto dst_desc = dst->GetDesc();
+        const auto src_desc = src->GetDesc();
+        if (dst_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            src_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+            return check(false);
+        if (dst_offset % bytes != 0 || src_offset % bytes != 0 || dst_offset > dst_desc.Width ||
+            dst_desc.Width - dst_offset < bytes || src_offset > src_desc.Width || src_desc.Width - src_offset < bytes)
+            return check(false);
         leonida::AtomicCopyBuffer copy{resource_id(dst), dst_offset, resource_id(src), src_offset, bytes, {}};
-        for (UINT i = 0; i < count; ++i)
-            copy.dependencies.push_back(
-                {resource_id(resources[i]), ranges[i].Subresource, ranges[i].Range.Begin, ranges[i].Range.End});
+        copy.dependencies.reserve(count);
+        for (UINT i = 0; i < count; ++i) {
+            ID3D12Resource* dep = resources[i];
+            if (!dep) return check(false);
+            const auto dep_desc = dep->GetDesc();
+            const auto& r = ranges[i];
+            UINT64 begin = r.Range.Begin;
+            UINT64 end = r.Range.End;
+            if (dep_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                if (r.Subresource != 0) return check(false);
+                if (begin >= end || (end != UINT64_MAX && end > dep_desc.Width))
+                    return check(false);
+            } else {
+                const UINT total_subresources = subresource_count(dep_desc);
+                if (r.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && r.Subresource >= total_subresources)
+                    return check(false);
+                if (begin != 0 || end != UINT64_MAX) return check(false);
+            }
+            copy.dependencies.push_back({resource_id(dep), r.Subresource, begin, end});
+        }
         check(list_.atomic_copy(copy));
     }
 
@@ -918,6 +1171,19 @@ private:
         state.layout = layout;
         state.data = {};
         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
+        // CreateRootSignature accepted it for the other bind point only (its log line says why).
+        if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
+            stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
+                                   : "SetGraphicsRootSignature(signature that does not fit the graphics layout)");
+            check(false);
+        }
+    }
+
+    bool is_compute(const RootState& state) const { return &state == &compute_; }
+
+    // The parameter's first user-data dword at this bind point (RootArgumentLayout).
+    std::uint32_t first_dword(const RootState& state, const RootArgumentLayout::Parameter& p) const {
+        return is_compute(state) ? p.compute_offset : p.user_offset;
     }
 
     // The parameter, if it exists and has the expected type; null after recording an invalid call.
@@ -959,7 +1225,8 @@ private:
         if (!p) return;
         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
-        for (UINT i = 0; i < count; ++i) write(state, p->user_offset + offset + i, values[i]);
+        const std::uint32_t first = first_dword(state, *p);
+        for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
@@ -969,8 +1236,11 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
-        write(state, p->user_offset, std::uint32_t(va));
-        write(state, p->user_offset + 1, std::uint32_t(va >> 32));
+        const std::uint32_t first = first_dword(state, *p);
+        write(state, first, std::uint32_t(va));
+        // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
+        // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
+        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -983,6 +1253,10 @@ private:
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
     std::uintptr_t graphics_pipeline_ = 0;
+    ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
+    ID3D12DescriptorHeap* sampler_heap_ = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
@@ -1047,10 +1321,44 @@ private:
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
     }
 
+    void set_descriptor_heaps(ID3D12DescriptorHeap* cbv, D3D12_GPU_VIRTUAL_ADDRESS cbv_base,
+                              ID3D12DescriptorHeap* smp, D3D12_GPU_VIRTUAL_ADDRESS smp_base) {
+        cbv_srv_uav_heap_ = cbv;
+        cbv_srv_uav_base_ = cbv_base;
+        sampler_heap_ = smp;
+        sampler_base_ = smp_base;
+    }
+
+    // D3D12 bundle rule: every non-null heap bound by a bundle's SetDescriptorHeaps must match the parent list's
+    // currently bound heap of that type, without clearing any omitted heap slot on the parent.
+    void verify_bundle_descriptor_heaps(ID3D12DescriptorHeap* cbv, ID3D12DescriptorHeap* smp) {
+        if ((cbv && cbv != cbv_srv_uav_heap_) || (smp && smp != sampler_heap_)) check(false);
+    }
+
+    void note_direct_heap_indexing(const RootArgumentLayout* layout) const {
+        if (!layout) return;
+        if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
+            if (!cbv_srv_uav_heap_)
+                note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
+            else
+                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+        }
+        if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
+            if (!sampler_heap_)
+                note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
+            else
+                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+        }
+    }
+
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
         compute_ = {};
         graphics_ = {};
+        cbv_srv_uav_heap_ = nullptr;
+        sampler_heap_ = nullptr;
+        cbv_srv_uav_base_ = 0;
+        sampler_base_ = 0;
         topology_ = 0;
         vertex_buffers_ = {};
         index_ = {};
@@ -1079,6 +1387,7 @@ private:
 
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
+        note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
 
@@ -1098,6 +1407,7 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
@@ -1153,14 +1463,19 @@ public:
         const VkSemaphore semaphore = fence_.semaphore();
         context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
             std::uint64_t now = 0;
-            context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now);
-            if (now >= queued && now < value) {
+            bool signaled = false;
+            if (context->vk.vkGetSemaphoreCounterValue(context->device(), semaphore, &now) == VK_SUCCESS &&
+                now >= queued && now < value) {
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
                 info.value = value;
-                context->vk.vkSignalSemaphore(context->device(), &info);
+                signaled = context->vk.vkSignalSemaphore(context->device(), &info) == VK_SUCCESS;
             }
             held->fetch_sub(1);
+            if (signaled) {
+                context->holds().signaled(semaphore, value);
+                context->holds().pump_ready();
+            }
         });
         return S_OK;
     }
@@ -1215,6 +1530,30 @@ public:
     // {e1a85d76-0b3f-4c29-a7d4-58f2c6e0b913}
     static constexpr GUID kTag{0xe1a85d76, 0x0b3f, 0x4c29, {0xa7, 0xd4, 0x58, 0xf2, 0xc6, 0xe0, 0xb9, 0x13}};
 
+    // What a held batch (queue_holds.h) keeps alive until it has run: the pipeline states and root signatures its
+    // lists name, which the application may release and Reset away as soon as ExecuteCommandLists returns. Resources
+    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this).
+    static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
+        auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
+            for (IUnknown* object : *held) object->Release();
+            delete held;
+        });
+        for (const GraphicsCommandList* list : lists)
+            for (IUnknown* object : list->pinned()) {
+                object->AddRef();
+                objects->push_back(object);
+            }
+        return objects;
+    }
+
+    // A D3D12 queue holds the fences it waits on and signals until the work has been submitted.
+    static leonida::VulkanQueue::PinFn fence_pin(ID3D12Fence* fence) {
+        return [fence]() -> std::shared_ptr<void> {
+            fence->AddRef();
+            return std::shared_ptr<void>(fence, [](void* held) { static_cast<ID3D12Fence*>(held)->Release(); });
+        };
+    }
+
     static leonida::VulkanQueue::QueueKind queue_kind_for(D3D12_COMMAND_LIST_TYPE type) {
         if (type == D3D12_COMMAND_LIST_TYPE_COPY) return leonida::VulkanQueue::QueueKind::copy;
         if (type == D3D12_COMMAND_LIST_TYPE_COMPUTE) return leonida::VulkanQueue::QueueKind::compute;
@@ -1235,7 +1574,11 @@ public:
     }
 
     bool ok() const { return queue_.ok(); }
-    leonida::ReplayResult last_result() const { return last_result_; }
+    leonida::ReplayResult last_result() {
+        // A batch the queue held fails when it is released, after the call returned: the failure is the result.
+        if (const auto held = queue_.take_held_failure(); held != leonida::ReplayResult::success) last_result_ = held;
+        return last_result_;
+    }
 
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override {
         d3d12_trace::record("ID3D12CommandQueue::GetDesc");
@@ -1247,11 +1590,35 @@ public:
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
         std::lock_guard lock(mutex_);
+        if (count > 0 && !lists) {
+            note_once("ExecuteCommandLists: null command list array with non-zero count");
+            last_result_ = leonida::ReplayResult::unsupported;
+            d3d12_trace::record(method, "failed");
+            return;
+        }
         std::vector<const leonida::CommandList*> recorded;
+        std::vector<const GraphicsCommandList*> graphics;
         for (UINT i = 0; i < count; ++i) {
             const GraphicsCommandList* list = GraphicsCommandList::from(lists[i]);
             if (!list || list->type() == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
                 std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is not a direct command list\n", i);
+                last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
+            // A list runs only on a queue of its own type (the debug layer's EXECUTECOMMANDLISTS_COMMANDLISTMISMATCH,
+            // message 836): a DIRECT list's draws would otherwise be recorded for a COPY queue's transfer-only
+            // Vulkan family. The whole batch is refused, as for the other checks here.
+            if (list->type() != desc_.Type) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u has type %d, the queue type %d\n", i,
+                             int(list->type()), int(desc_.Type));
+                last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
+            // A list whose recording failed (Close returned E_INVALIDARG) must not replay its earlier commands.
+            if (list->invalid()) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is invalid; refusing batch\n", i);
                 last_result_ = leonida::ReplayResult::unsupported;
                 d3d12_trace::record(method, "failed");
                 return;
@@ -1262,8 +1629,9 @@ public:
                 return;
             }
             recorded.push_back(&list->commands());
+            graphics.push_back(list);
         }
-        last_result_ = queue_.execute(recorded);
+        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
@@ -1289,10 +1657,10 @@ public:
                                               const D3D12_TILE_RANGE_FLAGS* flags, const UINT* offsets,
                                               const UINT* counts, D3D12_TILE_MAPPING_FLAGS mapping_flags) override {
         constexpr auto method = "ID3D12CommandQueue::UpdateTileMappings";
-        if (!update_buffer_tiles(resource, region_count, starts, sizes, heap, range_count, flags, offsets,
-                                 counts, mapping_flags)) {
+        if (!update_tiles(resource, region_count, starts, sizes, heap, range_count, flags, offsets, counts,
+                          mapping_flags)) {
             d3d12_trace::record(method, "refused");
-            note_once("ID3D12CommandQueue::UpdateTileMappings: invalid mapping or buffer sparse residency unavailable");
+            note_once("ID3D12CommandQueue::UpdateTileMappings: invalid mapping or sparse residency unavailable");
         } else {
             d3d12_trace::record(method, "ok");
         }
@@ -1303,13 +1671,13 @@ public:
                                             const D3D12_TILE_REGION_SIZE* size, D3D12_TILE_MAPPING_FLAGS flags) override {
         constexpr auto method = "ID3D12CommandQueue::CopyTileMappings";
         std::lock_guard lock(mutex_);
-        leonida::BufferTileRegion from, to;
+        std::vector<leonida::TileRegion> from, to;
         if ((flags & ~D3D12_TILE_MAPPING_FLAG_NO_HAZARD) || !dst_start || !src_start || !size ||
-            !buffer_tile_region(src_start, size, buffer_tiles(src), from) ||
-            !buffer_tile_region(dst_start, size, buffer_tiles(dst), to) ||
-            !queue_.copy_tile_mappings(resource_id(dst), to.first, resource_id(src), from)) {
+            !append_tile_regions(src_start, size, tile_grid(src), from) ||
+            !append_tile_regions(dst_start, size, tile_grid(dst), to) ||
+            !queue_.copy_tile_mappings(resource_id(dst), to, resource_id(src), from)) {
             d3d12_trace::record(method, "refused");
-            note_once("ID3D12CommandQueue::CopyTileMappings: invalid mapping or buffer sparse residency unavailable");
+            note_once("ID3D12CommandQueue::CopyTileMappings: invalid mapping or sparse residency unavailable");
         } else {
             d3d12_trace::record(method, "ok");
         }
@@ -1321,7 +1689,7 @@ public:
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
         if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
-        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value) ? S_OK : E_FAIL);
+        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value, fence_pin(fence)) ? S_OK : E_FAIL);
     }
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
@@ -1329,7 +1697,7 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        queue_.wait(f->semaphore(), value);
+        queue_.wait(f->semaphore(), value, fence_pin(fence));
         return d3d12_trace::result(method, S_OK);
     }
 
@@ -1468,23 +1836,26 @@ private:
         queue_.marker(kind, label.c_str());
     }
 
-    bool update_buffer_tiles(ID3D12Resource* resource, UINT region_count, const D3D12_TILED_RESOURCE_COORDINATE* starts,
-                             const D3D12_TILE_REGION_SIZE* sizes, ID3D12Heap* heap, UINT range_count,
-                             const D3D12_TILE_RANGE_FLAGS* flags, const UINT* offsets, const UINT* counts,
-                             D3D12_TILE_MAPPING_FLAGS mapping_flags) {
+    bool update_tiles(ID3D12Resource* resource, UINT region_count, const D3D12_TILED_RESOURCE_COORDINATE* starts,
+                      const D3D12_TILE_REGION_SIZE* sizes, ID3D12Heap* heap, UINT range_count,
+                      const D3D12_TILE_RANGE_FLAGS* flags, const UINT* offsets, const UINT* counts,
+                      D3D12_TILE_MAPPING_FLAGS mapping_flags) {
         if (!region_count || !range_count || (!starts && region_count != 1) ||
             (mapping_flags & ~D3D12_TILE_MAPPING_FLAG_NO_HAZARD)) return false;
-        const auto tiles = buffer_tiles(resource);
-        std::vector<leonida::BufferTileRegion> regions(region_count);
-        std::uint64_t total = 0;
+        const auto grid = tile_grid(resource);
+        std::vector<leonida::TileRegion> regions;
+        regions.reserve(region_count);
         for (UINT i = 0; i < region_count; ++i) {
-            if (!buffer_tile_region(starts ? starts + i : nullptr, sizes ? sizes + i : nullptr, tiles, regions[i]))
+            if (!append_tile_regions(starts ? starts + i : nullptr, sizes ? sizes + i : nullptr, grid, regions))
                 return false;
-            if (regions[i].count > UINT64_MAX - total) return false;
-            total += regions[i].count;
+        }
+        std::uint64_t total = 0;
+        for (const auto& region : regions) {
+            if (region.count > UINT64_MAX - total) return false;
+            total += region.count;
         }
 
-        std::vector<leonida::BufferTileRange> ranges;
+        std::vector<leonida::TileRange> ranges;
         ranges.reserve(range_count);
         std::uint64_t remaining = total, heap_tiles_required = 0;
         for (UINT i = 0; i < range_count; ++i) {
@@ -1519,7 +1890,9 @@ private:
             (!heap || heap_tiles_required > heap->GetDesc().SizeInBytes / leonida::tile_size_in_bytes))) return false;
         std::lock_guard lock(mutex_);
         return queue_.update_tiles(resource_id(resource), regions, ranges,
-                                   [&] { return heap_tiles_required ? tile_heap(heap, context_) : nullptr; });
+                                   [&](bool image, std::uint32_t types) {
+                                       return heap_tiles_required ? tile_heap(heap, context_, image, types) : nullptr;
+                                   });
     }
 
     D3D12_COMMAND_QUEUE_DESC desc_;
@@ -1627,7 +2000,11 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
         wait.semaphoreCount = count;
         wait.pSemaphores = semaphores.data();
         wait.pValues = values;
-        return context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX) == VK_SUCCESS ? S_OK : E_FAIL;
+        const VkResult result = context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX);
+        // Unlike a single fence's blocking SetEventOnCompletion, this path invokes Vulkan directly.
+        // A lost device must wake its other registered fence waiters and reject later submissions.
+        if (result == VK_ERROR_DEVICE_LOST) context.mark_device_lost();
+        return result == VK_SUCCESS ? S_OK : E_FAIL;
     }
     // Each fence's own waiter thread counts the shared waiter down; no thread of its own.
     const auto waiter = std::make_shared<FenceWaiter>(event, any ? 1u : count);
@@ -1660,7 +2037,7 @@ bool command_signature_info(ID3D12CommandSignature* signature, leonida::Indirect
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {
     if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
-    const CommandQueue* q = CommandQueue::from(queue);
+    CommandQueue* q = CommandQueue::from(queue);
     return q ? q->last_result() : leonida::ReplayResult::unsupported;
 }
 
@@ -1677,6 +2054,15 @@ bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Com
     if (!l) return false;
     const auto recorded = l->commands().commands();
     commands.assign(recorded.begin(), recorded.end());
+    return true;
+}
+
+bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS& cbv_srv_uav,
+                                 D3D12_GPU_VIRTUAL_ADDRESS& sampler) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    cbv_srv_uav = l->cbv_srv_uav_base();
+    sampler = l->sampler_base();
     return true;
 }
 

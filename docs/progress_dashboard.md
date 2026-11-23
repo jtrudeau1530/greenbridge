@@ -16,11 +16,13 @@ The page is one self-contained HTML file: no network, no packages, it opens from
 ## Sources
 
 Each source is optional. A missing one is listed under "Sources" on the page; it is never counted as zero or as a failure.
+For `--junit`, keep the original XML encoding. UTF-16 reports and reports with a supported encoding declaration
+are read directly; there is no need to re-save them as UTF-8.
 
 | Panel | Source | Unit |
 |---|---|---|
 | Unit tests | `--run-tests` runs `tests/test_*.py` with the selection `ci.yml` uses (standard-library files with a `__main__` block), one process each; the outcome and the commit it ran on are kept in `<out>/unit_results.json`. That is CI's standard-library loop only: `tests/semantic` (the translator suite) and files that need pytest or numpy are not run, so the panel is not the whole test suite; feed those through `--junit` (`python -m pytest tests/semantic --junitxml <file>`) to see them in the runtime-tests panel | test file |
-| Runtime tests | `runtime/build/Testing/Temporary/LastTest.log` and any `--junit` file (CTest `--output-junit` or pytest `--junitxml`) | test |
+| Runtime tests | `runtime/build/Testing/Temporary/LastTest.log` and any `--junit` file (CTest `--output-junit` or pytest `--junitxml`). CTest logs and XML reports are age-checked by file modification time | test |
 | GPU tests | `--gpu-log <file>[=<GPU, driver, OS>]`: the saved output of `runtime/test/shaders/check.py`, one group per GPU; a log older than the last commit touching `runtime/test/shaders` or `tools/rdna2spirv.py` counts as needing a re-run | test program |
 | Translator contract | the contract table in [design.md](design.md#translator-status-and-runtime-contract), each row classified by how it says it was confirmed | contract row |
 | Runtime imports | the measured tables in [runtime_imports.md](runtime_imports.md) | import |
@@ -44,7 +46,7 @@ it continues) and its pull requests. Nothing is posted: every `gh` call is a rea
 |---|---|---|---|---|---|
 | VERIFIED | passed, and nothing it depends on changed since | names a GPU check and leaves nothing open | image with 0 unimplemented imports | — | — |
 | IMPLEMENTED | — | confirmed by an LLVM/Mesa reference, a corpus count or a CPU test, not a GPU | bound to a shim, the host or a module | merged into `main` | a PR merged into `main` and none open |
-| PARTIAL | passed before a change to the test, `tools/`, `scripts/` or `make_game.py` (CTest: before the last commit touching `runtime/`) | waits for a GPU measurement, or names a GPU check with an item still open | — | open | pull request open |
+| PARTIAL | passed before a change to the test, `make_game.py`, or a Python file under `tools/`, `scripts/` or `runtime/test/shaders/` (CTest: before the last commit touching `runtime/`) | waits for a GPU measurement, or names a GPU check with an item still open | — | open | pull request open |
 | FAILED | failed on its last run | — | — | — | — |
 | MISSING | — | — | unimplemented | — | unclaimed |
 | UNKNOWN | skipped, or git can't tell what changed | states no confirmation method | — | — | claimed, no code yet |

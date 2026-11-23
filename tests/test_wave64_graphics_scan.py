@@ -249,6 +249,49 @@ class CliTests(unittest.TestCase):
                     scan.main([disasm, "--out", alias])
             self.assertNotEqual(cm.exception.code, 0)
 
+    def test_out_overwriting_a_wave_size_header_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            disasm = root / "disasm"
+            headers = root / "fssm"
+            disasm.mkdir()
+            headers.mkdir()
+            name, listing = PS_W64_SENSITIVE
+            (disasm / name).write_text(listing, encoding="utf-8", newline="\n")
+            header = headers / (Path(name).stem + ".fssm")
+            data = fssm_header.MAGIC + bytes(fssm_header.WAVE_FLAGS_OFFSET)
+            header.write_bytes(data)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as cm:
+                    scan.main([str(disasm), "--out", str(header)])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite", err.getvalue())
+            self.assertEqual(header.read_bytes(), data)
+
+    def test_uses_shared_same_report_path_and_catches_folding_volume_case_alias(self):
+        import report_paths
+        from unittest import mock
+        self.assertIs(scan.same_report_path, report_paths.same_report_path)
+        with tempfile.TemporaryDirectory() as work:
+            disasm = os.path.join(work, "dxbc", "disasm")
+            os.makedirs(disasm)
+            index = os.path.join(work, "dxbc", "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump([{"file": "ps_0001.dxbc", "stage": "ps"}], f)
+            name, text = PS_W64_SENSITIVE
+            with open(os.path.join(disasm, "ps_0001.s"), "w", encoding="utf-8") as f:
+                f.write(text)
+            folded_index = os.path.join(work, "dxbc", "INDEX.JSON")
+            with (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath),
+                  mock.patch.object(report_paths, "_resolved_key", side_effect=str),
+                  mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+                  mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe,
+                  contextlib.redirect_stderr(io.StringIO())):
+                with self.assertRaises(SystemExit) as cm:
+                    scan.main([disasm, "--out", folded_index])
+                self.assertEqual(cm.exception.code, 2)
+            self.assertGreaterEqual(probe.call_count, 1)
+
     def test_cli_execution_with_out_json(self):
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as outdir:
             for name, text in (PS_W64_SENSITIVE, VS_W64):

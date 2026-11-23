@@ -10,13 +10,15 @@ import os
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "manifest.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import manifest  # noqa: E402
+import report_paths  # noqa: E402
 
 
 class ManifestSha256Test(unittest.TestCase):
@@ -341,7 +343,7 @@ class ManifestCliTest(unittest.TestCase):
         self.out_manifest = os.path.join(self.tmp.name, "manifest.json")
 
     def run_cli(self, *args):
-        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, errors="replace")
 
     def test_cli_create_and_verify(self):
         p_create = self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "2")
@@ -598,7 +600,7 @@ class ManifestDigestCaseTest(unittest.TestCase):
         return subprocess.run(
             [sys.executable, "-I", "-B", TOOL, "verify", self.pkg,
              "--manifest", self.out, "--jobs", str(jobs)],
-            capture_output=True, text=True)
+            capture_output=True, text=True, errors="replace")
 
     def test_verify_accepts_hex_digest_case(self):
         for case in ("lower", "upper", "mixed"):
@@ -700,6 +702,21 @@ class ManifestPosixBackslashTest(unittest.TestCase):
             with contextlib.redirect_stdout(verify_out):
                 self.assertEqual(manifest.verify(pkg, out, jobs=1), 0)
             self.assertEqual(verify_out.getvalue(), "OK\n")
+
+
+class ManifestOutGuardTest(unittest.TestCase):
+    def test_out_guard_follows_the_folding_volume(self):
+        """--out asks report_paths, so a case-insensitive APFS volume refuses an --out that is one of the hashed
+        files; the private realpath+normcase copy answered "two files" there and let the manifest replace it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            composed = os.path.join(tmp, "café.json")
+            decomposed = os.path.join(tmp, unicodedata.normalize("NFD", "café.json"))
+            folding = [True]
+            with patch.object(report_paths, "sys", Mock(platform="darwin")), \
+                    patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+                self.assertTrue(manifest.same_report_path(composed, decomposed))
+                folding[0] = False
+                self.assertFalse(manifest.same_report_path(composed, decomposed))
 
 
 class ManifestBelowNormalTest(unittest.TestCase):

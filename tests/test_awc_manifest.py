@@ -89,7 +89,7 @@ class ManifestTest(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True,
-                              text=True, encoding="utf-8", timeout=60)
+                              text=True, errors="replace", timeout=60)
 
     def test_csv_rows_codecs_and_bad_bank_skip(self):
         bank = self.write_bank()
@@ -293,6 +293,26 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((doc["bank_count"], doc["stream_count"]), (0, 0))
         self.assertEqual(doc["streams"], [])
 
+    def test_incomplete_bank_discovery_preserves_the_previous_manifest(self):
+        root = self.tmp.name
+        blocked = os.path.join(root, "blocked")
+        out = os.path.join(root, "manifest.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+
+        def walk(path, onerror=None):
+            if onerror:
+                onerror(PermissionError(13, "permission denied", blocked))
+            return iter(())
+
+        with mock.patch.object(awc_manifest.os, "walk", walk), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc_manifest.main([root, "--out", out]), 1)
+        self.assertIn(blocked, err.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+
     def test_unreadable_bank_preserves_the_previous_manifest(self):
         good = os.path.join(self.tmp.name, "good.awc")
         blocked = os.path.join(self.tmp.name, "unreadable.awc")
@@ -335,6 +355,30 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
+    def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
+        out = os.path.join(self.tmp.name, "manifest.json")
+        previous = '{"previous": true}\n'
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(previous)
+        os.chmod(out, 0o444)
+        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".awc_manifest-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(awc_manifest.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(awc_manifest.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                awc_manifest.write_manifest([], 0, 0, "json", out)
+        self.assertEqual(len(made_writable), 1)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])
+
     def test_recursive_report_distinguishes_banks_with_the_same_basename(self):
         for folder in ("left", "right"):
             os.mkdir(os.path.join(self.tmp.name, folder))
@@ -356,6 +400,29 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((row["channels"], row["declared_samples"]), ("2", "960"))
         self.assertAlmostEqual(float(row["duration_s"]), 0.02, places=6)
         self.assertEqual(row["streamed_music"], "yes")
+
+
+    def test_a_single_named_file_that_is_not_a_bank_is_refused(self):
+        path = os.path.join(self.tmp.name, "notes.bin")
+        with open(path, "wb") as f:
+            f.write(b"not an AWC bank")
+        out = os.path.join(self.tmp.name, "manifest.json")
+        p = self.run_tool(path, "--out", out)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("holds no AWC bank", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_scanned_directory_with_no_bank_still_reports_empty(self):
+        # The refusal is for one named file: an empty folder scan is a valid "0 banks" answer.
+        os.mkdir(os.path.join(self.tmp.name, "banks"))
+        with open(os.path.join(self.tmp.name, "banks", "notes.bin"), "wb") as f:
+            f.write(b"not an AWC bank")
+        p = self.run_tool(os.path.join(self.tmp.name, "banks"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("0 banks, 0 streams, 0 streamed-music channels", p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], ",".join(HEADER))
 
 
 if __name__ == "__main__":

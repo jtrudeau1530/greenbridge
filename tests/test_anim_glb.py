@@ -91,7 +91,14 @@ def inverse_bind(q, t):
             r[2][0], r[2][1], r[2][2], 0.0, last[0], last[1], last[2], 1.0]
 
 
-def skeleton_resource(shift_bind=0.0, singular_bind=False):
+# Both bind matrices have rows 0 and 1 equal (zero determinant) and the same recovered origin (0, 0, 1),
+# so only the determinant distinguishes them from bone 0's valid bind. The first has a zero middle
+# cofactor; the second keeps it non-zero so a sign flip in that term is caught.
+SINGULAR_ZERO_COFACTOR = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+SINGULAR_LIVE_COFACTOR = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+
+
+def skeleton_resource(shift_bind=0.0, singular_bind=None):
     p = Page()
     directory = drawable_header(p, "synthetic_skeleton")
     p.b[directory + 8], p.b[directory + 9] = 1, 0
@@ -101,10 +108,8 @@ def skeleton_resource(shift_bind=0.0, singular_bind=False):
     records = p.alloc(bytes(0x50 * n))
     world = world_transforms()
     binds = [inverse_bind(q, (t[0] + shift_bind, t[1], t[2])) for q, t in world]
-    if singular_bind:
-        # Rows 0 and 1 are equal, so the determinant is zero, but the origin still resolves to (0, 0, 1),
-        # which is bone 0's composed translation. Only the determinant distinguishes this from a valid bind.
-        binds[0] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
+    if singular_bind is not None:
+        binds[0] = singular_bind
     matrices = p.alloc(b"".join(struct.pack("<16f", *m) for m in binds))
     parents = p.alloc(b"".join(struct.pack("<H", 0xFFFF if x is None else x) for x in PARENTS))
     for i, name in enumerate(NAMES):
@@ -238,10 +243,12 @@ class SkeletonAndPartTest(unittest.TestCase):
         self.assertGreater(worst, 0.29)
 
     def test_a_singular_inverse_bind_is_refused_even_when_its_origin_matches(self):
-        sys_page = skeleton_resource(singular_bind=True)
-        # Before the fix the origin check passed and the degenerate matrix was exported as a joint.
-        with self.assertRaisesRegex(anim_glb.ExportError, "inverse bind matrix 0"):
-            anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
+        for matrix in (SINGULAR_ZERO_COFACTOR, SINGULAR_LIVE_COFACTOR):
+            with self.subTest(matrix=matrix):
+                sys_page = skeleton_resource(singular_bind=matrix)
+                # Before the fix the origin check passed and the degenerate matrix was exported as a joint.
+                with self.assertRaisesRegex(anim_glb.ExportError, "inverse bind matrix 0"):
+                    anim_glb.read_skeleton(sys_page, anim_glb.drawable_at(sys_page, None))
 
     def test_part_binds_model_bones_to_joints_by_hash(self):
         joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
@@ -355,6 +362,11 @@ class ClipChannelTest(unittest.TestCase):
         self.assertEqual(out_mid[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
         out_hi, _ = self.channels(0.095, 0.095, 1.0)
         self.assertEqual(out_hi[("mover", "translation")], [(0.0, (30.0, 0.0, 0.0))])
+        # Even when start == end sits slightly before a frame within 1e-4, timestamp stays 0.0.
+        self.anim["duration"] = 4 / 32
+        t = 2 / 32 - 2**-14
+        out_tol, _ = self.channels(t, t, 1 / 1024)
+        self.assertEqual(out_tol[("mover", "translation")], [(0.0, (20.0, 0.0, 0.0))])
 
     def test_select_clips_handles_non_hex_0x_names_and_bad_selectors(self):
         d = {
@@ -603,6 +615,26 @@ class ExportTest(unittest.TestCase):
         (gltf, _binary), _report = self.export("--no-root-motion")
         self.assertNotIn("mover", [n.get("name") for n in gltf["nodes"]])
 
+    def test_clip_selection_must_have_an_animation_export(self):
+        out = os.path.join(self.tmp.name, "out.glb")
+        report = os.path.join(self.tmp.name, "report.json")
+        common = ["--skeleton", hex(self.offsets[0]), "--report", report]
+        for selector in (["--clip", "walk"], ["--dictionary", "0"]):
+            for mode, args in (("--anim", [out, "--part", hex(self.offsets[1])]),
+                               ("--coverage", ["--coverage", "--anim", self.anim])):
+                with self.subTest(selector=selector, mode=mode):
+                    result = self.run_tool(self.packs, *args, *common, *selector)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(selector[0], result.stderr.splitlines()[-1])
+                    self.assertIn(mode, result.stderr.splitlines()[-1])
+                    self.assertFalse(os.path.exists(out))
+                    self.assertFalse(os.path.exists(report))
+
+        # The same authored part is still a valid static export without selectors.
+        result = self.run_tool(self.packs, out, "--part", hex(self.offsets[1]), *common)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("animations", read_glb(out)[0])
+
     def test_coverage_counts_bone_tracks(self):
         report = os.path.join(self.tmp.name, "coverage.json")
         r = self.run_tool(self.packs, "--coverage", "--skeleton", hex(self.offsets[0]), "--anim", self.anim,
@@ -612,6 +644,17 @@ class ExportTest(unittest.TestCase):
             counts = json.load(f)["counts"]
         self.assertEqual((counts["dictionaries"], counts["bone_tracks"], counts["bone_tracks_in_skeleton"],
                           counts["dictionaries_all_bones_in_skeleton"]), (1, 3, 3, 1))
+
+    def test_a_jobs_count_below_one_is_refused(self):
+        # coverage() used max(1, jobs), so 0 and negatives ran one serial worker and still exited 0.
+        report = os.path.join(self.tmp.name, "coverage.json")
+        for jobs in ("0", "-4"):
+            r = self.run_tool(self.packs, "--coverage", "--skeleton", hex(self.offsets[0]), "--anim", self.anim,
+                              "--report", report, "--jobs", jobs)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--jobs", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(report), "the run still wrote a report")
 
     def test_a_skeleton_whose_binds_disagree_is_refused(self):
         write_archive(self.packs, [[skeleton_resource(shift_bind=0.3)]])
@@ -657,6 +700,14 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
         self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
+
+    def test_a_missing_archive_prints_its_path_without_repr_escaping(self):
+        missing = os.path.join(self.tmp.name, "missing", "packs.rpf")
+        r = self.run_tool(missing, os.path.join(self.tmp.name, "x.glb"),
+                          "--skeleton", "0x1000", "--part", "0x1000")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stderr.strip(), f"ERROR: {missing}: {os.strerror(2)}")
+        self.assertEqual(r.stdout, "")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -224,6 +225,20 @@ class RadvBinary(unittest.TestCase):
             P.radv_arch("NVIDIA GeForce RTX 3090")
 
 
+class HarnessEnvironment(unittest.TestCase):
+    def test_child_receives_selected_format_even_when_shell_sets_one(self):
+        # Use Python as the child to observe the actual harness environment, without a GPU.
+        args = (sys.executable, "-c", "import os; print(os.environ['VKH_COLOR_FORMAT'])",
+                "unused.raw", (1, 1), {})
+        with patch.dict(os.environ, VKH_COLOR_FORMAT="107:16"):
+            default = P.run_harness(*args)
+            narrow = P.run_harness(*args, fmt="r32u")
+            self.assertEqual(os.environ["VKH_COLOR_FORMAT"], "107:16")
+        for result, expected in ((default, "109:16"), (narrow, "98:4")):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), expected)
+
+
 class RadvOracleWithoutGpu(unittest.TestCase):
     """The Oracle on a stand-in vk_harness that hands back RADV binaries: the RDNA4 refusal and --set."""
 
@@ -234,7 +249,7 @@ class RadvOracleWithoutGpu(unittest.TestCase):
             open(os.path.join(d.name, name), "wb").close()
         bins = [(32, b"k" * 32, _radv(RadvBinary.CODE, stage=0, next_stage=4)), (32, b"q" * 32, _radv(RadvBinary.CODE))]
 
-        def fake(exe, vs, ps, out_raw, size, env):
+        def fake(exe, vs, ps, out_raw, size, env, fmt="rgba32f"):
             P.write_binaries(env["VKH_BINARY_OUT"], bins)
             with open(out_raw, "wb") as f:
                 f.write(bytes(16 * size[0] * size[1]))
@@ -265,6 +280,20 @@ class Cli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(P.main(["--build", d, "--show-template"]), 77)
 
+    def test_json_overwriting_an_input_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            asm = os.path.join(d, "prog.txt")
+            with open(asm, "w", encoding="utf-8") as f:
+                f.write("s_endpgm\n")
+            with self.assertRaises(SystemExit) as cm:    # the report is written after the run, so the guard comes first
+                P.main(["--build", d, "--asm", asm, "--json", asm])
+            self.assertEqual(cm.exception.code, 2)
+            with open(asm, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "s_endpgm\n")
+            with self.subTest(flag="--ps"), self.assertRaises(SystemExit) as cm:
+                P.main(["--build", d, "--asm", asm, "--ps", asm, "--json", asm])
+            self.assertEqual(cm.exception.code, 2)
+
 
 @unittest.skipUnless(os.environ.get("LEONIDA_PS_ORACLE_BUILD"), "set LEONIDA_PS_ORACLE_BUILD to a runtime build "
                      "and select an AMD GPU (LEONIDA_VK_DEVICE) to run the pixel shader on hardware")
@@ -294,6 +323,26 @@ class OnHardware(unittest.TestCase):
         self.assertEqual(px, [[u, 0, p10, 0x12345678] for u in want_u])
         self.assertEqual(again, [[u, 0, p10, 0x9ABCDEF0] for u in want_u])
         self.assertNotEqual(o.template_pixels, px)                     # the template's own shader gives other words
+
+    def test_other_target_formats(self):
+        # The driver picks the export format for the target: a compressed export reaches an RGBA16_UNORM target
+        # bit for bit (the halves are unorm16 values, not f16), and an RG32F target (32_GR) takes R from the last
+        # enabled of x/z and G from the last enabled of y/w (measured on gfx1036).
+        cases = [("rgba16unorm", ["v_mov_b32_e32 v2, 0x80017fff", "v_mov_b32_e32 v3, 0xc0003c01",
+                                  "exp mrt0, v2, v2, v3, v3 done compr vm"], [0x80017FFF, 0xC0003C01]),
+                 ("rg32f", ["v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v3, 2", "v_mov_b32_e32 v4, 3", "v_mov_b32_e32 v5, 4",
+                            "exp mrt0, v2, v3, v4, v5 done vm"], [3, 4]),
+                 ("rg32f", ["v_mov_b32_e32 v2, 1", "v_mov_b32_e32 v5, 4", "exp mrt0, v2, off, off, v5 done vm"], [1, 4])]
+        for fmt, body, want in cases:
+            with self.subTest(fmt=fmt, body=body[-1]):
+                try:
+                    o = P.Oracle(os.environ["LEONIDA_PS_ORACLE_BUILD"], template="const", size=(1, 1), fmt=fmt)
+                except P.Unavailable as e:
+                    self.skipTest(str(e))
+                try:
+                    self.assertEqual(o.run(body + ["s_endpgm"]), [want])
+                finally:
+                    o.close()
 
 
 if __name__ == "__main__":

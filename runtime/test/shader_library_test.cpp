@@ -351,7 +351,7 @@ int main() {
     const std::string hash2 = sha256_hex(bytes("another program"));
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
-        index << "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
+        index << "\xef\xbb\xbf" "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
               << "\", \"bindings\": [2], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": true, \"wave64\": false},\n"
                  " \"vs_test\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
@@ -384,6 +384,10 @@ int main() {
     // out-of-range number (register -1) reads as 0 instead of wrapping.
     const auto vs_all = library.candidates("vs", hash);
     CHECK(vs_all.size() == 2 && vs_all[0] == vs && vs_all[1]->name == "vs_same_program");
+    const std::string tagged_hash = hash + "-suffix";
+    CHECK(library.candidates(std::string_view("vs-extra", 2),
+                             std::string_view(tagged_hash).substr(0, hash.size())) == vs_all);
+    CHECK(library.candidates("vs", tagged_hash).empty());
     CHECK(vs_all[1]->input_signature.size() == 1 && vs_all[1]->input_signature[0].semantic_index == 3 &&
           vs_all[1]->input_signature[0].register_index == 0);
     const ShaderEntry* ps = library.find("ps", hash);
@@ -461,6 +465,73 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // XboxBvhBuilder.dll's programs (docs/embedded_shaders.md): FSSM in a DXIL container like the game's shaders,
+    // translated into <dir>/bvh (entries named "bvh/<name>") and found by fssm_sha256, the game shaders' key.
+    {
+        const auto builder = container({{fixed, 25}});  // what the DLL passes to slot 62: the whole container
+        const auto untranslated = container({{stored, 40}});
+        const std::string builder_hash = sha256_hex(bytes("hello hello hello leonida"));
+        const auto code = fspx_code(0x5000);
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        const auto write = [&](const std::filesystem::path& file, const std::string& text) {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << text;
+        };
+        const std::string game = "\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}";
+        const std::string program_entry =
+            "{\"stage\": \"cs\", \"fssm_sha256\": \"" + builder_hash +
+            "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], \"lds_bytes\": 32768, "
+            "\"uses_code_base\": true, \"wave64\": true, \"subgroup_size\": 64}";
+        std::filesystem::create_directories(dir / "bvh");
+        std::filesystem::create_directories(dir / "fspx");
+        write(dir / "index.json", "{" + game + "}");
+        write(dir / "fspx" / "index.json",
+              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
+        // The second entry is a program whose metadata failed: no key, so nothing can find it and it is not counted.
+        write(dir / "bvh" / "index.json",
+              "{\"BuilderProgram\": " + program_entry + ",\n \"NoKey\": {\"error\": \"ValueError: synthetic\"}}");
+        {
+            std::ofstream spv(dir / "bvh" / "BuilderProgram.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary bvh;
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 3 && bvh.bvh_size() == 1 && bvh.fspx_size() == 1);
+        const ComputeProgram program = compute_program(builder);
+        CHECK(program.kind == ComputeProgram::Kind::fssm && sha256_hex(program.bytes) == builder_hash);
+        const auto found = bvh.program_candidates("cs", program);
+        CHECK(found.size() == 1 && found[0]->name == "bvh/BuilderProgram" && found[0] == bvh.find("cs", builder_hash));
+        CHECK(found[0]->lds_bytes == 32768 && found[0]->wave64 && found[0]->subgroup_size == 64 &&
+              found[0]->uses_code_base && found[0]->local_size[0] == 64 && found[0]->fspx_code_sha256.empty());
+        CHECK(bvh.spirv(*found[0]).size() == 5);  // <dir>/bvh/BuilderProgram.spv
+        // The other indexes are untouched: the game's shader and the FSPX program are found as before, each by its
+        // own key, and a builder program is neither an FSPX program nor a shader of another stage.
+        CHECK(bvh.find("cs", hash) && bvh.find("cs", hash)->name == "cs_game");
+        CHECK(bvh.program_candidates("cs", compute_program(code)).at(0)->name == "fspx/upscaler_00");
+        CHECK(bvh.fspx_candidates("cs", builder_hash).empty() && bvh.candidates("vs", builder_hash).empty());
+        // A program the translator left out (Box16Rehydration today) has no entry: nothing is found, and no other
+        // program's module stands in for it.
+        CHECK(compute_program(untranslated).kind == ComputeProgram::Kind::fssm);
+        CHECK(bvh.program_candidates("cs", compute_program(untranslated)).empty());
+        // The same program in the game's index too: both entries, the game's first (index order).
+        write(dir / "index.json", "{" + game + ",\n \"cs_same\": " + program_entry + "}");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 4 && bvh.bvh_size() == 1);
+        const auto both = bvh.candidates("cs", builder_hash);
+        CHECK(both.size() == 2 && both[0]->name == "cs_same" && both[1]->name == "bvh/BuilderProgram");
+        write(dir / "index.json", "{" + game + "}");
+        // A broken bvh/index.json leaves the main index and the FSPX one loaded; a missing one is not an error
+        // either, and neither is a broken fspx/index.json for the builder's programs.
+        write(dir / "bvh" / "index.json", "{broken");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 0 && bvh.fspx_size() == 1 &&
+              bvh.program_candidates("cs", program).empty() && bvh.find("cs", hash));
+        std::filesystem::remove(dir / "bvh" / "index.json");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 0 && bvh.find("cs", hash));
+        write(dir / "bvh" / "index.json", "{\"BuilderProgram\": " + program_entry + "}");
+        write(dir / "fspx" / "index.json", "{broken");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 1 && bvh.fspx_size() == 0 &&
+              bvh.program_candidates("cs", program).size() == 1);
+        std::filesystem::remove_all(dir);
+    }
+
     // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
     // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
     // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.
@@ -507,6 +578,21 @@ int main() {
         CHECK(by64.size() == 1 && by64[0]->name == "fspx/pair_64" && !ambiguous);
         CHECK(pair.program_candidates("cs", compute_program(wrapped(state16)), &ambiguous).empty() && !ambiguous);
         CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).empty() && ambiguous);
+        // Slot 67 with all four pairs (RT-99): the payload the proxy builds carries kind 0, so each program finds
+        // its own translation, where the bare kind-6 program above is ambiguous.
+        {
+            const std::vector<std::uint8_t> kind1(20, 0x22), kind7(24, 0x77);
+            for (const auto* state : {&state32, &state64}) {
+                const FspxPart parts[] = {{0, state->data(), state->size()}, {1, kind1.data(), kind1.size()},
+                                          {6, code.data(), code.size()}, {7, kind7.data(), kind7.size()}};
+                const auto built = fspx_payload_from_parts(parts);
+                const ComputeProgram program = compute_program(built);
+                CHECK(program.kind == ComputeProgram::Kind::fspx && program.bytes == code && program.state == *state);
+                const auto found = pair.program_candidates("cs", program, &ambiguous);
+                CHECK(found.size() == 1 && !ambiguous &&
+                      found[0]->name == (state == &state32 ? "fspx/pair_32" : "fspx/pair_64"));
+            }
+        }
         // The same two keys with one module (a duplicate container) is not ambiguous for the bare program.
         write("pair_64", module(1));
         CHECK(pair.program_candidates("cs", compute_program(code), &ambiguous).size() == 2 && !ambiguous);
@@ -516,6 +602,35 @@ int main() {
         const auto bare = pair.program_candidates("cs", compute_program(code), &ambiguous);
         CHECK(bare.size() == 1 && bare[0]->name == "fspx/pair_32" && !ambiguous);
         std::filesystem::remove_all(dir);
+    }
+
+    // fspx_payload_from_parts: the slot-67 pairs as one payload, and every inconsistent pair refused before a read.
+    {
+        const auto code = fspx_code(0x5000);
+        const std::vector<std::uint8_t> state(28, 0x11), kind1(20, 0x22), kind7(24, 0x77);
+        const auto build = [&](std::initializer_list<FspxPart> parts) {
+            return fspx_payload_from_parts(std::span<const FspxPart>(parts.begin(), parts.size()));
+        };
+        const auto full = build({{0, state.data(), 28}, {1, kind1.data(), 20}, {6, code.data(), code.size()},
+                                 {7, kind7.data(), 24}});
+        CHECK(!full.empty() && full.size() % 16 == 0);
+        const FspxParts parsed = fspx_parts(full);
+        CHECK(std::vector<std::uint8_t>(parsed.code.begin(), parsed.code.end()) == code);
+        CHECK(std::vector<std::uint8_t>(parsed.state.begin(), parsed.state.end()) == state);
+        // Kinds 1 and 7 are optional (null pointer and zero size), as in the DLL's reader.
+        CHECK(compute_program(build({{0, state.data(), 28}, {1, nullptr, 0}, {6, code.data(), code.size()},
+                                     {7, nullptr, 0}})).state == state);
+        // A wild pointer with a size that is refused is never read; neither is anything after a refused pair.
+        const void* wild = reinterpret_cast<const void*>(std::uintptr_t(0x10));
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {7, wild, kFspxPartLimit + 1}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, nullptr, code.size()}}).empty());          // size without pointer
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), 0}}).empty());                // pointer without size
+        CHECK(build({{0, state.data(), 28}, {1, wild, 0}, {6, code.data(), code.size()}}).empty());
+        CHECK(build({{0, nullptr, 0}, {6, code.data(), code.size()}}).empty());           // no kind 0
+        CHECK(build({{0, state.data(), 28}, {7, kind7.data(), 24}}).empty());              // no kind 6
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {6, code.data(), code.size()}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {5, kind7.data(), 24}}).empty());
+        CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {99, kind7.data(), 24}}).empty());
     }
 
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");

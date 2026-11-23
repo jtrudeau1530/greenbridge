@@ -41,6 +41,7 @@ def make_bank(names, flags=0, extra_ids=()):
         out += bytes(4 * (n + 1))
     # a non-zero tag count in bits 31:29 must not leak into the id
     out += b"".join(struct.pack("<I", (1 << 29) | i) for i in ids)
+    struct.pack_into("<I", out, 12, len(out))
     return bytes(out)
 
 
@@ -91,6 +92,28 @@ class TestBanks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(os.path.join(tmp, "t.awc"), make_bank(["a", "b"])[:-3])
             with self.assertRaises(ValueError):
+                A.bank_ids(path)
+
+    def test_stream_table_outside_declared_header(self):
+        # The file is long enough, but the declared header cannot hold the stream table; the canonical
+        # rsc8_audio parser rejects the same bytes.
+        table = struct.pack("<II", 0x11223344, 0x55667788)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad.awc")
+            for header_size in (8, 16, 23):
+                with self.subTest(header_size=header_size):
+                    with open(path, "wb") as fh:
+                        fh.write(b"ADAT" + struct.pack("<III", 0, 2, header_size) + table)
+                    with self.assertRaisesRegex(ValueError, "declared header"):
+                        A.bank_ids(path)
+
+    def test_declared_header_past_the_file(self):
+        # The stream table fits in the file and in the declared header, but the header itself does not fit in
+        # the file; the canonical rsc8_audio parser rejects the same bytes.
+        raw = b"ADAT" + struct.pack("<IIII", 0, 1, 21, 7)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "bad.awc"), raw)
+            with self.assertRaisesRegex(ValueError, "declared header"):
                 A.bank_ids(path)
 
     def test_truncated_stream_table_reads_only_header(self):
@@ -207,6 +230,42 @@ class TestConversations(unittest.TestCase):
         # a repeated label is one variation, not two
         self.assertEqual(waves, ["yy_xau_efgh_01", "zz_rootau_abcd_01", "zz_rootau_abcd_02"])
 
+    @staticmethod
+    def pairs(*labels):
+        return [b"ZZ_ROOTAU_ABCD\x00" + label + b"\x00" for label in labels]
+
+    def carve(self, tmp, streams):
+        """A carve folder: one `<offset>.bin` per stream, laid out at 64 KiB steps as rpf9_carve.py names them."""
+        folder = os.path.join(tmp, "story000")
+        os.makedirs(folder)
+        for k, data in enumerate(streams):
+            write(os.path.join(folder, f"{k * 0x10000:012x}.bin"), data)
+        return folder
+
+    def full_stream(self, tail, head=b"PSIN" + bytes(12), size=65536):
+        """`size` bytes that start with `head` and end with `tail`."""
+        return head + b"\x01" * (size - len(head) - len(tail)) + tail
+
+    def test_pair_across_a_continuation_boundary(self):
+        # A carved stream of a whole number of 64 KiB blocks continues in the next file (docs/page_directory.md):
+        # the third pair is cut after 10 bytes and must still count, so the key has four waves (docs/audio.md).
+        one, two, three, four = self.pairs(b"ZZ_LINE_A", b"ZZ_LINE_B", b"ZZ_LINE_C", b"ZZ_LINE_D")
+        for size in (65536, 2 * 65536):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as tmp:
+                folder = self.carve(tmp, [self.full_stream(one + two + three[:10], size=size),
+                                          three[10:] + b"\x02" * 8 + four])
+                waves = sorted(A.conversation_waves([folder]))
+                self.assertEqual(waves, [f"zz_rootau_abcd_{n:02d}" for n in range(1, 5)])
+
+    def test_streams_that_do_not_continue_are_matched_apart(self):
+        # A stream short of a whole block ends its blob, and a new PSIN stream starts one: no pair is made across.
+        one, two = self.pairs(b"ZZ_LINE_A", b"ZZ_LINE_B")
+        for first, second in ((self.full_stream(one + two[:10], size=65535), two[10:]),
+                              (self.full_stream(one + two[:10]), b"PSIN" + two[10:])):
+            with self.subTest(first=len(first)), tempfile.TemporaryDirectory() as tmp:
+                folder = self.carve(tmp, [first, second])
+                self.assertEqual(A.conversation_waves([folder]), ["zz_rootau_abcd_01"])
+
 
 class TestCli(unittest.TestCase):
     def test_sources_with_same_basename_keep_separate_summaries_and_streams(self):
@@ -232,14 +291,14 @@ class TestCli(unittest.TestCase):
             banks = os.path.join(tmp, "banks")
             os.mkdir(banks)
             write(os.path.join(banks, "one.awc"), make_bank(["zz_rootau_abcd_01", "zz_rootau_abcd_02"],
-                                                            extra_ids=[12345]))
+                                                            extra_ids=[12345, 12345]))
             conv = write(os.path.join(tmp, "c.pso"),
                          b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00ZZ_ROOTAU_ABCD\x00ZZ_B\x00")
             words = write(os.path.join(tmp, "words.txt"), "unrelated\nother_word\n")
             out = os.path.join(tmp, "names.csv")
             with contextlib.redirect_stdout(io.StringIO()) as log:
                 self.assertEqual(A.main([banks, "--words", words, "--conversations", conv, "--out", out]), 0)
-            self.assertIn("2 named", log.getvalue())
+            self.assertIn("3 distinct bank/ID pairs, 2 named", log.getvalue())
             with open(out, encoding="utf-8", newline="") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual([(r["bank"], r["name"], r["rule"]) for r in rows],
@@ -284,7 +343,10 @@ class TestCli(unittest.TestCase):
                         out = os.path.join(os.path.dirname(target), "..", "nested", os.path.basename(target))
                     elif alias == "hardlink":
                         out = os.path.join(tmp, "names.csv")
-                        os.link(target, out)
+                        try:
+                            os.link(target, out)
+                        except (OSError, NotImplementedError) as e:
+                            self.skipTest(f"hard links unavailable: {e}")
                     else:
                         out = target
                     err = io.StringIO()
@@ -339,6 +401,31 @@ class TestCli(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
 
+    def test_min_token_below_one_is_rejected(self):
+        # --min-token counts the dictionary words a token must appear in. 0 or a negative used to pass
+        # type=int and silently disable the common-token filter (every token passes tokens[t] >= min_token).
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "b.awc"), make_bank(["abc_01", "abc_02", "abc_03"]))
+            words = write(os.path.join(tmp, "w.txt"), "abc_01\nabc_02\nabc_03\n")
+            for bad in ("0", "-1", "-5"):
+                with self.subTest(min_token=bad):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as cm:
+                            A.main([bank, "--words", words, "--min-token", bad])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("at least 1", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--words", words, "--min-token", "x"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertNotIn("Traceback", err.getvalue())
+            # 1 is the smallest meaningful value and still runs.
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(A.main([bank, "--words", words, "--min-token", "1"]), 0)
+
     @unittest.skipUnless(sys.platform == "win32", "the exclusive-lock repro needs Windows")
     def test_locked_words_input_reports_rc_2_without_traceback(self):
         # An exclusively locked (share-none) existing file passes the os.path.exists check, so the
@@ -371,6 +458,27 @@ class TestCli(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("cannot read", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
+
+    def test_scalar_json_words_report_rc_2_without_traceback(self):
+        # A JSON scalar is neither a hashdict object nor a word list: one error line, exit 2. A string
+        # must not be read as one word per character.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "o.csv")
+            for doc in ("42", "null", "true", '"abc"'):
+                with self.subTest(doc=doc):
+                    words = write(os.path.join(tmp, "words.json"), doc)
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        rc = A.main([tmp, "--words", words, "--out", out])
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                    self.assertIn("awc_names: error: cannot read", err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
+    def test_json_word_list_still_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "words.json"), json.dumps(["a_word", 2]))
+            self.assertEqual(A.read_words(path), ["a_word", "2"])
 
 
 if __name__ == "__main__":
