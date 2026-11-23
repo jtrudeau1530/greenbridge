@@ -128,9 +128,8 @@ def duplicates(repo, main, tree, min_length, block=3):
             line_number += 1
 
     def windows(rev, path):
-        r = git(repo, "show", f"{rev}:{path}", check=False)
-        if r.returncode:
-            return None, Counter()
+        # New files are already left out above (--- /dev/null), so a failed read is a real Git error, not a new file.
+        r = git(repo, "show", f"{rev}:{path}")
         lines = [(number, text) for number, raw in enumerate(r.stdout.split("\n"), 1) if (text := raw.strip())]
         content = [text for _, text in lines]
         return lines, Counter(tuple(content[i:i + block]) for i in range(len(content) - block + 1))
@@ -138,12 +137,8 @@ def duplicates(repo, main, tree, min_length, block=3):
     for path, added in additions.items():
         if not added:
             continue
-        before_lines, before = windows(main, path)
-        if before_lines is None:
-            continue  # a new file: nothing to duplicate
+        _, before = windows(main, path)
         after_lines, after = windows(tree, path)
-        if after_lines is None:
-            continue
         marked = set()
         for i in range(len(after_lines) - block + 1):
             window = after_lines[i:i + block]

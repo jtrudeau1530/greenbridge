@@ -225,9 +225,13 @@ class TestCli(unittest.TestCase):
                 f.write("prop_crate_01\n")
 
             folded_names = os.path.join(tmp, "NAMES.TXT")
-            with (mock.patch.object(report_paths, "path_key", side_effect=str),
+            # same_report_path compares the two resolved keys, then os.path.samefile, then _same_resolved_name;
+            # mocking the helpers it actually calls is what makes the folding volume fake, as in
+            # tests/test_wave64_graphics_scan.py (patching same_name_on_folding_volume no longer reaches it).
+            with (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath),
+                  mock.patch.object(report_paths, "_resolved_key", side_effect=str),
                   mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
-                  mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe,
+                  mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe,
                   mock.patch.object(sys, "argv", ["psin_names.py", src, "--names", names, "--refs", folded_names])):
                 with self.assertRaises(SystemExit) as cm:
                     N.main()
