@@ -2943,3 +2943,32 @@ else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
   leonida_vulkan_headers_missing()
 endif()
+
+# Timed condition-variable waits on Wine 9 (#3796): every Windows executable and DLL built against the dynamic CRT
+# (/MD, the default) gets src/crt_timed_wait.cpp, which keeps msvcprt.lib's statically linked timed wait out of the
+# link so that a wait and the mutex it unlocks always use msvcp140's own layout. A target that links the CRT
+# statically (MSVC_RUNTIME_LIBRARY MultiThreaded, MultiThreadedDebug) already agrees with itself and is left alone,
+# as are the fixtures linked with /NODEFAULTLIB, which have no CRT.
+if(WIN32 AND MSVC)
+  add_library(gta6rt_crt_timed_wait OBJECT src/crt_timed_wait.cpp)
+  target_compile_definitions(gta6rt_crt_timed_wait PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gta6rt_crt_timed_wait PRIVATE /W4 /permissive- /utf-8)
+  # A timed wait is woken by a thread that takes its mutex; shared_mutex and sleep_for still work.
+  add_executable(crt_timed_wait_test test/crt_timed_wait_test.cpp)
+  target_compile_options(crt_timed_wait_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+  add_test(NAME crt_timed_wait COMMAND crt_timed_wait_test)
+  set_tests_properties(crt_timed_wait PROPERTIES TIMEOUT 60)
+  get_property(_gta6rt_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_target IN LISTS _gta6rt_targets)
+    get_target_property(_type ${_target} TYPE)
+    if(NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+      continue()
+    endif()
+    get_target_property(_crt ${_target} MSVC_RUNTIME_LIBRARY)
+    get_target_property(_link_options ${_target} LINK_OPTIONS)
+    if((_crt AND NOT _crt MATCHES "DLL") OR "/NODEFAULTLIB" IN_LIST _link_options)
+      continue()  # static CRT, or no CRT at all (the CRT-free fixtures)
+    endif()
+    target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
+  endforeach()
+endif()
