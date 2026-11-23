@@ -334,6 +334,11 @@ def analyse(insns, stage, user_count, follow_skips=True):
                 uses[ins["pc"]] = None if slots is None else [shader_meta._slot_tag(sym, s) for s in slots]
             step(sym, ins, lanes)
 
+    # What load_source found for a load, by code offset. A descriptor's dwords all come from one load, and a chain
+    # of loads asks for the first one from every dword of every later one, so each load is worked out once. Only
+    # an answer that ran into no cycle is kept: that one does not depend on where the question started.
+    found_load, cycles = {}, [0]
+
     def source(tag, seen=()):
         """(where the address or value `tag` starts: "user" | "system" | "constant" | "code" | None,
         whether an offset on the way is run-time, the largest constant offset on the way)."""
@@ -354,15 +359,28 @@ def analyse(insns, stage, user_count, follow_skips=True):
             return "constant", dyn, k
         if tag[0] == "code":
             return "code", dyn, k
-        if tag[0] != "ld" or tag[1] in seen or tag[1] not in loads:
+        if tag[0] != "ld" or tag[1] not in loads:
+            return None, dyn, k
+        if tag[1] in seen:                             # a load whose address depends on the load itself
+            cycles[0] += 1
             return None, dyn, k
         # ("ld", pc, i): a pointer or V# that was itself loaded
-        where, _, k2, _ = load_source(loads[tag[1]], seen + (tag[1],))
+        where, _, k2, _ = found_load.get(tag[1]) or load_source(tag[1], seen)
         return where, dyn, max(k, k2)
 
-    def load_source(ld, seen=()):
-        """source() of the address a scalar load reads, with the load's own offset counted as well (run-time or
-        not, and the constants in it), and the reason when the start is unknown."""
+    def load_source(pc, seen=()):
+        """source() of the address the scalar load at pc reads, with the load's own offset counted as well
+        (run-time or not, and the constants in it), and the reason when the start is unknown. `seen` holds the
+        loads this one is being asked for."""
+        if pc in found_load:
+            return found_load[pc]
+        before = cycles[0]
+        found = one_load_source(loads[pc], seen + (pc,))
+        if cycles[0] == before:
+            found_load[pc] = found
+        return found
+
+    def one_load_source(ld, seen):
         base = ld["base"]
         if base is None:
             return None, False, 0, "load base not an SGPR range"
@@ -385,7 +403,7 @@ def analyse(insns, stage, user_count, follow_skips=True):
         """The class of a dword the load at pc brought."""
         if pc not in by_load:
             ld = loads.get(pc)
-            where, dyn, k, reason = load_source(ld, (pc,)) if ld else (None, False, 0, "load not seen")
+            where, dyn, k, reason = load_source(pc) if ld else (None, False, 0, "load not seen")
             if where is None:
                 by_load[pc] = "undetermined", reason
             elif where != "user":

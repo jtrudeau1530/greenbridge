@@ -354,6 +354,54 @@ class SamplerSourceCensus(unittest.TestCase):
                    ("s_load_dwordx4 s[28:31], s[10:11], 0x40", 8), SAMPLE, END]
         self.assertEqual(self.classes(pointer), [("undetermined", "load base not followed")])
 
+    def test_a_chain_of_loads_is_followed_once_per_load(self):
+        # Each load takes its V# (four dwords) or its pointer (two) from the load before it. Following every
+        # dword back on its own asked for the first load 4**depth times; the work has to grow with the chain.
+        def calls(lines):
+            self.work.add("one", "ps", lines)
+            insns = ssc.shader_ir.parse_file(os.path.join(self.work.disasm, "one.s"))["insns"]
+            count = [0]
+
+            def profile(frame, event, arg):
+                count[0] += event == "call" and frame.f_code.co_name == "load_source"
+            sys.setprofile(profile)
+            try:
+                classes = list(ssc.analyse(insns, "ps", 32)[0].values())
+            finally:
+                sys.setprofile(None)
+            return classes, count[0]
+        wait = ("s_waitcnt lgkmcnt(0)", 4)
+        for depth in (2, 3, 4, 5, 12, 40):
+            vsharp = [("s_buffer_load_dwordx4 s[28:31], s[28:31], 0", 8), wait] * depth + [SAMPLE, END]
+            pointer = [("s_load_dwordx2 s[8:9], s[8:9], 0", 8), wait] * depth + \
+                [("s_load_dwordx4 s[28:31], s[8:9], 0x40", 8), SAMPLE, END]
+            for lines, loads in ((vsharp, depth), (pointer, depth + 1)):
+                classes, n = calls(lines)
+                self.assertEqual(classes, [("user_pointer", "static")], depth)
+                self.assertLessEqual(n, 2 * loads, f"{n} load_source calls for a chain of {loads} loads")
+        # The same chains from a fixed table: what a load is remembered as is its own source, not user data.
+        fixed = [("s_mov_b32 s8, 0x7f001000", 8), ("s_mov_b32 s9, 0", 4),
+                 ("s_load_dwordx4 s[28:31], s[8:9], 0x40", 8)]
+        chain = [("s_buffer_load_dwordx4 s[28:31], s[28:31], 0", 8), wait] * 12
+        self.assertEqual(calls(fixed + chain + [SAMPLE, END])[0], [("other_base", "constant address")])
+        self.assertEqual(calls(USER_TABLE[:2] + chain + [SAMPLE, END])[0], [("user_pointer", "static")])
+
+    def test_a_pointer_chased_in_a_loop_ends_and_is_not_followed(self):
+        # s[8:9] is the entry pointer or the one the load itself brought on the turn before: the load's address
+        # depends on the load. That is given up, every time it is asked, and what it is given up as is not
+        # remembered for the loads around it: the one before the loop stays user data.
+        before = ("s_load_dwordx4 s[40:43], s[8:9], 0x80", 8)
+        loop = [("s_load_dwordx2 s[8:9], s[8:9], 0", 8), ("s_cmp_lt_u32 s5, s6", 4), ("s_cbranch_scc1 0xfffc", 4),
+                ("s_load_dwordx4 s[28:31], s[8:9], 0x40", 8), SAMPLE,
+                ("image_sample v[0:3], v[4:5], s[20:27], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D", 8), SAMPLE, END]
+        lost = ("undetermined", "load base not followed")
+        self.assertEqual(self.classes([before] + loop), [lost, ("user_pointer", "static"), lost])
+        # A V# that is its own source through a loop, read after another load of the same cycle.
+        ring = [("s_buffer_load_dwordx4 s[28:31], s[28:31], 0", 8),
+                ("s_buffer_load_dwordx4 s[28:31], s[28:31], 0x10", 8),
+                ("s_cmp_lt_u32 s5, s6", 4), ("s_cbranch_scc1 0xfffa", 4), SAMPLE, END]
+        self.assertEqual(self.classes(ring), [("undetermined", "V# from different sources")])
+
     def test_only_the_sampler_operand_counts(self):
         # The T# comes from a constant address and the S# from user data: not a driver sampler table. A load
         # nobody samples with, and an image_load (no sampler operand), count nothing.
