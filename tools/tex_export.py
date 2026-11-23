@@ -34,6 +34,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from amd_swizzle import _parity, equation, load  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from tex_headers import FMT_INFO  # noqa: E402
 
 # DXGI format -> (bytes per element, block dimension), from the indexer's table; eq4k has SW_4K_S equations
@@ -214,6 +215,10 @@ def main():
         texs = texs[: a.limit]
     if os.path.exists(a.out) and not os.path.isdir(a.out):
         print(f"ERROR: {a.out} is a file, not a folder", file=sys.stderr)
+        return 2
+    report = os.path.join(a.out, "export_log.json")
+    if same_report_path(report, a.index):
+        print(f"ERROR: {report} must not overwrite input index {a.index}", file=sys.stderr)
         return 2
     try:
         os.makedirs(a.out, exist_ok=True)

@@ -680,3 +680,22 @@ def test_main_still_accepts_an_empty_list(tmp_path, monkeypatch, capsys):
     _argv(monkeypatch, index, tmp_path, out)
     assert T.main() in (None, 0)   # main() has no explicit return; sys.exit(None) is exit 0
     assert (out / "export_log.json").is_file()
+
+
+def test_main_refuses_to_overwrite_input_index_as_export_log(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "out"
+    out.mkdir()
+    index = out / "export_log.json"
+    original = '[{"archive": "a", "gpu": 0}, {"archive": "b", "gpu": 1}]\n'
+    index.write_text(original, encoding="utf-8", newline="\n")
+    _argv(monkeypatch, index, tmp_path, out, "--limit", "1")
+    assert T.main() == 2
+    err = capsys.readouterr().err
+    assert "ERROR:" in err and "must not overwrite" in err, err
+    assert index.read_text(encoding="utf-8") == original
+    if os.name == "nt":
+        _argv(monkeypatch, out / "EXPORT_LOG.JSON", tmp_path, out, "--limit", "1")
+        assert T.main() == 2
+        err = capsys.readouterr().err
+        assert "ERROR:" in err and "must not overwrite" in err, err
+        assert index.read_text(encoding="utf-8") == original
