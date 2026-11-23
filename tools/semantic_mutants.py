@@ -187,11 +187,11 @@ def run_test(test_file: str, tools_dir: str, timeout: int) -> tuple[bool, str]:
     path = os.pathsep.join(filter(None, [here, os.path.join(ROOT, "tests", "semantic"), os.environ.get("PYTHONPATH")]))
     env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=path)
     try:
-        p = subprocess.run([sys.executable, os.path.abspath(test_file)], env=env, capture_output=True, text=True,
-                           timeout=timeout)
+        p = subprocess.run([sys.executable, os.path.abspath(test_file)], env=env, capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, f"timed out after {timeout} s"
-    tail = (p.stdout + p.stderr).strip().splitlines()
+    tail = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
     return p.returncode == 0, tail[-1] if tail else ""
 
 

@@ -153,5 +153,25 @@ class EndToEnd(unittest.TestCase):
         self.assertRegex(out, r"caught\s+line \d+: last operand \{ya\} -> \{xa\}")
 
 
+class RunTestEncoding(unittest.TestCase):
+    def test_utf8_bytes_outside_windows_codepage_do_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            test = os.path.join(tmp, "test_utf8_out.py")
+            with open(test, "w", encoding="utf-8", newline="\n") as f:
+                f.write("import sys\nsys.stdout.buffer.write(b'fail: \\xe2\\x86\\x90 bad\\n')\nsys.exit(1)\n")
+            ok, last = sm.run_test(test, os.path.join(ROOT, "tools"), 30)
+        self.assertEqual((ok, last), (False, "fail: \u2190 bad"))
+
+    def test_invalid_utf8_bytes_are_replaced_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            test = os.path.join(tmp, "test_bad_bytes.py")
+            with open(test, "w", encoding="utf-8", newline="\n") as f:
+                f.write("import sys\nsys.stderr.buffer.write(b'raw: \\xff\\xfe\\n')\nsys.exit(1)\n")
+            ok, last = sm.run_test(test, os.path.join(ROOT, "tools"), 30)
+        self.assertIs(ok, False)
+        self.assertIn("raw:", last)
+        self.assertIn("\ufffd", last)
+
+
 if __name__ == "__main__":
     unittest.main()
