@@ -596,6 +596,53 @@ class Gen:
             return list(mods)
         return [m for m in mods if m not in cls._DPP_MODS and not m.startswith(cls._DPP_PREFIXES)]
 
+    def _check_int32_valu(self, op, raw_op, a, mods, *, allow_sdwa_dpp=False):
+        """Validate operands and modifiers for 32-bit integer 2-source VALU ops (vdst, src0, src1)."""
+        orig_a = self.cur_ins["args"] if self.cur_ins is not None else a
+        if len(a) != 3 or len(orig_a) != 3:
+            raise Unsupported(f"{op} operands")
+        if a[0].get("k") != "vgpr" or a[0].get("n", 1) != 1:
+            raise Unsupported(f"{op} destination")
+        if any(s.get("n", 1) != 1 or s.get("k") in ("vlist", "slist") for s in orig_a[1:]):
+            raise Unsupported(f"{op} source")
+        is_dpp = raw_op.endswith("_dpp")
+        is_sdwa = raw_op.endswith("_sdwa")
+        if not allow_sdwa_dpp:
+            if is_dpp or is_sdwa:
+                raise Unsupported(f"{op} form")
+            if mods:
+                raise Unsupported(f"{op} modifiers")
+            if any(s.get("neg") or s.get("abs") or s.get("sext") for s in orig_a):
+                raise Unsupported(f"{op} operand modifier")
+            return
+        if is_sdwa:
+            for m in mods:
+                if ":" not in m:
+                    raise Unsupported(f"{op} modifiers")
+                k, v = m.split(":", 1)
+                if k in ("dst_sel", "src0_sel", "src1_sel"):
+                    if v not in self.SDWA_SEL:
+                        raise Unsupported(f"{op} modifiers")
+                elif k == "dst_unused":
+                    if v not in ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"):
+                        raise Unsupported(f"{op} modifiers")
+                else:
+                    raise Unsupported(f"{op} modifiers")
+            if orig_a[0].get("neg") or orig_a[0].get("abs") or orig_a[0].get("sext"):
+                raise Unsupported(f"{op} operand modifier")
+            if any(s.get("neg") or s.get("abs") for s in orig_a[1:]):
+                raise Unsupported(f"{op} operand modifier")
+        elif is_dpp:
+            if self.non_dpp_mods(raw_op, mods):
+                raise Unsupported(f"{op} modifiers")
+            if any(s.get("neg") or s.get("abs") or s.get("sext") for s in orig_a):
+                raise Unsupported(f"{op} operand modifier")
+        else:
+            if mods:
+                raise Unsupported(f"{op} modifiers")
+            if any(s.get("neg") or s.get("abs") or s.get("sext") for s in orig_a):
+                raise Unsupported(f"{op} operand modifier")
+
     @staticmethod
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
@@ -9088,6 +9135,7 @@ class Gen:
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
             self.write_half16(a[0], lo, dhi)
         elif op == "v_bcnt_u32_b32":
+            self._check_int32_valu(op, ins["op"], a, mods)
             x, acc = self.src_u(a[1]), self.src_u(a[2])
             c, r = self.tmp(), self.tmp()
             self.emit(f"{c} = OpBitCount %uint {x}")
@@ -9582,6 +9630,7 @@ class Gen:
             self.emit(f"{r} = OpNot %uint {x}")
             self.dst(a[0], r)
         elif op == "v_mul_hi_i32":
+            self._check_int32_valu(op, ins["op"], a, mods)
             x, y = self.as_int(self.src_u(a[1])), self.as_int(self.src_u(a[2]))
             s, hi, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{s} = OpSMulExtended %smul {x} {y}")
@@ -10508,6 +10557,7 @@ class Gen:
             self.emit(f"{r} = OpFAdd %float {self.flush_f32(m)} {z}")
             self.dst(a[0], self.tou(self.flush_f32_mods(r, mods)))
         elif op in ("v_mul_lo_u32", "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32"):
+            self._check_int32_valu(op, ins["op"], a, mods, allow_sdwa_dpp=(op != "v_mul_lo_u32"))
             x, y = self.src_u(a[1]), self.src_u(a[2])
             r = self.tmp()
             if op == "v_mul_lo_u32":
@@ -11226,6 +11276,7 @@ class Gen:
             self.emit(f"{r} = OpBitwiseOr %uint {keep} {ins_}")
             self.dst(a[0], r)
         elif op == "v_mul_hi_u32":
+            self._check_int32_valu(op, ins["op"], a, mods)
             x, y = self.src_u(a[1]), self.src_u(a[2])
             s, r = self.tmp(), self.tmp()
             self.emit(f"{s} = OpUMulExtended %umul {x} {y}")
