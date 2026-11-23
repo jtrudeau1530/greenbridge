@@ -4,8 +4,9 @@
 //   slot 26   GetCustomHeapProperties, the PC slot, but the retail executable calls it with the buffer for the
 //             returned struct in RCX and the device in RDX (node mask in R8, heap type in R9). A PC C++ method has
 //             the device in RCX and the buffer in RDX. The thunk takes the console form when RDX holds a device
-//             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too; no call of them by
-//             the executable has been seen yet, so they are forwarded in the PC form.
+//             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too and are still
+//             forwarded in the PC form: 25 is reported called the same way later in the boot (#6982), with console
+//             resource descriptions the PC method cannot take as they are, and no call of 43 has been seen.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
