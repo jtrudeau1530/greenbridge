@@ -1693,8 +1693,11 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
 // created on the PC never allocated through the hooks, so the whole range was left and the assert fired. Each committed
 // resource made by slots 76 and 127 therefore allocates its size through the hooks as a lease: the resource holds it
 // (SetPrivateDataInterface) and the hooks' free runs when the resource is destroyed. The bytes are not used for the
-// resource; the PC device owns its memory. The size is the one slot 25 answers for the same description
-// (console_allocation_size), the figure the title budgets with.
+// resource; the PC device owns its memory. The size is the console's (lease_size): for a render target of a listed
+// shape, its whole SW_64KB_D tiles (console_render_target_size), never the PC size. The title's budget is sized for
+// exactly those (two 3840 x 2160 RGBA8 targets are 2 x 510 tiles of a 64 MiB range), and a PC driver may answer more:
+// AMD's Windows driver gives 513 x 64 KiB for that target, and leasing that overran the range (an int3 in the title's
+// hook, @controldebils on #7240). Anything else leases the PC size.
 // HYPOTHESIS: the attribute word, allocator ID 0x80 (eXALLOCAllocatorId_D3D) with page-size field 2 and object type 0.
 // Of it the measured matcher reads only the page-size field; a title hook that matches on other fields may not take
 // these leases for the console's allocations.
@@ -1703,11 +1706,10 @@ inline constexpr std::uint64_t kXmemCommittedResourceAttributes = (0x80ULL << 16
 // {6c1f3a52-8d47-4e0b-9b1e-2f7a5c3d9e61}: the private-data entry a committed resource keeps its lease under.
 constexpr GUID kTitleMemoryLeaseGuid{0x6c1f3a52, 0x8d47, 0x4e0b, {0x9b, 0x1e, 0x2f, 0x7a, 0x5c, 0x3d, 0x9e, 0x61}};
 
-// Slot 25's answer for one clean description: the PC size, plus what a render target lacks of whole console tiles.
-UINT64 console_allocation_size(ID3D12Device* real, const D3D12_RESOURCE_DESC& clean_desc) {
-    const UINT64 pc = real->GetResourceAllocationInfo(0, 1, &clean_desc).SizeInBytes;
-    if (pc == UINT64_MAX) return pc;
-    return pc + console_render_target_extra(&clean_desc, 1, [&](UINT) { return pc; });
+// The console allocation for one clean description: a listed render-target shape's whole tiles, else the PC size.
+UINT64 lease_size(ID3D12Device* real, const D3D12_RESOURCE_DESC& clean_desc) {
+    if (const UINT64 tiles = console_render_target_size(clean_desc)) return tiles;
+    return real->GetResourceAllocationInfo(0, 1, &clean_desc).SizeInBytes;
 }
 
 // One reference is held by the resource; the last Release gives the memory back through the hooks' free.
@@ -1752,7 +1754,7 @@ void lease_title_resource_memory(DeviceProxy* self, void* created, const D3D12_R
         free_fn = g_heap_free;
     }
     if (!alloc_fn) return;
-    const UINT64 size = console_allocation_size(self->real, clean_desc);
+    const UINT64 size = lease_size(self->real, clean_desc);
     if (size == 0 || size == UINT64_MAX || size > (std::numeric_limits<std::size_t>::max)()) return;
     void* const memory = alloc_fn(static_cast<std::size_t>(size), kXmemCommittedResourceAttributes);
     if (!memory) return;

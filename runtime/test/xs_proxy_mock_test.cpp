@@ -198,6 +198,8 @@ D3D12_RESOURCE_DESC g_seen_descs[4];  // the first descriptions the mock device'
 std::uint32_t g_seen_desc_count = 0;
 std::uint32_t g_seen_calls = 0;  // slot 25 calls since the test cleared it; only the first is recorded
 
+std::uint64_t g_texture_size_bias = 0;  // added to each texture's answer: a driver that pads more than the console
+
 std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::uint64_t descs_word) {
     const auto* descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(descs_word);
     if (g_seen_calls++ == 0) {
@@ -214,6 +216,7 @@ std::uint64_t mock_allocation_info(std::uint64_t ret, std::uint64_t count, std::
             bytes = d.Width * d.Height * d.DepthOrArraySize * (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4);
         refused = refused || d.Width == 0;
         total += (bytes + 65535) / 65536 * 65536;
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) total += g_texture_size_bias;
     }
     auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(ret);
     *out = {refused ? UINT64_MAX : total, 65536};
@@ -1254,7 +1257,7 @@ int check_committed_resource_leases() {
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
-    // Slot 76: the lease is the console-tiled size slot 25 answers (135 tiles), not the PC one.
+    // Slot 76: the lease is the console tile size (135 tiles), not the PC one.
     void* resource = nullptr;
     std::uint64_t words76[10] = {word(&heap), 0, word(&desc), 0, 0, word(&kResourceIid), word(&resource), 0, 0, 0};
     EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource);
@@ -1282,6 +1285,19 @@ int check_committed_resource_leases() {
     EXPECT(g_heap_hook.alloc_calls == 2 && g_heap_hook.last_alloc_size == 3 * 65536);
     EXPECT(release(resource) == 0 && g_heap_hook.free_calls == 2);
 #endif
+
+    // A driver whose PC answer is above the console tiles (AMD's Windows driver: 513 x 64 KiB for a 3840 x 2160 RGBA8
+    // target, 510 tiles on the console) still leases the tiles: the title's 64 MiB range holds two of those and no more.
+    desc.Width = 3840;
+    desc.Height = 2160;
+    g_texture_size_bias = 6 * 65536;  // the mock's 507 x 64 KiB becomes 513 x 64 KiB
+    resource = nullptr;
+    EXPECT(hr_of(raw10(device, 76, words76)) == S_OK && resource);
+    EXPECT(g_heap_hook.last_alloc_size == 30ull * 17 * 65536);
+    EXPECT(release(resource) == 0);
+    g_texture_size_bias = 0;
+    desc.Width = 1920;
+    desc.Height = 1080;
 
     // Hooks that return null: the resource is still created, and nothing is freed later.
     g_heap_hook.next_ptr = nullptr;
