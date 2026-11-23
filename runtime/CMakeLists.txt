@@ -2882,6 +2882,16 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_geometry_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_geometry COMMAND d3d12_geometry_test)
       set_tests_properties(d3d12_geometry PROPERTIES SKIP_RETURN_CODE 77)
+      # LEONIDA_PROBE and LEONIDA_DEBUG_CLEAR: built-in probe stages and the magenta clear (src/debug_probe.h).
+      add_executable(d3d12_debug_probe_test test/d3d12_debug_probe_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS} ${LEONIDA_TEST_FS_SOLID})
+      target_link_libraries(d3d12_debug_probe_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_debug_probe_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}")
+      target_compile_options(d3d12_debug_probe_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_debug_probe COMMAND d3d12_debug_probe_test)
+      set_tests_properties(d3d12_debug_probe PROPERTIES SKIP_RETURN_CODE 77)
       # D3D-309: D24 depth bias and 24-bit depth in draws, with and without a pixel shader and with a geometry shader
       # (src/depth24_fragment.h).
       set(LEONIDA_TEST_VS_DEPTH ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth.spv)

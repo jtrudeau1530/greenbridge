@@ -78,6 +78,23 @@ Useful switches:
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
+* `LEONIDA_PROBE=<text>` (or `all`) splits a black first frame into the shaders and everything else. A graphics
+  pipeline whose vertex, geometry or pixel shader name in `spirv/index.json` contains the text is built with
+  built-in stages ([`runtime/src/debug_probe.h`](../runtime/src/debug_probe.h)): a pixel shader that writes opaque
+  green to render target 0 and a vertex shader that draws one triangle over the whole viewport from vertex IDs 0, 1
+  and 2, with culling off. Everything else (input layout, root signature, blend, depth, targets) stays the title's,
+  and each probed pipeline is logged once (`[rt] d3d12: LEONIDA_PROBE: ...`). `LEONIDA_PROBE_MODE=vs` or `ps`
+  replaces only that stage (default `both`). `LEONIDA_PROBE_POS=ndc` makes the built-in vertex shader pass the
+  POSITION0 input's x and y through as NDC instead, and `px:<W>x<H>` as pixels of a W x H target (y down; bare
+  `px` is 3840x2160), so the title's own geometry is drawn green. Reading the result: both stages built-in and the
+  target still not green means render state, submission or present; the title's pixel shader with the built-in
+  vertex shader covering it, while the title's vertex shader with the built-in pixel shader covers nothing, puts the
+  fault in the vertex shader's inputs (constants, vertex fetch). The title's pixel shader then reads varyings the
+  built-in vertex shader does not write, which are undefined. A geometry or mesh pipeline keeps its own first stage.
+  `d3d12_debug_probe_test` checks each mode.
+* `LEONIDA_DEBUG_CLEAR=1` turns every all-zero `ClearRenderTargetView` colour into opaque magenta (read when a
+  command list is made), so a black frame can be told apart from a target no draw reached: draws that cover it but
+  output black leave black, nothing reaching it leaves magenta.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").

@@ -27,6 +27,7 @@
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/debug_probe.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
@@ -206,6 +207,34 @@ void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t by
             std::memset(to + at, 0, run);
         at += run;
     }
+}
+
+// True the first time `key` is passed: for lines logged once per distinct text (a setting, a probed pipeline).
+bool first_time(const std::string& key) {
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::lock_guard lock(mutex);
+    return seen.insert(key).second;
+}
+
+// LEONIDA_PROBE's settings (src/debug_probe.h). Read for every graphics pipeline, so a test can change them between
+// pipelines; a value that is not understood is logged once.
+leonida::DebugProbe debug_probe_from_env() {
+    const auto read = [](const char* name) {
+        std::string value;
+        char* text = nullptr;
+        std::size_t length = 0;
+        if (_dupenv_s(&text, &length, name) == 0 && text) value = text;
+        std::free(text);
+        return value;
+    };
+    const std::string probe = read("LEONIDA_PROBE");
+    if (probe.empty()) return {};
+    const std::string mode = read("LEONIDA_PROBE_MODE"), pos = read("LEONIDA_PROBE_POS");
+    leonida::DebugProbe settings = leonida::parse_debug_probe(probe.c_str(), mode.c_str(), pos.c_str());
+    if (!settings.problem.empty() && first_time(settings.problem))
+        std::fprintf(stderr, "[rt] d3d12: %s\n", settings.problem.c_str());
+    return settings;
 }
 
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
@@ -3989,6 +4018,49 @@ public:
                          pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
             return E_NOTIMPL;
         }
+        // LEONIDA_PROBE (src/debug_probe.h, docs/boot.md): a debugging switch that gives a pipeline whose shader names
+        // hold the text built-in stages. The title's entries stay the stages' entries, so the input layout, bindings
+        // and subgroup sizes are what they would be; only the words handed to Vulkan change.
+        std::vector<std::uint32_t> probe_vs, probe_ps;
+        if (const leonida::DebugProbe probe = debug_probe_from_env();
+            std::any_of(std::begin(stages), std::end(stages),
+                        [&](const Stage& s) { return s.entry && probe.matches(s.entry->name); })) {
+            std::string vs_note = "kept", ps_note = "kept";
+            if (probe.vertex && vs_stage.bit != VK_SHADER_STAGE_VERTEX_BIT) {
+                vs_note = "kept (a mesh pipeline)";
+            } else if (probe.vertex && gs_stage.entry) {
+                vs_note = "kept (its geometry shader reads it)";
+            } else if (probe.vertex) {
+                // The pass-through reads POSITION0 at its input register; without a float one, the triangle instead.
+                const leonida::SignatureElement* position = nullptr;
+                for (const auto& e : vs_stage.entry->input_signature)
+                    if (!e.system_value && e.semantic_index == 0 && equal_semantic(e.semantic, "POSITION") &&
+                        (e.component_type.empty() || e.component_type == "float"))
+                        position = &e;
+                leonida::DebugProbe vertex_probe = probe;
+                if (probe.position != leonida::DebugProbe::Position::fullscreen && !position)
+                    vertex_probe.position = leonida::DebugProbe::Position::fullscreen;
+                probe_vs = leonida::debug_probe_vertex_words(vertex_probe, position ? position->register_index : 0);
+                if (probe_vs.empty()) return E_FAIL;  // the embedded words lost the shape debug_probe.h patches
+                vs_note = vertex_probe.position == leonida::DebugProbe::Position::fullscreen
+                              ? "full-screen triangle"
+                              : vertex_probe.position == leonida::DebugProbe::Position::ndc ? "POSITION as NDC"
+                                                                                            : "POSITION as pixels";
+                if (vertex_probe.position != probe.position) vs_note += " (no float POSITION0 input)";
+                vs_note += ", culling off";
+            }
+            if (probe.pixel && ps_stage.entry) {
+                probe_ps = leonida::debug_probe_pixel_words();
+                ps_note = "solid green";
+            } else if (probe.pixel) {
+                ps_note = "none to replace";
+            }
+            const auto name = [](const Stage& s) { return s.entry ? s.entry->name : std::string("-"); };
+            const std::string line = "vs " + name(vs_stage) + ", gs " + name(gs_stage) + ", ps " + name(ps_stage) +
+                                     ": vertex shader " + vs_note + ", pixel shader " + ps_note;
+            if (first_time("LEONIDA_PROBE " + line))
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_PROBE: %s\n", line.c_str());
+        }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -4003,6 +4075,8 @@ public:
                     stage.words = std::move(patched);
                 }
             }
+            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !probe_vs.empty()) stage.words = probe_vs;
+            if (stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT && !probe_ps.empty()) stage.words = probe_ps;
             const VkShaderModule module = device_.shader_modules().acquire(stage.words);
             if (module == VK_NULL_HANDLE) return E_FAIL;
             modules_.push_back(module);
@@ -4140,6 +4214,7 @@ public:
         raster.cullMode = r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
                           : r.CullMode == D3D12_CULL_MODE_BACK ? VK_CULL_MODE_BACK_BIT
                                                                : VK_CULL_MODE_NONE;
+        if (!probe_vs.empty()) raster.cullMode = VK_CULL_MODE_NONE;  // the probe's winding is not the title's
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
         // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
