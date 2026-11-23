@@ -301,7 +301,8 @@ The executable's first boot confirms them, or names the slots that differ.
 
 `xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`.
 
-`XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout, also **not measured**:
+`XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout; the game-license struct is measured
+on the executable, the rest is not:
 - **Interfaces:** the class id doubles as `IXStoreImpl`'s; `IXStoreImpl2`-`6` answer with the same 84-slot vtable.
 - **Offline answers:** the game license is active and not a trial; a package's license is acquirable and valid;
   there are no add-on licenses, no products in any query and no package updates. License-changed and license-lost
@@ -309,9 +310,14 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Not available offline:** purchases, consumables, license tokens, collections and purchase ids, downloads and
   every store UI fail before starting (`E_FAIL`, logged once). The docs' three unnamed slots and
   `XStoreIsAvailabilityPurchasable` (no documented signature) answer `E_NOTIMPL`.
-- **UNVERIFIED:** `STORE_SKU_ID_SIZE` = 18, `SKU_ID_SIZE` = 5 and `TRIAL_UNIQUE_ID_MAX_SIZE` = 64, which fix
-  `XStoreGameLicense` (104 bytes) and `XStoreCanAcquireLicenseResult` (12 bytes). The public pages give no values;
-  confirm them from the buffer the executable passes to `XStoreQueryGameLicenseResult` before a boot relies on it.
+- **Measured on the executable:** `XStoreGameLicense` is 104 bytes. The title's `XStoreQueryGameLicenseResult`
+  call passes a 104-byte stack buffer and reads the SKU id as a C string at +0x00, the three booleans at
+  +0x13..+0x15, the trial id as a C string at +0x1C and the expiration time at +0x60. That fixes
+  `STORE_SKU_ID_SIZE` = 18 and the 104-byte total.
+- **UNVERIFIED:** `SKU_ID_SIZE` = 5 and the exact `TRIAL_UNIQUE_ID_MAX_SIZE` = 64. The executable bounds the
+  trial id to at most 68 bytes (the expiration time is at +0x60) but reads it as a C string, so it does not name
+  the bound; 64 is the public source's value. It does not call either can-acquire slot (24-27), so
+  `XStoreCanAcquireLicenseResult` (12 bytes) is unmeasured.
 
 `xgameruntime_store_test` drives the license check, add-ons, updates, package licenses and product queries.
 
