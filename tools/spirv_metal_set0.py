@@ -110,7 +110,7 @@ def rewrite(text, counts):
     cap_by_bind = {}    # binding -> OpConstant id (emitted once per binding)
     ptr_by_key = {}     # (binding, elem_type) -> new OpTypePointer id
     new_types = []      # inserted right after the variable's pointer type is declared
-    retype = {}         # variable -> new pointer type
+    retype = {}         # resized variable or copied pointer ID -> new pointer type
     for b, _, _, v, old_ptr, elem in sorted(candidates):
         if (b, elem) in ptr_by_key:
             retype[v] = ptr_by_key[(b, elem)]
@@ -139,6 +139,12 @@ def rewrite(text, counts):
         m = re.match(r"(\s*(%\S+) = OpVariable )(%\S+)( UniformConstant)$", ln)
         if m and m.group(2) in retype:
             ln = f"{m.group(1)}{retype[m.group(2)]}{m.group(4)}"
+        # Retype copies by source ID so arrays sharing a type in other sets are unaffected.
+        m = re.match(r"(\s*(%\S+) = OpCopyObject )%\S+ (%\S+)$", ln)
+        if m and m.group(3) in retype:
+            ptr = retype[m.group(3)]
+            retype[m.group(2)] = ptr
+            ln = f"{m.group(1)}{ptr} {m.group(3)}"
         out.append(ln)
         m = re.match(r"\s*(%\S+) = OpTypePointer", ln)
         if m:
