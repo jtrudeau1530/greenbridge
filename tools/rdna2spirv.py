@@ -259,7 +259,8 @@ class Gen:
         self.uses_store_views = set()  # image_store dims used (index into STORE_DIMS)
         self.uses_int_sampler = False    # 2D typed sampled-image types for sampling and gathering
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
-        self.uses_fmt_size = False     # %fmt_size_tab: byte size of each 7-bit buffer FORMAT code (0 = not in FORMATS)
+        self.uses_d16_image = False    # a d16 image result is narrowed: needs the normalized / 32-bit-float tables
+        self.uses_fmt_size = False    # %fmt_size_tab: byte size of each 7-bit buffer FORMAT code (0 = not in FORMATS)
         self.reads_store_views = False  # a coherent image_load reads a storage view (StorageImageReadWithoutFormat)
         self.coherent_images = False    # a glc image_load/image_store: the storage views are decorated Coherent
         self.writes_depth = False
@@ -12068,6 +12069,41 @@ class Gen:
             cls.INT_FORMATS = (u, si)
         return cls.INT_FORMATS
 
+    FLOAT_FORMATS = None
+
+    @classmethod
+    def float_format_masks(cls):
+        """(normalized, 32-bit-channel float) 512-bit tables over the GFX10 T# FORMAT field, for the d16 rounding
+        rule: a UNORM/SNORM channel is the one whose exact quotient the hardware rounds once, and a float channel
+        32 bits wide is the one it narrows toward zero (SHADER-308)."""
+        if cls.FLOAT_FORMATS is None:
+            norm, f32 = [0] * 16, [0] * 16
+            for k, name in GFX10_FORMATS.items():
+                if name.endswith(("_UNORM", "_SNORM")):
+                    norm[k >> 5] |= 1 << (k & 31)
+                elif name.endswith("_FLOAT") and re.fullmatch(r"GFX10_FORMAT_(32_)*32_FLOAT", name):
+                    f32[k >> 5] |= 1 << (k & 31)
+            cls.FLOAT_FORMATS = (norm, f32)
+        return cls.FLOAT_FORMATS
+
+    def fmt_float_flags(self, word1):
+        """(is UNORM/SNORM, is a 32-bit-channel float format) for a T# word1, from the 512-bit tables."""
+        for w in [16] + sum(self.float_format_masks(), []):
+            self.cu(w)
+        fmt, word, bit = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{fmt} = OpBitFieldUExtract %uint {word1} {self.cu(20)} {self.cu(9)}")
+        self.emit(f"{word} = OpShiftRightLogical %uint {fmt} {self.cu(5)}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {fmt} {self.cu(31)}")
+        flags = []
+        for mask in ("%fmt_norm_mask", "%fmt_f32_mask"):
+            ptr, w, b, nz = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{ptr} = OpAccessChain %_ptr_Private_uint {mask} {word}")
+            self.emit(f"{w} = OpLoad %uint {ptr}")
+            self.emit(f"{b} = OpBitFieldUExtract %uint {w} {bit} {self.cu(1)}")
+            self.emit(f"{nz} = OpINotEqual %bool {b} {self.cu(0)}")
+            flags.append(nz)
+        return flags
+
     def fmt_int_flags(self, word1):
         """(is UINT format, is SINT format) for a T# word1 (FORMAT [28:20]), from the 512-bit tables."""
         for w in [16] + sum(self.int_format_masks(), []):
@@ -12150,6 +12186,12 @@ class Gen:
                 self.emit(f"{im} = OpLoad %itximg{cls}_{di} {ip}")
                 return im
         is_u, is_s = self.fmt_int_flags(t1)
+        # SHADER-308: d16 image results follow the same rounding rule as d16 typed buffer loads. UNORM/SNORM are the
+        # exact quotient rounded once (the two D16_NORM_HALFWAY f32 values are 1 ulp high through f32), and a
+        # 32-bit float channel is narrowed toward zero, not to nearest even. Measured on an RX 6700 (gfx1031).
+        if d16:
+            self.uses_d16_image = True
+        is_norm_fmt, is_f32_fmt = self.fmt_float_flags(t1) if d16 else (None, None)
         hit = self.tmp()
         self.emit(f"{hit} = OpINotEqual %bool {idx} {self.cu(0)}")
         use_u, use_s = self.tmp(), self.tmp()
@@ -12174,11 +12216,14 @@ class Gen:
             for i in range(0, len(xs), 2):
                 dest = {"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}
                 if i + 1 == len(xs):
-                    lo = self.f16_bits(self.tof(xs[i])) if numeric_class == 0 else xs[i]
+                    lo = (self.d16_norm_f16(xs[i], is_norm_fmt, is_f32_fmt) if numeric_class == 0 else xs[i])
                     self.write_lo16(dest, lo)
                     continue
                 if numeric_class == 0:
-                    w = self.pack_f16_pair_int(self.tof(xs[i]), self.tof(xs[i + 1]))
+                    hi_s, w = self.tmp(), self.tmp()
+                    self.emit(f"{hi_s} = OpShiftLeftLogical %uint "
+                              f"{self.d16_norm_f16(xs[i + 1], is_norm_fmt, is_f32_fmt)} {self.cu(16)}")
+                    self.emit(f"{w} = OpBitwiseOr %uint {self.d16_norm_f16(xs[i], is_norm_fmt, is_f32_fmt)} {hi_s}")
                 else:
                     hi, w = self.tmp(), self.tmp()
                     self.emit(f"{hi} = OpShiftLeftLogical %uint {xs[i + 1]} {self.cu(16)}")
@@ -13717,6 +13762,7 @@ def assemble(gen):
         ["%x_buf"] if gen.emulate or gen.bar_rounds and not gen.bar_counts_in_lds() else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
+         (["%fmt_norm_mask", "%fmt_f32_mask"] if gen.uses_d16_image else []) + \
         (["%fmt_size_tab"] if gen.uses_fmt_size else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
         [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
@@ -14063,17 +14109,19 @@ def assemble(gen):
         sizes = [Gen.FORMATS[c][0] if c in Gen.FORMATS else 0 for c in range(128)]
         types += [f"%fmt_size_arr = OpTypeArray %uint {gen.cu(128)}",
                   "%_ptr_Private_fmt_size = OpTypePointer Private %fmt_size_arr"]
-        if not (gen.uses_store_views or gen.uses_int_fetch):
+        if not (gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image):
             types += ["%_ptr_Private_uint = OpTypePointer Private %uint"]
         types += ["%fmt_size_init = OpConstantComposite %fmt_size_arr " + " ".join(gen.cu(v) for v in sizes)]
         gvars += ["%fmt_size_tab = OpVariable %_ptr_Private_fmt_size Private %fmt_size_init"]
-    if gen.uses_store_views or gen.uses_int_fetch:
+    if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
                   f"%fmt_mask_arr = OpTypeArray %uint {gen.cu(16)}",
                   "%_ptr_Private_fmt = OpTypePointer Private %fmt_mask_arr",
                   "%_ptr_Private_uint = OpTypePointer Private %uint"]
-        for nm, words in (("uint", u), ("sint", si)):
+        for nm, words in (("uint", u), ("sint", si)) + (
+                (("norm", Gen.float_format_masks()[0]), ("f32", Gen.float_format_masks()[1]))
+                if gen.uses_d16_image else ()):
             ids = " ".join(gen.cu(w) for w in words)
             types += [f"%fmt_{nm}_init = OpConstantComposite %fmt_mask_arr {ids}"]
             gvars += [f"%fmt_{nm}_mask = OpVariable %_ptr_Private_fmt Private %fmt_{nm}_init"]
