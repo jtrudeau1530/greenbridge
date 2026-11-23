@@ -94,6 +94,9 @@ def mount_documents(paths):
     A carve directory (``index.json`` from rpf9_carve.py) and an ``.rpf`` are read as whole XML payloads, so a list
     split over several zlib streams stays in one piece. Any other directory is searched file by file.
     """
+    def scan_failed(error):
+        raise error
+
     for path in paths:
         if os.path.isdir(path) and os.path.isfile(os.path.join(path, "index.json")):
             for doc in gamedata_xml.carve_documents(path):
@@ -101,7 +104,7 @@ def mount_documents(paths):
         elif os.path.isfile(path) and path.lower().endswith(".rpf"):
             yield from _archive_documents(path)
         elif os.path.isdir(path):
-            for root, _dirs, files in os.walk(path):
+            for root, _dirs, files in os.walk(path, onerror=scan_failed):
                 for name in sorted(files):
                     full = os.path.join(root, name)
                     if os.path.getsize(full) <= MAX_LIST_BYTES:

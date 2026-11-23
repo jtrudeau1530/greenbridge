@@ -11,6 +11,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -316,6 +317,30 @@ class TestLoadPins(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_unreadable_mount_directory_preserves_the_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "empty.bk2")
+            with open(source, "wb"):
+                pass
+            mount = os.path.join(tmp, "mount")
+            os.mkdir(mount)
+            blocked = os.path.join(mount, "blocked")
+            report = os.path.join(tmp, "names.json")
+            with open(report, "wb") as f:
+                f.write(b"previous report")
+
+            def walk(path, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "permission denied", blocked))
+                return iter(())
+
+            with mock.patch.object(names_mod.os, "walk", walk), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(names_mod.main([source, "--mount", mount, "--out", report]), 1)
+            self.assertIn(blocked, err.getvalue())
+            with open(report, "rb") as f:
+                self.assertEqual(f.read(), b"previous report")
+
     def test_rejects_negative_max_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml = os.path.join(tmp, "list.xml")
