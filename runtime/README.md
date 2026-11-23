@@ -165,8 +165,9 @@ Current limits, by design:
   `--run` and `--init` refuse it with an error and exit code 1, and a `Loader` user must not run its code.
 - Threads that ran gta6rt's code before the reservation keep nothing of their TLS: they find a fresh copy at the new
   index. In gta6rt only the main thread has run its code by then, and its TLS moves with it.
-- The home clone stays loaded until the process ends (freeing it would free `gta6rt.exe`'s TLS blocks), so its file
-  stays in `%TEMP%` until a later run's clean-up of dead processes' clones deletes it. A `gta6rt.exe` whose TLS
+- The home clone stays loaded until the process ends (freeing it would free `gta6rt.exe`'s TLS blocks), and a mapped
+  image's file cannot be deleted, so its file stays in `%TEMP%` until the next run's clean-up of dead processes'
+  clones deletes it. The clones for mapped DLLs are deleted at exit as before. A `gta6rt.exe` whose TLS
   outgrows the helper's 16 KiB array is refused the move.
 - The TOC of the game's RPF archives is encrypted and is not read here. The loader works on the PE
   files and on any images the caller passes it.

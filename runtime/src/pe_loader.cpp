@@ -145,7 +145,10 @@ std::array<TlsHostModule, kMaxMappedTlsModules> g_tls_hosts{};
 std::array<std::atomic<Module*>, kTlsSlotCount> g_tls_slot_owners{};
 std::array<std::atomic<uint64_t>, kTlsSlotCount> g_tls_slot_generations{};
 std::atomic<uint64_t> g_next_tls_generation{1};
-std::vector<TlsCloneRecord> g_tls_clones;
+// Allocated with the first clone and never destroyed: cleanup_tls_clones_at_exit runs from the atexit table, and a
+// static vector's destructor (registered when its dynamic initializer ran) could run before it. Under
+// g_tls_alloc_mutex, as are its records.
+std::vector<TlsCloneRecord>* g_tls_clones = nullptr;
 
 // The move of module TLS index 0 (see kMainImageSlot): done at most once, by reserve_tls_index0 under
 // g_tls_alloc_mutex. `why` is the reason it was not done, for the executable that then maps with a helper index.
@@ -160,15 +163,18 @@ struct Index0Move {
 };
 Index0Move g_index0;
 
-// Frees every TLS helper clone this process loaded and deletes its files. load() registers the wrapper with atexit;
-// the --run path in main() must also call this directly before ExitProcess, which skips the atexit table. Call it
-// only when no mapped code can run again: it unmaps the helper images.
+// Frees every TLS helper clone recorded for a mapped DLL's slot and deletes its files. ensure_tls_host registers the
+// wrapper with atexit when it records the first clone; the --run path in main() must also call this directly before
+// ExitProcess, which skips the atexit table. Call it only when no mapped code can run again: it unmaps the helper
+// images. The home clone is not recorded (reserve_index0): it stays loaded, so its file outlives the process and the
+// next run's sweep deletes it.
 void cleanup_tls_clones_internal() {
-    for (const auto& rec : g_tls_clones) {
+    if (!g_tls_clones) return;
+    for (const auto& rec : *g_tls_clones) {
         if (rec.module) FreeLibrary(rec.module);
         if (!rec.path.empty()) DeleteFileW(rec.path.c_str());
     }
-    g_tls_clones.clear();
+    g_tls_clones->clear();
 }
 
 void cleanup_tls_clones_at_exit() { cleanup_tls_clones_internal(); }
@@ -192,10 +198,14 @@ DWORD clone_owner_pid(const wchar_t* name) {
 bool process_alive(DWORD pid) {
     // PROCESS_QUERY_LIMITED_INFORMATION needs no handle rights a normal process could deny; a failure means the
     // process is gone. A still-mapped or still-open file is caught by the checks below even for a misjudged PID.
+    // OpenProcess also succeeds on a process that has ended while another process still holds a handle to it (a
+    // parent waiting on its exit code, as CMake's execute_process does), so the exit code decides.
     HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!p) return false;
+    DWORD code = 0;
+    const bool alive = !GetExitCodeProcess(p, &code) || code == STILL_ACTIVE;
     CloseHandle(p);
-    return true;
+    return alive;
 }
 
 // Deletes clones left behind by processes that have exited. Deletion is scoped to files whose owner is gone: a
@@ -290,7 +300,6 @@ TlsHostModule load_tls_host_clone(const std::wstring& tag, std::filesystem::path
     if (!swept) {
         swept = true;
         sweep_stale_tls_clones(dir);
-        std::atexit(&cleanup_tls_clones_at_exit);
     }
     const std::wstring name = L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_" + tag + L".dll";
     clone_path = dir / name;
@@ -353,7 +362,11 @@ TlsHostModule ensure_tls_host(size_t slot) {
         DeleteFileW(clone_path.c_str());
         return {};
     }
-    g_tls_clones.push_back({loaded.module, clone_path});
+    if (!g_tls_clones) {
+        g_tls_clones = new std::vector<TlsCloneRecord>;
+        std::atexit(&cleanup_tls_clones_at_exit);
+    }
+    g_tls_clones->push_back({loaded.module, clone_path});
     g_tls_hosts[slot] = loaded;
     return g_tls_hosts[slot];
 }
@@ -542,6 +555,8 @@ std::string reserve_index0() {
                     reinterpret_cast<const void*>(owner.StartAddressOfRawData), raw) != 0)
         return drop("the home clone's mapped TLS template is not the owner's");
 
+    // Everything that can throw comes first: past the move this records the result and nothing more.
+    const std::string name = module_file_name(exe);
     // _tls_index sits in .data; made writable first in case a linker merged it into a read-only section.
     DWORD old_protect = 0;
     if (!VirtualProtect(owner_index, sizeof(DWORD), PAGE_READWRITE, &old_protect))
@@ -550,9 +565,10 @@ std::string reserve_index0() {
     VirtualProtect(owner_index, sizeof(DWORD), old_protect, &old_protect);
 
     // Kept loaded for the process lifetime: FreeLibrary would make the OS free every thread's block at its index, the
-    // owner's from now on. Not in g_tls_clones for that reason; a later run's sweep deletes the file.
+    // owner's from now on. Not in g_tls_clones for that reason. Its file cannot be deleted while it is mapped
+    // (DeleteFileW and a POSIX-semantics delete both fail with ERROR_ACCESS_DENIED on Windows 11), so it stays until
+    // a later run's sweep.
     g_index0.home = home;
-    const std::string name = module_file_name(exe);
     std::snprintf(g_index0.owner, sizeof(g_index0.owner), "%s", name.c_str());
     g_index0.moved = true;
     return {};
@@ -789,8 +805,16 @@ bool reserve_tls_index0(std::string* why) {
     static bool attempted = false;  // once: a later attempt could meet threads that already run this EXE's code
     if (!attempted) {
         attempted = true;
-        const std::string reason = reserve_index0();
-        std::snprintf(g_index0.why, sizeof(g_index0.why), "%s", reason.c_str());
+        // A throw (std::filesystem::temp_directory_path when GetTempPathW fails, an allocation) is a failed
+        // reservation like any other: gta6rt calls this before main, where an exception would end it with no message.
+        try {
+            const std::string reason = reserve_index0();
+            std::snprintf(g_index0.why, sizeof(g_index0.why), "%s", reason.c_str());
+        } catch (const std::exception& e) {
+            std::snprintf(g_index0.why, sizeof(g_index0.why), "%s", e.what());
+        } catch (...) {
+            std::snprintf(g_index0.why, sizeof(g_index0.why), "an unknown error while reserving it");
+        }
     }
     if (why) *why = g_index0.moved ? std::string() : std::string(g_index0.why);
     return g_index0.moved;
