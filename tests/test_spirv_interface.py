@@ -567,6 +567,19 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
                 v = b.reflect().outputs[0].varyings[0]
                 self.assertEqual(v.type, spv.AggregateType("array", (spv.NumericType("f", 32),), expected))
 
+    def test_array_length_accepts_int8_constants(self):
+        for opcode in (spv.OP_CONSTANT, spv.OP_SPEC_CONSTANT):
+            for signed, count in ((False, 0x82), (True, 5)):
+                with self.subTest(opcode=opcode, signed=signed):
+                    b = SpirvBuilder("vs")
+                    length_type = b.int_type(8, signed=signed)
+                    length_id = b.alloc()
+                    b.emit(opcode, length_type, length_id, count)
+                    arr_t = b.emit_type(spv.OP_TYPE_ARRAY, b.float_type(), length_id)
+                    b.variable(spv.STORAGE_OUTPUT, arr_t, location=0)
+                    varying = b.reflect().outputs[0].varyings[0]
+                    self.assertEqual(varying.type, spv.AggregateType("array", (spv.NumericType("f", 32),), count))
+
     def test_array_length_constant_errors(self):
         # Not an OpConstant (references an undefined ID).
         b = SpirvBuilder("vs")
@@ -583,10 +596,10 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
         with self.assertRaisesRegex(spv.InterfaceError, "must be an integer"):
             b.reflect()
 
-        # Unsupported integer width (8-bit) for array length.
+        # Unsupported integer width for array length.
         b = SpirvBuilder("vs")
-        i8 = b.emit_type(spv.OP_TYPE_INT, 8, 0)
-        c = b.constant(i8, 3)
+        u24 = b.int_type(24)
+        c = b.constant(u24, 3)
         arr_t = b.emit_type(spv.OP_TYPE_ARRAY, b.numeric("f", 32), c)
         b.variable(spv.STORAGE_OUTPUT, arr_t, location=0)
         with self.assertRaisesRegex(spv.InterfaceError, "must be an integer"):
@@ -603,6 +616,8 @@ class TypeAndConstantResolutionTest(unittest.TestCase):
 
         # Zero and negative signed counts.
         bad_counts = [
+            ("zero_u8", 8, False, (0,)),
+            ("neg_i8", 8, True, (0xFFFFFF80,)),
             ("zero_u32", 32, False, (0,)),
             ("neg_i16", 16, True, (0x8000,)),
             ("neg_i32", 32, True, (0xFFFFFFFF,)),
