@@ -98,6 +98,36 @@ class Resolve(unittest.TestCase):
         one = sk.collect_keys([self.jsav])
         self.assertEqual(sk.collect_keys([folder]), collections.Counter({k: 4 * n for k, n in one.items()}))
 
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the collection used to report
+        # the remaining saves and exit 0, hiding the incomplete directory.
+        with open(self.jsav, "rb") as f:
+            data = f.read()
+        folder = os.path.join(self.dir, "saves_sub")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "a.jsav"), "wb") as f:
+            f.write(data)
+        sub = os.path.join(folder, "sub")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "b.jsav"), "wb") as f:
+            f.write(data)
+        os.chmod(sub, 0o000)
+        try:
+            try:
+                os.listdir(sub)
+                self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+            except OSError:
+                pass
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = sk.main(["collect", folder])
+            self.assertEqual(rc, 1)
+            self.assertIn("error:", err.getvalue())
+            self.assertIn(sub, err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+        finally:
+            os.chmod(sub, 0o755)
+
     def test_resolve_counts_per_family(self):
         res = os.path.join(self.dir, "res.json")
         text = run(["resolve", self.jsav, "--dict", self.dict, "--out", res])
