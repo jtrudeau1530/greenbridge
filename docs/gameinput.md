@@ -478,6 +478,11 @@ as `A`, `B`, `X` and `Y`, the d-pad, L1/R1, L3/R3, Create as `View` and Options 
 0.0; shaking the pad by hand reached 1.00 on the accelerometer. With `--rumble` (the default `rumble` trigger mode)
 and `LEONIDA_DS_LIGHTBAR=00ff00`, the person holding the pad reported the motors, the trigger effects and the lightbar
 as working; nothing measured them, and the `resistance` mode was not tried.
+    size, the item calls, `E_INVALIDARG` / `E_FAIL` / `E_NOTIMPL`, the HID device closing on unplug, and a held
+    reading's `GetRawReport` waiting while a reconnect rebuilds the report tables.
+- `gameinput_probe [--seconds N] [--rumble]` (by hand, with a pad connected): lists the pads with each one's raw HID
+  report tables (or why it has none), plays each motor and trigger for a second with `--rumble`, then prints the live
+  reading and the newest raw input report.
 
 ## VERIFY
 

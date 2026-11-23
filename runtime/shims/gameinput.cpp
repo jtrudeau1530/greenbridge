@@ -663,6 +663,7 @@ bool Reading::GetRawReport(void** report) {
     if (!report) return false;
     *report = nullptr;
     if (!s_.has_raw) return false;
+    std::lock_guard lock(device_->hid_mu);
     const GameInputRawDeviceReportInfo* info = device_->find_raw(GameInputRawInputReport, s_.raw_id);
     if (!info) return false;
     *report = static_cast<IGameInputRawDeviceReport*>(new RawReport(device_, *info, s_.raw.data(), s_.raw.size()));

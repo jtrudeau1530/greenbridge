@@ -302,11 +302,16 @@ struct FakeRawHid {
     std::vector<std::vector<uint8_t>> writes, features_sent;
     std::vector<uint8_t> feature_reply;
     bool fail = false;
+    HANDLE in_open = nullptr, release_open = nullptr;
 };
 FakeRawHid g_raw;
 void* raw_open(const char*, uint16_t vendor, uint16_t product) {
     if (vendor != g_raw.vendor || product != g_raw.product) return nullptr;
     ++g_raw.opens;
+    if (g_raw.release_open) {
+        SetEvent(g_raw.in_open);
+        WaitForSingleObject(g_raw.release_open, 5000);
+    }
     return &g_raw;
 }
 void raw_close(void*) { ++g_raw.closes; }
@@ -464,6 +469,64 @@ void test_raw_hid(IGameInput* input) {
           "raw hid: no raw I/O once the pad is gone");
     rdev->Release();
     pdev->Release();
+    rt::gameinput::set_hid_backend(nullptr);
+}
+
+void test_raw_report_during_reconnect(IGameInput* input) {
+    rt::gameinput::set_hid_backend(&kFakeRawHid);
+    Pad raw_pad;
+    attach(raw_pad, "Leonida virtual raw pad", g_raw.vendor, g_raw.product, false);
+    rt::gameinput::poll();
+    g_raw.inputs.push_back({0x01, 0x44, 0x55, 0x66});
+    rt::gameinput::poll();
+    IGameInputReading* held = nullptr;
+    check(input->GetCurrentReading(GameInputKindRawDeviceReport, nullptr, &held) == S_OK && held,
+          "raw hid reconnect: a reading with a raw report to hold");
+    detach(raw_pad);
+    rt::gameinput::poll();
+    if (!held) {
+        rt::gameinput::set_hid_backend(nullptr);
+        return;
+    }
+
+    g_raw.in_open = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_raw.release_open = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE read_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    attach(raw_pad, "Leonida virtual raw pad", g_raw.vendor, g_raw.product, false);
+    std::thread poller([] { rt::gameinput::poll(); });
+    const bool in_open = WaitForSingleObject(g_raw.in_open, 5000) == WAIT_OBJECT_0;
+    bool got = false;
+    void* report = nullptr;
+    std::thread reader([&] {
+        got = held->GetRawReport(&report);
+        SetEvent(read_done);
+    });
+    const bool waited = WaitForSingleObject(read_done, 200) == WAIT_TIMEOUT;
+    SetEvent(g_raw.release_open);
+    poller.join();
+    const bool finished = WaitForSingleObject(read_done, 5000) == WAIT_OBJECT_0;
+    reader.join();
+    check(in_open && waited, "raw hid reconnect: GetRawReport waits while open_raw rebuilds the report tables");
+    auto* rr = static_cast<IGameInputRawDeviceReport*>(report);
+    check(finished && got && rr && raw_bytes(rr) == std::vector<uint8_t>({0x44, 0x55, 0x66}),
+          "raw hid reconnect: then it gives the held reading's report");
+    if (rr) rr->Release();
+    IGameInputDevice* dev = nullptr;
+    held->GetDevice(&dev);
+    void* created = nullptr;
+    check(dev && (dev->GetDeviceStatus() & GameInputDeviceRawIoEnabled) &&
+              dev->CreateRawDeviceReport(2, GameInputRawOutputReport, &created) == S_OK && created,
+          "raw hid reconnect: and the reconnected pad has raw I/O again");
+    if (created) static_cast<IGameInputRawDeviceReport*>(created)->Release();
+    if (dev) dev->Release();
+    held->Release();
+
+    CloseHandle(read_done);
+    CloseHandle(g_raw.in_open);
+    CloseHandle(g_raw.release_open);
+    g_raw.in_open = g_raw.release_open = nullptr;
+    detach(raw_pad);
+    rt::gameinput::poll();
     rt::gameinput::set_hid_backend(nullptr);
 }
 
@@ -2031,6 +2094,7 @@ int main() {
     test_force_feedback(input);
     test_haptic_motors(input);
     test_raw_hid(input);
+    test_raw_report_during_reconnect(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
