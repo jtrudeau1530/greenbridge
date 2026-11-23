@@ -3128,15 +3128,17 @@ bool host_ray_tracing(ID3D12Device* host) {
 }
 
 // Windows 10's runtime (no ID3D12Device10) still checks a buffer's initial state and refuses a HARDWARE_PROTECTED
-// heap, where newer runtimes and the layer accept them (measured on Windows 10 22H2 build 19045.5737). For a case
-// marked windows10_refuses only that pair is excused: the layer's S_OK against the host's E_INVALIDARG, on a host
-// without ID3D12Device10. Any other difference, and any difference on a newer host, is still a mismatch.
+// heap, where newer runtimes and the layer accept them (measured on Windows 10 22H2 build 19045.5737). Windows 11
+// 23H2's runtime (D3D12Core 10.0.22621.5415: ID3D12Device10 but no ID3D12Device11) still refuses the
+// HARDWARE_PROTECTED heap. For a case marked windows10_refuses only that pair is excused: the layer's S_OK against
+// the host's E_INVALIDARG, on a host without ID3D12Device11. Any other difference, and any difference on a newer
+// host, is still a mismatch.
 bool windows10_refusal(const char* name, ID3D12Device* host, HRESULT ours, HRESULT theirs) {
     if (ours != S_OK || theirs != E_INVALIDARG) return false;
-    Ref<ID3D12Device10> newer;
+    Ref<ID3D12Device11> newer;
     if (SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&newer.p)))) return false;
-    std::printf("invalid arguments %s: Windows 10's runtime refuses it (ours 0x%08lx, host 0x%08lx)\n", name, ours,
-                theirs);
+    std::printf("invalid arguments %s: an older host runtime (Windows 10, Windows 11 23H2) refuses it (ours 0x%08lx, "
+                "host 0x%08lx)\n", name, ours, theirs);
     return true;
 }
 
@@ -3152,6 +3154,14 @@ int compare_invalid_arguments(ID3D12Device* ours) {
     };
     const auto device10 = [](ID3D12Device* d) {
         Ref<ID3D12Device10> newer;
+        return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
+    };
+    // Windows 11 23H2's in-box runtime (D3D12Core 10.0.22621.5415) has ID3D12Device10 but not ID3D12Device11, and
+    // still answers five of the device10 cases as Windows 10 does (HARDWARE_PROTECTED and flag 0x400 refused, 2049
+    // shader-visible samplers refused, a type -1 list created). Those five are compared only on a host with
+    // ID3D12Device11, which newer runtimes have (d3d12_sampler2_test compares against one).
+    const auto device11 = [](ID3D12Device* d) {
+        Ref<ID3D12Device11> newer;
         return SUCCEEDED(d->QueryInterface(IID_PPV_ARGS(&newer.p)));
     };
     static const Case cases[] = {
@@ -3687,7 +3697,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: heap flag HARDWARE_PROTECTED on a texture", [](ID3D12Device* d) {
              return with_heap_flags(d, rgba8(), D3D12_HEAP_FLAG_HARDWARE_PROTECTED);
-         }, +device10},
+         }, +device11},
         {"committed: heap flag ALLOW_WRITE_WATCH on a buffer", [](ID3D12Device* d) {
              return with_heap_flags(d, buffer_desc(256), D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH);
          }},
@@ -3801,10 +3811,10 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(0x400);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }, +device10},
+         }, +device11},
         {"committed: resource flag 0x400 on a texture", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAGS(0x400)));
-         }, +device10},
+         }, +device11},
         // A null output is a capability check; with invalid arguments too, the host's answer says which comes first.
         {"committed: heap type 99, null output", [](ID3D12Device* d) {
              const H heap{D3D12_HEAP_TYPE(99)};
@@ -3887,7 +3897,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"descriptor heap: shader-visible 2049 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2049,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
-         }, +device10},
+         }, +device11},
         {"descriptor heap: shader-visible 2048 samplers", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
@@ -4098,11 +4108,12 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command list1: type copy", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(3)); }},
         {"command list1: type 7", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(7)); }},
         {"command list1: type 99", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99)); }},
-        // NONE (-1): Windows 10's runtime (19045, no ID3D12Device10) creates the list and Windows 11's refuses it
-        // (measured on #2297), so it is compared only on a host with ID3D12Device10.
+        // NONE (-1): Windows 10's runtime (19045, no ID3D12Device10) creates the list and newer Windows 11 runtimes
+        // refuse it (measured on #2297); Windows 11 23H2 (22621.5415, ID3D12Device10 but no ID3D12Device11) still
+        // creates it, so it is compared only on a host with ID3D12Device11.
         {"command list1: type -1", [](ID3D12Device* d) {
              return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(-1));
-         }, +device10},
+         }, +device11},
         {"command list1: node mask 1", [](ID3D12Device* d) {
              return command_list1(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT);
          }},
@@ -4385,7 +4396,8 @@ int compare_heap_neighbours(ID3D12Device* ours) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS));
          }},
         // The D3D12_HEAP_FLAGS documentation calls it unsupported, but the host accepts it (RTX 4070 SUPER and
-        // UHD 770, @CowBoYdu76). Windows 10's runtime refuses it, as it refuses the committed case above.
+        // UHD 770, @CowBoYdu76). Windows 10's and Windows 11 23H2's runtimes refuse it, as they refuse the committed
+        // case above.
         {"heap: HARDWARE_PROTECTED", [](ID3D12Device* d) {
              return heap_create(d, heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_HEAP_FLAG_HARDWARE_PROTECTED));
          }, true},
