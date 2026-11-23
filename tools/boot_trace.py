@@ -31,6 +31,7 @@ import re
 import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+D3D12_PROBLEMS = ("failed", "unsupported", "refused", "partial")
 
 
 class TraceError(ValueError):
@@ -179,6 +180,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "outcomes": {},
         "methods": [],
         "first": {},
+        "method_outcomes": {},
         "failed": [],
         "unsupported": [],
         "refused": [],
@@ -203,10 +205,12 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
                     trace["sequence_breaks"].append({"expected": expected, "observed": seq})
             trace["last_seq"] = seq
             trace["outcomes"][outcome] = trace["outcomes"].get(outcome, 0) + 1
+            counts = trace["method_outcomes"].setdefault(method, {})
+            counts[outcome] = counts.get(outcome, 0) + 1
             if method not in trace["first"]:
                 trace["methods"].append(method)
                 trace["first"][method] = {"seq": seq, "outcome": outcome}
-            if outcome in ("failed", "unsupported", "refused", "partial"):
+            if outcome in D3D12_PROBLEMS:
                 bucket = trace[outcome]
                 if len(bucket) < limit:
                     bucket.append({"seq": seq, "method": method})
@@ -309,6 +313,15 @@ def format_text(summary: dict, limit: int) -> str:
                 out.append(f"    expected #{item['expected']}, observed #{item['observed']}")
         if d3d12["methods"]:
             out.append(f"  first per method: {_tail(d3d12['methods'], limit)}")
+        problems = []
+        for method, counts in d3d12["method_outcomes"].items():
+            failures = {outcome: counts[outcome] for outcome in D3D12_PROBLEMS if outcome in counts}
+            if failures:
+                problems.append((sum(failures.values()), method, failures))
+        if problems:
+            out.append("  methods by problem count:")
+            for _, method, counts in sorted(problems, key=lambda row: (-row[0], row[1]))[:limit]:
+                out.append(f"    {method}: " + ", ".join(f"{outcome} {n}" for outcome, n in counts.items()))
         if d3d12["unsupported"]:
             unsupported = [f"#{c['seq']} {c['method']}" for c in d3d12["unsupported"]]
             out.append(f"  unsupported: {_tail(unsupported, limit)}")
