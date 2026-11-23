@@ -134,7 +134,7 @@ def reads_scc(ins):
     if op in _SCC_IMPLICIT_READS or op.startswith(("s_getreg", "s_setreg", "s_save_status")):
         return True
     for x in ins["args"]:
-        if x.get("k") == "special" and x.get("t") == "scc":
+        if x.get("k") == "special" and x.get("t") in ("scc", "src_scc"):
             return True
     return False
 

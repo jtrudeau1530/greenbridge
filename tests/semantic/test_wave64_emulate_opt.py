@@ -692,6 +692,33 @@ class DeadSccLivenessTests(unittest.TestCase):
         for lane in range(64):
             self.assertEqual(mem[lane * 4], 77, f"lane {lane}: expected 77 from cross-block live SCC")
 
+    def test_src_scc_keeps_mask_vote_live(self):
+        for threads in (64, 128):
+            for consumer in ("scalar", "vector"):
+                with self.subTest(threads=threads, consumer=consumer):
+                    insns = [
+                        ("v_and_b32_e32 v3, 63, v0", 4),
+                        ("v_cmp_eq_u32_e64 s[6:7], 45, v3", 8),
+                        ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+                    ]
+                    if consumer == "scalar":
+                        insns.append(("s_mov_b32 s14, src_scc", 4))
+                    insns.append(("s_mov_b64 exec, -1", 4))
+                    insns.append(("v_mov_b32_e32 v5, s14", 4) if consumer == "scalar"
+                                 else ("v_mov_b32_e32 v5, src_scc", 4))
+                    insns.extend([
+                        ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+                        ("buffer_store_dword v5, v6, s[0:3], 0 offen", 8),
+                        ("s_endpgm", 4),
+                    ])
+                    size = (threads, 1, 1)
+                    spirv, _ = _translate_encoded("cs_scc_inline_source", insns, size)
+                    mem, _ = run_emulated_workgroup(spirv, size, push_constants=VSHARP + [0] * 28)
+                    # Lane 45 is active on every wave, so the scalar SCC reads as one in every lane.
+                    actual = [mem[lane * 4] for lane in range(threads)]
+                    self.assertEqual(actual, [1] * threads,
+                                     f"{actual.count(1)}/{threads} lanes observed the live SCC")
+
     def test_non_emulated_unchanged_keeps_wqm_scc_vote(self):
         # Verify WAVE64_EMULATE=False keeps dead-SCC votes (required by test_translate.py WQM_MASK).
         insns = [
