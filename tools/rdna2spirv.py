@@ -12931,12 +12931,13 @@ def fold_far_branches(insns):
     return out
 
 
-def reachable_code(insns):
+def reachable_code(insns, code_end=None):
     """Instructions reachable from the first one, following fall-through and branch targets. Fall-through stops
     after s_endpgm, s_branch and s_setpc_b64. Raises Unsupported if a branch target isn't an instruction start, or if
     an instruction falls through into words that are not an instruction (undecodable words before later code)."""
     by_pc = {i["pc"]: k for k, i in enumerate(insns)}
-    code_end = max((i["pc"] + len(i["enc"]) // 2 for i in insns), default=0)
+    # the code ends at the declared end of its range (the listing header), or else after the last printed instruction
+    code_end = max([i["pc"] + len(i["enc"]) // 2 for i in insns] + [code_end or 0])
     seen, work = set(), [0]
     while work:
         k = work.pop()
@@ -13592,7 +13593,7 @@ def translate(path):
             ins["pc"] = at
             pos = at + len(enc)
         insns = fold_far_branches(insns)
-        insns = reachable_code(insns)
+        insns = reachable_code(insns, info.get("code_end"))
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
     else:
