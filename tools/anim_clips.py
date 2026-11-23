@@ -770,6 +770,27 @@ def count_motion_blend(c, stats):
         stats["motion_axis_name:" + AXIS_NAMES.get(h, f"0x{h:08x}")] += 1
 
 
+def window_matches_duration(start, end, rate, duration):
+    """True when an animation entry's clip window covers the clip exactly: (end - start) / rate equals the clip's
+    +0x78 duration, to float32 precision (relative 1e-5, absolute 1e-6). False for a zero or non-finite rate."""
+    if not rate or not all(math.isfinite(x) for x in (start, end, rate, duration)):
+        return False
+    return math.isclose((end - start) / rate, duration, rel_tol=1e-5, abs_tol=1e-6)
+
+
+def count_clip_windows(clips, stats):
+    """docs/animation.md: a clip plays each animation over [start, end] at its rate, and (end - start) / rate is the
+    clip's duration. Count the animation entries of ordinary clips that hold to it, and the ones with rate 0."""
+    for c in clips:
+        if c["kind"] != "clip":
+            continue
+        for e in c["animations"]:
+            stats["clip_windows"] += 1
+            stats["clip_windows_rate_zero"] += e["rate"] == 0
+            stats["clip_windows_match_duration"] += window_matches_duration(e["start"], e["end"], e["rate"],
+                                                                            c["duration"])
+
+
 def count_motion_samples(c, kind, axis, stats):
     """Counts for the +0x90 sample lists of a one-node `.motion` (+0x58 == 1) against its node (no values)."""
     lists = c.get("samples")
@@ -843,6 +864,7 @@ def decode_resource(path, segments, budget=None):
         stats["motion_children_in_external_refs"] += sum(dh in external for _ch, dh in c["children"])
         count_motion_blend(c, stats)
     stats["clip_animation_refs"] += sum(len(c["animations"]) for c in d["clips"])
+    count_clip_windows(d["clips"], stats)
     stats["packs_local"] += len(d["packs"])
     stats["packs_external"] += d["external_packs"]
     stats["dictionaries_without_local_pack"] += not d["packs"]

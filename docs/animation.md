@@ -491,8 +491,11 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | | `+0x60` array, 12-byte items | tracks `{u32 bone hash; u32 track type; u32 format}` |
 
 A clip plays its animations at the same time, each over its own `[start, end]` window at its rate: animation time
-`t` is clip time `(t − start) / rate`, and `(end − start) / rate` equals the clip's `+0x78` duration (4,471 of 4,471
-entries in 300 sampled dictionaries). In the samples, the animations of one clip covered different bones and could
+`t` is clip time `(t − start) / rate`, and `(end − start) / rate` equals the clip's `+0x78` duration: over all
+61,505 dictionaries of `anim.rpf` (`tools/anim_clips.py`, `clip_windows`), 784,562 of the 785,174 animation entries of
+ordinary clips match to float32 precision (relative 1e-5) and the other 612 within 2.2e-4 relative, 581 of them in
+one-frame (0.033 s) clips where the rounding shows most; none has rate 0 (the first check, 300 sampled
+dictionaries, had 4,471 of 4,471). In the samples, the animations of one clip covered different bones and could
 have different frame rates. `tools/anim_glb.py` plays clips on a fragment skeleton and writes them as glTF
 animations; see [character_skeleton.md](character_skeleton.md#animated-gltf-export).
 

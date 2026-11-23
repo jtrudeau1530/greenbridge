@@ -6,6 +6,7 @@ Every byte here is built by the test: a fake RPF9 data area holding clip-diction
 encoder below (dictionary root, clip, animation pack, animation, sequences and every decoded channel type,
 including a type-10 channel). No game file or game asset name is used.
 """
+import collections
 import json
 import math
 import os
@@ -867,6 +868,31 @@ class ArchiveTest(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["summary"]["counts"]["animations_decoded"], 2)
+
+
+class ClipWindowTest(unittest.TestCase):
+    """docs/animation.md: (end - start) / rate is the clip's +0x78 duration."""
+
+    def test_window_matches_duration(self):
+        f = anim_clips.window_matches_duration
+        self.assertTrue(f(0.0, 2.0, 1.0, 2.0))
+        self.assertTrue(f(1.0, 3.0, 0.5, 4.0))           # half speed: twice as long
+        self.assertTrue(f(0.0, 1.0 / 3.0, 1.0, 0.33333334))  # float32 rounding of the duration
+        self.assertFalse(f(0.0, 2.0, 1.0, 2.1))
+        self.assertFalse(f(0.0, 2.0, 0.0, 2.0))          # rate 0
+        self.assertFalse(f(0.0, math.inf, 1.0, math.inf))
+        self.assertFalse(f(0.0, math.nan, 1.0, 1.0))
+
+    def test_counts_only_ordinary_clips(self):
+        clips = [
+            {"kind": "clip", "duration": 2.0, "animations": [
+                {"start": 0.0, "end": 2.0, "rate": 1.0}, {"start": 0.0, "end": 1.0, "rate": 0.5},
+                {"start": 0.0, "end": 1.0, "rate": 1.0}, {"start": 0.0, "end": 1.0, "rate": 0.0}]},
+            {"kind": "motion", "duration": 9.0, "animations": [{"start": 0.0, "end": 1.0, "rate": 1.0}]},
+        ]
+        stats = collections.Counter()
+        anim_clips.count_clip_windows(clips, stats)
+        self.assertEqual(stats, {"clip_windows": 4, "clip_windows_match_duration": 2, "clip_windows_rate_zero": 1})
 
 
 if __name__ == "__main__":

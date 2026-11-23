@@ -300,8 +300,8 @@ it does and why:
   the track's bone hash. Bone hash 0 drives a `mover` node above the skeleton (root motion;
   `--no-root-motion` leaves it out). Other track types are counted, not exported. A clip entry
   plays its animation's `[start, end]` window at `rate`, so animation time `t` is clip time
-  `(t − start) / rate`. In 300 sampled dictionaries, `(end − start) / rate` equals the clip's
-  `+0x78` duration for all 4,471 entries.
+  `(t − start) / rate`. `(end − start) / rate` equals the clip's `+0x78` duration for all 785,174
+  entries of all 61,505 dictionaries, to within 2.2e-4 relative (see [animation.md](animation.md#clip-dictionaries-are-rage-resources)).
 - The whole skeleton sits under one node that turns RAGE Z-up into glTF Y-up. Skinned mesh nodes
   sit at the scene root, because glTF ignores a skinned mesh node's own transform.
 
