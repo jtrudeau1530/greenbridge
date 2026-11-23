@@ -292,6 +292,16 @@ int main() {
     CHECK(!zlib_inflate(broken, out));
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
     CHECK(!zlib_inflate(bytes("not zlib"), out));
+    // The reason a caller can ask for (dstorage.cpp reports each with its own HRESULT).
+    ZlibError why = ZlibError::limit;
+    CHECK(zlib_inflate(dynamic, out, 600, &why) && why == ZlibError::none);
+    CHECK(!zlib_inflate(dynamic, out, 599, &why) && why == ZlibError::limit);
+    CHECK(!zlib_inflate(bytes("not zlib"), out, 1 << 20, &why) && why == ZlibError::header);
+    broken = dynamic;
+    broken.back() ^= 1;
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::checksum);
+    broken.resize(100);
+    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
 
     Json json;
     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.
