@@ -19,6 +19,15 @@
 
 namespace {
 
+int fake_shim_han() { return 1; }
+int fake_shim_zi() { return 2; }
+int fake_shim_qmark() { return 3; }
+
+SHIM_TABLE(test_unicode_module_shims,
+           {"uni-\xe6\xbc\xa2.dll", "probe_han", reinterpret_cast<void*>(&fake_shim_han)},
+           {"uni-\xe5\xad\x97.dll", "probe_zi", reinterpret_cast<void*>(&fake_shim_zi)},
+           {"uni-?.dll", "probe_collide", reinterpret_cast<void*>(&fake_shim_qmark)});
+
 int g_failures = 0;
 
 void check(bool ok, const std::string& what) {
@@ -71,6 +80,48 @@ int main(int argc, char** argv) {
         check(owned != nullptr, "the shims hand out a pseudo-handle for the module they own (xmem.dll)");
         check(disable != nullptr && owned != nullptr && disable(owned) == TRUE,
               "DisableThreadLibraryCalls on a shim pseudo-handle answers TRUE");
+
+        // Host modules with distinct non-ASCII names must not collide on '?' in host_module_name() / get_proc_address().
+        using GetProcFn = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+        using LoadLibWFn = HMODULE(WINAPI*)(LPCWSTR);
+        const auto get_proc =
+            reinterpret_cast<GetProcFn>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+        const auto load_lib_w =
+            reinterpret_cast<LoadLibWFn>(rt::shims::find("kernel32.dll", "LoadLibraryW"));
+        check(get_proc != nullptr && load_lib_w != nullptr,
+              "the registry serves GetProcAddress and LoadLibraryW");
+        if (get_proc && load_lib_w) {
+            const std::filesystem::path uni_dir =
+                std::filesystem::temp_directory_path() /
+                ("leonida_ll_utf8_" + std::to_string(GetCurrentProcessId()));
+            std::error_code ec;
+            std::filesystem::remove_all(uni_dir, ec);
+            std::filesystem::create_directories(uni_dir, ec);
+            const std::filesystem::path han_path = uni_dir / L"Uni-\u6f22.dll";
+            const std::filesystem::path zi_path = uni_dir / L"Uni-\u5b57.dll";
+            std::filesystem::copy_file(dll, han_path, std::filesystem::copy_options::overwrite_existing, ec);
+            std::filesystem::copy_file(dll, zi_path, std::filesystem::copy_options::overwrite_existing, ec);
+            const HMODULE h_han = LoadLibraryW(han_path.c_str());
+            const HMODULE h_zi = LoadLibraryW(zi_path.c_str());
+            check(h_han != nullptr && h_zi != nullptr && h_han != h_zi,
+                  "native Windows loads distinct non-ASCII DLL copies");
+            if (h_han && h_zi) {
+                check(reinterpret_cast<void*>(get_proc(h_han, "probe_han")) ==
+                          reinterpret_cast<void*>(&fake_shim_han),
+                      "GetProcAddress resolves UTF-8 module name Uni-U+6F22.dll without '?' replacement");
+                check(reinterpret_cast<void*>(get_proc(h_zi, "probe_zi")) ==
+                          reinterpret_cast<void*>(&fake_shim_zi),
+                      "GetProcAddress resolves UTF-8 module name Uni-U+5B57.dll without '?' replacement");
+                check(get_proc(h_han, "probe_collide") == nullptr && get_proc(h_zi, "probe_collide") == nullptr,
+                      "distinct non-ASCII module names do not collapse to uni-?.dll");
+            }
+            if (h_han) FreeLibrary(h_han);
+            if (h_zi) FreeLibrary(h_zi);
+            const HMODULE owned_dir = load_lib_w(L"C:\\\u6f22\\xmem.dll");
+            check(owned_dir != nullptr && owned_dir == owned,
+                  "LoadLibraryW finds an owned ASCII shim inside a non-ASCII directory");
+            std::filesystem::remove_all(uni_dir, ec);
+        }
     } catch (const std::exception& e) {
         std::printf("FAIL unexpected exception: %s\n", e.what());
         ++g_failures;
