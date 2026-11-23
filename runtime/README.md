@@ -367,7 +367,8 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT/SINT/SNORM views of 2D mip slices and contiguous
 array-layer ranges, and MSAA. Other typeless color families also accept same-family typed RTVs, subject to Vulkan
 color-attachment support. Typed-resource RTV casts are limited to R8G8B8A8_UNORM resources whose castable-format
-list allows the view. 1D attachments and 3D typeless view reinterpretation remain refused.
+list allows the view. A 1D texture cannot be created as a render target or depth buffer (`CreateCommittedResource`
+refuses `ALLOW_RENDER_TARGET`/`ALLOW_DEPTH_STENCIL` on it), and 3D typeless view reinterpretation remains refused.
 
 ### Resource descriptions
 
