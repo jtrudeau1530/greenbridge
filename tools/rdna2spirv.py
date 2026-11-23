@@ -12577,12 +12577,12 @@ class Gen:
             for i, comp in enumerate(comps):
                 self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
 
-    # image atomic -> (SPIR-V op, value that leaves memory unchanged, used for inactive lanes)
-    IMG_ATOMICS = {"image_atomic_umin": ("OpAtomicUMin", 0xFFFFFFFF), "image_atomic_umax": ("OpAtomicUMax", 0),
-                   "image_atomic_smin": ("OpAtomicSMin", 0x7FFFFFFF), "image_atomic_smax": ("OpAtomicSMax", 0x80000000),
-                   "image_atomic_or": ("OpAtomicOr", 0), "image_atomic_xor": ("OpAtomicXor", 0),
-                   "image_atomic_and": ("OpAtomicAnd", 0xFFFFFFFF), "image_atomic_add": ("OpAtomicIAdd", 0),
-                   "image_atomic_sub": ("OpAtomicISub", 0)}
+    # image atomic -> SPIR-V op (guarded inside `if (active)` so inactive lanes skip the access)
+    IMG_ATOMICS = {"image_atomic_umin": "OpAtomicUMin", "image_atomic_umax": "OpAtomicUMax",
+                   "image_atomic_smin": "OpAtomicSMin", "image_atomic_smax": "OpAtomicSMax",
+                   "image_atomic_or": "OpAtomicOr", "image_atomic_xor": "OpAtomicXor",
+                   "image_atomic_and": "OpAtomicAnd", "image_atomic_add": "OpAtomicIAdd",
+                   "image_atomic_sub": "OpAtomicISub"}
     IMG_ATOMICS_EXTRA = ("image_atomic_swap", "image_atomic_inc", "image_atomic_dec",
                          "image_atomic_fmin", "image_atomic_fmax", "image_atomic_fcmpswap")
 
@@ -12950,7 +12950,7 @@ class Gen:
                 vals[i] = kept
         return vals + [lv]
 
-    def emit_image_atomic_extra(self, op, ip, iv, vdata, mods):
+    def emit_image_atomic_extra(self, op, ptr_ty, arr_var, idx, iv, vdata, mods):
         """Lower 32-bit image_atomic_{swap,inc,dec,fmin,fmax,fcmpswap} on an r32ui storage image (2D or 3D).
         Inactive lanes skip the op and preserve vdata. CAS loops use OpAtomicLoad (valid on Image pointers) +
         OpAtomicCompareExchange, requiring no shader float atomic extension."""
@@ -12964,7 +12964,8 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        tp = self.tmp()
+        ip, tp = self.tmp(), self.tmp()
+        self.dynamic_storage_access(ip, ptr_ty, arr_var, idx)
         self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
         sc, sem = self.cu(1), self.cu(0)
         if op == "image_atomic_swap":
@@ -13108,92 +13109,52 @@ class Gen:
                 raise Unsupported(op + " coords")
             return [self.as_int(c) for c in raw[:nc]]
 
-        if is3d_atomic:
-            # 3D r32ui storage image atomics (binding 7).
-            self.uses_storage3d = True
-            coords = atomic_coords(3)
-            iv, ip = self.tmp(), self.tmp()
-            self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
-            self.dynamic_storage_access(ip, "%_ptr_UC_simg3", "%simages3d", idx)
-            if op in self.IMG_ATOMICS_EXTRA:
-                self.emit_image_atomic_extra(op, ip, iv, vdata, mods)
-                return
-            tp, old, safe = self.tmp(), self.tmp(), self.tmp()
-            val = self.load_reg("vgpr", vdata["r"])
-            if op == "image_atomic_cmpswap":
-                cmpv = self.load_reg("vgpr", vdata["r"] + 1)
-                act = self.active_b()
-                do, end = self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"OpSelectionMerge {end} None")
-                self.emit(f"OpBranchConditional {act} {do} {end}")
-                self.emit(f"{do} = OpLabel")
-                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
-                if "glc" in mods:
-                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-                self.emit(f"OpBranch {end}")
-                self.emit(f"{end} = OpLabel")
-                return
-            spv, neutral = self.IMG_ATOMICS[op]
-            self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-            self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
-            self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {safe}")
-            if "glc" in mods:
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-            return
-        if op == "image_store":
-            self.image_store(a, mods, dim)
-            return
         if is_atomic:
-            # Storage image (2D r32ui). Atomics: vdata holds the operand; with 'glc' the pre-op value comes back.
-            self.uses_storage = True
-            coords = atomic_coords(2)
-            iv = self.tmp()
-            self.emit(f"{iv} = OpCompositeConstruct %v2int {coords[0]} {coords[1]}")
-            ip = self.tmp()
-            self.dynamic_storage_access(ip, "%_ptr_UC_simg", "%simages", idx)
+            # 2D (binding 4) or 3D (binding 7) r32ui storage image atomics.
+            # Guard OpAccessChain / OpImageTexelPointer / OpAtomic* inside `if (active)` so inactive lanes never
+            # execute spurious RMWs or dereference uninitialized descriptors/coordinates.
+            if is3d_atomic:
+                self.uses_storage3d = True
+                coords = atomic_coords(3)
+                iv = self.tmp()
+                self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
+                ptr_ty, arr_var = "%_ptr_UC_simg3", "%simages3d"
+            else:
+                self.uses_storage = True
+                coords = atomic_coords(2)
+                iv = self.tmp()
+                self.emit(f"{iv} = OpCompositeConstruct %v2int {coords[0]} {coords[1]}")
+                ptr_ty, arr_var = "%_ptr_UC_simg", "%simages"
             if op in self.IMG_ATOMICS_EXTRA:
-                self.emit_image_atomic_extra(op, ip, iv, vdata, mods)
-                return
-            val = self.load_reg("vgpr", vdata["r"])
-            if op == "image_store":
-                # Writes dmask component 0 as r32ui; only active lanes store.
-                img, lbl_do, lbl_end = self.tmp(), self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"{img} = OpLoad %simg2d_u {ip}")
-                v4 = self.tmp()
-                self.emit(f"{v4} = OpCompositeConstruct %v4uint {val} {self.cu(0)} {self.cu(0)} {self.cu(0)}")
-                act = self.active_b()      # must be computed before OpSelectionMerge (merge directly precedes branch)
-                self.emit(f"OpSelectionMerge {lbl_end} None")
-                self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
-                self.emit(f"{lbl_do} = OpLabel")
-                self.emit(f"OpImageWrite {img} {iv} {v4}")
-                self.emit(f"OpBranch {lbl_end}")
-                self.emit(f"{lbl_end} = OpLabel")
-                self.uses_v4uint = True
+                self.emit_image_atomic_extra(op, ptr_ty, arr_var, idx, iv, vdata, mods)
                 return
             if op == "image_atomic_cmpswap":
-                # vdata = (src, cmp): memory = (memory == cmp) ? src : memory; glc returns the old value.
-                cmpv = self.load_reg("vgpr", vdata["r"] + 1)
-                act = self.active_b()
-                do, end = self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"OpSelectionMerge {end} None")
-                self.emit(f"OpBranchConditional {act} {do} {end}")
-                self.emit(f"{do} = OpLabel")               # inactive lanes don't touch memory
-                tp, old = self.tmp(), self.tmp()
-                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
-                if "glc" in mods:
-                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-                self.emit(f"OpBranch {end}")
-                self.emit(f"{end} = OpLabel")
-                return
-            spv, neutral = self.IMG_ATOMICS[op]
-            tp, old, safe = self.tmp(), self.tmp(), self.tmp()
+                if vdata["k"] != "vgpr" or vdata.get("n", 1) != 2:
+                    raise Unsupported(op + " data")
+            elif vdata["k"] != "vgpr":
+                raise Unsupported(op + " data")
+            # Two-VGPR dmask:0x3 forms of the nine standard ops are 64-bit atomics; keep main's low-dword
+            # 32-bit behavior here so corpus translation count does not drop while Int64ImageEXT + fallback
+            # is handled separately.
+            val = self.load_reg("vgpr", vdata["r"])
+            cmpv = self.load_reg("vgpr", vdata["r"] + 1) if op == "image_atomic_cmpswap" else None
+            act = self.active_b()
+            do, end = self.tmp() + "_do", self.tmp() + "_end"
+            self.emit(f"OpSelectionMerge {end} None")
+            self.emit(f"OpBranchConditional {act} {do} {end}")
+            self.emit(f"{do} = OpLabel")               # inactive lanes don't touch memory
+            ip, tp, old = self.tmp(), self.tmp(), self.tmp()
+            self.dynamic_storage_access(ip, ptr_ty, arr_var, idx)
             self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-            self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
-            self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {safe}")
+            if op == "image_atomic_cmpswap":
+                self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
+            else:
+                spv = self.IMG_ATOMICS[op]
+                self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {val}")
             if "glc" in mods:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+            self.emit(f"OpBranch {end}")
+            self.emit(f"{end} = OpLabel")
             return
         ip, img = self.tmp(), self.tmp()
         if array_query:
