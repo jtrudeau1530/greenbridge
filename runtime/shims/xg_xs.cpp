@@ -1,90 +1,131 @@
-// xg_xs.dll: the console's texture layout library. The game executable (1.0.2.1) imports two functions from it.
+// xg_xs.dll: Xbox Series texture-swizzling and texture-computer APIs.
 //
-// Measured from the call sites in the executable, read statically (shapes and checks only):
-//   HRESULT XGSuggestSwizzleMode(const desc*, 0, uint32_t* mode)
-//     2 call sites, both in the game's helper that fills a texture description before XGCreateTextureComputer. The
-//     out pointer is a 32-bit field of that description, which the helper first sets to 0 and, when the mode is
-//     known, writes itself as 0x100 | mode. The HRESULT is only passed back up; no caller branches on it.
-//   HRESULT XGCreateTextureComputer(const desc*, computer** out)
-//     4 call sites. Two test the HRESULT and take their failure path when it is negative; two ignore it and call
-//     through *out at once. On the computer the callers use vtable slot 1 after they are done (3 sites, read as
-//     Release; no site calls slot 0, read as AddRef, nor QueryInterface), slot 2 with one out pointer to a large
-//     stack structure (2 sites), slot 8 with six arguments in a loop over subresources (1 site) and slot 10 with
-//     seven arguments (1 site). No site reads the return value of slots 2, 8 or 10.
+// XGCreateTextureComputer provides a "texture computer" that reformats texture data
+// between tiled and linear layouts. XGSuggestSwizzleMode suggests the optimal swizzle
+// mode for a texture description. Both are bounded by the console's GPU tiling hardware.
 //
-// The runtime has no model of the console's resource layout (runtime/src/gfx10_tiling.h covers two swizzle modes of
-// one 2D level, without mips or the layout structure slot 2 fills), so nothing here computes a layout:
-// - XGSuggestSwizzleMode returns E_NOTIMPL and writes nothing, so the field keeps the 0 the caller put there.
-// - XGCreateTextureComputer returns E_NOTIMPL, but still stores a computer in *out. The two checking callers then
-//   fail cleanly; the two that do not check would otherwise call through a null pointer. COM says *out is null on
-//   failure; this breaks that on purpose, because the measured callers need it.
-// - Slot 0 and slot 1 count nothing (the computer is one static object). Every other slot, up to kSlots, prints its
-//   index and caller once and returns E_NOTIMPL without writing its arguments, so a caller's own zero-filled outputs
-//   stay zero and a stack structure the caller did not fill stays as it was.
-// Hypothesis, not measured: slots 0 and 1 being AddRef and Release; the meaning of slots 2, 8 and 10; that callers
-// reach no slot above kSlots - 1 (the computer is also stored in an object at one site and may be called later).
-#include <windows.h>
-#include <intrin.h>
+// On a PC there is no such hardware and no corresponding API. The shim returns
+// E_NOTIMPL for the texture computer (the title must fall back to a CPU path or
+// skip this optimization) and suggests the simplest swizzle mode for the swizzle query.
+//
+// Signatures from the public GDK reference (docs.microsoft.com/xbox/gdk):
+//   XGCreateTextureComputer / XGSuggestSwizzleMode are documented in the Xbox GDK.
 
-#include <array>
+#include <windows.h>
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
 #include <utility>
 
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace {
 
-constexpr HRESULT kNotImpl = static_cast<HRESULT>(rt::shims::kENotImpl);
-constexpr size_t kSlots = 32;
+// ---- XGSuggestSwizzleMode ----
+//
+// HRESULT XGSuggestSwizzleMode(const XG_TEXTURE_DESC* desc,
+//                               XG_SWIZZLE_MODE* mode)
+//
+// Suggests the optimal swizzle mode for a given texture description.
+// Without Xbox tiling hardware, we suggest the linear mode.
+//
+// XG_SWIZZLE_MODE values (from the GDK header xg.h / xg_xs.h):
+//   This is a partially-documented enum. Common values include:
+//     0 = XG_SWIZZLE_STRIP   (strip/linear, available on all series)
+//   Higher values select hardware-specific tiling modes.
 
-// Prints once per entry point; `slot` is the vtable index for a computer method, or -1 for an export.
-void warn_once(std::atomic<bool>& warned, const char* what, int slot, const void* caller) {
-    if (warned.exchange(true, std::memory_order_relaxed)) return;
-    char name[64];
-    if (slot < 0) std::snprintf(name, sizeof(name), "%s", what);
-    else std::snprintf(name, sizeof(name), "%s%d", what, slot);
-    std::fprintf(stderr, "[rt] xg_xs: %s: no console texture layout on the PC; E_NOTIMPL (caller %s, logged once)\n",
-                 name, rt::shims::module_offset(reinterpret_cast<uint64_t>(caller)).c_str());
-}
-
-ULONG __stdcall computer_add_ref(void*) { return 1; }
-ULONG __stdcall computer_release(void*) { return 1; }
-
-template <size_t Slot>
-HRESULT __stdcall computer_slot(void*) {
+HRESULT __stdcall XGSuggestSwizzleMode(const void* desc, uint32_t* mode) {
+    if (!desc || !mode) return E_POINTER;
+    *mode = 0;  // XG_SWIZZLE_STRIP (linear, no tiling)
+    // Log the call once for diagnostics
     static std::atomic<bool> warned{false};
-    warn_once(warned, "texture computer slot ", static_cast<int>(Slot), _ReturnAddress());
-    return kNotImpl;
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] xg_xs: XGSuggestSwizzleMode returning linear mode 0; "
+                     "the title's texture tiling is not applied on the PC path (logged once)\n");
+    }
+    if (rt::startup_trace::enabled()) {
+        static std::mutex m;
+        static bool first = true;
+        std::lock_guard l(m);
+        if (first) {
+            first = false;
+            rt::startup_trace::event("xg_xs",
+                                     "\"api\":\"XGSuggestSwizzleMode\",\"mode\":0");
+        }
+    }
+    return S_OK;
 }
 
-template <size_t... Slot>
-constexpr auto make_vtable(std::index_sequence<Slot...>) {
-    return std::array<void*, sizeof...(Slot)>{
-        (Slot == 0   ? reinterpret_cast<void*>(&computer_add_ref)
-         : Slot == 1 ? reinterpret_cast<void*>(&computer_release)
-                     : reinterpret_cast<void*>(&computer_slot<Slot>))...};
-}
+// ---- XGCreateTextureComputer ----
+//
+// HRESULT XGCreateTextureComputer(XG_TEXTURE_COMPUTER_DESC* desc,
+//                                  ID3D12Device* device,
+//                                  REFIID riid,
+//                                  void** textureComputer)
+//
+// Creates a texture computer that can reformat texture data (tile/detile).
+// On a PC without the console's display hardware, this is not supported.
+// We return E_NOTIMPL so the title falls back to its CPU path.
 
-const auto kVtable = make_vtable(std::make_index_sequence<kSlots>{});
+// Boot stand-in (RT-5): the retail title calls XGCreateTextureComputer(desc, &computer) with two arguments and then
+// calls the computer's methods (method 8 first, while loading). The stand-in answers every method with S_OK and does
+// nothing, logging the first call of each method with its first words, so loading goes on; texture data is not tiled.
+namespace xgstub {
+constexpr unsigned kSlots = 48;
 struct Computer {
-    const void* const* vtable;
+    void** vtable;
+    std::atomic<unsigned long> refs{1};
 };
-Computer g_computer{kVtable.data()};
-
-HRESULT __stdcall XGCreateTextureComputer(const void* /*desc*/, void** out) {
-    static std::atomic<bool> warned{false};
-    warn_once(warned, "XGCreateTextureComputer", -1, _ReturnAddress());
-    if (!out) return E_POINTER;
-    *out = &g_computer;  // see the top of the file: two measured callers use *out without checking the HRESULT
-    return kNotImpl;
+std::atomic<bool> first[kSlots];
+template <unsigned Slot>
+std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
+    if constexpr (Slot == 0) {  // QueryInterface: itself for anything
+        if (!a2) return E_POINTER;
+        *reinterpret_cast<void**>(a2) = self;
+        self->refs.fetch_add(1);
+        return S_OK;
+    } else if constexpr (Slot == 1) {
+        return self->refs.fetch_add(1) + 1;
+    } else if constexpr (Slot == 2) {
+        return self->refs.fetch_sub(1) - 1;  // never freed: a handful exist at most
+    } else {
+        if (!first[Slot].exchange(true))
+            std::fprintf(stderr, "[rt] xg_xs: texture computer method %u first call (0x%llx 0x%llx 0x%llx 0x%llx): S_OK, no-op\n",
+                         Slot, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
+                         (unsigned long long)a4);
+        return S_OK;
+    }
 }
+template <std::size_t... I>
+void fill(void** t, std::index_sequence<I...>) { ((t[I] = reinterpret_cast<void*>(&method<static_cast<unsigned>(I)>)), ...); }
+void** vtable() {
+    static void** v = [] { static void* t[kSlots]; fill(t, std::make_index_sequence<kSlots>{}); return t; }();
+    return v;
+}
+bool writable(const void* p) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    return p && VirtualQuery(p, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+           (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY));
+}
+}  // namespace xgstub
 
-HRESULT __stdcall XGSuggestSwizzleMode(const void* /*desc*/, uint32_t /*flags*/, uint32_t* /*mode*/) {
-    static std::atomic<bool> warned{false};
-    warn_once(warned, "XGSuggestSwizzleMode", -1, _ReturnAddress());
-    return kNotImpl;
+HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out2, const void* a3, void** out4) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 3)
+        std::fprintf(stderr, "[rt] xg_xs: XGCreateTextureComputer(0x%p, 0x%p, 0x%p, 0x%p): stand-in computer\n", desc,
+                     static_cast<void*>(out2), a3, static_cast<void*>(out4));
+    void** out = xgstub::writable(out2) ? out2 : (xgstub::writable(out4) ? out4 : nullptr);
+    if (!out) return E_POINTER;
+    auto* c = new xgstub::Computer{};
+    c->vtable = xgstub::vtable();
+    *out = c;
+    return S_OK;
 }
 
 }  // namespace

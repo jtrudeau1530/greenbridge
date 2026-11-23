@@ -3487,6 +3487,20 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
     return hr;
 }
 
+// A texture's initial state as the PC accepts it: a console state with buffer-only or unknown bits becomes COMMON.
+D3D12_RESOURCE_STATES pc_texture_state(D3D12_RESOURCE_DIMENSION dimension, std::uint32_t state) {
+    if (dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return static_cast<D3D12_RESOURCE_STATES>(state);
+    constexpr std::uint32_t kTextureStates = 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x400 | 0x800 | 0x1000 | 0x2000 |
+                                             0x1000000;
+    if (state == 0xFFFFFFFFu || (state & ~kTextureStates)) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: texture initial state 0x%x has console bits; COMMON\n", state);
+        return D3D12_RESOURCE_STATE_COMMON;
+    }
+    return static_cast<D3D12_RESOURCE_STATES>(state);
+}
+
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
                               D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
                               D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -3501,6 +3515,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     // The Xbox layout word is 0x101 (tiled) or 0x1 (row-major buffer), and is not a PC layout value. Committed
     // resources take ROW_MAJOR for buffers and UNKNOWN for everything else, so the word is ignored and replaced.
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(pc_desc.Flags) & 0x5FF);
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -3512,8 +3527,9 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
     return create_committed_through_xmem(self, 76, static_cast<std::uint32_t>(heap_flags), pc_desc, *riid, out, [&] {
-        return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state, clear_value,
-                                                   *riid, out);
+        return self->real->CreateCommittedResource(
+            heap_properties, heap_flags, &pc_desc,
+            pc_texture_state(pc_desc.Dimension, static_cast<std::uint32_t>(initial_state)), clear_value, *riid, out);
     });
 }
 
