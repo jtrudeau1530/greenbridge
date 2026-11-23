@@ -1297,9 +1297,10 @@ Differences are `denormal` (the reference declines the program for a denormal: f
 which fails the run. Seeds 11 to 13, 600 programs each, up to 8 ops: Radeon gfx1036 wave32 597 match, 3 omod_neg_zero;
 wave64 593 match, 3 denormal, 4 omod_neg_zero; RTX 5080 wave32 595 match, 3 omod_neg_zero, 2 denormal; no mismatch.
 
-### Translated programs on a Vulkan GPU: `--oracle hw,vk` of `pk16_diff`, `vint_diff`, `wint_diff`, `sdwa_diff` (and `fmisc_diff`, `f32_fuzz`)
+### Translated programs on a Vulkan GPU: `--oracle hw,vk` of `pk16_diff`, `vint_diff`, `wint_diff`, `sdwa_diff` and `fmisc_diff`
 
-These fuzzers judge the translator in `spirv_mini_interp`, which cannot see what a driver does with the SPIR-V. With
+These fuzzers judge the translator in `spirv_mini_interp`, which cannot see what a driver does with the SPIR-V. `f32_fuzz`
+has no Vulkan path (its GPU oracle is `--oracle hw`, above). With
 `--oracle hw,vk` each program also runs through llvm-mc (gfx1013), `rdna2spirv.py` and `runtime/build/vk_compute_test`
 (`tools/vk_fuzz_run.py`; `--build DIR`, `--work DIR`, `LEONIDA_VK_DEVICE`) as one wave, and its words are judged against
 the hardware's words from a kernel run in the same wave size (`--wave 32` or `--wave 64`; wave64 needs native 64-wide
