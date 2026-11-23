@@ -319,9 +319,18 @@ def _join(row: dict, data: bytes) -> dict:
 
 
 def _read_index_rows(directory: str) -> list[dict]:
-    with open(os.path.join(directory, "index.json"), encoding="utf-8") as f:
+    index_path = os.path.join(directory, "index.json")
+    with open(index_path, encoding="utf-8") as f:
         index = json.load(f)
-    return sorted(index["files"], key=lambda r: r["off"])
+    # A hand-edited or half-written index used to fail as `error: 'files'`, naming neither the folder nor the
+    # file. Name the index and the malformed row like gamedata_blobs.check_carve_index does.
+    rows = index.get("files") if isinstance(index, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError(f"{index_path} has no 'files' list")
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict) or "off" not in row:
+            raise ValueError(f"{index_path}: row {i} needs an 'off'")
+    return sorted(rows, key=lambda r: r["off"])
 
 
 def read_payloads(directory: str, rows: list[dict] | None = None) -> list[dict]:
