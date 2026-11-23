@@ -2,7 +2,13 @@
 
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
-    python -m unittest discover -s tests/semantic -v
+    python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 26 s instead of 253 s on 16 cores
+    python -m unittest discover -s tests/semantic -v             # the same tests, one file after another
+
+The runner starts `python -m unittest <file>` for each file, several at a time, prints the output of the files that
+fail and one summary line; `-j N` sets how many run at once (`-j 1` is the discover command above) and `-v` prints
+every file's output. Files run side by side, so a test writes only into its own temporary folder (`tempfile`), never
+to a fixed path, and does not rely on another file having run first.
 
 Every file here must call `tools/rdna2spirv.py` (directly, through `support.py`, or by running the tool) and assert
 on what it emitted. A test that reimplements the instruction in Python passes whatever the translator does, so it is

@@ -54,5 +54,5 @@ methods are still open.
   A new test gets its expected values in the comment at its top and a check in `check.py`.
   [docs/testing.md](docs/testing.md) covers setup per OS, including native Windows options, and known problems.
 - Say what you tested and on which GPU in the pull request.
-- Run the translator tests with `python -m unittest discover -s tests/semantic -v` (see `tests/semantic/README.md`). A new
+- Run the translator tests with `python -I scripts/run_semantic_tests.py tests/semantic` (see `tests/semantic/README.md`). A new
   translator rule should come with a small hand-written `.asm` fixture and its expected output words.
