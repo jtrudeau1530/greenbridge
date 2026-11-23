@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -501,6 +502,18 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "ok")
         self.assertEqual(code, 0)
         self.assertIn("1 passed, 0 failed, 0 skipped under Wine (1 tests)", out)
+
+    def test_child_sees_eof_even_when_the_runner_has_input(self):
+        (self.artifact / "stdin.py").write_text(
+            "import sys\nassert sys.stdin.read() == ''\n", encoding="utf-8", newline="\n")
+        listing = self.list_tests([ctest_entry("stdin", self.command("stdin.py"))])
+        proc = subprocess.run(
+            [sys.executable, "-I", str(SCRIPTS / "run_wine_tests.py"), "--tests", listing,
+             "--windows-root", WINDOWS_ROOT, "--root", str(self.root),
+             "--wine", f'"{sys.executable.replace(os.sep, "/")}"', "--require", "stdin"],
+            input="input meant for the caller\n", capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("[PASS] stdin", proc.stdout)
 
     def test_relative_root_launches_the_artifact_from_its_working_directory(self):
         (self.artifact / "check_cwd.py").write_text(
