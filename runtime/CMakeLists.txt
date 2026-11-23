@@ -236,6 +236,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
   target_link_libraries(file_system_test PRIVATE advapi32)  # the ACL calls of the unlistable-marker-folder check
 
+  # LEONIDA_SKIP_INT3 (shims/startup_trace.h): its own executable, the variable is read once per process.
+  add_executable(int3_skip_test
+    test/int3_skip_test.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(int3_skip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(int3_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
+
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
@@ -965,6 +975,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
+  endif()
+  if(WIN32 AND TARGET int3_skip_test)
+    add_test(NAME int3_skip COMMAND int3_skip_test)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
