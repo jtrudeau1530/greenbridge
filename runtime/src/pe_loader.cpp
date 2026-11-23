@@ -342,6 +342,8 @@ struct ThreadTlsSlot {
     void* saved = nullptr;
     void* block = nullptr;
     uint32_t index = kNoTlsIndex;
+    void** ga_view = nullptr;           // the thread's slot-0 view for a /GA EXE (Module::tls_ga_slot)
+    uint32_t ga_slot = kNoTlsIndex;
 };
 
 // Per-thread installation state for each reserved TLS slot.
@@ -370,6 +372,10 @@ void release_thread_slot(size_t slot) {
     if (slot >= kMaxMappedTlsModules) return;
     ThreadTlsSlot& entry = g_thread_tls_slots[slot];
     if (!entry.module && !entry.block) return;
+    if (entry.ga_view) {
+        if (TlsGetValue(entry.ga_slot) == entry.ga_view) TlsSetValue(entry.ga_slot, nullptr);
+        VirtualFree(entry.ga_view, 0, MEM_RELEASE);
+    }
     if (entry.block) {
         void** slots = module_tls_slots();
         if (slots && entry.index < kMaxModuleTlsSlots && slots[entry.index] == entry.block)
@@ -451,6 +457,20 @@ void install_thread_block(Module& m) {
     if (m.tls_zero_fill)
         std::memset(static_cast<uint8_t*>(block) + m.tls_raw_size, 0, m.tls_zero_fill);
 
+    void** view = nullptr;
+    if (m.tls_ga_slot != kNoTlsIndex) {
+        // The /GA view: [0] and [tls_index] are this thread's block, the rest stays null (the image reads no other).
+        view = static_cast<void**>(
+            VirtualAlloc(nullptr, kMaxModuleTlsSlots * sizeof(void*), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!view) {
+            VirtualFree(block, 0, MEM_RELEASE);
+            throw std::runtime_error(m.name + ": TLS view allocation failed");
+        }
+        view[0] = block;
+        view[m.tls_index] = block;
+        TlsSetValue(m.tls_ga_slot, view);
+    }
+
     void* saved = slots[m.tls_index];
     slots[m.tls_index] = block;
     entry.module = &m;
@@ -458,6 +478,45 @@ void install_thread_block(Module& m) {
     entry.saved = saved;
     entry.block = block;
     entry.index = m.tls_index;
+    entry.ga_view = view;
+    entry.ga_slot = m.tls_ga_slot;
+}
+
+// Rewrites a /GA EXE's slot-0 TLS reads (Module::tls_ga_slot): every `mov r64, gs:[58h]` (65 REX.W 8B /r with
+// mod=00, r/m=100, SIB=25, disp32=58h; REX 48 or 4C for r8-r15) in an executable section becomes the same
+// instruction with disp32 = 1480h + 8 * slot, TEB->TlsSlots[slot]. Same length, so nothing else moves. The 9-byte
+// form, with its segment prefix, SIB 25 and that displacement, is not something code or tables produce by accident.
+// Must run before protect_sections() and before any of the image's code (its TLS callbacks included).
+size_t patch_ga_tls_reads(Module& m, uint32_t slot) {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    const uint32_t disp = 0x1480u + 8u * slot;
+    size_t sites = 0;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const uint32_t size = (std::min)(sec->Misc.VirtualSize, sec->SizeOfRawData);
+        if (sec->VirtualAddress > m.size || size > m.size - sec->VirtualAddress || size < 9) continue;
+        uint8_t* p = m.base + sec->VirtualAddress;
+        for (uint32_t k = 0; k + 9 <= size; ++k) {
+            if (p[k] != 0x65 || (p[k + 1] != 0x48 && p[k + 1] != 0x4C) || p[k + 2] != 0x8B) continue;
+            const uint8_t modrm = p[k + 3];
+            if ((modrm & 0xC7) != 0x04 || p[k + 4] != 0x25) continue;
+            uint32_t d;
+            std::memcpy(&d, p + k + 5, 4);
+            if (d != 0x58) continue;
+            std::memcpy(p + k + 5, &disp, 4);
+            ++sites;
+            k += 8;
+        }
+    }
+    return sites;
+}
+
+bool ga_tls_patch_enabled() {
+    char v[8] = {};
+    size_t n = 0;
+    return !(getenv_s(&n, v, "LEONIDA_TLS_GA_PATCH") == 0 && n == 2 && v[0] == '0');
 }
 
 void uninstall_thread_block(Module& m) {
@@ -1444,6 +1503,26 @@ void Loader::initialize_tls(Module& m) {
         // The index lives in a writable section and protect_sections() has not run yet, so the write needs no
         // VirtualProtect dance.
         if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = index;
+    }
+    {
+        // An EXE's code may read its TLS at index 0 directly (/GA); index 0 is gta6rt.exe's here (pe_loader.h,
+        // tls_ga_slot). Patched before any of the image's code runs, TLS callbacks included.
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + dos->e_lfanew);
+        if (!(nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && total && index != 0 && ga_tls_patch_enabled()) {
+            static const DWORD ga_slot = TlsAlloc();
+            if (ga_slot == TLS_OUT_OF_INDEXES || ga_slot >= 64) {
+                std::fprintf(stderr, "[rt] loader: %s: no TlsAlloc slot below 64 for its index-0 TLS reads\n",
+                             m.name.c_str());
+            } else {
+                m.tls_ga_sites = patch_ga_tls_reads(m, ga_slot);
+                if (m.tls_ga_sites) m.tls_ga_slot = ga_slot;
+                std::fprintf(stderr,
+                             "[rt] loader: %s: %zu index-0 TLS reads (gs:[58h]) now read its own TLS (TlsSlots[%lu]); "
+                             "its module TLS index is %u\n",
+                             m.name.c_str(), m.tls_ga_sites, static_cast<unsigned long>(ga_slot), index);
+            }
+        }
     }
     try {
         install_thread_block(m);

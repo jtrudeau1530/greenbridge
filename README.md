@@ -35,6 +35,8 @@ happens **on your PC, from your own copy of the game**.
 > from your game and stays on your PC. Never share those files.
 
 Discord: https://discord.gg/rexed
+
+Custom Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 <br>
 
 ## Project status

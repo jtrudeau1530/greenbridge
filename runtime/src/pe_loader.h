@@ -66,6 +66,12 @@ struct Module {
     const uint8_t* tls_template = nullptr;  // raw template in the mapped image
     uint32_t tls_raw_size = 0;
     uint32_t tls_zero_fill = 0;
+    // An EXE built with /GA reads its own TLS as ThreadLocalStoragePointer[0] without _tls_index: the process EXE
+    // always has index 0. Mapped into gta6rt, index 0 belongs to gta6rt.exe, so load() rewrites each such read
+    // (`mov r64, gs:[58h]`) to `mov r64, gs:[1480h + 8 * tls_ga_slot]`, a TlsAlloc slot (TEB->TlsSlots) whose value in
+    // each thread is a small array with this image's block at [0] and at [tls_index]. kNoTlsIndex when not patched.
+    uint32_t tls_ga_slot = kNoTlsIndex;
+    size_t tls_ga_sites = 0;
 };
 
 class Loader {
