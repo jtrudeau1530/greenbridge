@@ -1328,7 +1328,7 @@ private:
         graphics_pipeline_ = graphics_pipeline_id(state);
         if (state && !compute_pipeline_ && !graphics_pipeline_ && std::getenv("LEONIDA_FRAME_PROBE")) {
             static std::atomic<int> shown{0};
-            if (shown.fetch_add(1) < 12) std::fprintf(stderr, "[probe] bound pipeline %p is a placeholder\n", static_cast<void*>(state));
+            if (shown.fetch_add(1) < 12) print_placeholder_note(state);
         }
         if (state && !compute_pipeline_ && !graphics_pipeline_)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");

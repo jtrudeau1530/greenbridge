@@ -342,6 +342,11 @@ private:
     std::size_t size_ = 0;
 };
 
+// Boot diagnostic (LEONIDA_FRAME_PROBE): what a placeholder pipeline was asked to be.
+std::mutex g_placeholder_mutex;
+std::map<const void*, std::string> g_placeholder_notes;
+std::map<std::string, int> g_placeholder_classes;
+
 VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
                                              const leonida::cached_pso::Identity& identity) {
     const PipelineCacheSeed seed(pipeline_cache_path());
@@ -6728,6 +6733,32 @@ public:
         return d3d12_trace::result(method, S_OK);
     }
 
+    void note_placeholder(const void* object, const D3D12_PIPELINE_STATE_STREAM_DESC& desc, HRESULT failed) {
+        static const bool probe = std::getenv("LEONIDA_FRAME_PROBE") != nullptr;
+        if (!probe) return;
+        PipelineStream st;
+        const HRESULT parsed = parse_pipeline_stream(desc, st);
+        const auto& g = st.graphics;
+        char text[512], cls[256];
+        std::snprintf(cls, sizeof(cls), "parse=0x%08lx hr=0x%08lx cs=%d vs=%d ps=%d gs=%d hs=%d ms=%d topo=%d rts=%u f0=%d dsv=%d samples=%u rootsig=%d",
+                      static_cast<unsigned long>(parsed), static_cast<unsigned long>(failed), int(st.has_cs),
+                      g.VS.BytecodeLength != 0, g.PS.BytecodeLength != 0, g.GS.BytecodeLength != 0, g.HS.BytecodeLength != 0,
+                      st.ms.BytecodeLength != 0, int(g.PrimitiveTopologyType), g.NumRenderTargets, int(g.RTVFormats[0]),
+                      int(g.DSVFormat), g.SampleDesc.Count, g.pRootSignature != nullptr);
+        std::snprintf(text, sizeof(text), "%s vs_bytes=%zu ps_bytes=%zu", cls, g.VS.BytecodeLength, g.PS.BytecodeLength);
+        const std::lock_guard lock(g_placeholder_mutex);
+        g_placeholder_notes[object] = text;
+        ++g_placeholder_classes[cls];
+        static int n = 0;
+        if (++n == 11500) {
+            std::vector<std::pair<int, std::string>> rows;
+            for (const auto& [c, count] : g_placeholder_classes) rows.push_back({count, c});
+            std::sort(rows.rbegin(), rows.rend());
+            for (std::size_t r = 0; r < rows.size() && r < 25; ++r)
+                std::fprintf(stderr, "[probe] placeholder class %d x %s\n", rows[r].first, rows[r].second.c_str());
+        }
+    }
+
     // ID3D12Device2: a PSO from a pipeline state stream. A CS makes a compute PSO, an MS a mesh PSO, a VS the same
     // graphics PSO CreateGraphicsPipelineState makes (parse_pipeline_stream).
     HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid,
@@ -6752,6 +6783,7 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: pipeline stream (%zu bytes) failed with 0x%08lx; placeholder handed out\n",
                              static_cast<std::size_t>(desc->SizeInBytes), static_cast<unsigned long>(failed));
             auto* empty = new PipelineState(state_);
+            note_placeholder(empty, *desc, failed);
             empty->attach_device(identity());
             return d3d12_trace::result(method, hand_out(empty, riid, out));
         };
@@ -9737,6 +9769,12 @@ bool WindowPresenter::read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* e
 
 VkExtent2D WindowPresenter::extent() const { return presenter_->extent(); }
 std::uint64_t WindowPresenter::presented() const { return presenter_->presented(); }
+
+void print_placeholder_note(const void* object) {
+    const std::lock_guard lock(g_placeholder_mutex);
+    const auto it = g_placeholder_notes.find(object);
+    std::fprintf(stderr, "[probe] bound placeholder %p: %s\n", object, it == g_placeholder_notes.end() ? "no note" : it->second.c_str());
+}
 
 bool device_has_swapchain_colorspace(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);

@@ -359,6 +359,7 @@ private:
 };
 
 // Whether `device` (from create_vulkan_device*) was created with VK_EXT_swapchain_colorspace on its instance.
+void print_placeholder_note(const void* object);  // boot diagnostic
 bool device_has_swapchain_colorspace(ID3D12Device* device);
 
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
