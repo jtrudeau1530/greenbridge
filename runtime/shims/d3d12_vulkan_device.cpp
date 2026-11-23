@@ -420,6 +420,12 @@ constexpr Format rgb96_format(VkFormat wide, bool typeless = false) {
 // DXGI -> Vulkan for the formats render targets, depth buffers and common textures use. R32 and R16 typeless become
 // depth formats when the resource allows depth-stencil; R32G8X24 and R24G8 always do, as Vulkan has no colour format
 // with their layout.
+// Xbox GDK DXGI depth-16 + stencil-8 format family (absent from the PC dxgiformat.h enum).
+inline constexpr DXGI_FORMAT kXboxFormatR16G8Typeless = static_cast<DXGI_FORMAT>(117);
+inline constexpr DXGI_FORMAT kXboxFormatD16UnormS8Uint = static_cast<DXGI_FORMAT>(118);
+inline constexpr DXGI_FORMAT kXboxFormatR16UnormX8Typeless = static_cast<DXGI_FORMAT>(119);
+inline constexpr DXGI_FORMAT kXboxFormatX16TypelessG8Uint = static_cast<DXGI_FORMAT>(120);
+
 Format vulkan_format(DXGI_FORMAT format, bool depth) {
     constexpr VkImageAspectFlags color = VK_IMAGE_ASPECT_COLOR_BIT, d = VK_IMAGE_ASPECT_DEPTH_BIT,
                                  ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -527,7 +533,10 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
         return depth ? Format{VK_FORMAT_D16_UNORM, d, true} : Format{VK_FORMAT_R16_UNORM, color, true};
     case DXGI_FORMAT_R32G8X24_TYPELESS: return {VK_FORMAT_D32_SFLOAT_S8_UINT, ds, true};
     case DXGI_FORMAT_R24G8_TYPELESS: return {VK_FORMAT_D24_UNORM_S8_UINT, ds, true};
-    default: return {};
+    default:
+        if (format == kXboxFormatD16UnormS8Uint) return {VK_FORMAT_D24_UNORM_S8_UINT, ds};
+        if (format == kXboxFormatR16G8Typeless) return {VK_FORMAT_D24_UNORM_S8_UINT, ds, true};
+        return {};
     }
 }
 
@@ -1795,6 +1804,7 @@ DXGI_FORMAT format_family(DXGI_FORMAT format) {
     if (f == 88 || in(92, 93)) return DXGI_FORMAT_B8G8R8X8_TYPELESS;
     if (in(94, 96)) return DXGI_FORMAT_BC6H_TYPELESS;
     if (in(97, 99)) return DXGI_FORMAT_BC7_TYPELESS;
+    if (in(117, 120)) return kXboxFormatR16G8Typeless;
     return format;
 }
 
@@ -1803,14 +1813,17 @@ DXGI_FORMAT format_family(DXGI_FORMAT format) {
 bool depth_stencil_family(DXGI_FORMAT format) {
     const DXGI_FORMAT family = format_family(format);
     return family == DXGI_FORMAT_R32_TYPELESS || family == DXGI_FORMAT_R16_TYPELESS ||
-           family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS;
+           family == DXGI_FORMAT_R24G8_TYPELESS || family == DXGI_FORMAT_R32G8X24_TYPELESS ||
+           family == kXboxFormatR16G8Typeless;
 }
 
 // ALLOW_RENDER_TARGET: the host refuses the families below and accepts the rest, D32_FLOAT, D16_UNORM,
 // R9G9B9E5_SHAREDEXP and NV12 among them. R32G32B32 is the driver's answer (refused by both AMD drivers measured,
 // accepted by WARP); it is refused here, since Vulkan drivers rarely render to it.
 bool render_target_family(DXGI_FORMAT format) {
-    switch (format_family(format)) {
+    const DXGI_FORMAT family = format_family(format);
+    if (family == kXboxFormatR16G8Typeless) return false;
+    switch (family) {
         case DXGI_FORMAT_R32G32B32_TYPELESS:
         case DXGI_FORMAT_R32G8X24_TYPELESS:
         case DXGI_FORMAT_R24G8_TYPELESS:
@@ -5162,7 +5175,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         (view.format == DXGI_FORMAT_X24_TYPELESS_G8_UINT &&
          (desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT)) ||
         (view.format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT &&
-         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT));
+         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) ||
+        (view.format == kXboxFormatX16TypelessG8Uint &&
+         (desc.Format == kXboxFormatR16G8Typeless || desc.Format == kXboxFormatD16UnormS8Uint));
     if (stencil && !stencil_format_fits) {
         log_once("a stencil-plane view needs its texture family's stencil view format; format", int(view.format));
         return false;
@@ -5223,7 +5238,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             (desc.Format == DXGI_FORMAT_R24G8_TYPELESS && view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS) ||
             (desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT &&
              (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)) ||
-            (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
+            (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) ||
+            (desc.Format == kXboxFormatD16UnormS8Uint &&
+             (view.format == DXGI_FORMAT_UNKNOWN || view.format == kXboxFormatR16UnormX8Typeless)) ||
+            (desc.Format == kXboxFormatR16G8Typeless && view.format == kXboxFormatR16UnormX8Typeless);
         if (!depth_format_fits) {
             log_once("incompatible depth shader-resource view format:", int(view.format));
             return false;
@@ -9442,7 +9460,10 @@ bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UI
     case DXGI_FORMAT_X24_TYPELESS_G8_UINT: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 1; break;
     case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: family = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, named_plane = 0; break;
     case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: family = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, named_plane = 1; break;
-    default: break;
+    default:
+        if (format == kXboxFormatR16UnormX8Typeless) family = kXboxFormatD16UnormS8Uint, named_plane = 0;
+        else if (format == kXboxFormatX16TypelessG8Uint) family = kXboxFormatD16UnormS8Uint, named_plane = 1;
+        break;
     }
     const Format requested = vulkan_format(family, true);
     if (requested.typeless || !(requested.aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) return false;

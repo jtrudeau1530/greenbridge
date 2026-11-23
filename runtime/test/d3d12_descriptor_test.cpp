@@ -1254,12 +1254,16 @@ int main() {
             (d24_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
                 ? VK_FORMAT_D24_UNORM_S8_UINT
                 : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        const auto xbox_r16g8 = static_cast<DXGI_FORMAT>(117);
+        const auto xbox_r16x8 = static_cast<DXGI_FORMAT>(119);
+        const auto xbox_x16g8 = static_cast<DXGI_FORMAT>(120);
         for (const auto& [resource_format, stencil_view_format, depth_view_format, other_depth_view_format, depth_vk] :
              {std::tuple{DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT,
                          DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, d24_backing},
               std::tuple{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
                          DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
-                         VK_FORMAT_D32_SFLOAT_S8_UINT}}) {
+                         VK_FORMAT_D32_SFLOAT_S8_UINT},
+              std::tuple{xbox_r16g8, xbox_x16g8, xbox_r16x8, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, d24_backing}}) {
             D3D12_RESOURCE_DESC depth_desc = texture_desc;
             depth_desc.Format = resource_format;
             depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -2757,8 +2761,13 @@ int main() {
                                       DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R16_UNORM,
                                       DXGI_FORMAT_R8G8B8A8_UNORM}));
 
-            // D24_UNORM_S8_UINT / R24G8_TYPELESS and D32_FLOAT_S8X24_UINT / R32G8X24_TYPELESS: colour view formats
-            // must also be rejected, while depth-plane and stencil-plane views continue working.
+            // D24_UNORM_S8_UINT / R24G8_TYPELESS, D32_FLOAT_S8X24_UINT / R32G8X24_TYPELESS, and Xbox GDK
+            // D16_UNORM_S8_UINT (118) / R16G8_TYPELESS (117): colour view formats must also be rejected, while
+            // depth-plane and stencil-plane views continue working.
+            constexpr auto xbox_r16g8_local = static_cast<DXGI_FORMAT>(117);
+            constexpr auto xbox_d16s8_local = static_cast<DXGI_FORMAT>(118);
+            constexpr auto xbox_r16x8_local = static_cast<DXGI_FORMAT>(119);
+            constexpr auto xbox_x16g8_local = static_cast<DXGI_FORMAT>(120);
             for (const auto& [res_fmt, valid_depth_fmt, valid_stencil_fmt, is_typeless] :
                  {std::tuple{DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
                              DXGI_FORMAT_X24_TYPELESS_G8_UINT, false},
@@ -2767,7 +2776,9 @@ int main() {
                   std::tuple{DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
                              DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, false},
                   std::tuple{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
-                             DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, true}}) {
+                             DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, true},
+                  std::tuple{xbox_d16s8_local, xbox_r16x8_local, xbox_x16g8_local, false},
+                  std::tuple{xbox_r16g8_local, xbox_r16x8_local, xbox_x16g8_local, true}}) {
                 D3D12_RESOURCE_DESC ds_desc = texture_desc;
                 ds_desc.Format = res_fmt;
                 ds_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -2780,7 +2791,8 @@ int main() {
                                          {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT,
                                           DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
                                           DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
-                                          DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS}));
+                                          DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+                                          xbox_d16s8_local, xbox_r16g8_local}));
                 D3D12_SHADER_RESOURCE_VIEW_DESC ds_srv{};
                 ds_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                 ds_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
