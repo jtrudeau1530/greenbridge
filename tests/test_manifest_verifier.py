@@ -95,6 +95,54 @@ class TestManifestVerifier(unittest.TestCase):
         expected = hashlib.sha256(self.payloads["alpha.bin"]).hexdigest()
         self.assertEqual(mv.sha256_file(sample_path), expected)
 
+    def test_sha256_file_reuses_buffer_across_short_reads(self) -> None:
+        payload = bytes(range(25))
+        sample_path = os.path.join(self.root, "short-reads.bin")
+        with open(sample_path, "wb") as f:
+            f.write(payload)
+
+        buffers = []
+        with open(sample_path, "rb", buffering=0) as f:
+            real_readinto = f.readinto
+
+            def read_some(buffer):
+                view = memoryview(buffer)
+                buffers.append(view.obj)
+                return real_readinto(view[:3])
+
+            with patch.object(f, "readinto", read_some), patch.object(mv, "open", return_value=f, create=True):
+                self.assertEqual(
+                    mv.sha256_file(sample_path, chunk_size=8),
+                    hashlib.sha256(payload).hexdigest(),
+                )
+
+        self.assertGreater(len(buffers), 1)
+        self.assertEqual(len(buffers[0]), 8)
+        self.assertTrue(all(buf is buffers[0] for buf in buffers))
+
+        # Small files cap the reusable buffer to the file size rather than allocating CHUNK.
+        small_buffers = []
+        with open(sample_path, "rb", buffering=0) as f:
+            real_readinto = f.readinto
+
+            def record_buffer(buffer):
+                view = memoryview(buffer)
+                small_buffers.append(view.obj)
+                return real_readinto(view)
+
+            with patch.object(f, "readinto", record_buffer), patch.object(mv, "open", return_value=f, create=True):
+                self.assertEqual(mv.sha256_file(sample_path), hashlib.sha256(payload).hexdigest())
+
+        self.assertEqual(len(small_buffers), 1)
+        self.assertEqual(len(small_buffers[0]), len(payload))
+
+    def test_sha256_file_rejects_nonpositive_chunk_size(self) -> None:
+        sample_path = os.path.join(self.game_dir, "alpha.bin")
+        for bad in (0, -1):
+            with self.subTest(chunk_size=bad):
+                with self.assertRaises(ValueError):
+                    mv.sha256_file(sample_path, chunk_size=bad)
+
     def test_walk_normalization(self) -> None:
         items = dict(mv.walk(self.game_dir))
         self.assertEqual(sorted(items.keys()), sorted(SYNTHETIC_SIZES.keys()))
@@ -707,15 +755,15 @@ class TestStableHashing(unittest.TestCase):
                     return
                 reader = Mock(wraps=f)
 
-                def read(*read_args):
+                def readinto(buf):
                     nonlocal changed
-                    data = f.read(*read_args)
-                    if data and not changed:
+                    count = f.readinto(buf)
+                    if count and not changed:
                         changed = True
                         mutate()
-                    return data
+                    return count
 
-                reader.read.side_effect = read
+                reader.readinto.side_effect = readinto
                 yield reader
 
         with patch.object(mv, "open", hooked_open, create=True):
