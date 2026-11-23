@@ -55,6 +55,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
 from hw_oracle import asm  # noqa: E402
+from check import gpu_test_timeout, timed_out  # noqa: E402
 from compute_fixture import compute_header, find_test_program, unpinned_subgroup  # noqa: E402
 
 THREADS = 64
@@ -886,7 +887,11 @@ def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
         env["VKC_SUBGROUP_SIZE"] = "32"
     if index_entry.get("subgroup_size") and not emulate:
         env["VKC_SUBGROUP_SIZE"] = str(index_entry["subgroup_size"])
-    r = subprocess.run(args, capture_output=True, text=True, env=env)
+    limit = gpu_test_timeout()
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=limit)
+    except subprocess.TimeoutExpired:
+        return 1, timed_out(exe, limit)
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
