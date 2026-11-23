@@ -2198,9 +2198,12 @@ private:
     }
 
     std::uint64_t completed() const {
+        if (context_.is_device_lost()) return 0;
         std::uint64_t done = 0;
-        context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
-        return done;
+        const VkResult result = context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
+        if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+        // A failed timeline query cannot be used as a resource-retirement or command-buffer reuse ticket.
+        return result == VK_SUCCESS ? done : 0;
     }
 
     void collect_bindings(std::uint64_t done) {
@@ -2213,6 +2216,7 @@ private:
         if (context_.is_device_lost()) return nullptr;
         context_.drain_deleted_resources(context_.completed_retire_ticket());
         const auto done = completed();
+        if (context_.is_device_lost()) return nullptr;
         collect_bindings(done);
         CommandSlot* reuse = nullptr;
         for (auto& slot : buffers_) {
@@ -2259,7 +2263,10 @@ private:
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value) {
         if (context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
-        if (last_sparse_) collect_bindings(completed());
+        if (last_sparse_) {
+            collect_bindings(completed());
+            if (context_.is_device_lost()) return false;
+        }
         std::span<const VkSemaphore> semaphores = waits_;
         std::span<const std::uint64_t> values = wait_values_;
         std::vector<VkSemaphore> sparse_waits;
