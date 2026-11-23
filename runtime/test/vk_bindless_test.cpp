@@ -1081,6 +1081,7 @@ int main(int argc, char** argv) {
     for (const auto image : {target, stored, decoy, gradient}) vkDestroyImage(dev, image, nullptr);
     for (const auto buffer : {readback, upload, heap}) vkDestroyBuffer(dev, buffer, nullptr);
     for (const auto memory : allocations) vkFreeMemory(dev, memory, nullptr);
+    tail.destroy(vkGetDeviceProcAddr, dev);  // the --pc-tail-ubo block, when the shaders use one
     vkDestroyDevice(dev, nullptr);
     if (messenger) {
         LI(vkDestroyDebugUtilsMessengerEXT);
