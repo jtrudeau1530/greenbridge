@@ -208,6 +208,19 @@ class TestGalleryServer(unittest.TestCase):
         self.httpd.server_close()
         self.tmp.cleanup()
 
+    def test_texture_catalog_labels_jpeg_and_webp(self) -> None:
+        files = {"sky.JPG": "JPEG Image", "road.jpeg": "JPEG Image", "tree.webp": "WebP Image"}
+        for name in files:
+            with open(os.path.join(self.textures_dir, name), "wb") as f:
+                f.write(b"synthetic")
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/api/textures", timeout=3) as r:
+            textures = {row["name"]: row for row in json.load(r)["textures"]}
+        for name, expected in files.items():
+            with self.subTest(name=name):
+                self.assertIn(name, textures)
+                self.assertEqual(textures[name]["format"], expected)
+                self.assertEqual(textures[name]["preview"], textures[name]["url"])
+
     def test_endpoints(self) -> None:
         base = f"http://127.0.0.1:{self.port}"
 

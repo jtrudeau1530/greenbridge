@@ -2,6 +2,7 @@
 
 Launches a lightweight local HTTP server and opens a modern WebGL/glTF
 3D asset inspector in the browser with Vice City / Leonida aesthetic.
+The texture catalog lists DDS, PNG, JPEG (.jpg or .jpeg) and WebP files.
 
 Usage:
     python -I tools/gallery.py [--port 8080] [--models-dir <path>] [--textures-dir <path>]
@@ -23,6 +24,15 @@ try:
     import dds_png
 except ImportError:
     dds_png = None
+
+
+TEXTURE_FORMATS = {
+    ".dds": "DirectDraw Surface (DDS)",
+    ".png": "PNG Image",
+    ".jpg": "JPEG Image",
+    ".jpeg": "JPEG Image",
+    ".webp": "WebP Image",
+}
 
 
 def categorize_model(name: str, folder: str = "") -> str:
@@ -306,21 +316,20 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             for root, dirs, files in os.walk(self.textures_dir):
                 dirs.sort()
                 for fn in sorted(files):
-                    lower = fn.lower()
-                    if lower.endswith((".dds", ".png", ".jpg", ".webp")):
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in TEXTURE_FORMATS:
                         full_path = os.path.join(root, fn)
                         rel_path = os.path.relpath(full_path, self.textures_dir).replace("\\", "/")
                         try:
                             fsize = os.path.getsize(full_path)
                         except OSError:
                             fsize = 0
-                        fmt = "DirectDraw Surface (DDS)" if lower.endswith(".dds") else "PNG Image"
-                        preview_rel = os.path.splitext(rel_path)[0] + ".png" if lower.endswith(".dds") else rel_path
+                        preview_rel = os.path.splitext(rel_path)[0] + ".png" if ext == ".dds" else rel_path
                         items.append({
                             "name": fn,
                             "path": rel_path,
                             "size": fsize,
-                            "format": fmt,
+                            "format": TEXTURE_FORMATS[ext],
                             "url": f"/textures/{urllib.parse.quote(rel_path)}",
                             "preview": f"/textures/{urllib.parse.quote(preview_rel)}",
                         })
@@ -387,7 +396,7 @@ def start_server(
         max_count = 0
         for cand in candidates:
             if os.path.isdir(cand):
-                c = sum(1 for f in os.listdir(cand) if f.lower().endswith(('.png', '.dds', '.jpg', '.webp')))
+                c = sum(1 for f in os.listdir(cand) if os.path.splitext(f)[1].lower() in TEXTURE_FORMATS)
                 if c > max_count:
                     max_count = c
                     best_cand = cand
