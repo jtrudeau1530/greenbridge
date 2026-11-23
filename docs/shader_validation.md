@@ -48,6 +48,14 @@ a reference to be trusted. A hand-written SPIR-V twin of a test program is a use
 checks the harness and driver without involving the translator, so a harness failure is not blamed on
 translation.
 
+Assembling needs no external `spirv-as` binary: `tools/spirv_asm.py` encodes SPIR-V assembly text into binary
+words in process, as a module (`assemble(text, target_env="vulkan1.2")`) or from the command line
+(`python -I tools/spirv_asm.py in.spvasm -o out.spv`, with `--target-env` choosing the environment and
+`vulkan1.2` the default), using the Khronos SPIRV-Headers grammar kept in `tools/spirv_asm_tables.py`.
+`tools/rdna2spirv.py --assembler python` takes that path instead of the `spirv-as` subprocess and its
+temporary `.spvasm` file; `spirv-val` stays the external validator. `tests/test_spirv_asm.py` and
+`tests/test_spirv_asm_tables.py` cover the assembler and the tables.
+
 The CPU model is deliberately not a second translator. It interprets the listing's mnemonics and
 operands; it never consumes SPIR-V. That independence is what makes a disagreement meaningful.
 
