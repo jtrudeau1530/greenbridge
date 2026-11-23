@@ -1289,6 +1289,13 @@ if(TARGET Vulkan::Headers)
     # 300 s, not 120: the test's 60 s fence waits need headroom when other GPU tests share the device
     # (two concurrent `ctest -j 6` suites pushed it to 91-120 s; TEST-514 follow-up).
     set_tests_properties(d3d12_multithread PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # Several threads make the first CheckFeatureSupport(D3D12_OPTIONS1) call of a new device at the same time.
+    add_executable(d3d12_options1_first_use_test test/d3d12_options1_first_use_test.cpp)
+    target_link_libraries(d3d12_options1_first_use_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_options1_first_use_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_options1_first_use_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_options1_first_use COMMAND d3d12_options1_first_use_test)
+    set_tests_properties(d3d12_options1_first_use PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # A queued Wait must not block a Signal submitted by another D3D12 queue.
     add_executable(d3d12_queue_wait_test test/d3d12_queue_wait_test.cpp)
     target_link_libraries(d3d12_queue_wait_test PRIVATE gta6rt_d3d12_com)

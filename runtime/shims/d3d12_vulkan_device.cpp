@@ -550,7 +550,7 @@ struct DeviceState {
         bool wave_ops = false;
     };
     SubgroupFacts subgroups;
-    bool subgroups_read = false;
+    std::once_flag subgroups_once;
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties2 image_format_properties2 = nullptr;
@@ -827,14 +827,17 @@ struct DeviceState {
 
     // D3D12_OPTIONS1's wave facts, from the physical device: which subgroup operations exist and what wave sizes it
     // can run. Zeros and false when the device cannot be asked, which the query then reports as unsupported.
+    // Read once: std::call_once makes a concurrent first caller wait until the facts are complete.
     const SubgroupFacts& subgroup_facts() {
-        if (subgroups_read) return subgroups;
-        subgroups_read = true;
+        std::call_once(subgroups_once, [this] { read_subgroup_facts(); });
+        return subgroups;
+    }
+    void read_subgroup_facts() {
         const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             info.get_instance_proc
                 ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2")
                 : nullptr);
-        if (!properties2 || !info.physical) return subgroups;
+        if (!properties2 || !info.physical) return;
         VkPhysicalDeviceSubgroupSizeControlProperties size_control{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
         VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
@@ -867,7 +870,6 @@ struct DeviceState {
             properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !intel_xe_lpg_or_later &&
             subgroups.lane_min <= kIntelD3D12Lanes && kIntelD3D12Lanes <= subgroups.lane_max)
             subgroups.lane_min = subgroups.lane_max = kIntelD3D12Lanes;
-        return subgroups;
     }
 
     // Integer sampled images need not support multisampling. Pick a supported count for the
