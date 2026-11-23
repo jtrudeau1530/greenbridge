@@ -861,6 +861,7 @@ if(TARGET Vulkan::Headers)
     endif()
   endforeach()
   if(BUILD_TESTING)
+    add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)
     add_test(NAME vk_pipeline_check_cli COMMAND "${CMAKE_COMMAND}"
              "-DTOOL=$<TARGET_FILE:vk_pipeline_check>"
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
