@@ -84,7 +84,11 @@ def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float,
 def _banks(src: str):
     if os.path.isdir(src):
         found = []
-        for root, _dirs, files in os.walk(src):
+
+        def scan_failed(error):
+            raise error
+
+        for root, _dirs, files in os.walk(src, onerror=scan_failed):
             found += [os.path.join(root, name) for name in files if name.lower().endswith(".awc")]
         return [(path, os.path.splitext(os.path.relpath(path, src))[0].replace(os.sep, "/"))
                 for path in sorted(found)]
@@ -108,7 +112,11 @@ def main(argv=None) -> int:
     if not os.path.exists(a.src):
         print(f"awc_shorts: error: source does not exist: {a.src!r}", file=sys.stderr)
         return 2
-    banks = _banks(a.src)
+    try:
+        banks = _banks(a.src)
+    except OSError as e:
+        print(f"awc_shorts: cannot list {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
