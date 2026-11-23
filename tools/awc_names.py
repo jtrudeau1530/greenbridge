@@ -96,12 +96,17 @@ def bank_ids(path: str) -> list:
         head = fh.read(16)
         if len(head) < 16 or head[:4] != b"ADAT":
             raise ValueError(f"{path}: not a little-endian AWC")
-        flags, n, _header_size = struct.unpack_from("<III", head, 4)
+        flags, n, header_size = struct.unpack_from("<III", head, 4)
         skip = (4 if flags & 0x400000 else 0) + (n * 2 if flags & 0x10000 else 0) \
             + ((n + 1) * 4 if flags & 0x200000 else 0)
         table_end = 16 + skip + 4 * n
-        if table_end > os.fstat(fh.fileno()).st_size:
+        file_size = os.fstat(fh.fileno()).st_size
+        if table_end > file_size:
             raise ValueError(f"{path}: stream table extends past the end of the file")
+        if header_size > file_size:
+            raise ValueError(f"{path}: declared header extends past the end of the file")
+        if header_size < 16 or table_end > header_size:
+            raise ValueError(f"{path}: stream table extends past the declared header")
         fh.seek(16 + skip)
         table = fh.read(4 * n)
     if len(table) < 4 * n:
