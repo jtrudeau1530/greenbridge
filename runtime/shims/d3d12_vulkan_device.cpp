@@ -189,11 +189,20 @@ bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes,
     }
 }
 
+// Whether a VirtualQuery region holds committed pages a read of which succeeds: a readable protection and neither
+// PAGE_NOACCESS nor PAGE_GUARD (a guard page raises STATUS_GUARD_PAGE_VIOLATION on the first access and clears the
+// flag; PAGE_NOACCESS and PAGE_EXECUTE, which has no read bit, are not in the readable set). Such a range is neither
+// copied nor imported: the GPU's read of a pinned guard or no-access page would fault in the driver.
+bool title_region_readable(const MEMORY_BASIC_INFORMATION& region) {
+    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return region.State == MEM_COMMIT && (region.Protect & readable) &&
+           !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+}
+
 // Copies [from, from + bytes) of the title's address space to `to`, for a slot-133 shadow buffer. Only committed,
 // readable pages are read (xmem commits on first touch, and a read of a reserved page faults); the rest is zero.
 void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
-    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     for (std::size_t at = 0; at < bytes;) {
         MEMORY_BASIC_INFORMATION region{};
         std::size_t run = bytes - at;
@@ -201,8 +210,7 @@ void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t by
         if (VirtualQuery(from + at, &region, sizeof(region))) {
             const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
             run = std::min<std::size_t>(run, end - reinterpret_cast<std::uintptr_t>(from + at));
-            read = region.State == MEM_COMMIT && (region.Protect & readable) &&
-                   !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+            read = title_region_readable(region);
         }
         if (!read || !copy_guarded(to + at, from + at, run, (region.Protect & PAGE_WRITECOMBINE) != 0))
             std::memset(to + at, 0, run);
@@ -2315,14 +2323,15 @@ public:
         const VkDeviceSize offset = start - base;
         const VkDeviceSize bytes = (offset + desc_.Width + alignment - 1) & ~(alignment - 1);
         // The whole imported range must be committed, possibly across several allocations (the retail buffer spans
-        // three mapped windows); a page not committed yet (xmem commits on first touch) or a write-combined one (on
-        // an RTX 5090 such an import succeeded but GPU reads returned wrong bytes, found in review) is not imported,
-        // and the ordinary-buffer fallback answers instead.
+        // three mapped windows); a page not committed yet (xmem commits on first touch), one a read faults on
+        // (PAGE_NOACCESS, PAGE_GUARD, no read bit) or a write-combined one (on an RTX 5090 such an import succeeded
+        // but GPU reads returned wrong bytes, found in review) is not imported, and the ordinary-buffer fallback
+        // answers instead.
         bool importable = true;
         for (VkDeviceSize at = 0; at < bytes;) {
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(static_cast<const char*>(base_address) + at, &region, sizeof(region)) ||
-                region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
+                !title_region_readable(region) || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
                 importable = false;
                 break;
             }

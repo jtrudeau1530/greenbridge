@@ -373,6 +373,23 @@ int check_title_placed_all(ID3D12Device* device) {
     // half and never reads the other, which a GPU copy sees as zeros.
     failures += check_title_placed_shadow(device, "half-committed range", partial, size / 2, size);
     VirtualFree(partial, 0, MEM_RELEASE);
+    // Pages a read faults on are not imported either (a driver pins them for the GPU): the first page is readable
+    // and carries the pattern, the second holds 0xA5 bytes but is PAGE_NOACCESS, PAGE_GUARD or PAGE_EXECUTE (no read
+    // bit), and the GPU sees zeros there. Where the
+    // range was imported anyway the GPU's read of that page faults or returns what the driver pinned, not zeros.
+    for (const DWORD unreadable : {DWORD(PAGE_NOACCESS), DWORD(PAGE_READWRITE | PAGE_GUARD), DWORD(PAGE_EXECUTE)}) {
+        constexpr SIZE_T page = 0x1000;
+        char* guarded = static_cast<char*>(VirtualAlloc(nullptr, 2 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        // Non-zero bytes behind the unreadable page, so an import of it reads them and the shadow's zeros differ.
+        if (guarded) std::memset(guarded + page, 0xA5, page);
+        DWORD previous = 0;
+        EXPECT(guarded != nullptr && VirtualProtect(guarded + page, page, unreadable, &previous));
+        failures += check_title_placed_shadow(device, unreadable == PAGE_NOACCESS  ? "readable page, then PAGE_NOACCESS"
+                                              : unreadable == PAGE_EXECUTE ? "readable page, then PAGE_EXECUTE"
+                                                                           : "readable page, then PAGE_GUARD",
+                                              guarded, page, 2 * page);
+        VirtualFree(guarded, 0, MEM_RELEASE);
+    }
     return failures;
 }
 
