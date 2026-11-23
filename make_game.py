@@ -1344,13 +1344,20 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
 
 
 def fspx_cache_complete(spirv: str) -> bool:
-    """Check that the FSPX translation index names at least one program and that its named modules are present.
-    A translation that produced no modules writes a bare `{}`, which must not be cached as a finished step."""
+    """Require a runtime-addressable compute program and all of the modules in the saved translation index."""
     try:
         index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
     except ValueError:
         return False
-    return isinstance(index, dict) and bool(index) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    if not isinstance(index, dict):
+        return False
+    # The translator can write a module with an error-only metadata row. Such a module has no runtime lookup key.
+    has_compute_key = any(
+        isinstance(meta, dict) and meta.get("stage") == "cs"
+        and isinstance(meta.get("fspx_code_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", meta["fspx_code_sha256"])
+        for meta in index.values()
+    )
+    return has_compute_key and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
