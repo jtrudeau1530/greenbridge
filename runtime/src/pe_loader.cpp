@@ -397,6 +397,8 @@ struct ExistingThreadBlock {
     void*** vector = nullptr;  // that thread's TEB->ThreadLocalStoragePointer field; the array itself can be replaced
     void* saved = nullptr;     // what the block replaced
     void* block = nullptr;
+    void** ga_cell = nullptr;  // that thread's TEB->TlsSlots[tls_ga_slot]: inline in the TEB, so it never moves
+    void* ga_view = nullptr;   // the /GA view that cell points at (Module::tls_ga_slot)
 };
 
 // Immortal, like the thread events that use them. `ended` holds the ids of threads whose DLL_THREAD_DETACH has run:
@@ -422,6 +424,17 @@ bool has_existing_thread_block(DWORD thread, const Module& m) {
     for (const auto& b : existing_threads().blocks)
         if (b.thread == thread && b.module == &m && b.generation == m.tls_generation) return true;
     return false;
+}
+
+// The /GA view a thread's TlsSlots[Module::tls_ga_slot] points at: [0] and [tls_index] are this thread's block.
+// Null when it cannot be allocated.
+void** make_ga_view(const Module& m, void* block) {
+    auto* view = static_cast<void**>(
+        VirtualAlloc(nullptr, kMaxModuleTlsSlots * sizeof(void*), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!view) return nullptr;
+    view[0] = block;
+    view[m.tls_index] = block;
+    return view;
 }
 
 void install_thread_block(Module& m) {
@@ -460,14 +473,11 @@ void install_thread_block(Module& m) {
     void** view = nullptr;
     if (m.tls_ga_slot != kNoTlsIndex) {
         // The /GA view: [0] and [tls_index] are this thread's block, the rest stays null (the image reads no other).
-        view = static_cast<void**>(
-            VirtualAlloc(nullptr, kMaxModuleTlsSlots * sizeof(void*), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        view = make_ga_view(m, block);
         if (!view) {
             VirtualFree(block, 0, MEM_RELEASE);
             throw std::runtime_error(m.name + ": TLS view allocation failed");
         }
-        view[0] = block;
-        view[m.tls_index] = block;
         TlsSetValue(m.tls_ga_slot, view);
     }
 
@@ -610,6 +620,16 @@ void*** running_thread_tls_vector(HANDLE thread) {
     return reinterpret_cast<void***>(static_cast<uint8_t*>(info.teb) + 0x58);
 }
 
+// That thread's TEB->TlsSlots[slot] cell (0x1480 + 8 * slot): inline in the TEB, so it cannot be replaced while the
+// thread runs. Null when the thread is gone.
+void** running_thread_tls_cell(HANDLE thread, uint32_t slot) {
+    ThreadBasicInfo info{};
+    const QueryThreadFn query = query_thread_fn();
+    if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof info, nullptr) < 0) return nullptr;
+    if (info.exit_status != STILL_ACTIVE || !info.teb) return nullptr;
+    return reinterpret_cast<void**>(static_cast<uint8_t*>(info.teb) + 0x1480 + 8 * slot);
+}
+
 // Another thread's TLS array and one entry of it, read through its TEB. False when the memory is not there any more
 // (the thread was terminated). No C++ objects in these three: they are __try frames.
 bool read_thread_slot(void*** vector, uint32_t index, void**& slots, void*& value) noexcept {
@@ -642,10 +662,32 @@ void restore_thread_slot(void*** vector, uint32_t index, void* block, void* save
     }
 }
 
+// Writes one TlsSlots cell of another thread; false when the thread's TEB is gone already.
+bool write_tls_cell(void** cell, void* value) noexcept {
+    __try {
+        *cell = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Empties a TlsSlots cell that still holds `view` (a thread that ended may hold another value).
+void restore_tls_cell(void** cell, void* view) noexcept {
+    __try {
+        if (*cell == view) *cell = nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 // Takes a block out of its slot and frees it. The existing-threads lock is held; b.vector is null when the thread
 // is gone.
 void remove_existing_block(const ExistingThreadBlock& b) {
     if (b.vector && b.index < kMaxModuleTlsSlots) restore_thread_slot(b.vector, b.index, b.block, b.saved);
+    if (b.ga_view) {
+        if (b.ga_cell) restore_tls_cell(b.ga_cell, b.ga_view);
+        VirtualFree(b.ga_view, 0, MEM_RELEASE);
+    }
     VirtualFree(b.block, 0, MEM_RELEASE);
 }
 
@@ -740,7 +782,26 @@ void install_on_existing_threads(Module& m) {
                                  m.name.c_str());
                 continue;
             }
-            state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block});
+            void** ga_cell = nullptr;
+            void* ga_view = nullptr;
+            if (m.tls_ga_slot != kNoTlsIndex) {
+                // The /GA view this thread's rewritten index-0 TLS reads go through, as install_thread_block gives
+                // a thread started after load(). Without it those reads dereference null on this thread.
+                ga_cell = running_thread_tls_cell(c.handle, m.tls_ga_slot);
+                if (ga_cell) ga_view = make_ga_view(m, block);
+                if (!ga_view || !write_tls_cell(ga_cell, ga_view)) {
+                    if (ga_view) VirtualFree(ga_view, 0, MEM_RELEASE);
+                    ga_cell = nullptr;
+                    ga_view = nullptr;
+                    static std::atomic<bool> logged_view{false};
+                    if (!logged_view.exchange(true))
+                        std::fprintf(stderr, "[rt] loader: %s: a running thread did not take its /GA TLS view; "
+                                             "index-0 TLS reads in it have no block\n",
+                                     m.name.c_str());
+                }
+            }
+            state.blocks.push_back(
+                {c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block, ga_cell, ga_view});
         }
     }
 }
@@ -760,6 +821,7 @@ void remove_from_existing_threads(Module& m) {
         const HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, b.thread);
         if (!h || running_thread_tls_vector(h) != b.vector) b.vector = nullptr;
         if (h) CloseHandle(h);
+        if (!b.vector) b.ga_cell = nullptr;  // the TEB went with the thread
         remove_existing_block(b);
     }
 }
@@ -776,6 +838,7 @@ void forget_ended_thread_id() {
             continue;
         }
         VirtualFree(it->block, 0, MEM_RELEASE);
+        VirtualFree(it->ga_view, 0, MEM_RELEASE);
         it = state.blocks.erase(it);
     }
 }
