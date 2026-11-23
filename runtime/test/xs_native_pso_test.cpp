@@ -484,8 +484,8 @@ void test_arguments_and_results() {
     no_b.desc.state_b = {};
     EXPECT(call57(device, &no_b.desc, &kPipelineIid, &out) == E_INVALIDARG);
     Desc half = d;
-    half.desc.stages[0].records = {};
-    EXPECT(call57(device, &half.desc, &kPipelineIid, &out) == E_INVALIDARG && mock->stream_calls == 0);
+    half.desc.stages[0].records = {};  // code without records: unresolvable, not malformed
+    EXPECT(call57(device, &half.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->stream_calls == 0);
 
     mock->result = E_INVALIDARG;
     EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_INVALIDARG && !out && mock->stream_calls == 1);

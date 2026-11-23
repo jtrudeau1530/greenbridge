@@ -23,6 +23,8 @@
 #include <atomic>
 #include <climits>
 #include <cstring>
+#include <cwchar>
+#include <span>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -57,7 +59,8 @@ inline SRWLOCK g_lock = SRWLOCK_INIT;
 inline bool g_loaded = false;  // under g_lock
 inline std::filesystem::path* g_dir = nullptr;
 inline np::HashMap* g_map = nullptr;  // null when there is no usable map
-inline std::atomic<std::uint64_t> g_calls{0}, g_created{0}, g_stubbed{0}, g_refused{0}, g_stub_asks{0};
+inline std::atomic<std::uint64_t> g_calls{0}, g_created{0}, g_stubbed{0}, g_refused{0}, g_stub_asks{0},
+    g_malformed{0};
 inline std::atomic<bool> g_first_logged{false}, g_odd_logged{false};
 
 // "0", "off", "false" and "no" (any case) are off; anything else set is on.
@@ -208,6 +211,63 @@ inline const char* status_name(np::PlanStatus s) {
 // A bare FSSM blob that no index names: the device's own "no translated shader" path answers it.
 inline constexpr std::uint8_t kStubProgram[16] = {'F', 'S', 'S', 'M'};
 
+// LEONIDA_NATIVE_PSO_DEBUG=N: the layout of the first N descriptions (sizes and offsets only, no contents).
+inline std::atomic<std::uint64_t> g_debugged{0};
+
+inline void debug_hits(const char* what, std::span<const std::uint8_t> b, const np::HashMap& map) {
+    std::string hits, tags;
+    for (std::size_t at = 0; at + 16 <= b.size(); at += 4) {
+        np::Digest d;
+        std::memcpy(d.data(), b.data() + at, 16);
+        if (const np::ShaderRef* r = map.find(d)) hits += " " + std::to_string(at) + ":" + r->stage;
+    }
+    for (std::size_t at = 0; at + 4 <= b.size(); at += 4)
+        if (np::read_u32(b, at) == 0x43) tags += " " + std::to_string(at);
+    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 debug:   %s %zu B, 0x43 words at%s, digest hits at%s\n", what,
+                 b.size(), tags.empty() ? " -" : tags.c_str(), hits.empty() ? " -" : hits.c_str());
+}
+
+inline void debug_layout(const np::GraphicsDesc& desc, const np::HashMap* map, std::uint64_t call) {
+    wchar_t value[8] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_NATIVE_PSO_DEBUG", value, 8);
+    if (n == 0 || n >= 8) return;
+    const std::uint64_t limit = std::wcstoull(value, nullptr, 10);
+    if (g_debugged.fetch_add(1) >= limit) return;
+    const auto* words = reinterpret_cast<const std::uint64_t*>(&desc);
+    std::string pairs;
+    for (std::size_t i = 1; i < sizeof(desc) / 8; i += 2)
+        pairs += " " + std::to_string(i * 8) + ":" + (words[i] ? "p" : "0") + "/" + std::to_string(words[i + 1]);
+    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 debug call %llu: offset:pointer/size%s\n",
+                 static_cast<unsigned long long>(call), pairs.c_str());
+    if (const DWORD dn = GetEnvironmentVariableW(L"LEONIDA_NATIVE_PSO_DUMP", nullptr, 0)) {
+        std::wstring dir(dn, L'\0');
+        dir.resize(GetEnvironmentVariableW(L"LEONIDA_NATIVE_PSO_DUMP", dir.data(), dn));
+        const auto dump = [&](const std::wstring& name, const np::Pair& pair) {
+            if (np::pair_state(pair) != np::PairState::present) return;
+            std::ofstream(std::filesystem::path(dir) / name, std::ios::binary)
+                .write(static_cast<const char*>(pair.data), static_cast<std::streamsize>(pair.size));
+        };
+        const std::wstring prefix = std::to_wstring(call) + L"_";
+        dump(prefix + L"a.bin", desc.state_a);
+        dump(prefix + L"b.bin", desc.state_b);
+        for (std::size_t k = 0; k < np::kStageBlocks; ++k) {
+            dump(prefix + std::to_wstring(k) + L"_code.bin", desc.stages[k].code);
+            dump(prefix + std::to_wstring(k) + L"_rec.bin", desc.stages[k].records);
+        }
+    }
+    if (!map) return;
+    const np::HashMap& m = *map;
+    if (np::pair_state(desc.state_a) == np::PairState::present) debug_hits("blob A", np::bytes(desc.state_a), m);
+    if (np::pair_state(desc.state_b) == np::PairState::present) debug_hits("blob B", np::bytes(desc.state_b), m);
+    for (std::size_t k = 0; k < np::kStageBlocks; ++k) {
+        const std::string tag = "block " + std::to_string(k);
+        if (np::pair_state(desc.stages[k].code) == np::PairState::present)
+            debug_hits((tag + " code").c_str(), np::bytes(desc.stages[k].code), m);
+        if (np::pair_state(desc.stages[k].records) == np::PairState::present)
+            debug_hits((tag + " records").c_str(), np::bytes(desc.stages[k].records), m);
+    }
+}
+
 // The device's answer: failures are logged and counted, an odd pointer is refused, successes are counted in `done`.
 inline HRESULT finish(HRESULT hr, void** out, std::uint64_t call, const char* what, std::atomic<std::uint64_t>& done) {
     if (FAILED(hr)) {
@@ -270,7 +330,7 @@ inline void reset_native_pso_state() {
     g_dir = nullptr;
     g_loaded = false;
     ReleaseSRWLockExclusive(&g_lock);
-    g_calls = g_created = g_stubbed = g_refused = g_stub_asks = 0;
+    g_calls = g_created = g_stubbed = g_refused = g_stub_asks = g_malformed = 0;
 }
 
 // slot 57 (desc, riid, out); `create` makes the pipeline from its stream on the device behind the proxy.
@@ -297,13 +357,16 @@ inline HRESULT create_native_graphics_pipeline(PipelineStreamCreator create, voi
     const std::filesystem::path* dir = nullptr;
     const np::HashMap* map = hash_map(&dir);
     const np::HashMap empty;
+    debug_layout(desc, map, call);
     const np::Plan plan = np::plan(desc, map ? *map : empty);
     if (plan.status == np::PlanStatus::malformed) {
-        const std::uint64_t n = g_refused.fetch_add(1) + 1;
+        g_refused.fetch_add(1);
+        const std::uint64_t n = g_malformed.fetch_add(1) + 1;
         if (log_this(n))
-            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 call %llu: malformed description (blob B %llu B); "
-                         "E_INVALIDARG (%llu so far)\n", static_cast<unsigned long long>(call),
-                         static_cast<unsigned long long>(desc.state_b.size), static_cast<unsigned long long>(n));
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 call %llu: malformed description: %s (block %zu, blob B "
+                         "%llu B); E_INVALIDARG (%llu so far)\n", static_cast<unsigned long long>(call), plan.reason,
+                         plan.failed_block, static_cast<unsigned long long>(desc.state_b.size),
+                         static_cast<unsigned long long>(n));
         return E_INVALIDARG;
     }
     if (plan.status != np::PlanStatus::ok || !dir)

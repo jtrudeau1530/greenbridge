@@ -53,8 +53,9 @@ inline constexpr std::uint64_t kPairLimit = 16u << 20;
 // A pair is absent (both zero), present (both set, size within the limit), or malformed.
 enum class PairState { absent, present, malformed };
 
+// A table entry with size 0 is absent whatever its pointer (the title passes base + offset, measured on 1.0.2.1).
 inline PairState pair_state(const Pair& p) {
-    if (!p.data && !p.size) return PairState::absent;
+    if (!p.size) return PairState::absent;
     if (!p.data || !p.size || p.size > kPairLimit) return PairState::malformed;
     return PairState::present;
 }
@@ -98,8 +99,12 @@ inline constexpr std::uint32_t kMaxSemanticName = 256;
 
 // Empty for a blob that is too short, names more than 8 targets, a topology type past PATCH (4), or an element
 // list that runs past the blob or has a malformed name. Bytes after the last element are allowed.
-inline std::optional<FixedState> decode_state_b(std::span<const std::uint8_t> b) {
-    if (b.size() < kStateBHeader) return std::nullopt;
+inline std::optional<FixedState> decode_state_b(std::span<const std::uint8_t> b, const char** why = nullptr) {
+    const auto fail = [&](const char* reason) {
+        if (why) *why = reason;
+        return std::nullopt;
+    };
+    if (b.size() < kStateBHeader) return fail("blob B shorter than its header");
     FixedState s;
     std::memcpy(s.rtv_formats.data(), b.data() + 0x10, 8);
     s.sample_mask = read_u32(b, 0x1c);
@@ -107,17 +112,20 @@ inline std::optional<FixedState> decode_state_b(std::span<const std::uint8_t> b)
     s.rt_count = b[0x25];
     s.topology_type = b[0x26] & 0x0f;
     s.sample_count = b[0x28] ? b[0x28] : 1;
-    if (s.rt_count > 8 || s.topology_type > 4) return std::nullopt;
+    if (s.rt_count > 8) return fail("blob B render target count over 8");
+    if (s.topology_type > 4) return fail("blob B topology type over 4");
     const std::uint32_t count = read_u32(b, 0x4c);
-    if (count > kMaxInputElements) return std::nullopt;
+    if (count > kMaxInputElements) return fail("blob B input element count over 32");
     std::size_t at = kStateBHeader;
     for (std::uint32_t i = 0; i < count; ++i) {
-        if (at + 4 > b.size()) return std::nullopt;
+        if (at + 4 > b.size()) return fail("blob B input element past the end");
         const std::uint32_t length = read_u32(b, at);
         at += 4;
-        if (length < 2 || length > kMaxSemanticName || at + length + 24 > b.size()) return std::nullopt;
+        if (length < 2 || length > kMaxSemanticName || at + length + 24 > b.size())
+            return fail("blob B semantic name length out of range");
         const auto* name = reinterpret_cast<const char*>(b.data() + at);
-        if (name[length - 1] != '\0' || std::memchr(name, '\0', length - 1)) return std::nullopt;
+        if (name[length - 1] != '\0' || std::memchr(name, '\0', length - 1))
+            return fail("blob B semantic name not one NUL-terminated string");
         InputElement e;
         e.name.assign(name, length - 1);
         at += length;
@@ -236,8 +244,8 @@ struct PlannedStage {
 
 enum class PlanStatus {
     ok,
-    malformed,    // a pair is malformed, a block has code without records, or blob B does not decode
-    missing,      // a stage's digest names no translated container
+    malformed,    // a pair is malformed or blob B does not decode
+    missing,      // a stage has no records, or its digest names no translated container
     ambiguous,    // a stage's records name two different containers
     unsupported,  // a stage kind this path does not build (hs, ds, cs), two of one kind, or no VS/MS
 };
@@ -246,7 +254,8 @@ struct Plan {
     PlanStatus status = PlanStatus::malformed;
     FixedState state;
     std::vector<PlannedStage> stages;  // in block order
-    std::size_t failed_block = 0;      // for missing/ambiguous/unsupported
+    std::size_t failed_block = 0;      // for missing/ambiguous/unsupported/malformed blocks
+    const char* reason = "";           // why a description is malformed
     bool mesh = false;                 // an MS stage: the pipeline goes through a pipeline state stream
 
     const ShaderRef* stage(std::string_view name) const {
@@ -258,17 +267,22 @@ struct Plan {
 
 inline Plan plan(const GraphicsDesc& desc, const HashMap& map) {
     Plan p;
-    if (pair_state(desc.state_a) == PairState::malformed || pair_state(desc.state_b) != PairState::present)
-        return p;
-    auto state = decode_state_b(bytes(desc.state_b));
+    if (pair_state(desc.state_a) == PairState::malformed) return p.reason = "blob A pair malformed", p;
+    if (pair_state(desc.state_b) != PairState::present) return p.reason = "blob B pair absent or malformed", p;
+    auto state = decode_state_b(bytes(desc.state_b), &p.reason);
     if (!state) return p;
     p.state = std::move(*state);
     for (std::size_t k = 0; k < kStageBlocks; ++k) {
         const StageBlock& block = desc.stages[k];
         const PairState code = pair_state(block.code), records = pair_state(block.records);
-        if (code == PairState::malformed || records == PairState::malformed) return p;
+        p.failed_block = k;
+        if (code == PairState::malformed || records == PairState::malformed)
+            return p.reason = "a stage pair malformed", p;
         if (code == PairState::absent && records == PairState::absent) continue;
-        if (records != PairState::present) return p;
+        if (records != PairState::present) {  // code without records: nothing names its container
+            p.status = PlanStatus::missing;
+            return p;
+        }
         const ShaderRef* found = nullptr;
         for (const Digest& d : record_digests(bytes(block.records))) {
             const ShaderRef* ref = map.find(d);

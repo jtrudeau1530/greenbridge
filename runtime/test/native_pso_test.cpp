@@ -253,19 +253,26 @@ void test_plan() {
         Fixture f;
         f.stage(0, vs);
         f.desc.stages[0].records = {};
-        EXPECT(np::plan(f.desc, map).status == np::PlanStatus::malformed);
+        EXPECT(np::plan(f.desc, map).status == np::PlanStatus::missing);
+        f.desc.stages[0].records.size = 0;  // a table entry of size 0 with a pointer, as the title passes
+        f.desc.stages[0].records.data = f.rec[0].data();
+        EXPECT(np::plan(f.desc, map).status == np::PlanStatus::missing);
     }
     {
         Fixture f;
         f.stage(0, vs);
         f.desc.state_b = {};
-        EXPECT(np::plan(f.desc, map).status == np::PlanStatus::malformed);
+        const auto p = np::plan(f.desc, map);
+        EXPECT(p.status == np::PlanStatus::malformed && std::string(p.reason) == "blob B pair absent or malformed");
     }
     {
         Fixture f;
         f.stage(0, vs);
-        f.desc.state_a.size = 0;
-        EXPECT(np::plan(f.desc, map).status == np::PlanStatus::malformed);
+        f.desc.state_a.size = 0;  // size 0 is absent whatever the pointer
+        EXPECT(np::plan(f.desc, map).status == np::PlanStatus::ok);
+        f.desc.state_a = {nullptr, 384};
+        const auto p = np::plan(f.desc, map);
+        EXPECT(p.status == np::PlanStatus::malformed && std::string(p.reason) == "blob A pair malformed");
     }
     {
         Fixture f;
