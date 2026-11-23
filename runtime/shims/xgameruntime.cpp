@@ -61,6 +61,8 @@ std::atomic<int> g_runtime_refs{0};
 // (no caller in the shipped DLLs to measure), and the classes of the other xgameruntime_*.cpp files through their
 // query functions; for any other class QueryApiImpl logs the class and interface id and refuses it, so the first boot
 // with the executable lists the interfaces to implement next.
+//
+// The thunks look up a sixth name, XErrorReport (served below GetApiVersionImpl), and refuse the runtime without it.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -645,6 +647,13 @@ HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
     if (second) *second = kOfflineApiVersion;
     return S_OK;
 }
+
+// XErrorReport, the sixth name xgameruntime.lib's thunks GetProcAddress in xgameruntime.dll: in both package DLLs its
+// string sits in the same block as the five entry points above, and when the lookup fails the thunks give up before
+// they call an initializer (libHttpClient.GDK.dll's initialisation then returns 0x89240101,
+// E_GAMERUNTIME_DLL_NOT_FOUND, and XCurl.dll's fails too). The arguments are IXErrorImpl slot 3's without `this`, and
+// the slot's function serves it, so a report reaches the callback XErrorSetCallback set either way.
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
 
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
@@ -1323,6 +1332,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    XGR(XErrorReport),  // looked up with the five above; without it the thunks refuse the runtime
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
