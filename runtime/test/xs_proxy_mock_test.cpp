@@ -2501,6 +2501,11 @@ int check_get_desc_c_abi() {
         EXPECT(console_get_desc(nullptr, queue) == nullptr);
         EXPECT(queue_mock->calls[18] == 1 && xs::queue_slot_hits(18) == 2);
 
+        // Pin the older layout first (#2490): an undetected queue answers PC-order slot 18 as the newer layout's
+        // frequency getter, which cannot overrun an 8-byte out; PC-order GetDesc there is the older layout's.
+        UINT64 frequency = 0;
+        EXPECT(hr_of(raw(queue, 16, word(&frequency))) == S_OK && frequency == 1000000);
+
         D3D12_COMMAND_QUEUE_DESC pc_out{};
         EXPECT(pc_get_desc(queue, &pc_out) == &pc_out);
         EXPECT(std::memcmp(&pc_out, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
