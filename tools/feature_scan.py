@@ -505,10 +505,13 @@ def same_path(first: str, second: str) -> bool:
 
 
 def inside_dir(path: str, folder: str) -> bool:
-    """True when path is folder itself or anything under it."""
-    root = os.path.normcase(os.path.abspath(folder))
-    target = os.path.normcase(os.path.abspath(path))
-    return target == root or target.startswith(root + os.sep)
+    """True when the path itself or its symlink target is in the folder."""
+    for resolve in (os.path.abspath, os.path.realpath):
+        root = os.path.normcase(resolve(folder))
+        target = os.path.normcase(resolve(path))
+        if target == root or target.startswith(os.path.join(root, "")):
+            return True
+    return False
 
 
 def main() -> int:
