@@ -156,8 +156,9 @@ def test_explicit_mip_depth_compare(make_shader, a16, d16):
     result, ref, lod = sample.groups()
     assert float_source_register(ref) == ["%vgpr", "%c0"]
     if a16:
-        packed_word = defs[lod].split()[-1]
-        unpacked_half = defs[packed_word].split()[-1]
+        unpacked_half = lod
+        while defs[unpacked_half].startswith("OpBitcast "):   # a bitcast round trip is the original id
+            unpacked_half = defs[unpacked_half].split()[-1]
         op, _, pair, half = defs[unpacked_half].split()
         assert (op, half) == ("OpCompositeExtract", "0")
         raw = defs[pair].split()[-1]

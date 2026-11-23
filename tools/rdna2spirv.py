@@ -233,6 +233,9 @@ class Gen:
         self.reg_ptrs = {}
         self.body = []
         self.consts = {}
+        # tof/tou results -> the id they were bitcast from. A bitcast of a bitcast gives the original id back: wherever
+        # the key is valid its source is too (the key's own definition uses it), so no dominance is lost.
+        self.bitcast_from = {}
         self.n = 0
         self.outputs = {}
         self.partial_color_outputs: set[str] = set()
@@ -1373,15 +1376,28 @@ class Gen:
         return r
 
     def tof(self, u):
+        """The %float with the bits of %uint u. Bitcasting a tou result back gives tou's argument (Gen.bitcast_from),
+        so u must be a %uint and tou's argument a %float; an %int's bits go through int_bits."""
+        if u in self.bitcast_from:
+            return self.bitcast_from[u]
         f = self.tmp()
         self.emit(f"{f} = OpBitcast %float {u}")
+        self.bitcast_from[f] = u
         return f
 
     def tou(self, f):
+        if f in self.bitcast_from:
+            return self.bitcast_from[f]
         u = self.tmp()
         self.emit(f"{u} = OpBitcast %uint {f}")
+        self.bitcast_from[u] = f
         return u
 
+    def int_bits(self, i):
+        """The %uint bits of %int i. Not tou: tou remembers its argument, which tof would then return as a %float."""
+        u = self.tmp()
+        self.emit(f"{u} = OpBitcast %uint {i}")
+        return u
     def src_f(self, a):
         return self.tof(self.src_u(a))
 
@@ -3825,7 +3841,7 @@ class Gen:
             unorm_view = [red, unorm_rgba[1], blue, unorm_rgba[3]]
             signed_ic = ic
             if d16:
-                signed_ic = [self.tou(self.i16_half(regs[i // 2], i % 2)) for i in range(n)]
+                signed_ic = [self.int_bits(self.i16_half(regs[i // 2], i % 2)) for i in range(n)]
                 signed_ic = signed_ic + [self.cu(0)] * (4 - len(signed_ic))
             # MUBUF 2-component stores infer COMP_SWAP from V# DST_SEL_X/Y/Z (measured natively on gfx1036 across
             # all 1,296 valid DST_SEL tuples, wave32 and wave64): XY01 -> (x, y), YX01 -> (y, x), XYZW -> (x, w),
@@ -7950,7 +7966,7 @@ class Gen:
             vals = []
             for k, s_ in enumerate(a[1:4]):
                 u = self.src_u(s_)
-                h = self.u16_half(u, sb[k]) if op == "v_mad_u16" else self.tou(self.i16_half(u, sb[k]))
+                h = self.u16_half(u, sb[k]) if op == "v_mad_u16" else self.int_bits(self.i16_half(u, sb[k]))
                 vals.append(h)
             x, y, z = vals
             prod, tot = self.tmp(), self.tmp()

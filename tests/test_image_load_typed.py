@@ -561,13 +561,13 @@ class VolumeGradientSamples(unittest.TestCase):
                 self.assertEqual(len(clamp), int("_cl " in line))
 
                 def source(value: str) -> tuple[int, int | None]:
-                    op, (_, word) = module.defs[value]
-                    self.assertEqual(op, "OpBitcast")
-                    op, args = module.defs[word]
+                    # Through the bitcasts between a VGPR word and a float (a round trip is the original id).
+                    op, args = module.defs[value]
+                    while op == "OpBitcast":
+                        op, args = module.defs[args[1]]
                     half = None
-                    if op == "OpBitcast":  # f16 coord converted to f32, then kept in a VGPR word
-                        extract, (_, unpacked, selector) = module.defs[args[1]]
-                        self.assertEqual(extract, "OpCompositeExtract")
+                    if op == "OpCompositeExtract":  # f16 coord converted to f32
+                        _, unpacked, selector = args
                         unpack, (_, _, name, packed) = module.defs[unpacked]
                         self.assertEqual((unpack, name), ("OpExtInst", "UnpackHalf2x16"))
                         half = int(selector)
