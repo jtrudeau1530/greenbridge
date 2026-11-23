@@ -76,6 +76,14 @@ bool write_file(const std::string& path, const void* data, std::size_t bytes) {
     return bool(f);
 }
 
+// The size a structure's header gives (totalSizeIn64BNodes does not count the header): the nodes the build wrote,
+// at most the layout's size, which leaves room for the most a tree of that many elements can have.
+std::size_t header_size(const void* structure) {
+    std::uint32_t units = 0;
+    std::memcpy(&units, static_cast<const char*>(structure) + 4, 4);
+    return (std::size_t(units) + 1) * 64;
+}
+
 std::string tris_json(const std::vector<Tri>& tris) {
     std::string s = "[";
     for (std::size_t i = 0; i < tris.size(); ++i) {
@@ -120,6 +128,7 @@ void expand(const Geometry& g, std::uint32_t geometry, std::vector<Tri>& out) {
 
 struct Built {
     std::uint64_t address = 0;
+    std::size_t size = 0;              // as the header gives it
     std::vector<Tri> tris;
 };
 
@@ -183,6 +192,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         return recorded;
     }));
     built.address = base;
+    built.size = header_size(static_cast<const char*>(dst.map) + (base - dst.address));
     auto dump = [&](const std::string& case_name, const Buffer& buffer, std::uint64_t at, const std::vector<Tri>& tris) {
         const auto* bytes = static_cast<const char*>(buffer.map) + (at - buffer.address);
         const std::string json = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
@@ -192,7 +202,9 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
                                  (box16 ? ", \"box16\": true" : ", \"box16\": false") +
                                  (name == "blas_paired_rotations" ? ", \"all_rotations\": true" : "") +
                                  ", \"triangles\": " + tris_json(tris) + "}\n";
-        return write_file(dir + "/" + case_name + ".bin", bytes, layout.size) &&
+        const std::size_t size = header_size(bytes);
+        if (size > layout.size) return false;
+        return write_file(dir + "/" + case_name + ".bin", bytes, size) &&
                write_file(dir + "/" + case_name + ".json", json.data(), json.size());
     };
     if (!moved) {
@@ -493,7 +505,9 @@ int main(int argc, char** argv) {
         barrier_to_host(gpu, cb);
         return recorded;
     }));
-    EXPECT(write_file(dir + "/tlas.bin", static_cast<const char*>(dst.map) + (base - dst.address), layout.size));
+    const char* tlas_bytes = static_cast<const char*>(dst.map) + (base - dst.address);
+    EXPECT(header_size(tlas_bytes) <= layout.size);
+    EXPECT(write_file(dir + "/tlas.bin", tlas_bytes, header_size(tlas_bytes)));
     std::string json = "{\"kind\": \"tlas\", \"address\": " + std::to_string(base) + ", \"bias\": " +
                        std::to_string(bias) + ", \"blas\": [\"blas_random\", " +
                        "\"blas_grid_u16_stride16\"], \"instances\": [";
@@ -521,7 +535,7 @@ int main(int argc, char** argv) {
         barrier_to_host(gpu, cb);
         return recorded;
     }));
-    EXPECT(write_file(dir + "/tlas_refit.bin", static_cast<const char*>(dst.map) + (base - dst.address), layout.size));
+    EXPECT(write_file(dir + "/tlas_refit.bin", tlas_bytes, header_size(tlas_bytes)));
     std::string json2 = "{\"kind\": \"tlas\", \"address\": " + std::to_string(base) + ", \"bias\": " +
                         std::to_string(bias) + ", \"blas\": [\"blas_random\", \"blas_grid_u16_stride16\"], \"instances\": [";
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -553,7 +567,8 @@ int main(int argc, char** argv) {
         std::uint64_t compacted = 0, clone_size = 0;
         std::memcpy(&compacted, info.map, 8);
         std::memcpy(&clone_size, static_cast<char*>(info.map) + 8, 8);
-        EXPECT(compacted == blas_layout.size);          // a build is exactly its layout's size
+        // a build is already as small as it gets: the size its header gives, within the layout's room
+        EXPECT(compacted == random.size && compacted <= blas_layout.size);
         EXPECT(clone_size == compacted);
         auto dump_blas = [&](const std::string& name, const Buffer& b, std::uint64_t at, std::size_t bytes) {
             const std::string j = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
@@ -561,7 +576,7 @@ int main(int argc, char** argv) {
             return write_file(dir + "/" + name + ".bin", static_cast<const char*>(b.map) + (at - b.address), bytes) &&
                    write_file(dir + "/" + name + ".json", j.data(), j.size());
         };
-        EXPECT(dump_blas("blas_clone", clone, clone_at, blas_layout.size));
+        EXPECT(dump_blas("blas_clone", clone, clone_at, std::size_t(compacted)));
         // COMPACT into exactly the compacted size; a guard word after it must survive
         Buffer packed = make(gpu, std::size_t(compacted) + 256 + 4);
         EXPECT(packed.buffer);
@@ -587,7 +602,7 @@ int main(int argc, char** argv) {
             return ok;
         }));
         EXPECT(write_file(dir + "/tlas_refit_clone.bin", static_cast<const char*>(tclone.map) + (tclone_at - tclone.address),
-                          layout.size));
+                          header_size(tlas_bytes)));
         std::string json3 = json2;
         json3.replace(json3.find(std::to_string(base)), std::to_string(base).size(), std::to_string(tclone_at));
         EXPECT(write_file(dir + "/tlas_refit_clone.json", json3.data(), json3.size()));

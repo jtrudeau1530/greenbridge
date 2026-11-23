@@ -562,13 +562,15 @@ def _inverse_dir(d):
     return [1.0 / c if c != 0.0 else math.copysign(FLT_MAX, c) for c in d]
 
 
-def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst):
+def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst, stats=None):
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
     while stack:
         p = stack.pop()
         if p == INVALID:
             continue
+        if stats is not None:
+            stats["steps"] += 1
         r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
         if r is None:
             continue
@@ -588,13 +590,14 @@ def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst):
     return hit
 
 
-def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
+def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0, stats=None):
     """Closest hit of a ray in a TLAS or BLAS at ``bvh_va``: a dict with t, instance (None for a BLAS), geometry,
     primitive, bary and front, or None. ``bias`` is added to the BLAS addresses instance records hold (application
-    address to the address in ``mem``)."""
+    address to the address in ``mem``). With ``stats`` (a dict), its "steps" counts the traversal steps: one per node
+    or triangle tested, the work of one image_bvh_intersect_ray."""
     flags = mem.u32(bvh_va)[0]
     if flags & FLAG_BOTTOM_LEVEL:
-        return _trace_blas(mem, bvh_va, org, d, tmax, None, None)
+        return _trace_blas(mem, bvh_va, org, d, tmax, None, None, stats)
     hit = None
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
@@ -616,8 +619,10 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0):
                 raise ValueError(f"instance root {root:#x} is not the BLAS header's root")
             index = mem.u32(rec + 112)[0]
             # the object-space ray keeps the world t: the direction is transformed, not normalised
-            hit = _trace_blas(mem, blas_va, lo, ld, tmax, hit, index)
+            hit = _trace_blas(mem, blas_va, lo, ld, tmax, hit, index, stats)
             continue
+        if stats is not None:
+            stats["steps"] += 1
         r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
         if r:
             stack.extend(reversed([k for k in r if k != INVALID]))
@@ -930,13 +935,14 @@ def check_build(directory, rays=300, seed=1):
                 src = blas[inst["blas"]]["triangles"] if inst["blas"] >= 0 else []
                 scene.append((rows, inst["mask"], [t[:3] for t in src]))
                 inst_ids.append([(t[3], t[4]) for t in src])      # list position -> (geometry, primitive)
+        stats = {"steps": 0}
         bad = hits = 0
         case_rays = min(rays, desc.get("rays", rays))      # a large case may ask for fewer (brute force is slow)
         for _ in range(case_rays):
             o = [rng.uniform(-12, 12) for _ in range(3)]
             target = [rng.uniform(-6, 6) for _ in range(3)]
             d = [target[c] - o[c] for c in range(3)]
-            got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0))
+            got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0), stats=stats)
             want = brute_force(scene, o, d)
             hits += got is not None
             if (got is None) != (want is None):
@@ -959,7 +965,7 @@ def check_build(directory, rays=300, seed=1):
             bad += not same
         paired = f", {pairs} TRI1" if pairs else ""
         print(f"{n}: {len(data)} bytes{paired}, {len(errs)} validation errors, {bad}/{case_rays} rays differ "
-              f"({hits} hits)")
+              f"({hits} hits), {stats['steps'] / max(case_rays, 1):.1f} steps per ray")
         if bad:
             problems.append(f"{n}: {bad} of {case_rays} rays differ from brute force")
         if desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:

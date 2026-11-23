@@ -901,9 +901,50 @@ the destination buffer:
 2. a 30-bit Morton key of each box centre, then a stable sort: up to 1,024 keys in one workgroup's shared memory
    (one dispatch), more with a radix sort of 8 passes of 4-bit digits over 256-element tiles (24 dispatches
    whatever the count, no padding to a power of two);
-3. BOX32 nodes, built level by level from four consecutive sorted children, with the parent table and each
-   instance's `ParentNode`; or BOX16 nodes (below);
-4. the header.
+3. a binary radix tree over the sorted keys (Karras 2012; equal keys are told apart by their sorted position), one
+   thread per inner node;
+4. the inner nodes: those at an even depth of the binary tree, each taking the children of its children (two to
+   four), numbered in sorted order by a scan, so the root is node 0; with the parent table. They are BOX32, or
+   BOX16 (below), and TRI1 pairing (below) happens here;
+5. the boxes, bottom-up in one dispatch: each element writes its box into its parent's slot and merges it into the
+   parent's accumulator; the last child to arrive carries on with the parent's box. The invocations meet only
+   through atomics ordered by `memoryBarrierBuffer`, so no plain load reads another workgroup's store of the same
+   dispatch. An instance's `ParentNode` is written here;
+6. the header.
+
+The tree used to group four consecutive sorted elements per node, level by level. Those groups ignore where the
+Morton prefix changes, so sibling boxes overlapped and a ray took about twice as many steps (found by DaniSBR1 on
+D3D-410). Measured with `xdxr_bvh.py check-build`, which counts the traversal steps (one per node or triangle
+tested, the work of one `image_bvh_intersect_ray`) over 1,000 random rays per case:
+
+| Case | Steps per ray, four consecutive | Steps per ray, radix tree |
+|---|---|---|
+| `blas_three_sort_tiles` (5,000 random triangles) | 42.0 | 23.0 |
+| `blas_box16_sort_tiles` (the same, BOX16) | 43.9 | 23.7 |
+| `blas_paired_sort_tiles` (7,200-triangle grid, TRI1 pairing) | 37.6 | 19.5 |
+| `blas_random` (1,000 random triangles) | 24.1 | 16.0 |
+| `blas_grid_u16_stride16` (288-triangle height grid) | 11.0 | 8.0 |
+| `blas_refit_in_place` (3,000 triangles, refitted after moving) | 74.8 | 55.5 |
+| `tlas` (4 instances) | 26.3 | 18.1 |
+
+Every ray finds the same hit as brute force in both. A CPU model of the choice (a scratch script, not kept) gave
+35.1 steps per ray for a greedy surface-area collapse of the same radix tree, 35.8 for the largest-subtree one and
+35.7 for the even-depth one this builder uses, against 76.8 for four consecutive elements (5,000 random triangles;
+11.2, 11.4, 11.5 and 24.4 on a height field). The even-depth collapse is the only one of the three that needs no
+pass from the top down.
+
+The cost is in the build and in memory. Wall clock of `vk_xdxr_build_test <dir> <n>` (random triangles, best of 3):
+
+| GPU | Triangles | Build before → after (ms) | Refit before → after (ms) |
+|---|---|---|---|
+| RTX 5090 | 1,000 | 0.17 → 0.17 | 0.10 → 0.09 |
+| RTX 5090 | 1,000,000 | 5.50 → 5.99 | 4.12 → 4.28 |
+| Radeon iGPU (gfx1036) | 1,000 | 0.17 → 0.23 | 0.09 → 0.10 |
+| Radeon iGPU (gfx1036) | 1,000,000 | 133 → 180 | 41.8 → 62.2 |
+
+On the iGPU about half of the refit's increase is the accumulator atomics (measured before BOX16 and pairing). The tree has more nodes: about one per
+two elements, against one per three. A build writes 137,856 bytes for 1,000 triangles where it wrote 113,536, and
+the layout leaves room for the most a tree can have.
 
 The radix sort's scan writes the prefix sums of the digit counts to their own scratch array, not over the counts.
 No invocation of the builder stores to a word and then uses a value it loaded from that word earlier. SPIRV-Cross
@@ -920,10 +961,10 @@ store in the same test.
 
 **BOX16 nodes.** A bottom-level build with `MINIMIZE_MEMORY` writes BOX16 inner nodes: 64 bytes, not 128, so a BLAS
 is about a fifth smaller (39,040 bytes against 48,768 for the 428-triangle BLAS of `d3d12_xdxr_rt_test`). The tree
-is the same; only the node records and their offsets change, so the layout still follows from the count, and
+is the same; only the node records and their offsets change, and
 `GetRaytracingAccelerationStructurePrebuildInfo` gives the smaller size when it gets the same flag. Each child box
-is rounded outward to halves (min toward -inf, max toward +inf) from the exact box, which the builder keeps in
-scratch, so the rounding does not add up from level to level. The rounding is integer code, because `packHalf2x16`
+is rounded outward to halves (min toward -inf, max toward +inf) from the exact box, which the builder keeps in its
+accumulators, so the rounding does not add up from level to level. The rounding is integer code, because `packHalf2x16`
 rounds in an implementation-defined way (AMD's driver rounds toward zero). Beyond the half range a bound becomes
 +-inf on its outward side and +-65504 on its inward side, so an empty slot (min +inf, max -inf) is still empty. A
 bound smaller than the smallest normal half (2^-14) in magnitude becomes 0 or +-2^-14, whichever is on its outward
@@ -936,14 +977,15 @@ switch for BOX16. The offline BLASes in the `*_bvh4.rpf` packs have BOX16 roots 
 choice between the two at run time is not traced. The one traced datum points at a finer rule: `docs/xdxr.md` §3
 finds a different bottom-level path that needs `MINIMIZE_MEMORY` and a stream setting (type 0, `+0x08`) above 10.0,
 so the flag alone may not be the switch. A bottom-level structure authored in world coordinates gets looser boxes
-from BOX16 the same way a top-level one would: slower to trace, never wrong. A BOX16 layout ends with one spare,
-zeroed 64-byte unit: the root is the last node, and the translator's `image_bvh_intersect_ray` loads a box node's
-112 bytes of BOX32 bounds before it checks the type, so a 64-byte root would otherwise be read past the structure.
+from BOX16 the same way a top-level one would: slower to trace, never wrong. A BOX16 build ends with one spare,
+zeroed 64-byte unit after the last node it wrote, and the header's size counts it: the translator's
+`image_bvh_intersect_ray` loads a box node's 112 bytes of BOX32 bounds before it checks the type, so the last
+64-byte node would otherwise be read past the structure, or past a compacted copy of it.
 
 **TRI1 pairing.** A bottom-level build without `ALLOW_UPDATE` pairs triangles into TRI0/TRI1 leaves, as the console
-builder does in its offline BLASes (§4a, check 4 of "How a match is verified"). The pass that writes the nodes just
-above the leaves pairs each triangle with a later sibling (among that node's at most four children) when four things
-hold. The two must share an edge in opposite directions, with the same two vertices bit for bit. They must come from
+builder does in its offline BLASes (§4a, check 4 of "How a match is verified"). The pass that writes the nodes
+pairs each triangle child of a node with a later triangle child of the same node (among its at most four children)
+when four things hold. The two must share an edge in opposite directions, with the same two vertices bit for bit. They must come from
 the same geometry, since a leaf holds one `GeometryIndexAndFlags`. And both must be active. The first triangle is
 rotated so the shared edge is slots 1 -> 2, the sibling's third vertex goes in slot 3, its primitive index in
 `PrimitiveIndex2`, and each node type's remap byte returns D3D12's barycentrics for its own vertex order. The node
@@ -952,15 +994,21 @@ sibling's own leaf is left unused. The tree, the layout and the sizes are theref
 Nothing is saved yet: reclaiming the unused leaves would need a compaction that moves records and rewrites pointers,
 and compaction here copies bytes. What pairing gives is the console's leaf format, with a pair's two triangles in
 one 64-byte record. Because pairs never cross nodes, one thread owns each leaf it rewrites, and both pointers of a
-pair have the same parent, so the parent table has one writer per entry. On a sorted grid of 7,200 triangles, 2,625
-of the 3,600 possible pairs form. A refit rewrites every leaf as one triangle, so a structure that may be updated is
+pair have the same parent, so the parent table has one writer per entry. The pass records each triangle's pointer
+(TRI0, or TRI1 for the sibling) in scratch, so the bottom-up box pass finds the sibling's slot through the first
+triangle's leaf. On a sorted grid of 7,200 triangles, 2,208 of the 3,600 possible pairs form (2,625 with the tree of four
+consecutive elements: a radix-tree node often has an inner node among its children, and only triangle children
+pair). A refit rewrites every leaf as one triangle, so a structure that may be updated is
 not paired. **ASSUMPTION:** that pairing only siblings is close enough. The console builder's pairing rule is not
 traced; `tools/xdxr_bvh.py` `build_blas(pair=True)` pairs greedily over the whole mesh instead, and both traverse
 the same way. `check-build` compares barycentrics as well as hits, and checks that a paired case has TRI1 nodes and
 that cases that must not pair (other geometry, same direction) have none.
 
-The tree's shape depends only on the element count. `XdxrLayout` therefore computes the result and scratch sizes
-exactly when the build is recorded, and the same numbers can answer `GetRaytracingAccelerationStructurePrebuildInfo`.
+The node count depends on the keys. A kept node has two children only when both of its binary children are
+elements, so with N elements there are at most (3N - 2) / 4 nodes. `XdxrLayout` computes the result and scratch
+sizes for that many when the build is recorded, and the same numbers answer
+`GetRaytracingAccelerationStructurePrebuildInfo`. The header's `totalSizeIn64BNodes` counts only the nodes the build
+wrote.
 A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with
 no BLAS and one with a singular transform. An instance record holds its BLAS address in 256-byte units in 32 bits,
 so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
@@ -975,23 +1023,25 @@ scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against br
 `xdxr_build` and `xdxr_build_check`.
 
 **Updates** (D3D12 `PERFORM_UPDATE`) refit: the source structure is copied to the destination unless it is the
-destination, the elements are rewritten at their slots, and each node's boxes are recomputed bottom-up from the
-children it already points to. The tree is kept, so a refit is valid for any motion and skips the Morton pass and
-the sort. It takes 0.07 ms for 1,000 triangles and 9.8 ms for 1,000,000 on an RTX 2050, against 0.19 ms and 22 ms for
-a build, but the tree traverses more slowly as the geometry moves away from where it was built.
+destination (as many bytes as its header gives, so a compacted source works too), the elements are rewritten at
+their slots, and each node's boxes are recomputed bottom-up from the children it already points to, through the
+parent table, by the same pass as a build. The tree is kept, so a refit is valid for any motion and skips the Morton pass and
+the sort. It took 0.07 ms for 1,000 triangles and 9.8 ms for 1,000,000 on an RTX 2050, against 0.19 ms and 22 ms for
+a build, with the tree of four consecutive elements (the radix tree's times are above). The tree traverses more
+slowly as the geometry moves away from where it was built.
 
 **Copies and postbuild info.** `CopyRaytracingAccelerationStructure` with `CLONE` or `COMPACT` copies the
 structure's bytes. The records are position-independent: node pointers count from the structure's start, and a TLAS
 names its BLASes by address, which a clone keeps. The size comes from the source header (`totalSizeIn64BNodes`), so
-a copy can follow a build in the same command list, and it is bounded by the destination resource. A build is
-already exactly its layout's size, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
+a copy can follow a build in the same command list, and it is bounded by the destination resource. A build's size
+is the nodes it wrote, so `COMPACTED_SIZE` and `CURRENT_SIZE` (from
 `EmitRaytracingAccelerationStructurePostbuildInfo` or the postbuild descs of a build) are both
-`64 * (totalSizeIn64BNodes + 1)`, and compaction saves nothing. Serialization, deserialization and the tools-visualization
+`64 * (totalSizeIn64BNodes + 1)`, and compaction gives back the room the layout left for more nodes. Serialization, deserialization and the tools-visualization
 mode are refused at replay as unsupported, not faked. In `LEONIDA_RT_AS=khr` mode the postbuild descs stay ignored,
 as before.
 
-Not done yet: serialization; a compaction that reclaims the leaves that pairing leaves unused. A higher-quality
-build (SAH) would also come later.
+Not done yet: serialization; a compaction that reclaims the leaves that pairing leaves unused. A surface-area
+collapse of the radix tree, or treelet restructuring, would trim a few more steps.
 
 ```powershell
 python -I tools/xdxr_bvh.py selftest --seed 1 --rays 400   # build BLASes, compare closest hits with brute force

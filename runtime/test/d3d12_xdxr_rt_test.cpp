@@ -383,9 +383,12 @@ int main(int argc, char** argv) {
         std::memcpy(sizes, p, sizeof sizes);
         info_rb->Unmap(0, nullptr);
     }
-    // the builds are exactly their prebuild size, so the compacted size is that size
-    if (sizes[0] != blas_info.ResultDataMaxSizeInBytes || sizes[1] != tlas_info.ResultDataMaxSizeInBytes ||
-        sizes[2] != tlas_info.ResultDataMaxSizeInBytes) {
+    // A build's size is the nodes it wrote, within the prebuild size (room for the most a tree of that many
+    // elements can have), and it is already as small as it gets: COMPACTED_SIZE and CURRENT_SIZE are that size. The
+    // same TLAS built twice has the same tree.
+    auto fits = [](UINT64 size, UINT64 max) { return size && size % 64 == 0 && size <= max; };
+    if (!fits(sizes[0], blas_info.ResultDataMaxSizeInBytes) || !fits(sizes[1], tlas_info.ResultDataMaxSizeInBytes) ||
+        sizes[2] != sizes[1]) {
         std::fprintf(stderr, "postbuild sizes %llu %llu %llu, prebuild %llu %llu\n",
                      static_cast<unsigned long long>(sizes[0]), static_cast<unsigned long long>(sizes[1]),
                      static_cast<unsigned long long>(sizes[2]),
@@ -440,7 +443,9 @@ int main(int argc, char** argv) {
         std::memcpy(&box16_size, p, 8);
         info_rb->Unmap(0, nullptr);
     }
-    if (box16_size != box16_info.ResultDataMaxSizeInBytes) return fail("MINIMIZE_MEMORY postbuild size");
+    // the nodes the build wrote and the spare unit, within the prebuild size and below the BOX32 build's own size
+    if (!box16_size || box16_size % 64 || box16_size > box16_info.ResultDataMaxSizeInBytes || box16_size >= sizes[0])
+        return fail("MINIMIZE_MEMORY postbuild size");
     if (!dump(box16_rb.p, box16_info.ResultDataMaxSizeInBytes, "d3d12_blas_box16",
               "{\"kind\": \"blas\", \"pairs\": false, \"box16\": true, \"address\": " +
                   std::to_string(box16_blas->GetGPUVirtualAddress()) +
