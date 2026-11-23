@@ -5720,7 +5720,7 @@ int main() {
                E_INVALIDARG && !refused_buffer.p);
 
         Ref<ID3D12Resource> rt_resource, packed565, ds, untouched, upload, readback, volume, line, line_array,
-            line_refused;
+            line_refused, line_target;
         D3D12_RESOURCE_DESC xbox_rt =
             texture_desc(size, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         xbox_rt.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
@@ -5753,10 +5753,11 @@ int main() {
         refused_line.Height = 2;
         EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
                !line_refused.p);
-        refused_line = line_shape;
-        refused_line.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        EXPECT(create(default_heap, refused_line, D3D12_RESOURCE_STATE_COMMON, line_refused) == E_INVALIDARG &&
-               !line_refused.p);
+        // A 1D render target is created, as the PC runtime does (d3d12_texture1d_target_test compares them).
+        auto line_target_shape = line_shape;
+        line_target_shape.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        EXPECT(SUCCEEDED(create(default_heap, line_target_shape, D3D12_RESOURCE_STATE_RENDER_TARGET, line_target)) &&
+               rt::d3d12::vulkan_image(line_target.p));
         EXPECT(rt_resource->GetDesc().Width == size && rt_resource->GetDesc().Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
         EXPECT(rt::d3d12::vulkan_image(rt_resource.p) && !rt::d3d12::vulkan_image(upload.p));
 
@@ -6889,7 +6890,7 @@ int main() {
         upload->Unmap(0, nullptr);
         readback->Unmap(0, nullptr);
         for (auto* r : {&rt_resource, &packed565, &ds, &untouched, &upload, &readback, &source, &whole, &part, &bc,
-                        &line, &line_array}) r->reset();
+                        &line, &line_array, &line_target}) r->reset();
         list7.reset();
         list.reset();
         allocator.reset();

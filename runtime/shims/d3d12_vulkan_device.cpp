@@ -1991,6 +1991,7 @@ public:
         binding.array_layers = info.arrayLayers;
         binding.depth = depth;
         binding.volume = volume;
+        binding.line = one_d;
         binding.samples = samples;
         binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
         binding.sampled = (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
@@ -7610,11 +7611,6 @@ private:
             log_once("committed resource dimension not supported:", desc->Dimension);
         } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc->Height != 1) {
             log_once("1D texture height must be 1:", int(desc->Height));
-            hr = E_INVALIDARG;
-        } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
-                   (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
-            log_once("1D texture cannot be an attachment, flags:", int(desc->Flags));
             hr = E_INVALIDARG;
         } else if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
                    (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {

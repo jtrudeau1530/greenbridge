@@ -382,10 +382,13 @@ What is implemented (all of it testable without the game):
   - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE2D`, `TEXTURE2DMS`,
     `TEXTURE2DARRAY` and `TEXTURE2DMSARRAY` (a slice range; `ArraySize` -1 is every slice from the first on, as
     on the host, `d3d12_view_slices_test`; 1D and 1D-array DSVs wait for 1D textures, D3D-63);
+  - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE1D`, `TEXTURE1DARRAY`,
+    `TEXTURE2D`, `TEXTURE2DMS`, `TEXTURE2DARRAY` and `TEXTURE2DMSARRAY` (a slice range);
   - `CopyDescriptors` / `CopyDescriptorsSimple`. A descriptor is the bytes of its slot, so a copy is a byte copy:
     the destination and source range lists are walked together, one descriptor at a time, and null size arrays
     mean one descriptor per range;
-  - committed buffers (upload and readback heaps mapped persistently and zeroed), 1D textures and 1D arrays, and
+  - committed buffers (upload and readback heaps mapped persistently and zeroed), 1D textures and 1D arrays (render
+    targets and depth-stencils too: their attachment views are `VK_IMAGE_VIEW_TYPE_1D_ARRAY`), and
     2D textures in the common render-target, depth and texture formats (typeless families become mutable-format
     images; `R24G8_TYPELESS` and `R32G8X24_TYPELESS` are depth-stencil images with or without
     `ALLOW_DEPTH_STENCIL`, as Vulkan has no colour format with their layout), plus non-attachment 3D textures with

@@ -439,6 +439,18 @@ dimension outside the enum must be refused alike. It also copies a pattern throu
 ```powershell
 $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_placed_dimensions_test.exe
+### 1D render targets and depth buffers
+
+`d3d12_texture1d_target_test` creates `TEXTURE1D` textures with `ALLOW_RENDER_TARGET` (10 color formats) or
+`ALLOW_DEPTH_STENCIL` (4 depth formats), one texture and a 6-layer array each, on the Vulkan-backed device, the
+hardware adapter and WARP. Where every reference creates one and the Vulkan device can make that 1D attachment image,
+the layer must create it and `GetResourceAllocationInfo` must answer a size. It then clears through `TEXTURE1D` and
+`TEXTURE1DARRAY` RTVs and DSVs (whole and with rectangles, on mips and slice ranges) and through a 1D UAV with a
+rectangle, and compares every subresource's bytes with WARP. It is registered in CTest (`d3d12_texture1d_target`).
+
+```powershell
+$env:LEONIDA_VK_VALIDATION = '1'
+.\runtime\build\RelWithDebInfo\d3d12_texture1d_target_test.exe
 ```
 
 ### Depth and stencil resolves

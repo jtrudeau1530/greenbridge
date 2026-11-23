@@ -1467,7 +1467,7 @@ private:
         if (const auto it = views_.find(key); it != views_.end()) return it->second;
         VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         info.image = r.image;
-        info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        info.viewType = r.line ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;  // 1D images take no 2D view
         info.format = r.format;
         info.subresourceRange = range;
         // Attachment views need only color-attachment usage. Inheriting STORAGE usage from a mutable/extended

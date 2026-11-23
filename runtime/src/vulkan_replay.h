@@ -78,6 +78,7 @@ struct ResourceBinding {
     std::uint64_t va = 0;              // a buffer's console VA (GetGPUVirtualAddress), for vertex/index views
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
+    bool line = false;                 // a 1D image (TEXTURE1D): its attachment views are 1D arrays
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
     bool typeless = false;  // A TYPELESS color resource: views name a format of its family (D3D-275).
     bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
