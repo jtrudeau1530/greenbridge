@@ -385,6 +385,20 @@ Scans of the inflated payloads found no `RSC7`, `RSC8`, `BVH4`, `BVH`, `0DRP`, `
 shared, 4 in story) and the strings inside those manifests, including the substring `bvh` in the per-tile
 `*_bvh.rpf` entries. No DXBC/DXIL shader container starts any chunk in the header census.
 
+### 3.5 The nested packs of core_bvh4.rpf
+
+`core_bvh4.rpf` is a container of nested files, not one pack. Its last streams hold a changeset (section 5) that
+registers 1,276 names. A nested file starts with a 16-byte entry header whose first four bytes are `9FPR`, then a
+TOC of `u32@+4` bytes, then its streams. The container's own header is at 0, outside the data area; the first nested
+entry is at `0x10000`, 0x200 bytes after the data-start and on a 64 KiB boundary. Entries are page aligned: of the
+1,282 `9FPR` tags in the data area, 1,281 are 16-byte aligned and 1,260 start a 4 KiB page. A filter on a plausible
+TOC size (`u32@+4` below `0x10000` with the entry template at `+0x18`) accepts 1,191 tags. That filter is narrower
+than a tag search, so 1,191 counts template matches, not packs.
+
+The counts do not reconcile: 1,276 names against 1,282 tags, 85 names without an entry and 6 tags without a name.
+The names stay encrypted and the TOCs are not decrypted, so a file is attached by position, not by name; the first
+changeset name is `int_abd_interiors` at the first entry.
+
 ## 4. Format family
 
 **Verified by bytes:** the archives are prebuilt BVH4-style acceleration data, not shader payloads and not a
@@ -633,6 +647,17 @@ the descriptor key at `+0x40` hashes; how the game picks the entity of a BLAS wh
 drawable match does it here); whether the game composes TLAS instances as `I * E * M^-1`; whether the runtime
 rehydrates these packs at all (above).
 
+## Where BLAS live
+
+* **Per stream:** the 208-byte instance descriptor immediately precedes its `bvh4` stream, 269,106 of 269,106 in
+  `core_bvh4.rpf` (section 3.2).
+* **Per interior:** one interior file is one cell and holds only the entities that have their own acceleration
+  structure. The §4a sample's first file is exactly ten pairs, and its other entities' streams lie in 31 other
+  packs (§4a). The BLAS itself stores no interior or entity list, so placing an interior's pieces needs its entity
+  list (`CMloArchetypeDef`, #1981).
+* **Per tile:** the nested files are per tile; the final changeset lists the `*_bvh.rpf` packs per tile and
+  `story000_bvh4.rpf` registers them without data (section 5).
+
 ## 5. Cross-check of the small packs
 
 Both small packs are ordinary RPF9 files with the same header, zlib streams and zero padding.
@@ -658,6 +683,8 @@ into three 64 KiB/26 KiB chunks. These list the per-tile BVH packs; they are the
    269,106/269,106 cases. The 2,531 instance descriptors with N > 1 precede the other 2,531 BVH streams, each of
    which holds N BLAS back to back at the offsets the descriptor's entries give (§3.2a); read all of them, not only
    the header at `0x100`. The 22,301 table descriptors own no BVH buffer.
+3. **Pair descriptor to buffer.** The other descriptor sizes account for 2,528 more BVH buffers; 3 more are preceded
+   by other streams. The 208-byte pairing is in "Where BLAS live".
 4. **Parse the header, then stop guessing.** The exact header table, node pointer encoding and runtime
    `Node16`/`Node32`/`Leaf` records are in section 3.1, and the dehydrated element and box packing in §4a; do not
    infer a runtime child array from the `0x140` slot space.
