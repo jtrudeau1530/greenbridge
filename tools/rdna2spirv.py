@@ -3418,6 +3418,20 @@ class Gen:
             self.emit(f"{sum3} = OpIAdd %uint {sum_} {self.cu(3)}")
             self.emit(f"{n2} = OpShiftRightLogical %uint {sum3} {self.cu(2)}")
             self.emit(f"{need} = OpSelect %uint {known} {n2} {self.cu(1)}")
+        # Two-byte typed loads at odd effective addresses read like out-of-bounds
+        # loads, including the descriptor's constant channel selectors.
+        if fixed_fmt is None or self.FORMATS.get(fixed_fmt, (0,))[0] == 2:
+            low_bit, even = self.tmp(), self.tmp()
+            self.emit(f"{low_bit} = OpBitwiseAnd %uint {alo} {self.cu(1)}")
+            self.emit(f"{even} = OpIEqual %bool {low_bit} {self.cu(0)}")
+            permitted = even
+            if fixed_fmt is None:
+                other_size, permitted = self.tmp(), self.tmp()
+                self.emit(f"{other_size} = OpINotEqual %bool {size} {self.cu(2)}")
+                self.emit(f"{permitted} = OpLogicalOr %bool {other_size} {even}")
+            accessible = self.tmp()
+            self.emit(f"{accessible} = OpLogicalAnd %bool {in_b} {permitted}")
+            in_b = accessible
         cond = self.tmp()
         self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
         lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
