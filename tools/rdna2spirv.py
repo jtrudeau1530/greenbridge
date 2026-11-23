@@ -6041,8 +6041,10 @@ class Gen:
     def f64_source_words(self, src: dict, op: str) -> tuple[str, str]:
         if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
             return self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
-        if src.get("f64_literal"):
+        if src.get("f64_literal") and -0x80000000 <= src["v"] <= 0xFFFFFFFF:
+            # One literal dword: bits 63:32 of the constant (docs/design.md, f64 literal sources).
             return self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
+        # A wider literal is LLVM's two-dword form, so both words of it are the constant: fall through.
         if src["k"] == "fimm":
             bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
         elif src["k"] == "imm":
@@ -7693,12 +7695,13 @@ class Gen:
             elif src["k"] == "fimm":
                 bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
                 low, high = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            elif src.get("f64_literal"):
-                if not 0 <= src["v"] <= 0xFFFFFFFF:
-                    raise Unsupported(op + " literal")
+            elif src.get("f64_literal") and -0x80000000 <= src["v"] <= 0xFFFFFFFF:
+                # One literal dword: bits 63:32 of the constant (docs/design.md, f64 literal sources).
                 low, high = self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
-            elif src["k"] == "imm" and -16 <= src["v"] <= 64:
-                low, high = self.cu(src["v"] & 0xFFFFFFFF), self.cu(0xFFFFFFFF if src["v"] < 0 else 0)
+            elif src["k"] == "imm" and (-16 <= src["v"] <= 64 or src.get("f64_literal")):
+                # An inline integer is sign-extended; a wider literal is LLVM's two-dword form, both words the constant.
+                bits = src["v"] & 0xFFFFFFFFFFFFFFFF
+                low, high = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
             else:
                 raise Unsupported(op + " source")
             if src.get("abs"):
