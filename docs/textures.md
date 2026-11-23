@@ -999,7 +999,15 @@ than four distinct byte values; the other 36 start with near-constant bytes and 
 
 Sizes of the 121: 62 below 64 KiB, 16 of exactly 64 KiB, 32 from 64 KiB to 16 MiB, 11 of 16 MiB or more. So,
 apart from one 4 KiB stream, the opaque data of `textures.rpf` is not pool texture data, and three of the large
-streams share a long identical start with a pool chunk and then diverge (not traced here). Method: the carve's
+streams share a long identical start with a pool chunk and then diverge.
+
+Following them past the divergence with an in-order alignment (extend identical runs; on a mismatch, resync on a
+64-byte piece of the chunk taken up to 64 KiB ahead, found within the next 256 KiB of the stream): in the 6 MiB and
+32 MiB streams, five different 4 MiB `data/ttdb` chunks each reappear in order for 65.8% to 97.5% of their bytes,
+in short runs broken by 164 to 1,007 gaps, while the stream advances about 1.4 to 1.5 times the chunk's length; in
+the 12 MiB stream only 8.6%. That five different chunks align this well with the same two streams says the chunks
+are alike among themselves, so repetitive content may account for part of it: this measures shared runs, not a
+copy, and what the streams are remains open. Method: the carve's
 inflated streams and `tools/ttpf_mips.py`'s `Pool` chunk table; counts only.
 
 Not measured here (hypothesis): what the 1,313 texture pairs are keyed by, and whether the format codes are
