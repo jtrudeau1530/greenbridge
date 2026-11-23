@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -446,7 +447,44 @@ class CliBadInputTest(unittest.TestCase):
             # and no SPIR-V tools on PATH.
             self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names,
                                              path=os.path.join(tmp, "empty-path")), "spirv-as")
+            self.assertFalse(os.path.exists(out))     # the output folder this run made is removed again
+            # An output folder that already existed stays, with what this run put in it removed.
+            os.makedirs(out)
+            self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names,
+                                             path=os.path.join(tmp, "empty-path")), "spirv-as")
+            self.assertEqual(os.listdir(out), [])
 
+    def test_assembler_failure_preserves_concurrent_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "spirv").mkdir()
+            (root / "spirv/index.json").write_text("{}", encoding="utf-8")
+            disasm = root / "dxbc/disasm"
+            disasm.mkdir(parents=True)
+            (disasm / "one.s").write_text("s_endpgm\n", encoding="utf-8")
+            names = root / "names.txt"
+            names.write_text("one\n", encoding="utf-8")
+
+            for preexisting in (True, False):
+                with self.subTest(preexisting=preexisting):
+                    out = root / ("existing" if preexisting else "fresh")
+                    if preexisting:
+                        out.mkdir()
+                    sibling = out / "other-job.txt"
+
+                    def fail_assembler(command, **kwargs):
+                        self.assertEqual(command[0], "spirv-as")
+                        out.mkdir(exist_ok=True)
+                        sibling.write_bytes(b"other job")
+                        raise subprocess.CalledProcessError(1, command)
+
+                    with patch.object(AB.subprocess, "run", side_effect=fail_assembler), \
+                            contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
+                            self.assertRaises(SystemExit) as raised:
+                        AB.main([tmp, tmp, str(out), "--names", str(names)])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertTrue(sibling.is_file(), "cleanup deleted concurrent output")
+                    self.assertEqual(sibling.read_bytes(), b"other job")
 
     def test_bad_index_shape_and_stale_names_leave_no_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -454,7 +492,8 @@ class CliBadInputTest(unittest.TestCase):
             os.makedirs(os.path.join(shaders, "spirv"))
             index = os.path.join(shaders, "spirv", "index.json")
             out = os.path.join(tmp, "out")
-            for payload in ("[]", '{"one": []}'):
+            for payload in ("[]", '{"one": []}', '{"one": {"bindings": 5}}', '{"one": {"features": "x"}}',
+                            '{"one": {"bindings": [[0]]}}', '{"one": {"features": {"a": 1}}}'):
                 with open(index, "w", encoding="utf-8", newline="\n") as f:
                     f.write(payload)
                 self.check_one_line(self.run_cli(tmp, shaders, out), "metadata")
@@ -467,6 +506,57 @@ class CliBadInputTest(unittest.TestCase):
                     f.write(payload)
                 self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names), "cannot read selected")
                 self.assertFalse(os.path.exists(out))
+
+    def test_unreadable_output_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            os.makedirs(os.path.join(shaders, "dxbc", "disasm"))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("one\n")
+            with open(os.path.join(shaders, "dxbc", "disasm", "one.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("s_endpgm\n")
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            # Listing the folder fails (what a mode 000 folder does to a non-root user, injected so that it also
+            # runs as root and on Windows).
+            real_listdir = os.listdir
+
+            def listdir(path="."):
+                if os.fspath(path) == out:
+                    raise PermissionError(13, "Permission denied", out)
+                return real_listdir(path)
+            stderr = io.StringIO()
+            with patch("os.listdir", listdir), contextlib.redirect_stderr(stderr), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                AB.main([tmp, shaders, out, "--names", names])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("cannot create", stderr.getvalue())
+
+    @unittest.skipIf(os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0,
+                     "mode 000 does not stop root or Windows")
+    def test_mode_000_output_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "shaders")
+            os.makedirs(os.path.join(shaders, "spirv"))
+            os.makedirs(os.path.join(shaders, "dxbc", "disasm"))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("one\n")
+            with open(os.path.join(shaders, "dxbc", "disasm", "one.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("s_endpgm\n")
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            os.chmod(out, 0)
+            try:
+                self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names), "cannot create")
+            finally:
+                os.chmod(out, 0o700)
 
 
 class ResultClassificationTest(unittest.TestCase):
