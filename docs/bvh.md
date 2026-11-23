@@ -399,7 +399,10 @@ to a half in most cases).
   30,574 streams, so this interior is about 0.4 % of it. A pack is therefore not one block per interior: the 10
   drawables of the table above (from the base list and two entity sets) open the pack, and the interior's other 115
   archetypes with a BLAS are some 231,000 streams later, among streams this measurement does not attribute; no
-  archetype has a stream in both places.
+  archetype has a stream in both places. The data area also holds 1,282 `9FPR` tags after the file's own (1,281 of
+  them 16-byte aligned), which read as nested packs: taking each tag as the start of one, the first 10 streams are
+  the whole first nested pack, and the other 121 lie in 31 other packs, up to 19 in one; one archetype has streams
+  in two of them.
 * **The light proxy.** 21 streams fit its 2-triangle drawable, 20 of them with the same header, one of which is
   stream 4; a quad of that size cannot be told from another drawable's.
 * **No BLAS.** Of the 16 exported archetypes without one, 11 have only geometries whose shaders the matched drawables
