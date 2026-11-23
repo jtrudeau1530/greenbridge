@@ -620,6 +620,43 @@ class OperandClassificationTests(unittest.TestCase):
             with self.subTest(build=build):
                 self.assertEqual(self._literal_samplers_with(build), [[0x92, want, 0, 0]])
 
+    def test_shift_bitfield_min_max_abs_fold_into_literal_sampler(self):
+        # s_ashr_i32, s_bfm_b32, s_bfe_u32, s_min_u32, s_max_u32 and s_abs_i32 of known constants give a known
+        # constant. The expected values are the ones the translator computes for immediates (rdna2spirv.py).
+        cases = [
+            (["s_ashr_i32 s13, s8, 4"], 0xF8000000),          # the sign bit comes in from the left
+            (["s_ashr_i32 s13, s9, 4"], 0x0000000F),
+            (["s_ashr_i32 s13, s8, 36"], 0xF8000000),         # the shift count is taken modulo 32
+            (["s_bfm_b32 s13, 4, 8"], 0x00000F00),            # width 4, offset 8
+            (["s_bfm_b32 s13, 0, 8"], 0x00000000),
+            (["s_bfm_b32 s13, 31, 1"], 0xFFFFFFFE),
+            (["s_bfe_u32 s13, s9, 0x40004"], 0x0000000F),     # offset 4, width 4
+            (["s_bfe_u32 s13, s8, 0x20001f"], 0x00000001),    # offset 31, width 32: the field stops at bit 31
+            (["s_bfe_u32 s13, s9, 0x4"], 0x00000000),         # width 0
+            (["s_min_u32 s13, s9, 0x10"], 0x00000010),
+            (["s_min_u32 s13, s8, s9"], 0x000000F0),          # unsigned: 0x80000000 is the larger value
+            (["s_max_u32 s13, s9, 0x10"], 0x000000F0),
+            (["s_max_u32 s13, s8, s9"], 0x80000000),
+            (["s_abs_i32 s13, s9"], 0x000000F0),
+            (["s_abs_i32 s13, -16"], 0x00000010),
+            (["s_abs_i32 s13, s8"], 0x80000000),              # the most negative value has no positive form
+        ]
+        for build, want in cases:
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [[0x92, want, 0, 0]])
+
+    def test_shift_bitfield_min_max_abs_of_unknown_source_is_not_a_literal(self):
+        for build in (["s_ashr_i32 s13, s3, 4"],
+                      ["s_mov_b32 s13, 0", "s_ashr_i32 s13, s9, s3"],
+                      ["s_bfm_b32 s13, s3, 8"],
+                      ["s_bfe_u32 s13, s3, 0x40004"],
+                      ["s_bfe_u32 s13, s9, s3"],
+                      ["s_min_u32 s13, s9, s3"],
+                      ["s_max_u32 s13, s3, s9"],
+                      ["s_mov_b32 s13, 0", "s_abs_i32 s13, s3"]):
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [])
+
     def test_inverted_scalar_logic_of_unknown_source_is_not_a_literal(self):
         # A source that is not a known constant (the user SGPR s3) must not give a literal sampler, also when the
         # destination held a known constant before the operation.

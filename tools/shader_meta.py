@@ -204,6 +204,21 @@ def _fold_scalar_alu(op, x, y):
         return (x & 0xFFFFFFFF) >> (y & 31)
     if op == "s_mul_i32":
         return (x * y) & 0xFFFFFFFF
+    if op == "s_ashr_i32":
+        signed = x - 0x100000000 if x & 0x80000000 else x
+        return (signed >> (y & 31)) & 0xFFFFFFFF
+    if op == "s_bfm_b32":
+        # A mask of (x & 31) ones, shifted left by (y & 31).
+        return (((1 << (x & 31)) - 1) << (y & 31)) & 0xFFFFFFFF
+    if op == "s_bfe_u32":
+        # y packs the offset in bits [4:0] and the width in bits [22:16]; the field stops at bit 31.
+        offset = y & 31
+        width = min((y >> 16) & 0x7F, 32 - offset)
+        return ((x & 0xFFFFFFFF) >> offset) & ((1 << width) - 1)
+    if op == "s_min_u32":
+        return min(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
+    if op == "s_max_u32":
+        return max(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
     return None
 
 
@@ -351,6 +366,11 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
         c = _const_of(sym, a[1])
         if c is not None:
             new_sym[a[0]["r"]] = ("const", ~c & 0xFFFFFFFF)
+    elif op == "s_abs_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+        c = _const_of(sym, a[1])
+        if c is not None:
+            signed = c - 0x100000000 if c & 0x80000000 else c
+            new_sym[a[0]["r"]] = ("const", abs(signed) & 0xFFFFFFFF)  # abs(0x80000000) stays 0x80000000
     elif op == "v_readfirstlane_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         if a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1 and a[1]["r"] in vscale:
             new_scale[a[0]["r"]] = vscale[a[1]["r"]]
@@ -405,8 +425,8 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             # High-dword carry-add on a zeroed upper word (descriptor table truncated below 4 GB).
             new_sym[d] = ("const", 0)
     elif op in ("s_lshl_b32", "s_lshr_b32", "s_mul_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
-                "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32") and len(a) >= 3 \
-            and a[0]["k"] == "sgpr":
+                "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_ashr_i32",
+                "s_bfm_b32", "s_bfe_u32", "s_min_u32", "s_max_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
         d = a[0]["r"]
         cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
         if cx is not None and cy is not None:
