@@ -53,6 +53,17 @@ This page collects the setup steps and the problems testers have run into so far
 
 ## Build the test programs
 
+On a Windows runtime build with Vulkan enabled, CMake only registers `d3d12_translated_draw`, `d3d12_m2_textured`,
+`d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m4_compute` and `d3d12_buffer_uav` when it finds `llvm-mc`,
+`spirv-as` and `spirv-val`. It registers `d3d12_subgroup` only when it finds `llvm-mc` and `glslangValidator`.
+Without `glslangValidator`, other tests are also omitted, including `d3d12_compute`, `d3d12_draw`,
+`d3d12_set0_compute` and `d3d12_mesh`; some registered tests run only part of their checks. These tests can be
+**absent**, not reported as skipped, when their build prerequisites are missing, so a passing `ctest` percentage
+alone does not establish that they ran. Check the CMake configure messages and list the
+configured tests with `ctest --test-dir runtime/build -C RelWithDebInfo -N` before comparing test counts. After
+installing missing tools, rerun CMake in an environment where they are visible and rebuild.
+
+
 Windows, from a "Developer PowerShell for VS 2022" or a plain shell:
 
 ```powershell
