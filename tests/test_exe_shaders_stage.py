@@ -282,6 +282,17 @@ class ExeStage(unittest.TestCase):
         self.assertEqual(self.run_step(), TOOLS)
         self.assertEqual(self.run_step(), [])
 
+    def test_empty_cached_index_is_rebuilt(self):
+        """A cached index.json with no usable entries ({} or all error entries) must not be reused as finished."""
+        self.assertEqual(self.run_step(), TOOLS)
+        for bad_index in ("{}", '{"container_00": {"error": "ValueError: synthetic"}}'):
+            with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(bad_index)
+            self.assertEqual(self.run_step(), TOOLS)
+            self.assertIn(f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated", self.logs)
+            self.assertEqual(self.run_step(), [])
+            self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated"])
+
 
 class ShadersStageWithTheExe(unittest.TestCase):
     """The whole shaders() stage with both DLLs and the executable: exe_shaders() runs last and runs alone when only
