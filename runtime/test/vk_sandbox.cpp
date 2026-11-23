@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -144,7 +145,7 @@ struct Ground {
     float cell = 4, x0 = 0, y0 = 0;
     int nx = 0, ny = 0;
     std::vector<std::vector<float>> tris;   // per cell: 9 floats a triangle
-    void build(const Scene& s) {
+    explicit Ground(const Scene& s) {
         float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
         std::vector<float> all;
         for (const Draw& d : s.draws) {
@@ -639,7 +640,7 @@ int main(int argc, char** argv) {
     if (make_swap() < 0) { std::fprintf(stderr, "cannot create a swapchain (TRANSFER_DST unsupported?)\n"); return 1; }
     VkSemaphoreCreateInfo semi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkSemaphore acquired; CHECK(vkCreateSemaphore(dev, &semi, nullptr, &acquired));
-    Ground ground; ground.build(scene);
+    std::optional<Ground> ground;
     auto last = std::chrono::steady_clock::now();
     bool shot_held = false;
     int frame = 0;
@@ -662,6 +663,10 @@ int main(int argc, char** argv) {
             cam.pos[0] += r[0] * side * v; cam.pos[1] += r[1] * side * v;
             cam.pos[2] += (float(key('E')) - float(key('Q'))) * v;
         } else {
+            if (!ground) {
+                ground.emplace(scene);
+                last = std::chrono::steady_clock::now();  // Exclude grid construction from the next movement step.
+            }
             const float h = std::hypot(f[0], f[1]) > 1e-4f ? std::hypot(f[0], f[1]) : 1;
             if (cam.mode == 1) cam.speed = fwd * (key(VK_SHIFT) ? 7.f : 2.5f);
             else { cam.speed += fwd * 12.f * dt; cam.speed *= std::pow(0.6f, dt); cam.yaw -= side * dt * std::clamp(cam.speed / 10.f, -1.f, 1.f); }
@@ -669,7 +674,7 @@ int main(int argc, char** argv) {
             if (cam.mode == 1) { cam.pos[0] += r[0] * side * 2.5f * dt; cam.pos[1] += r[1] * side * 2.5f * dt; }
             const float eye = cam.mode == 1 ? 1.7f : 1.2f;
             float gz;
-            if (ground.height(cam.pos[0], cam.pos[1], cam.pos[2] - eye + 0.6f, gz)) cam.pos[2] = gz + eye;
+            if (ground->height(cam.pos[0], cam.pos[1], cam.pos[2] - eye + 0.6f, gz)) cam.pos[2] = gz + eye;
         }
         uint32_t idx = 0;
         if (!swap) {   // minimised at start or since the last resize
