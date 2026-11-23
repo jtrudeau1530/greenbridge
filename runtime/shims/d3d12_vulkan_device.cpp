@@ -5262,9 +5262,8 @@ public:
         auto& vk = state_.context->vk;
         if (desc && state_.context->xdxr_acceleration_structures()) {
             // XDXR records: the layout depends only on the triangle or instance count and on whether the nodes are
-            // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h). Its size has room for the most nodes a tree of
-            // that many elements can have; a build's own size, in its header, is what COMPACTED_SIZE reports. An
-            // update refits (no sort); the build's scratch size covers it.
+            // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h), so the sizes are exact. An update refits (no
+            // sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
             build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
             if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
