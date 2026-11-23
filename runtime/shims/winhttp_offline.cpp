@@ -34,6 +34,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 
 #include "shims.h"
 
@@ -114,12 +115,17 @@ void release(Handle* h) {
     }
 }
 
-HINTERNET make_handle(Kind kind, Handle* parent, bool async) {
+HINTERNET make_handle(Kind kind, Handle* parent, bool async, LPCWSTR server = nullptr, INTERNET_PORT port = 0) {
+    std::wstring host = server ? server : L"";
     auto* h = new (std::nothrow) Handle;
     if (!h) {
+        if (parent) release(parent);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
     }
+    // Publish connection metadata before live() / HANDLE_CREATED: the callback can use or close the handle inline.
+    h->server = std::move(host);
+    h->port = port;
     h->kind = kind;
     h->parent = parent;
     h->async = async;
@@ -136,8 +142,15 @@ HINTERNET make_handle(Kind kind, Handle* parent, bool async) {
         live().insert(h);
     }
     if (parent) {
+        h->refs.fetch_add(1);  // held while HANDLE_CREATED runs, so HANDLE_CLOSING comes after it
         HINTERNET self = to_hinternet(h);
         notify(h, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED, &self, sizeof(self));
+        const bool closed = h->closed.load();
+        release(h);
+        if (closed) {
+            SetLastError(ERROR_WINHTTP_OPERATION_CANCELLED);
+            return nullptr;
+        }
     }
     return to_hinternet(h);
 }
@@ -194,15 +207,7 @@ HINTERNET WINAPI open_connection(HINTERNET session, LPCWSTR server, INTERNET_POR
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    const HINTERNET h = make_handle(Kind::Connect, s, s->async);  // keeps the reference on the session
-    if (!h) {
-        release(s);
-        return nullptr;
-    }
-    auto* c = reinterpret_cast<Handle*>(h);
-    c->server = server;
-    c->port = port;
-    return h;
+    return make_handle(Kind::Connect, s, s->async, server, port);  // keeps the reference on the session
 }
 
 HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD) {
@@ -212,9 +217,7 @@ HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR, LPCWSTR, L
         SetLastError(error);
         return nullptr;
     }
-    const HINTERNET h = make_handle(Kind::Request, c, c->async);  // keeps the reference on the connection
-    if (!h) release(c);
-    return h;
+    return make_handle(Kind::Request, c, c->async);  // keeps the reference on the connection
 }
 
 BOOL WINAPI send_request(HINTERNET request, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR context) {

@@ -5,6 +5,9 @@
 // the only host WinHTTP call the shims make is WinHttpCrackUrl, which parses a string.
 #include <windows.h>
 #include <winhttp.h>
+#include <fcntl.h>
+#include <io.h>
+#include <string>
 
 #include <atomic>
 #include <chrono>
@@ -43,6 +46,108 @@ void check(bool condition, const char* what) {
 template <typename Fn>
 Fn resolve(const char* name) {
     return reinterpret_cast<Fn>(rt::shims::find("winhttp.dll", name));
+}
+
+struct StderrCapture {
+    int saved_fd = -1;
+    int read_fd = -1;
+
+    StderrCapture() {
+        std::fflush(stderr);
+        const int stderr_fd = _fileno(stderr);
+        int fds[2] = {-1, -1};
+        if (stderr_fd < 0 || _pipe(fds, 4096, _O_TEXT) != 0) return;
+        const int dup_saved = _dup(stderr_fd);
+        if (dup_saved < 0 || _dup2(fds[1], stderr_fd) != 0) {
+            if (dup_saved >= 0) _close(dup_saved);
+            _close(fds[0]);
+            _close(fds[1]);
+            return;
+        }
+        _close(fds[1]);
+        saved_fd = dup_saved;
+        read_fd = fds[0];
+    }
+
+    ~StderrCapture() { stop(); }
+
+    std::string stop() {
+        std::string out;
+        if (saved_fd >= 0) {
+            std::fflush(stderr);
+            _dup2(saved_fd, _fileno(stderr));
+            _close(saved_fd);
+            saved_fd = -1;
+        }
+        if (read_fd >= 0) {
+            char buf[512];
+            for (;;) {
+                const int n = _read(read_fd, buf, static_cast<unsigned int>(sizeof(buf)));
+                if (n <= 0) break;
+                out.append(buf, static_cast<size_t>(n));
+            }
+            _close(read_fd);
+            read_fd = -1;
+        }
+        return out;
+    }
+};
+
+struct CreatedRequestProbe {
+    OpenRequestFn open_request = nullptr;
+    SendRequestFn send = nullptr;
+    CloseHandleFn close = nullptr;
+    int created_calls = 0;
+    HINTERNET created_handle = nullptr;
+    HINTERNET request_handle = nullptr;
+    BOOL send_result = TRUE;
+    DWORD send_error = 0;
+    BOOL request_closed = FALSE;
+};
+CreatedRequestProbe* g_created_probe = nullptr;
+
+void CALLBACK on_created_send_request(HINTERNET handle, DWORD_PTR, DWORD status, LPVOID, DWORD) {
+    if (status != WINHTTP_CALLBACK_STATUS_HANDLE_CREATED || !g_created_probe) return;
+    CreatedRequestProbe& p = *g_created_probe;
+    if (p.created_calls++ != 0) return;
+    p.created_handle = handle;
+    p.request_handle = p.open_request(handle, L"GET", L"/created", nullptr, WINHTTP_NO_REFERER,
+                                      WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (p.request_handle) {
+        SetLastError(0);
+        p.send_result = p.send(p.request_handle, nullptr, 0, nullptr, 0, 0, 0);
+        p.send_error = GetLastError();
+        p.request_closed = p.close(p.request_handle);
+    }
+}
+
+struct CreatedCloseProbe {
+    CloseHandleFn close = nullptr;
+    int created_calls = 0;
+    int closing_calls = 0;
+    bool in_created = false;
+    bool closing_during_created = false;
+    HINTERNET created_handle = nullptr;
+    HINTERNET closing_handle = nullptr;
+    BOOL close_result = FALSE;
+};
+CreatedCloseProbe* g_close_probe = nullptr;
+
+void CALLBACK on_created_close_handle(HINTERNET handle, DWORD_PTR, DWORD status, LPVOID info, DWORD length) {
+    if (!g_close_probe) return;
+    CreatedCloseProbe& p = *g_close_probe;
+    if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CREATED) {
+        ++p.created_calls;
+        p.created_handle = handle;
+        p.in_created = true;
+        if (p.close) p.close_result = p.close(handle);
+        p.in_created = false;
+    } else if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING && info && length == sizeof(HINTERNET) &&
+               *static_cast<HINTERNET*>(info) == handle) {
+        if (p.in_created) p.closing_during_created = true;
+        ++p.closing_calls;
+        p.closing_handle = handle;
+    }
 }
 
 // What the status callback saw, for the asynchronous checks.
@@ -491,6 +596,56 @@ int main() {
                   parts.nScheme == INTERNET_SCHEME_HTTPS && std::wcscmp(host, L"example.invalid") == 0 &&
                   std::wcscmp(path, L"/a/b") == 0,
               "WinHttpCrackUrl parses a URL");
+    }
+
+    // Sending a request from inside HANDLE_CREATED must see the connection's server and port already initialized.
+    {
+        CreatedRequestProbe probe{open_request, send, close};
+        g_created_probe = &probe;
+        const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        check(set_callback(session, &on_created_send_request, WINHTTP_CALLBACK_FLAG_HANDLES, 0) == nullptr,
+              "HANDLE_CREATED probe callback registers");
+        StderrCapture capture;
+        const HINTERNET connection = connect(session, L"created-cb.invalid", 8443, 0);
+        const std::string logged = capture.stop();
+        g_created_probe = nullptr;
+        check(connection != nullptr && probe.created_handle == connection && probe.request_handle != nullptr &&
+                  probe.send_result == FALSE && probe.send_error == ERROR_WINHTTP_CANNOT_CONNECT &&
+                  probe.request_closed != FALSE,
+              "request sent during connection HANDLE_CREATED fails with ERROR_WINHTTP_CANNOT_CONNECT");
+        check(logged.find("[rt] winhttp: offline, refused created-cb.invalid:8443") != std::string::npos &&
+                  logged.find("[rt] winhttp: offline, refused :0") == std::string::npos,
+              "refused-server log inside HANDLE_CREATED records server:port instead of :0");
+        close(connection);
+        close(session);
+    }
+
+    // Closing the connection handle inside HANDLE_CREATED must not trigger a use-after-free, must report
+    // HANDLE_CLOSING after HANDLE_CREATED returns, and must fail WinHttpConnect with ERROR_WINHTTP_OPERATION_CANCELLED
+    // (measured against the host's winhttp.dll on Windows 11 26200).
+    {
+        CreatedCloseProbe probe{close};
+        g_close_probe = &probe;
+        const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        check(set_callback(session, &on_created_close_handle, WINHTTP_CALLBACK_FLAG_HANDLES, 0) == nullptr,
+              "HANDLE_CREATED close callback registers");
+        SetLastError(0);
+        const HINTERNET connection = connect(session, L"closed-in-handle-created-callback-long-host.invalid", 8443, 0);
+        const DWORD connect_error = GetLastError();
+        g_close_probe = nullptr;
+        check(connection == nullptr && connect_error == ERROR_WINHTTP_OPERATION_CANCELLED &&
+                  probe.created_calls == 1 && probe.created_handle != nullptr && probe.close_result != FALSE &&
+                  !probe.closing_during_created && probe.closing_calls == 1 &&
+                  probe.closing_handle == probe.created_handle,
+              "closing connection handle inside HANDLE_CREATED reports HANDLE_CLOSING after HANDLE_CREATED and fails with ERROR_WINHTTP_OPERATION_CANCELLED");
+        SetLastError(0);
+        check(close(probe.created_handle) == FALSE && GetLastError() == ERROR_INVALID_HANDLE,
+              "connection handle closed inside HANDLE_CREATED is already invalid after WinHttpConnect returns");
+        g_close_probe = &probe;
+        const BOOL session_closed = close(session);
+        g_close_probe = nullptr;
+        check(session_closed != FALSE && probe.closing_calls == 2 && probe.closing_handle == session,
+              "closing session afterwards drops the last reference and reports HANDLE_CLOSING once");
     }
 
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
