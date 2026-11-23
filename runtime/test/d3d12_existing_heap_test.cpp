@@ -173,7 +173,11 @@ int check_import(ID3D12Device* device, bool supported) {
 // pattern is written after the buffer exists and read back through a READBACK buffer. Checked on a VirtualAlloc range
 // and on a view of a pagefile-backed section, the form xmem's physical pages are mapped in. A texture is E_NOTIMPL
 // and an address off the import alignment E_INVALIDARG.
-int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size) {
+// `may_refuse`: the driver is allowed to refuse importing these pages, and the layer then answers with its fallback.
+// RADV imports host memory through amdgpu userptr, which takes anonymous memory only, so it refuses a view of a
+// pagefile-backed section with EPERM (measured on an RX 9060 XT under Wine, found in review), while NVIDIA and
+// AMD's Windows driver import it. The fallback is checked to exist; the readback below needs the import.
+int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size, bool may_refuse = false) {
     const char* who = "vulkan slot-133 buffer";
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -183,6 +187,11 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     Ref<ID3D12Resource> buffer;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
+    if (may_refuse && buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages)) {
+        std::printf("%s: %s, %llu bytes: this driver refused the import; the fallback resource answered\n", who, kind,
+                    static_cast<unsigned long long>(size));
+        return 0;
+    }
     EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
     auto* bytes = static_cast<std::uint8_t*>(pages);
     for (UINT64 i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(i * 131u + 7u);
@@ -248,7 +257,7 @@ int check_title_placed_all(ID3D12Device* device) {
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
     if (!view) return failures + 1;
-    failures += check_title_placed(device, "section view", view, size);
+    failures += check_title_placed(device, "section view", view, size, /*may_refuse=*/true);
     UnmapViewOfFile(view);
     CloseHandle(section);
 
