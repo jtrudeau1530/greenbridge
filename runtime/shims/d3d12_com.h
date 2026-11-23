@@ -183,6 +183,10 @@ struct VulkanDeviceInfo {
     // colours fall back to transparent black.
     bool custom_border_color = false;
     bool custom_border_color_without_format = false;
+    // VK_EXT_external_memory_host is enabled on `device` when this is non-zero (its
+    // minImportedHostPointerAlignment): OpenExistingHeapFromAddress backs a heap with the caller's own committed
+    // memory. Zero: existing heaps stay unsupported.
+    VkDeviceSize host_pointer_alignment = 0;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
