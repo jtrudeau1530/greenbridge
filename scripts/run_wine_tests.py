@@ -368,7 +368,7 @@ def main() -> int:
                 for line in detail.rstrip().splitlines()[-40:]:
                     print(f"    {line}")
 
-    missing = [n for n in args.require if n not in results]
+    missing = list(dict.fromkeys(n for n in args.require if n not in results))
     failed_required = [n for n in args.require if results.get(n) != "pass"]
     counts = {s: sum(1 for v in results.values() if v == s) for s in ("pass", "fail", "skip")}
     print(f"\n{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped under Wine "
@@ -387,6 +387,9 @@ def main() -> int:
                 f.write("| Test | Result | Required |\n|---|---|---|\n")
                 for name, status in results.items():
                     f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
+                for name in missing:
+                    # The job fails on these, so the table must name them, not only the log.
+                    f.write(f"| `{name}` | missing: not listed by the Windows build | yes |\n")
                 f.write("\n")
         except OSError as e:
             print(f"ERROR: cannot write the summary {args.summary}: {e.strerror or e}", file=sys.stderr)
