@@ -131,9 +131,9 @@ needs about 30 GB; the `assets` stage (~370 GB) is only for the asset tools, and
 Ogg Opus size (the preflight prints this choice when the assets stage is what does not fit). `--work` and `--out`
 can sit on another drive. The runtime maps the package in place, so a read-only package drive needs
 `gta6rt --overlay <writable folder>`; `--overlay` is a `gta6rt` option, not a `make_game.py` one. Leave the `.s`
-files in `work/shaders/dxbc/disasm` in place: deleting them, along with the translated
-`work/shaders/spirv/index.json`, can leave the shaders stage looking finished with zero shaders. A `disasm`
-folder that is a symlink is refused when the stage has to clear it.
+files in `work/shaders/dxbc/disasm` in place: the next run checks them against the list in `disasm.done` and
+disassembles the missing ones again (all of them for a folder whose `disasm.done` predates that list), then
+translates every shader again. A `disasm` folder that is a symlink is refused when the stage has to clear it.
 
 **From a terminal**, with the same behaviour and more control:
 
