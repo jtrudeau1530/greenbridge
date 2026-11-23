@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +39,7 @@
 #include "shims.h"
 #include "startup_trace.h"
 #include "../src/title_va_alias.h"
+#include "xmem_pages.h"
 
 namespace {
 
@@ -1025,6 +1027,52 @@ BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
 
 #define TITLE_MEMORY(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, \
                                  {dll, "VirtualFree", reinterpret_cast<void*>(&TitleVirtualFree)}
+
+// xmem_pages.h. The backings are collected under the lock and written outside it, each through a view of its own:
+// the shared_ptr keeps a section alive if the title frees the page meanwhile, and a view of a section is the same
+// memory as every other view of it, so a page mapped into a window shows the bytes at once. Pages that follow one
+// another in one section (what a single XMemAllocatePhysicalPages call returns) are written through one view.
+bool rt::xmem::write_physical_pages(const uint64_t* page_array, size_t offset, const void* source, size_t size) {
+    if (size == 0) return true;
+    if (!page_array || !source || offset >= kPhysicalPageSize) return false;
+    if (size > (std::numeric_limits<size_t>::max)() - offset - (kPhysicalPageSize - 1)) return false;
+    const size_t count = (offset + size + kPhysicalPageSize - 1) / kPhysicalPageSize;
+
+    std::vector<PhysicalPage> pages;
+    pages.reserve(count);
+    {
+        const std::lock_guard lock(g_phys_mutex);
+        for (size_t i = 0; i < count; ++i) {
+            const auto it = g_pages.find(page_array[i]);
+            if (it == g_pages.end()) return false;
+            pages.push_back(it->second);
+        }
+    }
+
+    const auto* from = static_cast<const uint8_t*>(source);
+    size_t first = 0;
+    size_t in_page = offset;  // where the data starts in pages[first]
+    while (size != 0) {
+        size_t last = first + 1;
+        while (last < count && pages[last].section == pages[first].section &&
+               pages[last].offset == pages[last - 1].offset + kPhysicalPageSize) {
+            ++last;
+        }
+        const size_t run_bytes = (last - first) * kPhysicalPageSize;
+        const size_t chunk = (std::min)(size, run_bytes - in_page);
+        const uint64_t at = pages[first].offset;  // a multiple of 64 KiB, the allocation granularity
+        void* const view = MapViewOfFile(pages[first].section->handle, FILE_MAP_WRITE, static_cast<DWORD>(at >> 32),
+                                         static_cast<DWORD>(at), in_page + chunk);
+        if (!view) return false;
+        std::memcpy(static_cast<uint8_t*>(view) + in_page, from, chunk);
+        UnmapViewOfFile(view);
+        from += chunk;
+        size -= chunk;
+        first = last;
+        in_page = 0;
+    }
+    return true;
+}
 
 // The classic libraries and the memory api sets a title's imports name.
 SHIM_TABLE(title_memory,

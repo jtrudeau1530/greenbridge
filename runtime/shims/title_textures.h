@@ -4,6 +4,7 @@
 struct ID3D12Device;
 struct ID3D12Resource;
 #include <algorithm>
+#include <atomic>
 #include <vector>
 namespace rt::title_textures {
 // The one layout title-side texture memory has here: every subresource linear, rows 256-byte aligned, mips of a slice in
@@ -63,6 +64,8 @@ void note_linear_upload(std::uint64_t base, std::uint32_t subresource, const voi
 bool create_view(ID3D12Device* device, std::uint64_t resource_desc, std::uint64_t view_desc, std::uint64_t destination);
 // A layer texture whose title address is `base` (Resource::title_shadow): uploads to it go to the image.
 void register_shadow(std::uint64_t base, ID3D12Resource* resource);
+// GetTickCount64 of the title's first indexed draw (its UI), 0 before it.
+extern std::atomic<unsigned long long> ui_started_tick;
 // Before each ExecuteCommandLists: late uploads and buffer contents.
 void refresh(ID3D12Device* device);
 }  // namespace rt::title_textures

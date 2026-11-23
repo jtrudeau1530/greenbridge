@@ -1,4 +1,5 @@
 #include "title_textures.h"
+#include "../src/title_tiling.h"
 
 #include <windows.h>
 
@@ -13,6 +14,7 @@
 #include <vector>
 
 namespace rt::title_textures {
+std::atomic<unsigned long long> ui_started_tick{0};
 namespace {
 struct Linear {
     std::vector<std::uint8_t> bytes;
@@ -23,6 +25,11 @@ struct Texture {
     D3D12_RESOURCE_DESC desc{};
     bool dirty = true;
     bool uploaded = false;  // it was left in COMMON by an upload
+    std::uint32_t mode = 0;        // GFX10 swizzle mode of the title's memory (layout word & 0xFF)
+    bool tiled = false;            // the layout word names one (0x100 | mode)
+    std::uint64_t bytes = 0;       // of the title's memory
+    std::uint64_t hash = 0;        // of the samples last uploaded
+    std::uint64_t retry_at = 0;    // the submission of the next look
 };
 struct Buffer {
     ID3D12Resource* resource = nullptr;
@@ -46,6 +53,8 @@ std::map<std::uint64_t, std::map<std::uint32_t, Linear>> g_linear;
 std::map<std::uint64_t, Texture> g_textures;
 std::map<std::pair<std::uint64_t, std::uint64_t>, Buffer> g_buffers;
 bool g_any_dirty = false;
+std::vector<std::uint64_t> g_tiled;  // addresses of textures in a tiled layout
+std::size_t g_tiled_cursor = 0;
 std::uint64_t g_submission = 0;
 std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>> g_fresh;
 std::pair<std::uint64_t, std::uint64_t> g_cursor{0, 0};
@@ -71,6 +80,7 @@ D3D12_RESOURCE_DESC clean(const D3D12_RESOURCE_DESC& in) {
     d.DepthOrArraySize = in.DepthOrArraySize;
     d.MipLevels = in.MipLevels;
     d.Format = in.Format;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && d.Format == DXGI_FORMAT_A8_UNORM) d.Format = DXGI_FORMAT_R8_UNORM;
     d.SampleDesc.Count = in.SampleDesc.Count ? in.SampleDesc.Count : 1;
     return d;
 }
@@ -170,6 +180,77 @@ void upload(ID3D12Device* device, Texture& t, const std::map<std::uint32_t, Line
                      static_cast<unsigned long long>(t.desc.Width), t.desc.Height, int(t.desc.Format), data.size(),
                      static_cast<unsigned long>(hr));
 }
+// Samples of the title's memory: cheap enough to look for data that arrived or changed. 0: unreadable or all zero.
+std::uint64_t sample_hash(std::uint64_t va, std::uint64_t bytes) {
+    std::uint64_t h = 1469598103934665603ull, any = 0;
+    const std::uint64_t step = std::max<std::uint64_t>(64, bytes / 96) & ~63ull;
+    for (std::uint64_t at = 0; at + 32 <= bytes; at += step) {
+        std::uint64_t w[4];
+        if (!guarded_copy(w, reinterpret_cast<const void*>(va + at), sizeof(w))) return any ? h : 0;
+        for (std::uint64_t x : w) {
+            any |= x;
+            h = (h ^ x) * 1099511628211ull;
+        }
+    }
+    return any ? (h ? h : 1) : 0;
+}
+
+// The texture's subresources out of the title's memory, ready for upload().
+bool detile_texture(std::uint64_t va, const Texture& t, std::map<std::uint32_t, Linear>& out) {
+    namespace tt = leonida::title_tiling;
+    std::uint32_t bytes = 4, edge = 1;
+    format_block(static_cast<std::uint32_t>(t.desc.Format), bytes, edge);
+    std::vector<std::uint8_t> raw;
+    raw.resize(static_cast<std::size_t>(t.bytes));
+    for (std::uint64_t at = 0; at < t.bytes;) {  // region by region: a missing page is a hole, not a refusal
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(va + at), &mbi, sizeof(mbi))) break;
+        const std::uint64_t end = std::min<std::uint64_t>(t.bytes, reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize - va);
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            guarded_copy(raw.data() + at, reinterpret_cast<const void*>(va + at), static_cast<std::size_t>(end - at));
+        if (end <= at) break;
+        at = end;
+    }
+    if (t.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        Linear l;
+        if (t.mode == 5) {
+            if (!tt::detile_volume(static_cast<std::uint32_t>(t.desc.Width), t.desc.Height, t.desc.DepthOrArraySize, bytes, raw.data(), raw.size(), l.bytes))
+                return false;
+            l.row = static_cast<std::uint32_t>(t.desc.Width) * bytes;
+            l.slice = l.row * t.desc.Height;
+        } else {
+            l.row = (static_cast<std::uint32_t>(t.desc.Width) * bytes + 255) & ~255u;
+            l.slice = l.row * t.desc.Height;
+            l.bytes = std::move(raw);
+        }
+        out[0] = std::move(l);
+        return true;
+    }
+    const tt::Layout layout = tt::layout_2d(t.mode, static_cast<std::uint32_t>(t.desc.Width), t.desc.Height, t.desc.DepthOrArraySize,
+                                            t.desc.MipLevels, bytes, edge);
+    if (!layout.ok) return false;
+    for (std::uint32_t slice = 0; slice < layout.slices; ++slice)
+        for (std::uint32_t mip = 0; mip < layout.mips.size(); ++mip) {
+            Linear l;
+            if (!tt::detile(layout, mip, slice, raw.data(), raw.size(), l.bytes)) continue;
+            l.row = layout.mips[mip].blocks_w * bytes;
+            l.slice = l.row * layout.mips[mip].blocks_h;
+            out[slice * t.desc.MipLevels + mip] = std::move(l);
+        }
+    return !out.empty();
+}
+
+std::uint64_t title_bytes(const Texture& t) {
+    std::uint32_t bytes = 4, edge = 1;
+    format_block(static_cast<std::uint32_t>(t.desc.Format), bytes, edge);
+    if (t.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        if (t.mode == 5) return leonida::title_tiling::volume_size(static_cast<std::uint32_t>(t.desc.Width), t.desc.Height, t.desc.DepthOrArraySize, bytes);
+        return ((t.desc.Width * bytes + 255) & ~255ull) * t.desc.Height * t.desc.DepthOrArraySize;
+    }
+    const auto l = leonida::title_tiling::layout_2d(t.mode, static_cast<std::uint32_t>(t.desc.Width), t.desc.Height, t.desc.DepthOrArraySize,
+                                                    t.desc.MipLevels, bytes, edge);
+    return l.ok ? l.size : 0;
+}
 }  // namespace
 
 void note_linear_upload(std::uint64_t base, std::uint32_t subresource, const void* data, std::uint32_t row_pitch,
@@ -232,6 +313,7 @@ bool create_view(ID3D12Device* device, std::uint64_t resource_desc, std::uint64_
             b.size = size;
         }
         if (b.seen != g_submission || !b.seen) g_fresh.push_back({{va, size}, g_submission});
+        if (b.resource && !b.mapped) b.resource->Map(0, nullptr, reinterpret_cast<void**>(&b.mapped));
         b.seen = g_submission;
         if (b.mapped) guarded_copy(b.mapped, reinterpret_cast<const void*>(va), static_cast<std::size_t>(size));
         device->CreateShaderResourceView(b.resource, &srv, dest);
@@ -249,11 +331,28 @@ bool create_view(ID3D12Device* device, std::uint64_t resource_desc, std::uint64_
                          static_cast<unsigned long long>(va), int(g_linear.count(va)), probe[0], probe[1], probe[2], probe[3]);
         }
     }
+    if (!va) {
+        device->CreateShaderResourceView(nullptr, &srv, dest);
+        return true;
+    }
+    if (in.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && srv.Format == DXGI_FORMAT_A8_UNORM) srv.Format = DXGI_FORMAT_R8_UNORM;
     Texture& t = g_textures[va];
     const D3D12_RESOURCE_DESC d = clean(in);
     if (!t.resource || std::memcmp(&t.desc, &d, sizeof(d)) != 0) {
         t = Texture{};  // the old resource may be in flight: kept
         t.desc = d;
+        t.tiled = (reinterpret_cast<const std::uint32_t*>(resource_desc)[11] & 0xFF00) == 0x100;
+        t.mode = reinterpret_cast<const std::uint32_t*>(resource_desc)[11] & 0xFF;
+        t.bytes = t.tiled ? title_bytes(t) : 0;
+        if (t.tiled) {
+            g_tiled.push_back(va);
+            if (!t.bytes) {
+                static std::atomic<int> k{0};
+                if (log_first(k, 20))
+                    std::fprintf(stderr, "[title] layout 0x1%02x of %llux%ux%u mips %u format %d is not known\n", t.mode,
+                                 static_cast<unsigned long long>(d.Width), d.Height, d.DepthOrArraySize, d.MipLevels, int(d.Format));
+            }
+        }
         D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         const HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST,
                                                            nullptr, IID_PPV_ARGS(&t.resource));
@@ -274,7 +373,8 @@ void refresh(ID3D12Device* device) {
     for (auto it = g_buffers.upper_bound(g_cursor); budget && it != g_buffers.end(); ++it) {
         g_cursor = it->first;
         if (!it->second.mapped) continue;
-        guarded_copy(it->second.mapped, reinterpret_cast<const void*>(it->first.first), static_cast<std::size_t>(it->second.size));
+        if (!guarded_copy(it->second.mapped, reinterpret_cast<const void*>(it->first.first), static_cast<std::size_t>(it->second.size)))
+            it->second.mapped = nullptr;  // the title freed it
         budget -= std::min<std::uint64_t>(budget, it->second.size + 4096);
     }
     if (budget) g_cursor = {0, 0};
@@ -287,7 +387,8 @@ void refresh(ID3D12Device* device) {
         }
         const auto it = g_buffers.find(key);
         if (it != g_buffers.end() && it->second.mapped)
-            guarded_copy(it->second.mapped, reinterpret_cast<const void*>(key.first), static_cast<std::size_t>(it->second.size));
+            if (!guarded_copy(it->second.mapped, reinterpret_cast<const void*>(key.first), static_cast<std::size_t>(it->second.size)))
+                it->second.mapped = nullptr;
         ++k;
     }
     // Pages of a shadow written since the last submission: those subresources go to the image.
@@ -323,6 +424,34 @@ void refresh(ID3D12Device* device) {
         }
     }
     g_shadow_dirty.clear();
+    // Tiled textures: a round robin looks for data that arrived or changed and uploads it, within a budget.
+    std::uint64_t upload_budget = 24ull << 20;
+    for (std::size_t looked = 0; looked < 192 && looked < g_tiled.size() && upload_budget; ++looked) {
+        if (g_tiled_cursor >= g_tiled.size()) g_tiled_cursor = 0;
+        const std::uint64_t va = g_tiled[g_tiled_cursor++];
+        const auto it = g_textures.find(va);
+        if (it == g_textures.end() || !it->second.resource || !it->second.tiled || !it->second.bytes) continue;
+        Texture& t = it->second;
+        if (t.retry_at > g_submission) continue;
+        if (!readable(va, 64)) {  // not backed yet, or freed
+            t.retry_at = g_submission + 180;
+            continue;
+        }
+        const std::uint64_t h = sample_hash(va, t.bytes);
+        if (!h || h == t.hash) {
+            t.retry_at = g_submission + (t.hash ? 240 : 30);
+            continue;
+        }
+        std::map<std::uint32_t, Linear> data;
+        if (t.bytes <= (256ull << 20) && detile_texture(va, t, data)) {
+            upload(device, t, data);
+            t.hash = h;
+            upload_budget -= std::min<std::uint64_t>(upload_budget, t.bytes);
+            t.retry_at = g_submission + 8;  // the rest of a texture may still be arriving
+        } else {
+            t.retry_at = g_submission + 100000;
+        }
+    }
     if (!g_any_dirty) return;
     g_any_dirty = false;
     for (auto& [va, t] : g_textures) {

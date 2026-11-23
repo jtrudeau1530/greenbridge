@@ -24,6 +24,7 @@
 #include "shims.h"
 #include "startup_trace.h"
 #include "title_textures.h"
+#include "../src/title_tiling.h"
 
 namespace {
 
@@ -115,6 +116,15 @@ void block_of(std::uint32_t f, std::uint32_t& bytes, std::uint32_t& edge) {
     if (f >= 60 && f <= 66) { bytes = 1; return; }
     bytes = 4;
 }
+leonida::title_tiling::Layout tiled_layout(const std::uint32_t* words) {
+    const Shape s = shape_of(words);
+    const std::uint32_t word = words[11];
+    if (s.dimension != 3 || (word & 0xFF00) != 0x100) return {};
+    std::uint32_t bytes = 4, edge = 1;
+    block_of(s.format, bytes, edge);
+    return leonida::title_tiling::layout_2d(word & 0xFF, static_cast<std::uint32_t>(s.width), s.height, s.depth, s.mips, bytes, edge);
+}
+
 // GetResourceTiling (method 10): total tiles, packed mips, standard 64 KiB tile shape, then one entry per subresource.
 void resource_tiling(const std::uint32_t* words, std::uint64_t total, std::uint64_t packed, std::uint64_t tile,
                      std::uint64_t count, std::uint32_t first, std::uint64_t tilings) {
@@ -141,6 +151,56 @@ void resource_tiling(const std::uint32_t* words, std::uint64_t total, std::uint6
         }
         tw *= edge;
         th *= edge;
+    }
+    // Memory order: the packed tail first, then mips from the smallest, every slice of a mip together in SW_64KB_D arrays.
+    std::uint32_t words64[14];
+    std::memcpy(words64, words, sizeof(words64));
+    words64[11] = 0x10A;
+    if (const auto t = tiled_layout(words64); t.ok && s.dimension == 3) {
+        constexpr std::uint64_t k64 = 65536;
+        const std::uint32_t packed_mips = s.mips - t.first_tail;
+        std::uint32_t capacity = count ? *reinterpret_cast<std::uint32_t*>(count) : 0, written = 0;
+        for (std::uint32_t slice = 0; slice < t.slices; ++slice)
+            for (std::uint32_t mip = 0; mip < s.mips; ++mip) {
+                const std::uint32_t sub = slice * s.mips + mip;
+                std::uint32_t w = 0, h = 0, d = 0, start = 0xFFFFFFFFu;
+                if (mip < t.first_tail) {
+                    w = t.mips[mip].padded_w / t.block_w;
+                    h = t.mips[mip].padded_h / t.block_h;
+                    d = 1;
+                    start = static_cast<std::uint32_t>(leonida::title_tiling::slice_offset(t, t.mips[mip], slice) / k64);
+                }
+                if (tilings && sub >= first && written < capacity) {
+                    auto* e = reinterpret_cast<std::uint32_t*>(tilings + std::uint64_t(written) * 12);
+                    e[0] = w;
+                    e[1] = (h & 0xFFFF) | (d << 16);
+                    e[2] = start;
+                    ++written;
+                }
+            }
+        if (packed) {
+            auto* b = reinterpret_cast<std::uint8_t*>(packed);
+            std::memset(b, 0, 12);
+            b[0] = static_cast<std::uint8_t>(t.first_tail);
+            b[1] = static_cast<std::uint8_t>(packed_mips);
+            const std::uint32_t tiles = packed_mips ? 1 : 0, at = 0;
+            std::memcpy(b + 4, &tiles, 4);
+            std::memcpy(b + 8, &at, 4);
+        }
+        if (total) *reinterpret_cast<std::uint32_t*>(total) = static_cast<std::uint32_t>((t.size + k64 - 1) / k64);
+        if (tile) {
+            auto* q = reinterpret_cast<std::uint32_t*>(tile);
+            q[0] = tw;
+            q[1] = th;
+            q[2] = td;
+        }
+        if (count) *reinterpret_cast<std::uint32_t*>(count) = written;
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 12)
+            std::fprintf(stderr, "[xg] tiling %llux%ux%u mips %u format %u layout 0x%x: %llu tiles, first tail mip %u\n",
+                         static_cast<unsigned long long>(s.width), s.height, s.depth, s.mips, s.format, words[11],
+                         static_cast<unsigned long long>(t.size / k64), t.first_tail);
+        return;
     }
     const std::uint32_t layers = s.dimension == 4 ? 1 : s.depth;
     std::uint32_t standard = 0;
@@ -239,6 +299,30 @@ std::uint64_t resource_layout(const std::uint32_t* words, std::uint64_t out) {
         u32(p + 0x38, s.dimension == 4 ? k.depth : l.layers);
         u32(p + 0x3C, 1);
     }
+    if (const auto t = tiled_layout(words); t.ok) {  // the memory layout streaming reads and writes
+        std::uint32_t bytes = 4, edge = 1;
+        block_of(s.format, bytes, edge);
+        u64(o, t.size);
+        u64(o + 8, t.linear ? 256 : t.tile);
+        u64(plane + 0x08, t.size);
+        u64(plane + 0x10, t.slice_size);
+        for (std::size_t m = 0; m < t.mips.size() && m < 15; ++m) {
+            const auto& k = t.mips[m];
+            std::uint8_t* q = plane + 0x38 + m * 0x70;
+            u64(q, t.mip_major ? k.region * t.slices : k.region);
+            u64(q + 8, k.offset);
+            u64(q + 0x10, k.region);
+            u32(q + 0x18, k.padded_w * edge);
+            u32(q + 0x1C, k.padded_w * bytes);
+            u32(q + 0x20, t.linear ? 256 : t.tile);
+            u32(q + 0x24, k.padded_w);
+            u32(q + 0x28, k.padded_h);
+            u32(q + 0x2C, t.slices);
+            u32(q + 0x30, k.blocks_w);
+            u32(q + 0x34, k.blocks_h);
+            u32(q + 0x38, t.slices);
+        }
+    }
     static std::atomic<int> n{0};
     if (n.fetch_add(1) < 8)
         std::fprintf(stderr, "[xg] layout dim %u %llux%ux%u mips %u format %u: %llu bytes, pitch %u\n", s.dimension,
@@ -249,6 +333,18 @@ std::uint64_t resource_layout(const std::uint32_t* words, std::uint64_t out) {
 
 template <unsigned Slot>
 std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, std::uint64_t a6) {
+    if (Slot >= 1 && Slot != 8 && (self->desc[7] & 0xFFFF) > 1 && std::getenv("LEONIDA_IO_TRACE")) {
+        static std::atomic<int> k{0};
+        if (k.fetch_add(1) < 60) {
+            void* frames[4];
+            const USHORT fn = RtlCaptureStackBackTrace(1, 4, frames, nullptr);
+            std::fprintf(stderr, "[xga] %p slot %u %ux%ux%u mips %u fmt %u layout 0x%x flags 0x%x (0x%llx 0x%llx 0x%llx 0x%llx)", (void*)self, Slot, self->desc[4],
+                         self->desc[6], self->desc[7] & 0xFFFF, self->desc[7] >> 16, self->desc[8], self->desc[11], self->desc[12], (unsigned long long)a1,
+                         (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4);
+            for (USHORT f = 0; f < fn; ++f) std::fprintf(stderr, " <- %p", frames[f]);
+            std::fprintf(stderr, "\n");
+        }
+    }
     // Not COM: AddRef, Release, GetResourceLayout, GetResourceSizeBytes, GetResourceBaseAlignmentBytes,
     // GetMipLevelOffsetBytes, GetTexelElementOffsetBytes, ..., CopyIntoSubresource (8), CopyFromSubresource (9),
     // GetResourceTiling (10). Measured at the retail title's call sites: slot 2 fills a layout, slot 1 releases.
@@ -259,12 +355,15 @@ std::uint64_t WINAPI method(Computer* self, std::uint64_t a1, std::uint64_t a2, 
     } else if constexpr (Slot == 2) {
         return resource_layout(self->desc, a1);
     } else if constexpr (Slot == 3) {
+        if (const auto t = tiled_layout(self->desc); t.ok) return t.size;
         return layout_of(self->desc).total;
     } else if constexpr (Slot == 4) {
+        if (const auto t = tiled_layout(self->desc); t.ok) return t.linear ? 256 : t.tile;
         return 0x10000;
     } else if constexpr (Slot == 5) {  // (plane, mip)
         const auto l = layout_of(self->desc);
         const auto mip = static_cast<std::uint32_t>(a2);
+        if (const auto t = tiled_layout(self->desc); t.ok) return mip < t.mips.size() ? t.mips[mip].offset : 0;
         return mip < l.mips.size() ? l.mips[mip].offset : 0;
     } else if constexpr (Slot == 6) {  // (plane, mip, x, y, array slice or z, sample, bit position*)
         const auto l = layout_of(self->desc);

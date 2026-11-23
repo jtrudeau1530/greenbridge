@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "gameinput.h"
+#include "title_textures.h"
 #include "gameinput_abi.h"
 #include "shims.h"
 
@@ -1653,8 +1654,8 @@ bool async_key_down(int vk) {
         return v ? std::atof(v) : -1.0;
     }();
     if (from >= 0 && vk == VK_RETURN) {
-        static const ULONGLONG start = GetTickCount64();
-        const double t = (GetTickCount64() - start) / 1000.0 - from;
+        const ULONGLONG start = rt::title_textures::ui_started_tick.load();  // counted from the title's first UI draw
+        const double t = start ? (GetTickCount64() - start) / 1000.0 - from : -1.0;
         static const long long count = [] {  // LEONIDA_AUTO_A_COUNT presses (default 1): never past a screen that asks for consent
             const char* v = std::getenv("LEONIDA_AUTO_A_COUNT");
             return v ? std::atoll(v) : 1ll;
@@ -1662,6 +1663,7 @@ bool async_key_down(int vk) {
         const long long k = static_cast<long long>(t / 5.0);
         if (t >= 0 && k < count && t - 5.0 * k < 0.2) return true;
     }
+    if (from >= 0) return false;  // an unattended run does not listen to the person at the keyboard
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 

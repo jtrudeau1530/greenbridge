@@ -32,6 +32,7 @@
 #include <intrin.h>
 #include "d3d12_trace.h"
 #include "title_textures.h"
+#include "../src/title_tiling.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
 #include "d3d12_xs_pso_stream.h"
@@ -2132,7 +2133,8 @@ void refresh_title_gpu_memory() {
     const std::lock_guard lock(g_late_mutex);
     ++g_late_submission;
     while (!g_late.empty() && g_late.front().submission + 3 < g_late_submission) g_late.pop_front();
-    for (const LateCopy& c : g_late) late_copy(c.to, reinterpret_cast<const void*>(c.va), static_cast<std::size_t>(c.size));
+    for (LateCopy& c : g_late)
+        if (c.size && !late_copy(c.to, reinterpret_cast<const void*>(c.va), static_cast<std::size_t>(c.size))) c.size = 0;  // freed
 }
 
 // An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
@@ -2377,6 +2379,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t, std::uint64_t,
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
+            if constexpr (pc == 13) {  // the first DrawIndexedInstanced: the title's UI has started
+                static std::atomic<bool> first_indexed{false};
+                if (!first_indexed.exchange(true, std::memory_order_relaxed))
+                    rt::title_textures::ui_started_tick.store(GetTickCount64());
+            }
             if constexpr (pc == 10) {
                 // Reset(allocator, pso) — console 10, and 139 as the retail title calls it: the title hands its
                 // allocator proxy; the real list takes the real one (and a wrapped pipeline state, if that ever
@@ -3631,6 +3638,21 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
     return hr;
 }
 
+// The size and alignment of a texture whose layout word names a known tiled layout (0x100 | GFX10 mode): its memory is
+// exactly the mip chain, which streamed data fills (src/title_tiling.h).
+bool title_allocation(const D3D12_RESOURCE_DESC& d, D3D12_RESOURCE_ALLOCATION_INFO& info) {
+    const auto word = static_cast<std::uint32_t>(d.Layout);
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || (word & 0xFF00) != 0x100 || d.SampleDesc.Count > 1) return false;
+    std::uint32_t bytes = 4, edge = 1;
+    rt::title_textures::format_block(static_cast<std::uint32_t>(d.Format), bytes, edge);
+    const auto t = leonida::title_tiling::layout_2d(word & 0xFF, static_cast<std::uint32_t>(d.Width), d.Height,
+                                                    d.DepthOrArraySize, d.MipLevels, bytes, edge);
+    if (!t.ok) return false;
+    const std::uint64_t alignment = t.linear ? 4096 : t.tile;
+    info = {(t.size + alignment - 1) / alignment * alignment, alignment};
+    return true;
+}
+
 // The TYPELESS family of an RGBA8/BGRA8 render target or UAV texture, else its own format.
 DXGI_FORMAT castable_texture_format(const D3D12_RESOURCE_DESC& d) {
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
@@ -4048,6 +4070,10 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     }
     *ret = device8->GetResourceAllocationInfo2(visible_mask, count, descs_to_pass, info1);
     device8->Release();
+    if (D3D12_RESOURCE_ALLOCATION_INFO own; raw_descs && count == 1 && title_allocation(raw_descs[0], own)) {
+        *ret = own;
+        if (info1) info1[0] = {0, own.SizeInBytes, own.Alignment};
+    }
     return reinterpret_cast<std::uint64_t>(ret);
 }
 
@@ -4317,6 +4343,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     ID3D12Device* const real = call.self->real;
     // Normalize console descriptors in a copy. PC calls can also pass the Xbox tiled layout explicitly. Otherwise
     // their flags and layout reach the host unchanged so the host can validate them.
+    const D3D12_RESOURCE_DESC* const raw_descs = descs;
     const UINT desc_count = static_cast<UINT>(count);
     std::unique_ptr<D3D12_RESOURCE_DESC[]> clean;
     if (descs && desc_count) {
@@ -4335,6 +4362,8 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    if (D3D12_RESOURCE_ALLOCATION_INFO own; raw_descs && desc_count == 1 && title_allocation(raw_descs[0], own))
+        info = own;
     static std::atomic<int> logged_invalid{0};
     if ((info.SizeInBytes >> 32) && descs && logged_invalid.fetch_add(1, std::memory_order_relaxed) < 16)
         for (UINT i = 0; i < desc_count; ++i)
