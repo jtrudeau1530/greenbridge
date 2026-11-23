@@ -134,6 +134,28 @@ class True16(unittest.TestCase):
                      "v_cvt_f32_f16 v8, v4.h", "v_mov_b32 v8, v4"):
             self.assertEqual(asm.true16_spelling(same), same)
 
+    def test_op_sel_of_the_16_bit_integer_vop3_ops_is_named_on_their_vgprs(self):
+        """Bit i of op_sel picks source i's half, the last bit the destination's. GFX11+ assemblers reject the bare
+        form of these eight ops (gfx1100, gfx1150 and gfx1201 checked with AMD LLVM 23); SGPRs and constants keep
+        taking their half from the op_sel list, so it stays as written."""
+        for old, new in (
+                ("v_max_u16_e64 v14, s12, v5 op_sel:[1,0,0]", "v_max_u16_e64 v14.l, s12, v5.l op_sel:[1,0,0]"),
+                ("v_mul_lo_u16_e64 v12, s16, v14 op_sel:[0,1,0]",
+                 "v_mul_lo_u16_e64 v12.l, s16, v14.h op_sel:[0,1,0]"),
+                ("v_max_u16_e64 v18, v18, s9 op_sel:[1,1,0]", "v_max_u16_e64 v18.l, v18.h, s9 op_sel:[1,1,0]"),
+                ("v_mul_lo_u16_e64 v16, s19, 0x100 op_sel:[1,1,1]",
+                 "v_mul_lo_u16_e64 v16.h, s19, 0x100 op_sel:[1,1,1]"),
+                ("  v_lshlrev_b16_e64 v2, v19, 32 op_sel:[0,1,1]",
+                 "  v_lshlrev_b16_e64 v2.h, v19.l, 32 op_sel:[0,1,1]"),
+                ("v_ashrrev_i16 v0, s13, v18 op_sel:[0,1,0]", "v_ashrrev_i16 v0.l, s13, v18.h op_sel:[0,1,0]")):
+            self.assertEqual(asm.opsel16_spelling(old), new)
+            self.assertEqual(asm.opsel16_spelling(new), new)        # already spelled that way
+        for same in ("v_max_u16_e64 v5, v1, v3",                   # no op_sel: the bare form still assembles
+                     "v_add_nc_u16 v1, v2, v3 op_sel:[1,0,0]",     # these ops take the bare form on GFX11+
+                     "v_mad_u16 v1, v2, v3, v4 op_sel:[1,0,0,0]",
+                     "v_max_u16_e64 v1, v2 op_sel:[1,0,0]"):       # not a destination and two sources
+            self.assertEqual(asm.opsel16_spelling(same), same)
+
     def test_the_non_returning_compare_and_store_is_respelled_and_swapped_on_gfx11(self):
         """GFX11 has no ds_cmpst_b32, and ds_cmpstore_b32 takes the store value before the compare value."""
         self.assertEqual(asm.ds_line("ds_cmpst_b32 v0, v1, v2", "gfx1150"),
@@ -255,6 +277,19 @@ class ToolchainFallbacks(unittest.TestCase):
             kernel = asm.Kernel(["v_cvt_f16_f32 v8, v1", "s_endpgm"], words=1, raw=True)
             self.assertEqual(o.run([kernel], words=1), [[0x3C00]])
             self.assertEqual("v8.l" in texts[0], true16)
+
+    def test_op_sel_halves_are_named_on_gfx11_and_later_even_without_true16(self):
+        # The assembler that takes a bare v_cvt_f16_f32 (true16 probe: no) still needs v14.l / v5.l on these lines.
+        line = "v_max_u16_e64 v14, s12, v5 op_sel:[1,0,0]"
+        for arch, want in (("gfx1036", line), ("gfx1100", "v_max_u16_e64 v14.l, s12, v5.l op_sel:[1,0,0]"),
+                           ("gfx1201", "v_max_u16_e64 v14.l, s12, v5.l op_sel:[1,0,0]")):
+            o = self.oracle(arch)
+            o.true16, texts = False, []
+            o._assemble = lambda text, wave=32: (texts.append(text) or "k.co", "")
+            o._launch = lambda co, names, words=4: (0, "k0 00000001\n", "")
+            kernel = asm.Kernel([line, "s_endpgm"], words=1, raw=True)
+            self.assertEqual(o.run([kernel], words=1), [[1]])
+            self.assertIn(want, texts[0], arch)
 
     def test_a_mode_the_architecture_cannot_set_is_never_assembled(self):
         # FUZZ-43: gfx1170+ rejects .amdhsa_ieee_mode / .amdhsa_dx10_clamp. Those kernels come back as a reason; the

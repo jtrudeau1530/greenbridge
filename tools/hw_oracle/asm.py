@@ -384,6 +384,39 @@ def true16_spelling(text):
     return _F16_SRC.sub(r"\1.l", _F16_DST.sub(r"\1.l", text))
 
 
+# ---- op_sel on GFX11+: the two-source 16-bit integer VOP3 ops want it on the registers too ----
+# This is separate from true16_spelling: AMD LLVM 23 (rocm-sdk-core 10.0.0) still takes a bare `v_cvt_f16_f32 v8, v1`
+# on gfx1100, gfx1150 and gfx1201, so the runner's true16 probe says no, yet it rejects
+# `v_max_u16_e64 v14, s12, v5 op_sel:[1,0,0]` on all three ("operands are not valid for this GPU or mode") and takes
+# `v_max_u16_e64 v14.l, s12, v5.l op_sel:[1,0,0]`, which encodes to the same op_sel bits and operands as gfx1036's
+# bare form. v_add_nc/v_sub_nc_*16 and the three-source 16-bit ops still take the bare form there.
+_OPSEL16_OPS = ("v_ashrrev_i16", "v_lshlrev_b16", "v_lshrrev_b16", "v_max_i16", "v_max_u16", "v_min_i16",
+                "v_min_u16", "v_mul_lo_u16")
+_OPSEL16 = re.compile(rf"^([ \t]*(?:{'|'.join(_OPSEL16_OPS)})(?:_e64)?[ \t]+)([^\n]*?)([ \t]+op_sel:\[([01,]+)\])"
+                      r"([^\n]*)$", re.M)
+
+
+def _opsel16_halves(m):
+    """One _OPSEL16 line with each bare VGPR operand named by the half its op_sel bit picks: bit i for source i,
+    the last bit for the destination. The op_sel list itself is kept, since SGPR and constant sources still
+    take their half from it."""
+    head, operands, opsel, bits, tail = m.groups()
+    ops = [o.strip() for o in operands.split(",")]
+    bits = [b == "1" for b in bits.split(",")]
+    if len(bits) != len(ops):     # not the dst + sources shape this respells; leave it to the assembler to judge
+        return m.group(0)
+    for i, o in enumerate(ops):
+        if re.fullmatch(r"v\d+", o):
+            ops[i] = o + (".h" if bits[i - 1] else ".l")    # i - 1: the destination (operand 0) is the last bit
+    return head + ", ".join(ops) + opsel + tail
+
+
+def opsel16_spelling(text):
+    """The VGPRs of the _OPSEL16_OPS lines that have op_sel, written as the half it selects, for GFX11 and later.
+    Lines without op_sel and every other op are left as they are. Line numbers don't change."""
+    return _OPSEL16.sub(_opsel16_halves, text)
+
+
 def failing_kernels(stderr, starts):
     """Indices of the kernels an assembler error message points into (error lines are 'file:LINE:COL: error')."""
     bad = set()

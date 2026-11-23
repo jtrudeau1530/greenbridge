@@ -336,6 +336,8 @@ class Oracle:
             text, names, starts = asm.module_text([programs[i] for i in live], self.arch, wave=wave)
             if self.true16:
                 text = asm.true16_spelling(text)
+            if asm.family(self.arch) != "gfx10":
+                text = asm.opsel16_spelling(text)    # needed even where the true16 probe says no (asm.py)
             co, err = self._assemble(text, wave)
             if co is not None:
                 break
