@@ -38,6 +38,12 @@ than failing.
 C++ CMake tools are installed. Its direct-`cl.exe` fallback compiles a fixed file list without the shim and warns
 about it.
 
+On Linux, `make_game.py`'s runtime stage (the clang-cl + xwin cross-build) passes `-DLEONIDA_SDL3_FETCH=ON` when
+`LEONIDA_SDL3_FETCH` is set to `1`, and warns at the end of the stage when `gta6rt.exe` came out without the shim.
+Under Wine there is no host `GameInput.dll` to fall back to, so without the shim `GameInputCreate` fails and the retail
+executable stops on its result. An installed SDL3 for this build has to be a Windows build of SDL3 (`SDL3_DIR`); a
+distribution's SDL3 package is a Linux library.
+
 ## Mapping
 
 GameInput's buttons are positional, as on an Xbox pad, and SDL's are too, so the face buttons go by position, not by

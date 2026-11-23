@@ -2221,10 +2221,24 @@ def cross_configure() -> str:
     tools = [f"-DCMAKE_{var}={shutil.which(name + suffix) or name + suffix}" for var, name in CROSS_VARS.items()
              ] if suffix else []
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
-                    f"-DXWIN_DIR={xwin}", *tools, hint="CMake's error above says what the cross-build lacks "
+                    f"-DXWIN_DIR={xwin}", *tools, *sdl3_fetch_args(),
+                    hint="CMake's error above says what the cross-build lacks "
                     "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
                     "runtime from --stages (the default without it: check,shaders,assets,pipelines).")
     return build
+
+
+def sdl3_fetch_args() -> list:
+    """-DLEONIDA_SDL3_FETCH=ON when LEONIDA_SDL3_FETCH is set to 1/true/yes/on. Nothing is downloaded unless asked:
+    without it, CMake builds the GameInput shim only from an SDL3 it finds installed."""
+    v = (os.environ.get("LEONIDA_SDL3_FETCH") or "").strip().lower()
+    return ["-DLEONIDA_SDL3_FETCH=ON"] if v in ("1", "true", "yes", "on") else []
+
+
+def gameinput_shim_built(build: str) -> bool:
+    """Whether CMake built the GameInput shim: it adds the gameinput_test target only then (runtime/CMakeLists.txt),
+    whatever the generator."""
+    return os.path.isdir(os.path.join(build, "CMakeFiles", "gameinput_test.dir"))
 
 
 def cross_build_runtime(jobs: int) -> str:
@@ -2232,6 +2246,13 @@ def cross_build_runtime(jobs: int) -> str:
     build = cross_configure()
     cmake_build(build, ["gta6rt", "gta6rt_tls_host"], jobs,
                 "See the compiler output above; docs/testing.md has the cross-build's requirements.")
+    if not gameinput_shim_built(build):
+        # Under Wine there is no host GameInput.dll to fall back to, so GameInputCreate fails and the retail
+        # executable stops on its result. CMake only prints a STATUS line for this, which the build output buries.
+        log("runtime: WARNING: gta6rt.exe was built without the GameInput shim (no SDL3 found). Under Wine there is "
+            "no host GameInput.dll, so GameInputCreate fails and the game stops at it. Set LEONIDA_SDL3_FETCH=1 to "
+            "download the pinned SDL3 release once and build the shim (docs/gameinput.md), or point SDL3_DIR at a "
+            "Windows build of SDL3 3.2+ (a distribution's SDL3 package is a Linux library and does not link).")
     return build
 
 

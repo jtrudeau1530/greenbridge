@@ -480,6 +480,51 @@ class RuntimeBuildPackagingTest(unittest.TestCase):
                 self.assertTrue(os.access(launcher, os.X_OK))
 
 
+class CrossBuildGameInputTest(unittest.TestCase):
+    """The Linux cross-build passes LEONIDA_SDL3_FETCH on to CMake and says when gta6rt.exe has no GameInput shim."""
+
+    def test_sdl3_fetch_is_asked_for_only_by_a_true_value(self):
+        for value, expected in (("1", True), ("ON", True), (" yes ", True), ("true", True),
+                                ("0", False), ("off", False), ("", False), (None, False)):
+            env = {} if value is None else {"LEONIDA_SDL3_FETCH": value}
+            with self.subTest(value=value), mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(make_game.sdl3_fetch_args(), ["-DLEONIDA_SDL3_FETCH=ON"] if expected else [])
+
+    def configure_args(self, env: dict) -> tuple:
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(make_game, "xwin_dir", return_value="/sdk"), \
+                mock.patch.object(make_game, "cross_build_dir", return_value="/build"), \
+                mock.patch.object(make_game, "configured_cross_tools", return_value={"CXX": "clang-cl"}), \
+                mock.patch.object(make_game, "cmake_configure") as configure:
+            make_game.cross_configure()
+        return configure.call_args.args
+
+    def test_cross_configure_forwards_the_sdl3_fetch(self):
+        self.assertIn("-DLEONIDA_SDL3_FETCH=ON", self.configure_args({"LEONIDA_SDL3_FETCH": "1"}))
+
+    def test_cross_configure_downloads_nothing_unless_asked(self):
+        self.assertFalse(any("SDL3" in arg for arg in self.configure_args({})))
+
+    def warnings(self, with_shim: bool) -> list:
+        with tempfile.TemporaryDirectory() as build:
+            if with_shim:
+                os.makedirs(os.path.join(build, "CMakeFiles", "gameinput_test.dir"))
+            with mock.patch.object(make_game, "cross_configure", return_value=build), \
+                    mock.patch.object(make_game, "cmake_build"), \
+                    mock.patch.object(make_game, "log") as log:
+                self.assertEqual(make_game.cross_build_runtime(4), build)
+        return [c.args[0] for c in log.call_args_list if "GameInput" in c.args[0]]
+
+    def test_a_build_without_the_shim_is_reported(self):
+        lines = self.warnings(with_shim=False)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("LEONIDA_SDL3_FETCH=1", lines[0])
+        self.assertIn("Wine", lines[0])
+
+    def test_a_build_with_the_shim_says_nothing(self):
+        self.assertEqual(self.warnings(with_shim=True), [])
+
+
 class PipelineCheckExeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
