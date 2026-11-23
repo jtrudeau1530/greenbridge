@@ -11,8 +11,9 @@ thunk would be counted too, which is rare, and a call that goes through a regist
 slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
 
 With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. A `--import` value must
-carry both halves of `DLL!NAME` and a `--dll` value only a DLL name: a value that can match no import is refused instead of
-being answered with a count of zero. Output is counts and RVAs only, no instruction bytes (docs/runtime_imports.md, "The
+carry both halves of `DLL!NAME` and a `--dll` value only a DLL name, and both must name an import of the image: a value
+that can match no import is refused instead of being answered with a count of zero. Output is counts and RVAs only, no
+instruction bytes (docs/runtime_imports.md, "The
 retail executable (RT-5)").
 """
 import argparse
@@ -119,6 +120,17 @@ def dll_selector(text: str) -> str:
     return text
 
 
+def unmatched_selectors(data: bytes, wanted, dlls) -> list:
+    """The well-formed selectors that name nothing this image imports: a misspelled half of `DLL!NAME`, or a DLL the
+    image does not import. They answered "0 import(s), 0 call site(s)", which reads as "the image never calls it".
+    `call_sites()` keeps answering `{}` for a caller that selects nothing on purpose."""
+    keys = import_slots(pe_inspect.PeImage(data))
+    names = {key.lower() for key in keys.values()}
+    libs = {key.partition("!")[0].lower() for key in keys.values()}
+    return [f"--import {w}" for w in wanted if w.lower() not in names] + \
+           [f"--dll {d}" for d in dlls if d.lower() not in libs]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Count the direct calls to chosen imports of an x86-64 PE image.")
     ap.add_argument("image")
@@ -136,6 +148,11 @@ def main(argv=None):
         print(f"{os.path.basename(sys.argv[0])}: {e}", file=sys.stderr)
         return 2
     imports = result["imports"]
+    missing = unmatched_selectors(data, args.imports, args.dlls)
+    if missing:
+        print(f"{os.path.basename(sys.argv[0])}: {os.path.basename(args.image)}: "
+              f"no import matches {', '.join(missing)}", file=sys.stderr)
+        return 2
     if args.json:
         printable = {k: {f: [hex(x) for x in v] for f, v in e.items()} for k, e in imports.items()}
         print(json.dumps({"image_base": hex(result["image_base"]), "imports": printable}, indent=1))

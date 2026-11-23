@@ -169,6 +169,25 @@ class ImportCallSitesTest(unittest.TestCase):
                 self.assertEqual(import_call_sites.main([path, "--import", "xmem.dll!XMemFoo"]), 0)
                 self.assertEqual(import_call_sites.main([path, "--dll", "xmem.dll"]), 0)
 
+    def test_cli_refuses_a_well_formed_selector_this_image_does_not_have(self):
+        """A misspelling inside a well-formed value names no import of this image, and the run printed
+        "0 import(s), 0 call site(s)" for it: a proof of absence that was only a proof of a typo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(self.data)
+            for argv in (["--import", "xmem.dll!XMemFooo"], ["--import", "xmem!XMemFoo"],
+                         ["--dll", "xmem"], ["--dll", "other.dll"]):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(import_call_sites.main([path, *argv]), 2, argv)
+                self.assertIn(argv[0], err.getvalue(), argv)
+                self.assertIn(argv[1].lower(), err.getvalue().lower(), argv)
+            # A matching name beside a misspelled one is still refused: no partial answer.
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(import_call_sites.main([path, "--import", "xmem.dll!XMemFoo",
+                                                         "--import", "xmem.dll!XMemFooo"]), 2)
+
     def test_cli_reports_an_unreadable_or_non_pe_file_with_exit_2(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "not_a_pe.bin")
