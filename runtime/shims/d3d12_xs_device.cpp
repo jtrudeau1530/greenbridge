@@ -35,6 +35,7 @@
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
 // WindowPresenter. Other builds of this file (mock and COM tests) keep the refused-slot behaviour.
 #include "xbox_present.h"
+#include "title_window.h"
 #endif
 
 #include <windows.h>
@@ -1376,9 +1377,10 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
 
 struct PresentState {
     ~PresentState() {
-        if (window) DestroyWindow(window);  // the presentation and its window die with the device proxy
+        if (window && owns_window) DestroyWindow(window);  // the title's own window outlives the device proxy
     }
     HWND window = nullptr;
+    bool owns_window = false;
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
 };
@@ -1391,6 +1393,26 @@ LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, L
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
+// The runtime's own window, for a title that has no visible window of its own by its first PresentX.
+HWND create_present_window() {
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = present_window_proc;
+    window_class.hInstance = GetModuleHandleW(nullptr);
+    window_class.lpszClassName = L"LeonidaPresentX";
+    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+        return nullptr;
+    }
+    HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+                                  window_class.hInstance, nullptr);
+    if (!window) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+        return nullptr;
+    }
+    return window;
+}
+
 // Lazily builds the window, presenter and XboxPresentation a console PresentX needs, once per device. Returns the
 // state even when `xbox` stays null (no presentation support): the failure is logged once, not retried.
 PresentState* present_state_for(DeviceProxy* device) {
@@ -1399,21 +1421,15 @@ PresentState* present_state_for(DeviceProxy* device) {
     if (!state) return nullptr;
     device->present_state = state;
     state->tried = true;
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = present_window_proc;
-    window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
-        return state;
+    if (HWND title = rt::d3d12::find_title_window(GetCurrentProcessId())) {
+        state->window = title;
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX shows its frames in the title's window %p\n",
+                     static_cast<void*>(title));
+    } else {
+        state->window = create_present_window();
+        state->owns_window = state->window != nullptr;
     }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
-                                  window_class.hInstance, nullptr);
-    if (!state->window) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
-        return state;
-    }
+    if (!state->window) return state;
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
