@@ -2305,15 +2305,6 @@ void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
     vtable[kConsoleClearDepthStencilView] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
 }
 
-// Console list slot 51, PC ClearDepthStencilView: its FLOAT depth arrives in XMM3, which the integer thunk does not
-// declare and note_list_slot's first-call log clobbers, so this slot gets a typed thunk (#2490 review).
-void WINAPI list_clear_depth_stencil_view(ListProxy* self, D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
-                                          FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT* rects) {
-    note_list_slot(51, view.ptr, static_cast<std::uint32_t>(flags), stencil, rect_count,
-                   self->device->console_layout.load(std::memory_order_relaxed));
-    self->real->ClearDepthStencilView(view, flags, depth, stencil, rect_count, rects);
-}
-
 void** get_list_vtable() {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;  // no thread-safe-static guard: lists are made on title threads
     static void* storage[kListSlots]{};
