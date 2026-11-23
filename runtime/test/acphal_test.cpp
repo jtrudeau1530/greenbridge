@@ -74,6 +74,8 @@ int main() {
     uint8_t* inner = static_cast<uint8_t*>(big) + 0x1900;
     check(valid(inner, 0x40) && valid(inner, 0x80) && valid(inner, 0x800) == FALSE,
           "ApuIsVirtualAddressValid checks the alignment");
+    check(valid(big, 3) == FALSE, "ApuIsVirtualAddressValid rejects non-power-of-two alignment");
+    check(valid(big, 0) && valid(big, 0x800), "zero and power-of-two alignments remain valid");
     check(valid(static_cast<uint8_t*>(big) + 0x222E00, 0x40) == FALSE, "an address past the block is not valid");
     int local = 0;
     check(valid(&local, 1) == FALSE && map_va(&local) == 0, "memory outside the heap is not valid and maps to 0");
@@ -90,6 +92,12 @@ int main() {
     void* again = nullptr;
     check(alloc(&again, nullptr, 0x1000, 0x800, 2) == S_OK && again == big, "freed space is reused");
     check(free_mem(again) == S_OK && free_mem(small) == S_OK, "ApuFree of the remaining blocks");
+
+    void* highly_aligned = nullptr;
+    check(alloc(&highly_aligned, nullptr, 0x100, 0x80000000u, 0) == S_OK && highly_aligned,
+          "ApuAlloc accepts alignment above 64 KiB");
+    check(valid(highly_aligned, 0x80000000u), "validity uses the same offset alignment as ApuAlloc");
+    check(free_mem(highly_aligned) == S_OK, "ApuFree releases the highly aligned block");
 
     // Shape contexts: 6 counts then 6 pointers; the caller sets the fifth count and clears count * 64 bytes.
     struct {

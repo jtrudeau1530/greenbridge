@@ -95,8 +95,9 @@ HRESULT ApuFree(void* va) {
     return g_blocks.erase(static_cast<uint32_t>(p - g_heap)) ? S_OK : kEInvalidArg;
 }
 
-// TRUE when the address is inside a live block and its APU address is a multiple of `align`.
+// TRUE when the address is inside a live block and its heap offset is a multiple of `align`.
 BOOL ApuIsVirtualAddressValid(const void* va, uint32_t align) {
+    if (align && (align & (align - 1)) != 0) return FALSE;
     std::lock_guard lock(g_mutex);
     auto* p = static_cast<const uint8_t*>(va);
     if (!g_heap || p < g_heap || p >= g_heap + g_heap_size) return FALSE;
@@ -105,7 +106,7 @@ BOOL ApuIsVirtualAddressValid(const void* va, uint32_t align) {
     if (it == g_blocks.begin()) return FALSE;
     --it;
     if (offset - it->first >= it->second) return FALSE;
-    return align == 0 || ((kApuBase + offset) & (align - 1)) == 0;
+    return align == 0 || (offset & (align - 1)) == 0;
 }
 
 uint32_t ApuMapVirtualAddress(const void* va) {
@@ -136,11 +137,19 @@ void* g_shape[kShapeTypes] = {};
 HRESULT AcpHalAllocateShapeContexts(ShapeContexts* s) {
     if (!s) return kEPointer;
     std::lock_guard lock(g_mutex);
+    void* new_shape[kShapeTypes] = {};
+    for (int i = 0; i < kShapeTypes; ++i) {
+        if (!s->count[i]) continue;
+        new_shape[i] = _aligned_malloc(s->count[i] * kShapeContextSize, 64);
+        if (!new_shape[i]) {
+            for (void* p : new_shape) _aligned_free(p);
+            return kEOutOfMemory;
+        }
+        std::memset(new_shape[i], 0, s->count[i] * kShapeContextSize);
+    }
     for (int i = 0; i < kShapeTypes; ++i) {
         _aligned_free(g_shape[i]);
-        g_shape[i] = s->count[i] ? _aligned_malloc(s->count[i] * kShapeContextSize, 64) : nullptr;
-        if (s->count[i] && !g_shape[i]) return kEOutOfMemory;
-        if (g_shape[i]) std::memset(g_shape[i], 0, s->count[i] * kShapeContextSize);
+        g_shape[i] = new_shape[i];
         if (s->count[i]) s->contexts[i] = g_shape[i];  // a zero count leaves its pointer alone: only +0x38 is measured
     }
     return S_OK;
