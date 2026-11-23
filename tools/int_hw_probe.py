@@ -25,6 +25,7 @@ Groups covered (each references its contract row in docs/design.md):
     valu_cvt_16         v_cvt_f16_u16/i16, v_cvt_u16/i16_f16 (kept half, op_sel, NaN, inf)
     valu_cvt_flr_rpi    v_cvt_flr_i32_f32, v_cvt_rpi_i32_f32 (exact floor(x+0.5), signed NaN)
     valu_cvt_pknorm     v_cvt_pknorm_i16_f32, v_cvt_pknorm_u16_f32 (ties, saturation, NaN)
+    valu_cvt_norm_f16   v_cvt_pknorm_i16/u16_f16 and v_cvt_norm_i16/u16_f16 (near-ties, saturation, NaN, op_sel on the pk forms, neg/abs)
     valu_bfe_past31     v_bfe_u32, v_bfe_i32 with offset + width > 32, width 0, offset/width bits above [4:0]
 
 Usage:
@@ -116,6 +117,38 @@ def _salu64_case(group, name, setup, op_line, scc_in, note=""):
 
 def _valu4_case(group, name, body, note=""):
     return Case(group, name, body, note)
+
+
+# f16 inputs for the normalised conversions: +-0, +-1, 1 +- 1ulp, +-0.5 and the f16 neighbours of the 0.5 tie (0x37ff and 0x3801 are
+# 0.5 -+ 2^-11, so x * 32767 is 16383.5 -+ a hair), +-0.25 and its neighbours, a denormal, +-65504, +-inf, quiet and signalling NaN.
+F16_NORM_VALUES = (0x0000, 0x8000, 0x3C00, 0xBC00, 0x3BFF, 0x3C01, 0xBBFF, 0xBC01, 0x3800, 0xB800, 0x37FF, 0x3801, 0xB7FF, 0xB801,
+                   0x3400, 0xB400, 0x33FF, 0x3401, 0x0001, 0x8001, 0x03FF, 0x7BFF, 0xFBFF, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7C01,
+                   0xFC01, 0x3555, 0xB555, 0x2E66, 0x4000, 0xC000)
+
+
+def _cvt_norm_f16_cases():
+    cases = []
+    vals = F16_NORM_VALUES
+    for i in range(0, len(vals) - 1, 1):
+        a, b = vals[i], vals[(i + 5) % len(vals)]
+        cases.append(_valu4_case("valu_cvt_norm_f16", f"pknorm_f16_{a:04x}_{b:04x}", [
+            f"v_mov_b32 v1, 0x{(b << 16) | a:08x}", f"v_mov_b32 v2, 0x{(a << 16) | b:08x}",
+            "v_cvt_pknorm_i16_f16 v8, v1, v2",                        # lo(v1), lo(v2)
+            "v_cvt_pknorm_u16_f16 v9, v1, v2",
+            "v_cvt_pknorm_i16_f16 v10, -v1, |v2| op_sel:[1,0]",        # hi(v1) negated, lo(v2) abs
+            "v_cvt_pknorm_u16_f16 v11, |v1|, -v2 op_sel:[0,1]",       # lo(v1) abs, hi(v2) negated
+        ], f"v_cvt_pknorm_i16/u16_f16 on f16 {a:04x}/{b:04x} (op_sel, neg, abs)"))
+    for a in vals:
+        cases.append(_valu4_case("valu_cvt_norm_f16", f"norm_f16_{a:04x}", [
+            f"v_mov_b32 v1, 0x{(0x3555 << 16) | a:08x}", f"v_mov_b32 v2, 0x{(a << 16) | 0x3C00:08x}",
+            f"v_mov_b32 v8, 0x{SENTINEL:08x}", f"v_mov_b32 v9, 0x{SENTINEL:08x}",
+            f"v_mov_b32 v10, 0x{SENTINEL:08x}", f"v_mov_b32 v11, 0x{SENTINEL:08x}",
+            "v_cvt_norm_i16_f16_e64 v8, v1",
+            "v_cvt_norm_u16_f16_e64 v9, v1",
+            "v_cvt_norm_i16_f16_e64 v10, -v2",                         # neg: GFX10 takes no op_sel on these two
+            "v_cvt_norm_u16_f16_e64 v11, |v2|",
+        ], f"v_cvt_norm_i16/u16_f16 on f16 {a:04x} (kept half, neg/abs)"))
+    return cases
 
 
 def build_cases():
@@ -594,6 +627,9 @@ def build_cases():
             "v_cvt_pknorm_u16_f32 v11, v3, v4",
         ], "v_cvt_pknorm_i16/u16_f32 ties at +-0.5 and +-1.0 endpoints"),
     ]
+
+    # 19b. v_cvt_pknorm_i16/u16_f16 and v_cvt_norm_i16/u16_f16 (f16 sources)
+    cases += _cvt_norm_f16_cases()
 
     # 20. Packed 16-bit integer ops (v_pk_add/sub_u16/i16, v_pk_mul_lo_u16, v_pk_mad_u16/i16, v_pk_min/max_u16/i16)
     cases += [
