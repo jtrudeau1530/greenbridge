@@ -182,7 +182,7 @@ class TestFormatDecoderBoundary(unittest.TestCase):
         self.gen = rdna2spirv.Gen("ps")
 
     def test_invalid_format_codes_raise_unsupported(self):
-        for code in (0, -1, 999, 255, 42, 100):
+        for code in (0, -1, 999, 255, 100, 127):   # 42 (10_11_11 SINT) is a format since #2022 and #2432
             with self.subTest(code=code):
                 with self.assertRaisesRegex(rdna2spirv.Unsupported, r"format .* \(not in FORMATS\)"):
                     self.gen.decode_format(["%w0", "%w1", "%w2", "%w3"], code)

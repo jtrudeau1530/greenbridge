@@ -39,7 +39,8 @@ class HarnessErrorExit(unittest.TestCase):
             mock.patch.object(sd.rdna2spirv, "translate", side_effect=sd.rdna2spirv.Unsupported("test opcode")),
             contextlib.redirect_stdout(out),
         ):
-            self.assertEqual(sd.main(["--programs", "1"]), 0)
+            # exit 2: a run where every program was skipped is not a success (#4448)
+            self.assertEqual(sd.main(["--programs", "1"]), 2)
         self.assertIn("1 skipped, 0 harness errors", out.getvalue())
         self.assertIn("translator unsupported: test opcode", out.getvalue())
 
