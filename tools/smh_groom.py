@@ -8,6 +8,10 @@ of byte offsets into per-guide, per-node and per-triangle arrays.
 Strands are not stored directly in the asset: the ``smh_gen_*_CS_InterpolateStrands`` compute shaders
 scatter strand roots across the scalp triangle mesh (whose vertices are the guide roots) using a
 deterministic integer RNG, then blend three guides per strand and trim to a per-strand length.
+Class 0 (``smh_gen_1``) and class 1 (``smh_gen_2``/``_4``/``_8``/``_16``) are two placement sets of
+one groom generated with the same points-per-strand (per-instance ``+0x54`` bits 16-23, 16 bytes/point)
+and drawn together as ``(count0 + count1) * (points - 1)`` segments in one batch; neither class is
+"more detailed".
 
 Pure Python standard library only (runs under ``python -I``, no third-party packages).
 
@@ -40,6 +44,27 @@ TYPE_ID = 0x7D8F3DB3
 PREFIX = b"\x00" * 16 + b"\x78"
 HEADER_SIZE = 0xA0
 MAX_INFLATE_BYTES = 64 << 20
+
+# System page +0xb8 metadata hashes and +0x48..+0x70 child-rig float sentinels.
+SKEL_HEAD_HASH = 0x34C53E77
+UNUSED_HASH_FILL = 0x89EA2ED6
+FLT_MAX_U32 = 0x7F7FFFFF
+NEG_FLT_MAX_U32 = 0xFF7FFFFF
+
+# Measured +0xcc (slot 5 of system page +0xb8) part class hashes across the corpus (30 distinct total).
+PART_CLASS_NAMES: dict[int, str] = {
+    0xD54A2D40: "main_hair",
+    0x27B342A3: "short_hair",
+    0xE61E1493: "long_hair",
+    0x1CAEB442: "fuzz",
+    0xE2500E92: "braids_ties",
+    0x44D2709F: "beard",
+    0x42C7E1D0: "beard",
+    0x83A664E7: "lashes",
+    0xA228CC57: "body_hair",
+    0x304DD218: "animal_fur",
+    0xC50E7D12: "animal_fur",
+}
 
 MODE_LINES = 1
 MODE_LINE_STRIP = 3
@@ -197,6 +222,122 @@ def scan_offsets(
                 yield off
 
 
+def _finite_f16(value: float) -> float | None:
+    return _clean_zero(value) if math.isfinite(value) else None
+
+
+def _round_opt(value: float | None, digits: int = 6) -> float | None:
+    return None if value is None else round(value, digits)
+
+
+def _round_style_params(params: dict | None) -> dict | None:
+    if params is None:
+        return None
+    out: dict = {
+        "strandWidth": _round_opt(params["strandWidth"]),
+        "longestGuideM": _round_opt(params["longestGuideM"]),
+        "longestGuideAltM": _round_opt(params["longestGuideAltM"]),
+        "braidParam": _round_opt(params["braidParam"]),
+    }
+    for key in ("curlFrizz0", "curlFrizz1"):
+        blk = params[key]
+        out[key] = {
+            "amounts": [_round_opt(v) for v in blk["amounts"]],
+            "radiiM": [_round_opt(v) for v in blk["radiiM"]],
+            "frequenciesPerM": [_round_opt(v) for v in blk["frequenciesPerM"]],
+        }
+    return out
+
+
+def parse_system_page(system: bytes | bytearray | memoryview) -> dict:
+    """Decode structured metadata from an inflated ``smh`` groom LOD system page.
+
+    Decodes bounding box (``+0x30``/``+0x40``), child-rig unset float sentinel detection in
+    ``+0x48..+0x70`` (secondary float4 bounds at ``+0x50..+0x6f`` set to ``+FLT_MAX``
+    ``0x7f7fffff`` / ``-FLT_MAX`` ``0xff7fffff``), skinning bone hashes (``+0x98/+0xa0``),
+    region records (``+0xa8/+0xb0``), the six ``+0xb8`` metadata hashes (slots 0..3 bone
+    hashes, slot 4 ``+0xc8`` style preset hash, slot 5 ``+0xcc`` part class hash), strand
+    totals (``+0xd0``), and the ``+0xe8..+0x110`` IEEE 754 ``float16`` style parameters
+    (when ``len(system) >= 0x110``).
+    """
+    sys_bytes = bytes(system)
+    if len(sys_bytes) < 0xE0:
+        raise GroomError(f"system page shorter than 0xe0 bytes ({len(sys_bytes)} bytes)")
+
+    box_min = struct.unpack_from("<3f", sys_bytes, 0x30)
+    box_max = struct.unpack_from("<3f", sys_bytes, 0x40)
+    box = (box_min, box_max)
+
+    # Child rigs leave the +0x50..+0x6f secondary bounds floats (within +0x48..+0x70) unset
+    # at +FLT_MAX (0x7f7fffff, little-endian ff ff 7f 7f) / -FLT_MAX (0xff7fffff).
+    rig_float_words = struct.unpack_from("<10I", sys_bytes, 0x48)
+    has_unset_rig_floats = any(w in (FLT_MAX_U32, NEG_FLT_MAX_U32) for w in rig_float_words)
+
+    totals = struct.unpack_from("<II", sys_bytes, 0xD0)
+    style_hashes = struct.unpack_from("<6I", sys_bytes, 0xB8)
+    slot_bone_hashes = style_hashes[:4]
+    style_preset_hash = style_hashes[4]
+    part_class_hash = style_hashes[5]
+    part_class = PART_CLASS_NAMES.get(part_class_hash)
+
+    bone_hashes: tuple[int, ...] = ()
+    n_bones = struct.unpack_from("<I", sys_bytes, 0x98)[0]
+    if 0 < n_bones <= 256 and struct.unpack_from("<Q", sys_bytes, 0xA0)[0]:
+        b_at = _sys_ptr(sys_bytes, 0xA0)
+        if b_at + 4 * n_bones <= len(sys_bytes):
+            bone_hashes = struct.unpack_from(f"<{n_bones}I", sys_bytes, b_at)
+
+    regions: list[dict] = []
+    n_reg = struct.unpack_from("<I", sys_bytes, 0xA8)[0]
+    if 0 < n_reg <= 64 and struct.unpack_from("<Q", sys_bytes, 0xB0)[0]:
+        r_at = _sys_ptr(sys_bytes, 0xB0)
+        for k in range(n_reg):
+            off_k = r_at + 12 * k
+            if off_k + 12 > len(sys_bytes):
+                break
+            n_tri, n_guide, n_s0, _pad, rid, n_s1 = struct.unpack_from("<HHHBBI", sys_bytes, off_k)
+            regions.append({
+                "id": rid,
+                "triangles": n_tri,
+                "guides": n_guide,
+                "strands": [n_s0, n_s1],
+            })
+
+    style_params: dict | None = None
+    if len(sys_bytes) >= 0x110:
+        h = [_finite_f16(v) for v in struct.unpack_from("<20e", sys_bytes, 0xE8)]
+        style_params = {
+            "strandWidth": h[0],          # +0xe8 (typically 0.1, or 0.03 in some grooms)
+            "longestGuideM": h[1],        # +0xea (longest guide in metres)
+            "longestGuideAltM": h[3],     # +0xee (longest guide in metres)
+            "braidParam": h[4],           # +0xf0 (correlates with braided styles, r = 0.75)
+            "curlFrizz0": {               # +0xf8..+0x103 (6 half-floats: 2 amounts, 2 radii in m, 2 freqs/m)
+                "amounts": [h[8], h[9]],
+                "radiiM": [h[10], h[11]],
+                "frequenciesPerM": [h[12], h[13]],
+            },
+            "curlFrizz1": {               # +0x104..+0x10f (6 half-floats; +0x10a correlates with curly, r = 0.81)
+                "amounts": [h[14], h[15]],
+                "radiiM": [h[16], h[17]],
+                "frequenciesPerM": [h[18], h[19]],
+            },
+        }
+
+    return {
+        "box": box,
+        "strand_totals": totals,
+        "bone_hashes": bone_hashes,
+        "regions": regions,
+        "style_hashes": style_hashes,
+        "slot_bone_hashes": slot_bone_hashes,
+        "style_preset_hash": style_preset_hash,
+        "part_class_hash": part_class_hash,
+        "part_class": part_class,
+        "has_unset_rig_floats": has_unset_rig_floats,
+        "style_params": style_params,
+    }
+
+
 @dataclass
 class Groom:
     """Decoded smh groom LOD resource."""
@@ -216,6 +357,11 @@ class Groom:
     regions: list[dict] = field(default_factory=list)
     bone_hashes: tuple[int, ...] = ()
     style_hashes: tuple[int, ...] = ()
+    style_preset_hash: int | None = None
+    part_class_hash: int | None = None
+    part_class: str | None = None
+    has_unset_rig_floats: bool = False
+    style_params: dict | None = None
     positions: list[list[tuple[float, float, float]]] = field(default_factory=list, repr=False)
     node_w: list[list[float]] = field(default_factory=list, repr=False)
     triangles: list[tuple[int, int, int]] = field(default_factory=list, repr=False)
@@ -228,7 +374,7 @@ class Groom:
     length_random: tuple[float, float] = (0.0, 1.0)
     present: dict[str, bool] = field(default_factory=dict, repr=False)
     optional_raw: dict[str, bytes] = field(default_factory=dict, repr=False)
-    tail: bytes = field(default=b"", repr=False)
+    tail: bytes = field(default_factory=b"", repr=False)
     sentinel_2c: int = 0xFFFFFFFF
     ext_3c_offset: int = 0
 
@@ -307,6 +453,11 @@ class Groom:
             "hasExt3c": bool(self.ext_3c_offset),
             "boneHashCount": len(self.bone_hashes),
             "styleHashes": [hex(h) for h in self.style_hashes],
+            "stylePresetHash": hex(self.style_preset_hash) if self.style_preset_hash is not None else None,
+            "partClassHash": hex(self.part_class_hash) if self.part_class_hash is not None else None,
+            "partClass": self.part_class,
+            "hasUnsetRigFloats": self.has_unset_rig_floats,
+            "styleParams": _round_style_params(self.style_params),
         }
 
 
@@ -435,35 +586,23 @@ def parse(
     regions: list[dict] = []
     bone_hashes: tuple[int, ...] = ()
     style_hashes: tuple[int, ...] = ()
+    style_preset_hash: int | None = None
+    part_class_hash: int | None = None
+    part_class: str | None = None
+    has_unset_rig_floats = False
+    style_params: dict | None = None
     if sys_bytes:
-        if len(sys_bytes) < 0xE0:
-            raise GroomError(f"system page shorter than 0xe0 bytes ({len(sys_bytes)} bytes)")
-        box_min = struct.unpack_from("<3f", sys_bytes, 0x30)
-        box_max = struct.unpack_from("<3f", sys_bytes, 0x40)
-        box = (box_min, box_max)
-        totals = struct.unpack_from("<II", sys_bytes, 0xD0)
-        style_hashes = struct.unpack_from("<6I", sys_bytes, 0xB8)
-
-        n_bones = struct.unpack_from("<I", sys_bytes, 0x98)[0]
-        if 0 < n_bones <= 256 and struct.unpack_from("<Q", sys_bytes, 0xA0)[0]:
-            b_at = _sys_ptr(sys_bytes, 0xA0)
-            if b_at + 4 * n_bones <= len(sys_bytes):
-                bone_hashes = struct.unpack_from(f"<{n_bones}I", sys_bytes, b_at)
-
-        n_reg = struct.unpack_from("<I", sys_bytes, 0xA8)[0]
-        if 0 < n_reg <= 64 and struct.unpack_from("<Q", sys_bytes, 0xB0)[0]:
-            r_at = _sys_ptr(sys_bytes, 0xB0)
-            for k in range(n_reg):
-                off_k = r_at + 12 * k
-                if off_k + 12 > len(sys_bytes):
-                    break
-                n_tri, n_guide, n_s0, _pad, rid, n_s1 = struct.unpack_from("<HHHBBI", sys_bytes, off_k)
-                regions.append({
-                    "id": rid,
-                    "triangles": n_tri,
-                    "guides": n_guide,
-                    "strands": [n_s0, n_s1],
-                })
+        sys_info = parse_system_page(sys_bytes)
+        box = sys_info["box"]
+        totals = sys_info["strand_totals"]
+        bone_hashes = sys_info["bone_hashes"]
+        regions = sys_info["regions"]
+        style_hashes = sys_info["style_hashes"]
+        style_preset_hash = sys_info["style_preset_hash"]
+        part_class_hash = sys_info["part_class_hash"]
+        part_class = sys_info["part_class"]
+        has_unset_rig_floats = sys_info["has_unset_rig_floats"]
+        style_params = sys_info["style_params"]
     else:
         xs = pos_flat[0::4]
         ys = pos_flat[1::4]
@@ -489,6 +628,11 @@ def parse(
         regions=regions,
         bone_hashes=bone_hashes,
         style_hashes=style_hashes,
+        style_preset_hash=style_preset_hash,
+        part_class_hash=part_class_hash,
+        part_class=part_class,
+        has_unset_rig_floats=has_unset_rig_floats,
+        style_params=style_params,
         positions=positions,
         node_w=node_w,
         triangles=triangles,
@@ -599,7 +743,9 @@ def scatter(
         groom: Decoded ``Groom`` resource.
         count: Number of strand threads (``0..count-1``). Defaults to ``groom.strand_totals[strand_class]``
             or the sum of per-triangle counts for ``strand_class``.
-        strand_class: ``0`` (primary, exact shader port) or ``1`` (secondary, approximate density).
+        strand_class: ``0`` (placement set 0, exact ``smh_gen_1`` shader port) or ``1`` (placement set 1,
+            approximate until ``smh_gen_2``/``_4``/``_8``/``_16`` are ported; both classes are generated
+            alike and drawn together as one batch).
         density_scale: Acceptance factor in ``saturate(tri_count * density_scale)``. Defaults to
             ``1.0 / max(max_tri_count, 1.0)`` so the densest triangle is always accepted.
         region_mask: Optional iterable of region IDs (1..255) to cull; region 0 is never culled.
@@ -1428,15 +1574,44 @@ def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
     class1_exact_match = 0
     sentinel_non_default = 0
     ext_3c_count = 0
+    unset_rig_float_assets = 0
     flags_hist: collections.Counter[str] = collections.Counter()
     lod_depth_hist: collections.Counter[int] = collections.Counter()
     opt_array_hist: collections.Counter[str] = collections.Counter()
     placement_hist: collections.Counter[str] = collections.Counter()
+    part_class_hist: collections.Counter[str] = collections.Counter()
+    style_preset_hist: collections.Counter[str] = collections.Counter()
     guides_min: int | None = None
     guides_max = 0
     ppg_min: int | None = None
     ppg_max = 0
     remaining = limit
+
+    def _row_from_groom(g: Groom, off: int) -> dict:
+        tc_totals = g.tri_count_totals()
+        longest = max(g.lengths) if g.lengths else 0.0
+        return {
+            "offset": off,
+            "error": None,
+            "guides": g.guides,
+            "ppg": g.nodes_per_guide,
+            "tris": g.triangles_n,
+            "flags": g.flags,
+            "s0": g.strand_totals[0],
+            "s1": g.strand_totals[1],
+            "tc0": tc_totals[0],
+            "tc1": tc_totals[1],
+            "bytes": len(g.buffer),
+            "box": g.box,
+            "longest": longest,
+            "opt": [n for n, p in g.present.items() if p and n.startswith(("ext", "node_", "direction"))],
+            "sentinel_2c": g.sentinel_2c,
+            "has_ext_3c": bool(g.ext_3c_offset),
+            "part_class": g.part_class,
+            "part_class_hash": g.part_class_hash,
+            "style_preset_hash": g.style_preset_hash,
+            "has_unset_rig_floats": g.has_unset_rig_floats,
+        }
 
     for target in targets:
         if remaining is not None and remaining <= 0:
@@ -1454,57 +1629,19 @@ def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
                             break
                         if remaining is not None:
                             remaining -= 1
-                        row = {"offset": off, "error": None}
                         try:
                             g = read_resource(mm, off, archive=target)
-                            tc_totals = g.tri_count_totals()
-                            longest = max(g.lengths) if g.lengths else 0.0
-                            row.update(
-                                guides=g.guides,
-                                ppg=g.nodes_per_guide,
-                                tris=g.triangles_n,
-                                flags=g.flags,
-                                s0=g.strand_totals[0],
-                                s1=g.strand_totals[1],
-                                tc0=tc_totals[0],
-                                tc1=tc_totals[1],
-                                bytes=len(g.buffer),
-                                box=g.box,
-                                longest=longest,
-                                opt=[n for n, p in g.present.items() if p and n.startswith(("ext", "node_", "direction"))],
-                                sentinel_2c=g.sentinel_2c,
-                                has_ext_3c=bool(g.ext_3c_offset),
-                            )
+                            rows.append(_row_from_groom(g, off))
                         except (GroomError, ValueError, IndexError) as exc:
-                            row["error"] = str(exc)
-                        rows.append(row)
+                            rows.append({"offset": off, "error": str(exc)})
                 else:
                     if remaining is not None:
                         remaining -= 1
-                    row = {"offset": 0, "error": None}
                     try:
                         g = load_groom(target)
-                        tc_totals = g.tri_count_totals()
-                        longest = max(g.lengths) if g.lengths else 0.0
-                        row.update(
-                            guides=g.guides,
-                            ppg=g.nodes_per_guide,
-                            tris=g.triangles_n,
-                            flags=g.flags,
-                            s0=g.strand_totals[0],
-                            s1=g.strand_totals[1],
-                            tc0=tc_totals[0],
-                            tc1=tc_totals[1],
-                            bytes=len(g.buffer),
-                            box=g.box,
-                            longest=longest,
-                            opt=[n for n, p in g.present.items() if p and n.startswith(("ext", "node_", "direction"))],
-                            sentinel_2c=g.sentinel_2c,
-                            has_ext_3c=bool(g.ext_3c_offset),
-                        )
+                        rows.append(_row_from_groom(g, 0))
                     except (GroomError, ValueError, IndexError) as exc:
-                        row["error"] = str(exc)
-                    rows.append(row)
+                        rows.append({"offset": 0, "error": str(exc)})
 
         ok_rows = [r for r in rows if not r["error"]]
         err_rows = [r for r in rows if r["error"]]
@@ -1542,6 +1679,14 @@ def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
             if lod0["tc1"] == lod0["s1"]:
                 class1_exact_match += 1
             placement_hist[classify_placement(lod0["box"], lod0["longest"])] += 1
+            if lod0["part_class"] is not None:
+                part_class_hist[lod0["part_class"]] += 1
+            elif lod0["part_class_hash"] is not None:
+                part_class_hist[hex(lod0["part_class_hash"])] += 1
+            if lod0["style_preset_hash"] is not None:
+                style_preset_hist[hex(lod0["style_preset_hash"])] += 1
+            if lod0["has_unset_rig_floats"]:
+                unset_rig_float_assets += 1
 
         per_source.append({
             "source": os.path.basename(target),
@@ -1566,11 +1711,15 @@ def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
             "class1TriSumMatchesLod0": class1_exact_match,
             "sentinel2cNonDefaultLods": sentinel_non_default,
             "ext3cLods": ext_3c_count,
+            "unsetRigFloatAssets": unset_rig_float_assets,
+            "stylePresetDistinctCount": len(style_preset_hist),
             "guidesRange": [guides_min or 0, guides_max],
             "nodesPerGuideRange": [ppg_min or 0, ppg_max],
         },
         "lodDepthHistogram": {str(k): v for k, v in sorted(lod_depth_hist.items())},
         "placementHistogram": dict(placement_hist.most_common()),
+        "partClassHistogram": dict(part_class_hist.most_common()),
+        "topStylePresets": dict(style_preset_hist.most_common(12)),
         "optionalArrays": dict(opt_array_hist.most_common()),
         "topFlags": dict(flags_hist.most_common(12)),
     }
@@ -1603,11 +1752,16 @@ def _parse_classes(text: str) -> tuple[int, ...]:
 
 
 def _format_inspect_text(summary: dict) -> str:
+    part_label = summary["partClass"] or "unknown"
+    part_hash = summary["partClassHash"] or "none"
+    preset_hash = summary["stylePresetHash"] or "none"
     lines = [
         f"Source:        {summary['archive']} @ {summary['offset']}",
         f"Geometry:      {summary['guides']} guides x {summary['nodesPerGuide']} nodes "
         f"({summary['nodes']} nodes), {summary['triangles']} scalp triangles",
-        f"Flags:         {summary['flags']}  (sentinel +0x2c={summary['sentinel2c']}, ext_3c={summary['hasExt3c']})",
+        f"Flags:         {summary['flags']}  (sentinel +0x2c={summary['sentinel2c']}, "
+        f"ext_3c={summary['hasExt3c']}, unset_rig_floats={summary['hasUnsetRigFloats']})",
+        f"Part / preset: part_class={part_label} ({part_hash})  style_preset={preset_hash}",
         f"Buffer:        {summary['bufferBytes']} B GPU, {summary['systemBytes']} B system, {summary['tailBytes']} B tail",
         f"Bounds (m):    min={summary['box'][0]}  max={summary['box'][1]}",
         f"Strands:       system={summary['strandTotals']}  tri_sum={summary['strandsFromTriangles']}",
@@ -1618,6 +1772,15 @@ def _format_inspect_text(summary: dict) -> str:
         f"Regions:       {len(summary['regions'])}  Bone hashes: {summary['boneHashCount']}",
         f"Optional:      {', '.join(summary['optionalArrays']) or 'none'}",
     ]
+    sp = summary.get("styleParams")
+    if sp is not None:
+        c0 = sp["curlFrizz0"]
+        c1 = sp["curlFrizz1"]
+        lines.append(
+            f"Style (+0xe8): width={sp['strandWidth']}  longest={sp['longestGuideM']}/{sp['longestGuideAltM']} m  "
+            f"braid={sp['braidParam']}  curl0(r={c0['radiiM']}, f={c0['frequenciesPerM']})  "
+            f"curl1(r={c1['radiiM']}, f={c1['frequenciesPerM']})"
+        )
     return "\n".join(lines)
 
 
@@ -1632,6 +1795,8 @@ def _format_census_text(report: dict) -> str:
         f"Nodes/guide range: {t['nodesPerGuideRange'][0]}..{t['nodesPerGuideRange'][1]}",
         f"LOD depths:   {report['lodDepthHistogram']}",
         f"Placement:    {report['placementHistogram']}",
+        f"Part classes: {report['partClassHistogram']}  "
+        f"(style presets: {t['stylePresetDistinctCount']} distinct, unset rig floats: {t['unsetRigFloatAssets']})",
     ]
     for src in report["sources"]:
         lines.append(
@@ -1669,7 +1834,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_glb.add_argument("--curves", action="store_true", help="Shorthand for --geometry curves")
     p_glb.add_argument("--strands", type=_parse_int, default=6000, help="Maximum strands per class to export")
-    p_glb.add_argument("--classes", type=_parse_classes, default=(0, 1), help="Comma-separated strand classes (0,1)")
+    p_glb.add_argument(
+        "--classes",
+        type=_parse_classes,
+        default=(0, 1),
+        help="Comma-separated placement classes to export (default 0,1; both sets are drawn together in one batch)",
+    )
     p_glb.add_argument("--no-scalp", action="store_true", help="Omit scalp triangle mesh")
     p_glb.add_argument("--no-guides", action="store_true", help="Omit guide curves/tubes")
     p_glb.add_argument("--guide-radius", type=float, default=0.0006, help="Display tube/ribbon radius for guides (m)")

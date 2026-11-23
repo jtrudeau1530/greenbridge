@@ -47,6 +47,8 @@ def build_synthetic_groom_buffers(
     tail_bytes: bytes = b"",
     sentinel_2c: int = 0xFFFFFFFF,
     include_ext_3c: bool = False,
+    unset_rig_floats: bool = False,
+    style_params_f16: dict[int, float] | None = None,
 ) -> tuple[bytes, bytes]:
     """Build a synthetic (system_page, gpu_buffer) pair for unit testing."""
     if guides_pos is None:
@@ -142,7 +144,7 @@ def build_synthetic_groom_buffers(
     header[0x80 // 4] = seeds[1]
     struct.pack_into("<40I", gpu, 0, *header)
 
-    # Build system page (>= 0x100 bytes + descriptor + bone hashes + region records).
+    # Build system page (>= 0x120 bytes + descriptor + bone hashes + region records).
     xs = [p[0] for g in guides_pos for p in g]
     ys = [p[1] for g in guides_pos for p in g]
     zs = [p[2] for g in guides_pos for p in g]
@@ -155,6 +157,12 @@ def build_synthetic_groom_buffers(
     struct.pack_into("<I", sysd, 0x1C, smh_groom.TYPE_ID)
     struct.pack_into("<3f", sysd, 0x30, min(xs), min(ys), min(zs))
     struct.pack_into("<3f", sysd, 0x40, max(xs), max(ys), max(zs))
+    if unset_rig_floats:
+        struct.pack_into("<4I", sysd, 0x50, *(smh_groom.FLT_MAX_U32,) * 4)
+        struct.pack_into("<4I", sysd, 0x60, *(smh_groom.NEG_FLT_MAX_U32,) * 4)
+    else:
+        struct.pack_into("<4f", sysd, 0x50, min(xs), min(ys), min(zs), 0.0)
+        struct.pack_into("<4f", sysd, 0x60, max(xs), max(ys), max(zs), 0.0)
 
     desc_off = len(sysd)
     sysd.extend(b"\x00" * 0x20)
@@ -177,6 +185,10 @@ def build_synthetic_groom_buffers(
 
     struct.pack_into("<6I", sysd, 0xB8, *style_hashes)
     struct.pack_into("<IIIHH", sysd, 0xD0, strand_totals[0], strand_totals[1], 0, tris, guides)
+
+    if style_params_f16 is not None:
+        for off_f16, val_f16 in style_params_f16.items():
+            struct.pack_into("<e", sysd, off_f16, val_f16)
 
     return bytes(sysd), bytes(gpu)
 
@@ -336,8 +348,116 @@ class ParsingTests(unittest.TestCase):
         groom = smh_groom.parse(None, gpu, archive="raw.smh", offset=0)
         self.assertEqual(groom.system, b"")
         self.assertEqual(groom.strand_totals, (24, 8))
+        self.assertIsNone(groom.style_preset_hash)
+        self.assertIsNone(groom.part_class_hash)
+        self.assertIsNone(groom.part_class)
+        self.assertFalse(groom.has_unset_rig_floats)
+        self.assertIsNone(groom.style_params)
         self.assertAlmostEqual(groom.box[0][0], -0.05, places=2)
         self.assertAlmostEqual(groom.box[1][2], 0.82, places=2)
+
+    def test_system_page_metadata_hashes_and_part_class_mapping(self):
+        for part_hash, expected_name in smh_groom.PART_CLASS_NAMES.items():
+            with self.subTest(part_hash=hex(part_hash), expected=expected_name):
+                hashes = (
+                    smh_groom.SKEL_HEAD_HASH,
+                    smh_groom.UNUSED_HASH_FILL,
+                    smh_groom.UNUSED_HASH_FILL,
+                    smh_groom.UNUSED_HASH_FILL,
+                    0x74792000,
+                    part_hash,
+                )
+                sysd, gpu = build_synthetic_groom_buffers(style_hashes=hashes)
+                parsed_sys = smh_groom.parse_system_page(sysd)
+                self.assertEqual(parsed_sys["slot_bone_hashes"], hashes[:4])
+                self.assertEqual(parsed_sys["style_preset_hash"], 0x74792000)
+                self.assertEqual(parsed_sys["part_class_hash"], part_hash)
+                self.assertEqual(parsed_sys["part_class"], expected_name)
+
+                groom = smh_groom.parse(sysd, gpu)
+                self.assertEqual(groom.style_preset_hash, 0x74792000)
+                self.assertEqual(groom.part_class_hash, part_hash)
+                self.assertEqual(groom.part_class, expected_name)
+                summary = groom.summary()
+                self.assertEqual(summary["stylePresetHash"], "0x74792000")
+                self.assertEqual(summary["partClassHash"], hex(part_hash))
+                self.assertEqual(summary["partClass"], expected_name)
+
+        # Unmapped slot 5 hash leaves part_class as None while preserving raw hash.
+        sysd_unk, gpu_unk = build_synthetic_groom_buffers(
+            style_hashes=(smh_groom.SKEL_HEAD_HASH, 0x89EA2ED6, 0x89EA2ED6, 0x89EA2ED6, 0x12345678, 0xDEADBEEF),
+        )
+        groom_unk = smh_groom.parse(sysd_unk, gpu_unk)
+        self.assertEqual(groom_unk.style_preset_hash, 0x12345678)
+        self.assertEqual(groom_unk.part_class_hash, 0xDEADBEEF)
+        self.assertIsNone(groom_unk.part_class)
+
+    def test_system_page_unset_child_rig_floats(self):
+        sysd_adult, gpu_adult = build_synthetic_groom_buffers(unset_rig_floats=False)
+        groom_adult = smh_groom.parse(sysd_adult, gpu_adult)
+        self.assertFalse(groom_adult.has_unset_rig_floats)
+        self.assertFalse(groom_adult.summary()["hasUnsetRigFloats"])
+
+        sysd_child, gpu_child = build_synthetic_groom_buffers(unset_rig_floats=True)
+        parsed_child = smh_groom.parse_system_page(sysd_child)
+        self.assertTrue(parsed_child["has_unset_rig_floats"])
+        groom_child = smh_groom.parse(sysd_child, gpu_child)
+        self.assertTrue(groom_child.has_unset_rig_floats)
+        self.assertTrue(groom_child.summary()["hasUnsetRigFloats"])
+
+    def test_system_page_half_float_style_parameters(self):
+        style_f16 = {
+            0xE8: 0.1,      # strand width
+            0xEA: 0.28,     # longest guide (m)
+            0xEE: 0.28,     # longest guide copy (m)
+            0xF0: 0.75,     # braid-correlated parameter
+            0xF8: 0.1,      # curl/frizz block 0: amount 0
+            0xFA: 0.05,     # amount 1
+            0xFC: 0.003,    # radius 0 (m)
+            0xFE: 0.004,    # radius 1 (m)
+            0x100: 12.75,   # frequency 0 (/m)
+            0x102: 61.0,    # frequency 1 (/m)
+            0x104: 0.08,    # curl/frizz block 1: amount 0
+            0x106: 0.02,    # amount 1
+            0x108: 0.003,   # radius 0 (m)
+            0x10A: 0.0007,  # radius 1 (m, curly-correlated)
+            0x10C: 70.0,    # frequency 0 (/m)
+            0x10E: 74.5,    # frequency 1 (/m)
+        }
+        sysd, gpu = build_synthetic_groom_buffers(style_params_f16=style_f16)
+        groom = smh_groom.parse(sysd, gpu)
+        sp = groom.style_params
+        self.assertIsNotNone(sp)
+        self.assertAlmostEqual(sp["strandWidth"], 0.1, places=3)
+        self.assertAlmostEqual(sp["longestGuideM"], 0.28, places=3)
+        self.assertAlmostEqual(sp["longestGuideAltM"], 0.28, places=3)
+        self.assertAlmostEqual(sp["braidParam"], 0.75, places=3)
+        self.assertAlmostEqual(sp["curlFrizz0"]["amounts"][0], 0.1, places=3)
+        self.assertAlmostEqual(sp["curlFrizz0"]["amounts"][1], 0.05, places=3)
+        self.assertAlmostEqual(sp["curlFrizz0"]["radiiM"][0], 0.003, places=4)
+        self.assertAlmostEqual(sp["curlFrizz0"]["radiiM"][1], 0.004, places=4)
+        self.assertAlmostEqual(sp["curlFrizz0"]["frequenciesPerM"][0], 12.75, places=2)
+        self.assertAlmostEqual(sp["curlFrizz0"]["frequenciesPerM"][1], 61.0, places=2)
+        self.assertAlmostEqual(sp["curlFrizz1"]["amounts"][0], 0.08, places=3)
+        self.assertAlmostEqual(sp["curlFrizz1"]["amounts"][1], 0.02, places=3)
+        self.assertAlmostEqual(sp["curlFrizz1"]["radiiM"][0], 0.003, places=4)
+        self.assertAlmostEqual(sp["curlFrizz1"]["radiiM"][1], 0.0007, places=4)
+        self.assertAlmostEqual(sp["curlFrizz1"]["frequenciesPerM"][0], 70.0, places=1)
+        self.assertAlmostEqual(sp["curlFrizz1"]["frequenciesPerM"][1], 74.5, places=1)
+
+        # Non-finite half-float (NaN = 0x7E00) decodes cleanly as None without crashing.
+        mut_nan = bytearray(sysd)
+        struct.pack_into("<H", mut_nan, 0x10A, 0x7E00)
+        parsed_nan = smh_groom.parse_system_page(mut_nan)
+        self.assertIsNone(parsed_nan["style_params"]["curlFrizz1"]["radiiM"][1])
+
+        # Minimal 0xe0-byte system page omits style_params safely.
+        short_sys = bytearray(0xE0)
+        short_sys[:0xE0] = sysd[:0xE0]
+        struct.pack_into("<I", short_sys, 0x98, 0)
+        struct.pack_into("<I", short_sys, 0xA8, 0)
+        parsed_short = smh_groom.parse_system_page(short_sys)
+        self.assertIsNone(parsed_short["style_params"])
 
     def test_native_resource_multi_chunk_and_scan_offsets(self):
         sys1, gpu1 = build_synthetic_groom_buffers(flags=0x440, seeds=(0x111, 0x222))
@@ -626,7 +746,10 @@ class ErrorHandlingTests(unittest.TestCase):
 
 class CliTests(unittest.TestCase):
     def test_cli_inspect_census_and_export_glb(self):
-        sysd, gpu = build_synthetic_groom_buffers()
+        sysd, gpu = build_synthetic_groom_buffers(
+            unset_rig_floats=True,
+            style_params_f16={0xE8: 0.1, 0xEA: 0.12, 0xEE: 0.12, 0xF0: 0.5, 0x10A: 0.003, 0x10C: 70.0},
+        )
         native = pack_native_resource(sysd, gpu)
         rpf_like = b"9FPR" + b"\x00" * 0x3C + native
 
@@ -645,6 +768,10 @@ class CliTests(unittest.TestCase):
                 capture_output=True, text=True, check=True,
             )
             self.assertIn("4 guides x 4 nodes", proc_txt.stdout)
+            self.assertIn("part_class=main_hair (0xd54a2d40)", proc_txt.stdout)
+            self.assertIn("style_preset=0x74792000", proc_txt.stdout)
+            self.assertIn("unset_rig_floats=True", proc_txt.stdout)
+            self.assertIn("Style (+0xe8):", proc_txt.stdout)
 
             proc = subprocess.run(
                 [sys.executable, "-I", os.path.join(TOOLS, "smh_groom.py"), "inspect", smh_path, "--json"],
@@ -653,6 +780,12 @@ class CliTests(unittest.TestCase):
             info = json.loads(proc.stdout)
             self.assertEqual(info["guides"], 4)
             self.assertEqual(info["triangles"], 2)
+            self.assertEqual(info["partClass"], "main_hair")
+            self.assertEqual(info["partClassHash"], "0xd54a2d40")
+            self.assertEqual(info["stylePresetHash"], "0x74792000")
+            self.assertTrue(info["hasUnsetRigFloats"])
+            self.assertAlmostEqual(info["styleParams"]["strandWidth"], 0.1, places=3)
+            self.assertAlmostEqual(info["styleParams"]["curlFrizz1"]["frequenciesPerM"][0], 70.0, places=1)
 
             # census --json across directory (finds both .rpf and .smh) and --limit 1
             proc_c = subprocess.run(
@@ -662,12 +795,16 @@ class CliTests(unittest.TestCase):
             cen = json.loads(proc_c.stdout)
             self.assertEqual(cen["totals"]["lods"], 2)
             self.assertEqual(cen["totals"]["errors"], 0)
+            self.assertEqual(cen["totals"]["unsetRigFloatAssets"], 2)
+            self.assertEqual(cen["totals"]["stylePresetDistinctCount"], 1)
+            self.assertEqual(cen["partClassHistogram"], {"main_hair": 2})
 
             proc_lim = subprocess.run(
                 [sys.executable, "-I", os.path.join(TOOLS, "smh_groom.py"), "census", tmp, "--limit", "1"],
                 capture_output=True, text=True, check=True,
             )
             self.assertIn("1 LOD resources", proc_lim.stdout)
+            self.assertIn("Part classes:", proc_lim.stdout)
 
             # export-glb --curves
             proc_g = subprocess.run(
