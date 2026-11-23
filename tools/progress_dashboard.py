@@ -238,11 +238,17 @@ def last_commit_time(path):
 
 
 # ----------------------------------------------------------------------------------------------- unit tests
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; the dashboard must not report an
+    # incomplete test selection or code digest as complete. main() turns the OSError into one error line.
+    raise exc
+
+
 def ci_test_files():
     """tests/test_*.py that CI runs one by one: standard-library files with a __main__ block (ci.yml)."""
     found = []
     tests = os.path.join(ROOT, "tests")
-    for base, dirs, files in os.walk(tests):
+    for base, dirs, files in os.walk(tests, onerror=_walk_error):
         dirs[:] = sorted(d for d in dirs if d not in ("semantic", "__pycache__", "fixtures"))
         for name in sorted(files):
             if not (name.startswith("test_") and name.endswith(".py")):
@@ -288,7 +294,7 @@ def code_digest():
     h = hashlib.sha256()
     rels = ["make_game.py"]
     for d in CODE_DIRS:
-        for base, dirs, files in os.walk(os.path.join(ROOT, d)):
+        for base, dirs, files in os.walk(os.path.join(ROOT, d), onerror=_walk_error):
             dirs[:] = sorted(x for x in dirs if x not in ("__pycache__", "bin", "obj", "target", "build") and not x.startswith("."))
             rels += [os.path.relpath(os.path.join(base, f), ROOT).replace("\\", "/") for f in sorted(files) if f.endswith(".py")]
     for rel in rels:
@@ -1016,7 +1022,11 @@ def main(argv=None):
         if args.tests and not args.test_files:
             ap.error("--tests did not match any test files")
     os.makedirs(out_dir, exist_ok=True)
-    snap = build(args, out_dir)
+    try:
+        snap = build(args, out_dir)
+    except OSError as exc:
+        print(f"error: {exc.filename or ''}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
     new = write_outputs(snap, out_dir)
     n = len(snap["components"])
     print(f"{n} units, {len(snap['metrics'])} metrics -> {os.path.join(out_dir, 'progress.html')}"
