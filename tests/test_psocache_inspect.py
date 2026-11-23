@@ -21,8 +21,8 @@ import psocache_inspect  # noqa: E402
 
 HEADER = 0x80
 CHUNK = 32
-ENTRY0 = 0x18 + 3 * CHUNK  # header 0x18 and three chunks
-ENTRY1 = 0x10 + 1 * CHUNK  # header 0x10 and one chunk
+ENTRY0 = 0x18 + 5 * CHUNK  # header 0x18, two 0x41 and two 0x42 and one 0x43 chunk
+ENTRY1 = 0x10 + 2 * CHUNK  # header 0x10, one 0x41 and one 0x43 chunk
 META_SIZE = ENTRY0 + ENTRY1
 CODE_SIZE = 0x200  # two 0x100-byte programs
 GRAPHICS = 2
@@ -67,15 +67,19 @@ def build():
     struct.pack_into("<2I", data, meta_index_off, 0, ENTRY0)
     struct.pack_into("<2I", data, meta_index_off + 8, ENTRY0, ENTRY1)
 
-    def chunk(pos, tag, word1):
-        struct.pack_into("<2I", data, meta_off + pos, tag, word1)
+    def chunk(pos, *words):
+        packed = list(words) + [0] * (8 - len(words))
+        struct.pack_into("<8I", data, meta_off + pos, *packed)
         return pos + CHUNK
 
-    pos = chunk(0x18, 0x41, 0x300)
-    pos = chunk(pos, 0x42, 0x00070001)
-    pos = chunk(pos, 0x43, 0xABCDEF01)
+    pos = chunk(0x18, 0x41, 0x300, 0x00, 0x11, 0x04, 0x00000408, 0xFFFFFFFF, 0)
+    pos = chunk(pos, 0x41, 0x303, 0x08, 0x12, 0x02, 0x00010504, 0xFFFFFFFF, 0)
+    pos = chunk(pos, 0x42, 0x00, 0x00070001, 0x11, 0x01, 0, 0xFFFFFFFF, 0)
+    pos = chunk(pos, 0x42, 0x00, 0x00020101, 0x12, 0x01, 0, 0xFFFFFFFF, 0)
+    pos = chunk(pos, 0x43, 0xABCDEF01, 0x12345678, 0x9ABCDEF0, 0x13579BDF)
     assert pos == ENTRY0
-    pos = chunk(ENTRY0 + 0x10, 0x41, 0x002)
+    pos = chunk(ENTRY0 + 0x10, 0x41, 0x002, 0x00, 0x1F4, 0x00, 0x00040D04, 0xFFFFFFFF, 0)
+    pos = chunk(pos, 0x43, 0x0FEDCBA9, 0x76543210, 0x0FEDCBA9, 0x2468ACE0)
     assert pos == META_SIZE
 
     shader_index_off = meta_index_off + META_INDEX * 8
@@ -145,9 +149,65 @@ class PsocacheInspectTest(unittest.TestCase):
         ch = r["chunks"]
         self.assertEqual(ch["chunk_lists"], 2)
         self.assertEqual(ch["unparsed"], 0)
-        self.assertEqual(ch["types"], {"0x41": 2, "0x42": 1, "0x43": 1})
-        self.assertEqual(ch["user_tags"], {"0x2": 1, "0x300": 1})
+        self.assertEqual(ch["types"], {"0x41": 3, "0x42": 2, "0x43": 2})
+        self.assertEqual(ch["user_tags"], {"0x2": 1, "0x300": 1, "0x303": 1})
         self.assertEqual(ch["entry_headers"], {"0x10": 1, "0x18": 1})
+
+    def test_meta_decode(self):
+        r = psocache_inspect.inspect(self.path, with_meta=True)
+        md = r["meta"]
+        self.assertEqual(md["records"], 2)
+        self.assertEqual(md["ordered"], 2)
+        self.assertEqual(md["one_hash"], 2)
+        self.assertEqual(md["exact_pairs"], 2)
+        self.assertEqual(md["records_with_extras"], 0)
+        self.assertEqual(md["tag_middle"], {"0x300/0": 1, "0x303/1": 1})
+        self.assertEqual(md["slot_space"], {"2": 1, "7": 1})
+        self.assertEqual(md["slot_middle"], {"0": 1, "1": 1})
+        self.assertEqual(md["slot_width"], {"1": 2})
+        self.assertEqual(md["slot_w4"], {"1": 2})
+        self.assertEqual(
+            md["tags"]["0x300"],
+            {
+                "count": 1,
+                "offset_min": 0,
+                "offset_max": 0,
+                "offset_values": 1,
+                "aligned8": True,
+                "sizes": {"8": 1},
+                "a": {"0x0": 1},
+                "b": {"0x4": 1},
+                "count_values": 1,
+            },
+        )
+        self.assertEqual(md["tags"]["0x303"]["offset_max"], 8)
+        self.assertEqual(md["tags"]["0x303"]["sizes"], {"4": 1})
+        self.assertEqual(md["tags"]["0x303"]["b"], {"0x5": 1})
+
+    def test_meta_entry_listing(self):
+        r = psocache_inspect.inspect(self.path, with_meta=True, entry=0)
+        lines = r["meta_entry"]
+        self.assertIn("entry offset 0x0 size %d: 5 chunks" % ENTRY0, lines[0])
+        self.assertTrue(any("0x41 kind=0x300" in line for line in lines))
+        self.assertTrue(any("0x42 slot=0x070001 space=7 middle=0 width=1" in line for line in lines))
+        self.assertTrue(any("0x43 16-byte value, not printed" in line for line in lines))
+        self.assertFalse(any("0xABCDEF01" in line for line in lines))
+
+    def test_meta_entry_out_of_range(self):
+        with self.assertRaises(ValueError):
+            psocache_inspect.inspect(self.path, entry=99)
+
+    def test_meta_cli(self):
+        p = run(self.path, "--meta", "--entry", "0")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("meta decode: 2 records", p.stdout)
+        self.assertIn("0x41 kind=0x300", p.stdout)
+        self.assertIn("0x42 slot=0x070001 space=7 middle=0 width=1", p.stdout)
+        self.assertNotIn("0xABCDEF01", p.stdout)
+        p = run(self.path, "--meta", "--limit", "1")
+        self.assertIn("meta decode: 1 records", p.stdout)
+        doc = json.loads(run(self.path, "--meta", "--json").stdout)
+        self.assertEqual(doc["meta"]["records"], 2)
 
     def test_markers(self):
         r = psocache_inspect.inspect(self.path)

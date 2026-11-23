@@ -113,8 +113,162 @@ def parse_chunks(m, base, start, size):
     return None, None
 
 
-def inspect(path):
+def entry_chunks(m, base, start, size):
+    """The 8-dword chunks of a parsed meta entry, or None when it is not a 0x41/0x42/0x43 list."""
+    header, _ = parse_chunks(m, base, start, size)
+    if header is None:
+        return None
+    return [
+        struct.unpack_from("<8I", m, base + pos)
+        for pos in range(start + header, start + size, CHUNK_SIZE)
+    ]
+
+
+def describe_entry(m, base, start, size):
+    """Human-readable lines for one meta index entry. The 0x43 16-byte value is not printed."""
+    chunks = entry_chunks(m, base, start, size)
+    if chunks is None:
+        return [
+            "entry offset 0x%x size %d: not a 0x41/0x42/0x43 chunk list" % (start, size)
+        ]
+    lines = ["entry offset 0x%x size %d: %d chunks" % (start, size, len(chunks))]
+    for w in chunks:
+        if w[0] == 0x41:
+            lines.append(
+                "  0x41 kind=0x%x offset=0x%x key=0x%x count=0x%x a=0x%x b=0x%x size=%d"
+                % (w[1], w[2], w[3], w[4], w[5] >> 16, (w[5] >> 8) & 0xFF, w[5] & 0xFF)
+            )
+        elif w[0] == 0x42:
+            lines.append(
+                "  0x42 slot=0x%06x space=%d middle=%d width=%d key=0x%x w4=0x%x"
+                % (
+                    w[2],
+                    (w[2] >> 16) & 0xFF,
+                    (w[2] >> 8) & 0xFF,
+                    w[2] & 0xFF,
+                    w[3],
+                    w[4],
+                )
+            )
+        elif w[0] == 0x43:
+            lines.append("  0x43 16-byte value, not printed")
+        else:
+            lines.append("  0x%x unexpected chunk" % w[0])
+    return lines
+
+
+def decode_meta(m, base, spans, limit=None):
+    """Aggregate the 0x41/0x42 shape over chunk-list records.
+
+    ``spans`` is a list of ``(offset, size)`` meta entries that parse as chunk lists. Everything here is measured
+    shape, not a decoder: tags, byte fields and counts are reported as found. ``limit`` bounds the records read.
+    """
+    records = ordered = one_hash = exact = with_extras = 0
+    tags = {}
+    slot_space = collections.Counter()
+    slot_middle = collections.Counter()
+    slot_width = collections.Counter()
+    slot_w4 = collections.Counter()
+    cross = collections.Counter()
+    extras = collections.Counter()
+    extras_per_record = collections.Counter()
+    for start, size in spans:
+        if limit is not None and records >= limit:
+            break
+        chunks = entry_chunks(m, base, start, size)
+        if chunks is None:
+            continue
+        records += 1
+        kinds = [w[0] for w in chunks]
+        if kinds == sorted(kinds) and kinds.count(0x43) == 1 and kinds[-1] == 0x43:
+            ordered += 1
+        if kinds.count(0x43) == 1:
+            one_hash += 1
+        for w in chunks:
+            if w[0] == 0x41:
+                entry = tags.setdefault(
+                    w[1],
+                    {
+                        "count": 0,
+                        "offset_min": w[2],
+                        "offset_max": w[2],
+                        "offsets": set(),
+                        "aligned8": True,
+                        "sizes": collections.Counter(),
+                        "a": collections.Counter(),
+                        "b": collections.Counter(),
+                        "counts": set(),
+                    },
+                )
+                entry["count"] += 1
+                entry["offset_min"] = min(entry["offset_min"], w[2])
+                entry["offset_max"] = max(entry["offset_max"], w[2])
+                entry["offsets"].add(w[2])
+                entry["aligned8"] = entry["aligned8"] and w[2] % 8 == 0
+                entry["sizes"][w[5] & 0xFF] += 1
+                entry["a"][w[5] >> 16] += 1
+                entry["b"][(w[5] >> 8) & 0xFF] += 1
+                entry["counts"].add(w[4])
+            elif w[0] == 0x42:
+                slot_space[(w[2] >> 16) & 0xFF] += 1
+                slot_middle[(w[2] >> 8) & 0xFF] += 1
+                slot_width[w[2] & 0xFF] += 1
+                slot_w4[w[4]] += 1
+        descriptor_41 = [
+            w for w in chunks if w[0] == 0x41 and w[1] in (0x300, 0x302, 0x303)
+        ]
+        slots_42 = [w for w in chunks if w[0] == 0x42]
+        if len(descriptor_41) == len(slots_42):
+            exact += 1
+            for w, slot in zip(descriptor_41, slots_42):
+                cross[(w[1], (slot[2] >> 8) & 0xFF)] += 1
+        elif len(slots_42) > len(descriptor_41):
+            with_extras += 1
+            extra = len(slots_42) - len(descriptor_41)
+            extras_per_record[extra] += 1
+            for slot in slots_42[len(descriptor_41) :]:
+                extras[
+                    ((slot[2] >> 16) & 0xFF, (slot[2] >> 8) & 0xFF, slot[2] & 0xFF)
+                ] += 1
+    return {
+        "records": records,
+        "ordered": ordered,
+        "one_hash": one_hash,
+        "exact_pairs": exact,
+        "records_with_extras": with_extras,
+        "extras_per_record": {str(k): v for k, v in sorted(extras_per_record.items())},
+        "extras": {
+            "space=%d middle=%d width=%d" % k: v for k, v in extras.most_common(8)
+        },
+        "tags": {
+            "0x%x" % tag: {
+                "count": entry["count"],
+                "offset_min": entry["offset_min"],
+                "offset_max": entry["offset_max"],
+                "offset_values": len(entry["offsets"]),
+                "aligned8": entry["aligned8"],
+                "sizes": {str(k): v for k, v in entry["sizes"].most_common()},
+                "a": {("0x%x" % k): v for k, v in entry["a"].most_common(6)},
+                "b": {("0x%x" % k): v for k, v in entry["b"].most_common(8)},
+                "count_values": len(entry["counts"]),
+            }
+            for tag, entry in sorted(tags.items())
+        },
+        "slot_space": {str(k): v for k, v in sorted(slot_space.items())},
+        "slot_middle": {str(k): v for k, v in sorted(slot_middle.items())},
+        "slot_width": {str(k): v for k, v in sorted(slot_width.items())},
+        "slot_w4": {str(k): v for k, v in sorted(slot_w4.items())},
+        "tag_middle": {
+            "0x%x/%d" % k: v
+            for k, v in sorted(cross.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+        },
+    }
+
+
+def inspect(path, with_meta=False, entry=None, limit=None):
     """Read ``path`` and return the report as a dict. Raises OSError/ValueError on unusable input."""
+    if limit is not None and limit < 1:
+        raise ValueError("--limit must be at least 1")
     with open(path, "rb") as fh:
         size = os.fstat(fh.fileno()).st_size
         if size < HEADER_SIZE:
@@ -184,6 +338,8 @@ def inspect(path):
             report["problems"] = problems
             report["references"] = None
             report["meta_index"] = None
+            report["meta"] = None
+            report["meta_entry"] = None
             report["shader_index"] = None
             report["chunks"] = None
             report["markers"] = None
@@ -201,29 +357,29 @@ def inspect(path):
                 and regions["compute"]["fits"]
                 and counts["meta_index"]
             ):
-                limit = counts["meta_index"]
+                meta_limit = counts["meta_index"]
                 bad_graphics = 0
                 for i in range(counts["graphics"]):
                     base = regions["graphics"]["offset"] + i * GRAPHICS_STRIDE
                     for delta in (8, 0xC, 0x50, 0x54, 0x58, 0x5C):
                         value = u32(m, base + delta)
-                        if value != 0xFFFFFFFF and value >= limit:
+                        if value != 0xFFFFFFFF and value >= meta_limit:
                             bad_graphics += 1
                 bad_compute = 0
                 for i in range(counts["compute"]):
                     base = regions["compute"]["offset"] + i * COMPUTE_STRIDE
                     for delta in (8, 0xC, 0x10, 0x14):
-                        if u32(m, base + delta) >= limit:
+                        if u32(m, base + delta) >= meta_limit:
                             bad_compute += 1
                 report["references"] = {
-                    "limit": limit,
+                    "limit": meta_limit,
                     "graphics_out_of_range": bad_graphics,
                     "compute_out_of_range": bad_compute,
                 }
                 if bad_graphics or bad_compute:
                     problems.append(
                         "%d graphics and %d compute record references are outside the %d-entry meta index"
-                        % (bad_graphics, bad_compute, limit)
+                        % (bad_graphics, bad_compute, meta_limit)
                     )
 
             # Meta index: contiguous (offset, size) pairs covering the meta blob from 0.
@@ -277,6 +433,7 @@ def inspect(path):
                 headers = collections.Counter()
                 types = collections.Counter()
                 user_tags = collections.Counter()
+                spans = []
                 for a, b in entries:
                     if a + b > meta_size:
                         unparsed += 1
@@ -290,6 +447,7 @@ def inspect(path):
                         no_chunks += 1
                         continue
                     parsed += 1
+                    spans.append((a, b))
                     for tag, word1 in tags:
                         types[tag] += 1
                         if tag == 0x41:
@@ -303,6 +461,17 @@ def inspect(path):
                     "types": {hex(k): v for k, v in sorted(types.items())},
                     "user_tags": {hex(k): v for k, v in sorted(user_tags.items())},
                 }
+                report["meta"] = None
+                report["meta_entry"] = None
+                if with_meta:
+                    report["meta"] = decode_meta(m, meta_off, spans, limit)
+                if entry is not None:
+                    if not 0 <= entry < len(entries):
+                        raise ValueError(
+                            "--entry %d is outside the %d-entry meta index"
+                            % (entry, len(entries))
+                        )
+                    report["meta_entry"] = describe_entry(m, meta_off, *entries[entry])
 
             # Shader index: (offset, size) pairs inside the code blob, in ascending offset order.
             if regions["shader_index"]["fits"] and regions["code_blob"]["fits"]:
@@ -474,6 +643,55 @@ def print_report(r, out=sys.stdout):
             "  0x41 user tags: %s"
             % " ".join("%s=%d" % (k, v) for k, v in ch["user_tags"].items())
         )
+    md = r.get("meta")
+    if md:
+        p(
+            "meta decode: %d records, %d ordered 0x41..0x42..0x43, %d with one 0x43, %d exact-count pairs"
+            % (md["records"], md["ordered"], md["one_hash"], md["exact_pairs"])
+        )
+        for tag, t in md["tags"].items():
+            p(
+                "  0x41 %s: %d, offset 0x%x..0x%x (%d values%s), sizes %s, b %s, counts %d values"
+                % (
+                    tag,
+                    t["count"],
+                    t["offset_min"],
+                    t["offset_max"],
+                    t["offset_values"],
+                    ", 8-aligned" if t["aligned8"] else "",
+                    " ".join("%s=%d" % (k, v) for k, v in t["sizes"].items()),
+                    " ".join("%s=%d" % (k, v) for k, v in t["b"].items()),
+                    t["count_values"],
+                )
+            )
+        p(
+            "  0x42 spaces: %s"
+            % " ".join("%s=%d" % (k, v) for k, v in md["slot_space"].items())
+        )
+        p(
+            "  0x42 middle bytes: %s"
+            % " ".join("%s=%d" % (k, v) for k, v in md["slot_middle"].items())
+        )
+        p(
+            "  0x42 widths: %s"
+            % " ".join("%s=%d" % (k, v) for k, v in md["slot_width"].items())
+        )
+        p(
+            "  0x41 kind -> 0x42 middle where counts match: %s"
+            % " ".join("%s=%d" % (k, v) for k, v in md["tag_middle"].items())
+        )
+        p(
+            "  0x42 beyond the 0x41 descriptor count: %d records %s, shapes %s"
+            % (
+                md["records_with_extras"],
+                md["extras_per_record"],
+                " ".join("%s=%d" % (k, v) for k, v in md["extras"].items()),
+            )
+        )
+    entry_lines = r.get("meta_entry")
+    if entry_lines:
+        for line in entry_lines:
+            p(line)
     mk = r["markers"]
     if mk:
         p(
@@ -501,11 +719,35 @@ def main(argv=None):
     ap.add_argument("cache", help="cache file (read-only)")
     ap.add_argument("--json", action="store_true", help="print the report as JSON")
     ap.add_argument(
+        "--meta",
+        action="store_true",
+        help="decode the meta chunk records (0x41 kinds, 0x42 slot bytes, positional pairing)",
+    )
+    ap.add_argument(
+        "--entry",
+        type=int,
+        default=None,
+        metavar="N",
+        help="with --meta, also list meta index entry N",
+    )
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="with --meta, decode at most N chunk-list records",
+    )
+    ap.add_argument(
         "--quiet", action="store_true", help="print nothing, only set the exit code"
     )
     a = ap.parse_args(argv)
     try:
-        report = inspect(a.cache)
+        report = inspect(
+            a.cache,
+            with_meta=a.meta or a.entry is not None,
+            entry=a.entry,
+            limit=a.limit,
+        )
     except (OSError, ValueError) as e:
         print("%s: %s" % (a.cache, e), file=sys.stderr)
         return 2

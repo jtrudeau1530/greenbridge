@@ -98,27 +98,97 @@ mapping is not proven here.
 The third dword of a 0x42 chunk takes 26 distinct values shaped like 0x000SSIIRR (0x00070001, 0x000D0201 and so on),
 which is consistent with space/index/register slots, but the fields are not decoded.
 
+## Meta records: what the chunks decode to
+
+The chunk lists have a fixed order: all 0x41 chunks, then all 0x42 chunks, then exactly one 0x43. That holds for
+20,318 of 20,318 records, so one record belongs to one stage. The decode below is measured shape plus an
+inference per field.
+
+### 0x41: user-data entries
+
+| Word | Role measured | Confidence |
+|---:|---|---|
+| +0 | 0x41 kind | high |
+| +4 | offset, always a multiple of 8, 0..0x820; zero for 0x2, 0x100 and 0x401 | high that it is 8-byte-granular; the table it points into is not identified |
+| +8 | key 0..0x1fd; repeats, 0 is common | low, it is not a unique binding id |
+| +0xc | count 0..0x800, 73 distinct for 0x300 | low |
+| +0x10 | three bytes: `a` (bits 16..31), `b` (bits 8..15), size (bits 0..7) | high on the split, meaning below |
+| +0x14 | 0xffffffff | measured |
+| +0x18 | 0 | measured |
+
+Per kind: 0x401 has offset 0, `b`=0, size 4 and `a`=1..24, consistent with a number of 32-bit constants
+(medium); 0x2 has offset 0, `b`=5..13 and size 4 (sampler-like, medium); 0x100 has offset 0, `b`=6..11 and
+size 2 (low); 0x300/0x302/0x303 carry the nonzero offsets, `b`=4..13, and size 4 or 8 (0x300, 0x303) or 4
+(0x302). Reading `b` as a register space and `a` as a base register for descriptors, or as a count for 0x401,
+fits the values but has no independent check (medium/low).
+
+### 0x42: register slots
+
+The slot splits as 0x00SS_IIRR: SS 1..16, II 0..3, RR 1..2. The slots follow the 0x41 descriptors in order. In
+the 5,230 records where their counts are equal, positional pairing gives II=0 for 23,047 of 23,049 0x300
+entries, II=1 for 4,144 of 4,146 0x303 entries and II=2 for all 6,100 0x302 entries. That is the order
+SRV=0, UAV=1, CBV=2 of D3D12_DESCRIPTOR_RANGE_TYPE, so II is probably the range type (medium-high). SS is
+probably a register space or table index (medium) and RR (1 or 2) a width (low).
+
+The 0x2 samplers and the 0x401 constants take no slot at all (0 of 13,897 and 0 of 33,596). Static samplers
+taking no user-data dwords matches the layer's contract in [d3d12_vulkan.md](d3d12_vulkan.md) 3.5 (medium-high).
+Another 15,068 records have more slots than descriptors, usually one or two; those extras all have RR=2, a
+zero key and w4=0, with (SS,II) mostly (14,3), (2,0) or (10,0). They are not decoded (low).
+
+### Relation to the 32 user-data dwords
+
+A 1:1 packing into the 32-dword root-argument block is not supported by the counts. A compute PSO's chunk
+record has a median of 17 slots (max 281), and 0x41 offsets reach 0x820 (2,080 bytes); 199,074 of 402,328
+offsets (49.5%) fit inside 128 bytes, but only 5,581 of 20,318 records have all of theirs inside. The record
+therefore describes a larger layout than the 32 dwords, and at most half of the 0x41 entries can be part of
+that block (medium). No mapping from a slot to a user-SGPR index was confirmed.
+
+### Which PSOs reference which records
+
+- A graphics PSO's u32 at +8 names a stage record (sizes 380..520) and +0xC an input-layout record; +0x50..+0x5C
+  are 0xFFFFFFFF in this corpus.
+- The stage record names chunk records at +4 (entry 4 on 13,409 PSOs, entry 6 on 12,062), at +0x2C (entry 2 on
+  25,469) and further at +0x78, +0x90, +0x150 and +0x1A4. Graphics PSOs share eight chunk records in total, not
+  one per PSO.
+- A compute PSO's +8 and +0xC name 20- and 28-byte hash records, +0x10 a mixed record and +0x14 a chunk record
+  (2,693 references, 2,684 distinct records).
+
 ## What remains unknown
 
 - The meaning of the two header strings, the 0x48 value and the six 0x41 second-dword values. The SRV/CBV/UAV/sampler
   names are the external note's, not this file's.
-- The encoding of the 0x41 and 0x42 payload dwords and of the 8-byte values in the 0x70 records. The 0x43 16-byte
-  value was not matched against any hash in the package.
+- The `a` and `b` bytes of 0x41 w5 and the SS/II/RR meanings of the 0x42 slot word: the readings above are
+  inferences from value ranges and order, not confirmed by the shader code.
+- The encoding of the w3 key and w4 count, and the 15,068 records with extra slots.
+- The 0x43 16-byte value was not matched against any hash in the package.
 - The 30,909 meta entries that are not chunk lists.
 - Whether the code blob is raw RDNA2. The evidence is the two marker words and the `s_code_end` filler; no
   disassembly or translation was run on this blob.
 
-## Checking a carved copy
+## Checking and carving a copy
+
+`tools/psocache_extract.py` finds the cache in an RPF9 archive without the TOC: it walks the archive's stream
+table in order, inflates each stream to learn its extent, keeps only the first 4 bytes, and stops at the first
+stream whose output starts with the magic. It then appends the following contiguous streams (up to 1 MiB of zero
+padding) until the header's declared total is reached, writes the file under the temporary directory and runs
+the checks below. `--budget` bounds the compressed bytes examined and `--max-streams` the number of streams; a
+source folder is scanned in sorted order and the report names the archive index and the stream offset, never the
+path.
+
+```
+python -I tools/psocache_extract.py <archive.rpf|folder> <cache-in-tmp>
+```
 
 `tools/psocache_inspect.py` reads the cache file only:
 
 ```
-python -I tools/psocache_inspect.py <cache>
+python -I tools/psocache_inspect.py <cache> --meta
 ```
 
 It checks the magic, reads the four counts and two sizes above, bounds all six regions against the file, checks that
 the meta index is contiguous over the meta blob and that every shader entry stays inside the code blob, parses the
-chunk lists and counts `s_endpgm` and `s_code_end` in the code blob. It prints offsets, sizes and counts, names every
-field that does not fit instead of stopping, and exits 0 when the regions add up to the file size, 1 on a
-disagreement and 2 when the file is not a cache. `--json` prints the same report as JSON. It does not decode a chunk,
-disassemble the code or verify a hash.
+chunk lists and counts `s_endpgm` and `s_code_end` in the code blob. `--meta` adds the aggregate 0x41/0x42 decode
+described above, `--entry N` lists one meta index entry and `--limit N` bounds how many records `--meta` reads. It
+prints offsets, sizes and counts, names every field that does not fit instead of stopping, and exits 0 when the
+regions add up to the file size, 1 on a disagreement and 2 when the file is not a cache. `--json` prints the same
+report as JSON. It does not decode a chunk payload, disassemble the code or verify a hash.
