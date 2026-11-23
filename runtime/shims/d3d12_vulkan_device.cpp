@@ -17,6 +17,7 @@
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/host_stall.h"
 #include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
@@ -3984,9 +3985,15 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
-            return E_FAIL;
+        VkResult created = VK_ERROR_UNKNOWN;
+        {
+            // The console makes this pipeline from native code at once; the driver's compile of the translated module
+            // is host-only time on the title's thread, which a guest Sleep sits out (src/host_stall.h).
+            const rt::host_stall::Scope compiling;
+            created = vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                                  &pipeline_.pipeline);
+        }
+        if (created != VK_SUCCESS) return E_FAIL;
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).

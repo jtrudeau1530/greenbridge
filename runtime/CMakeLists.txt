@@ -123,6 +123,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/library_loader.cpp
     shims/process.cpp
     shims/dstorage.cpp
+    shims/host_stall.cpp
   )
   # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
   # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file
@@ -280,6 +281,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(process_cmdline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
+
+  # Host-only stalls (src/host_stall.h): the ledger with times passed in, and the Sleep the registry serves held
+  # while a stall is open, on synthetic threads.
+  add_executable(host_stall_test
+    test/host_stall_test.cpp
+    shims/host_stall.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(host_stall_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(host_stall_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(host_stall_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+  target_link_options(host_stall_test PRIVATE /OPT:NOREF)
 
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
   add_executable(file_system_test
@@ -1165,6 +1178,10 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
+  endif()
+  if(WIN32 AND TARGET host_stall_test)
+    add_test(NAME host_stall COMMAND host_stall_test)
+    set_tests_properties(host_stall PROPERTIES TIMEOUT 60)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)

@@ -127,3 +127,63 @@ is not measured and stays 0.
 
 These are one run's first failures, not a list of what is missing. Every stand-in above is local and untested
 beyond "the title goes on to the next call". Nothing has reached a draw or a present yet.
+
+## 5. The startup hang check
+
+A stop that is a time limit, not a call: it ends a boot wherever the boot happens to be when the time is up. On
+other machines it showed inside `XboxBvhBuilder.dll`'s constructor ("stop 18" in #7333), because that is where a
+cold start spends its time.
+
+Measured 2026-11-23 on a second machine: Windows 11, RTX 4080 (driver 610.88), i9-12900K, MSVC 2022
+`RelWithDebInfo`, `LEONIDA_D3D12=vulkan`, own 1.0.2.1 copy. The tree is `Pipodi:boot-integration` at `b2e606620`
+(`main` `1cc6e3c12` with the pull requests and stand-ins of #6982) plus #6943, run with that branch's
+`LEONIDA_SKIP_ASSERTS=20` and the builder's 52 programs translated with `--wave64-emulate`.
+
+### 5.1 What the title does
+
+From a static read of the check's loop in the executable and from the timing of the runs: import names, counts and
+values only.
+
+| Fact | Value |
+|---|---|
+| The check's thread | started by the title during startup; it is not the main thread |
+| One round | `Sleep(1000)`, imported from `api-ms-win-core-synch-l1-2-0.dll`, with `QueryPerformanceCounter` read before and after |
+| The limit | 30 rounds in a row in which the main thread's progress mark did not change |
+| At the limit | the thread writes to address 0; without a debugger the process ends with `C0000005` |
+| A late round | a round whose `Sleep` took more than 2 s by `QueryPerformanceCounter` starts the count again at 30, as a suspended console would look to it |
+
+In six runs the kill came 32.3 to 34.1 s after process start, whatever the title was doing then. In one of them
+it came before `D3D12XboxCreateDevice`, with no D3D12 call made; in the other five it came inside the builder's
+compute pipeline compiles, at 1,641 D3D12 calls. So up to that point of the boot the main thread
+does not move its mark: everything from the check's start to there has to fit into about 31 s.
+
+On the console the builder's pipelines are made from native code and take no time worth counting. Here each one
+is a driver compile of a translated module on the title's thread.
+
+### 5.2 What clears it
+
+The layer marks the driver's compile of a compute pipeline as a host-only stall (`runtime/src/host_stall.h`), and
+the runtime serves `Sleep` (`runtime/shims/host_stall.cpp`): a guest `Sleep` that a stall overlaps does not return
+while the stall is open, and then lasts as much longer as stalls overlapped it. The check's round then comes back
+late, and the title's own late-round rule starts the count again. No pipeline is skipped and the check stays armed:
+a boot that hangs with no stall open still ends after 30 rounds.
+
+| Run | Driver cache | `Sleep` | First slot 62 call | Outcome | D3D12 calls |
+|---|---|---|---|---|---:|
+| before | cold | host | 4.1 s | killed by the check at 32.4 s, inside the compiles | 1,641 |
+| after | cold | held during stalls | 7.4 s | the compiles end at 63.1 s (55.7 s of them); the run goes on to the next stop at 63.4 s | 1,661 |
+| reference | warm | host | 8.4 s | the compiles take 13.2 s; the next stop at 22.3 s | 1,661 |
+
+For the two cold runs each of the 52 modules got one unused constant, a different one per run, so the driver's
+disk cache missed. An earlier pair gave the same result (killed at 32.3 s; compiles of 57.5 s survived). The next stop is the same in the last two rows: device slots 74, 86 and 108 and the slot 67
+programs, which #7323, #7201, #7180 and #7529 are about.
+
+### 5.3 What it does not cover
+
+- Time lost outside a marked stall counts as before. The run that ended before `D3D12XboxCreateDevice` sat for
+  more than 31 s after the first `IDStorageFactoryX::OpenFile`; the next three runs took 25 s, 7 s and 3 s to get
+  from there to the first `XDisplayTryEnableHdrMode`. Hypothesis: a cold file cache. Nothing marks that time.
+- Graphics pipelines are built on first use, from whichever thread replays the list, and are not marked.
+- Only `Sleep` is held. A check built on `SleepEx`, a wait with a timeout or a clock would not see the stall.
+- Every guest `Sleep` that overlaps a stall is held, not only the check's: in the "after" run the first one held
+  was a `Sleep(10)` of another title thread.
