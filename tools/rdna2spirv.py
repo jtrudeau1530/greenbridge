@@ -1559,7 +1559,8 @@ class Gen:
 
     def check_lane_local(self, ins, lines):
         """Fail loudly if ins, judged lane-local, emitted something an active run can't hold."""
-        vgpr_ptrs = set()
+        # hoisted register pointers (#4440) are declared once in %entry, so they never appear in these lines
+        vgpr_ptrs = {p for (kind, _), p in self.reg_ptrs.items() if kind == "vgpr"}
         for line in lines:
             s = line.strip()
             words = s.split()
