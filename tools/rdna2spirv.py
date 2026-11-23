@@ -2361,7 +2361,24 @@ class Gen:
                 v2, x = self.tmp(), self.tmp()
                 self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {f}")
                 self.emit(f"{x} = OpCompositeExtract %float {v2} 0")
-                out.append(self.tou(x))
+                # A half NaN widens by shifting its payload, keeping the sign and the quiet bit as they are:
+                # measured natively on RDNA2 (gfx1036, tools/f16_widen_probe.py) 0x7ddb (sNaN) -> 0x7FBB6000 and
+                # 0x7FE6 (qNaN) -> 0x7FFCC000, the same words for formats 13, 29 and 71, MUBUF and MTBUF, wave32
+                # and wave64. UnpackHalf2x16 leaves a NaN undefined: the interpreter canonicalises it to
+                # 0x7FC00000 and v_cvt_f32_f16 (what a driver lowers it to) sets the quiet bit, which the typed
+                # load does not, so the NaN case is built from the bits.
+                mag, is_nan, sg, sgsh, fr, mant, nan0, nan_bits, xb, res = (self.tmp() for _ in range(10))
+                self.emit(f"{mag} = OpBitwiseAnd %uint {f} {self.cu(0x7FFF)}")
+                self.emit(f"{is_nan} = OpUGreaterThan %bool {mag} {self.cu(0x7C00)}")
+                self.emit(f"{sg} = OpBitwiseAnd %uint {f} {self.cu(0x8000)}")
+                self.emit(f"{sgsh} = OpShiftLeftLogical %uint {sg} {self.cu(16)}")
+                self.emit(f"{fr} = OpBitwiseAnd %uint {f} {self.cu(0x3FF)}")
+                self.emit(f"{mant} = OpShiftLeftLogical %uint {fr} {self.cu(13)}")
+                self.emit(f"{nan0} = OpBitwiseOr %uint {sgsh} {self.cu(0x7F800000)}")
+                self.emit(f"{nan_bits} = OpBitwiseOr %uint {nan0} {mant}")
+                self.emit(f"{xb} = OpBitcast %uint {x}")
+                self.emit(f"{res} = OpSelect %uint {is_nan} {nan_bits} {xb}")
+                out.append(res)
             elif kind == "unorm":
                 out.append(normalize(f, w))
             elif kind == "uscaled":

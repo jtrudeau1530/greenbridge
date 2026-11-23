@@ -125,6 +125,25 @@ def f32_round(q):
     return min(cands, key=lambda b: (err(b), b & 1))
 
 
+def f16_to_f32(h):
+    """16_FLOAT -> f32 bits. Exact for finite and infinite halves; a NaN shifts its 10-bit payload into the f32
+    mantissa and keeps the sign and the quiet bit exactly as the half has them (measured on gfx1036 with
+    tools/f16_widen_probe.py: 0x7ddb -> 0x7fbb6000, 0x7fe6 -> 0x7ffcc000). struct's '<e' is not used: before
+    Python 3.14 it drops the payload and returns a canonical NaN, from 3.14 it keeps it, and the hardware keeps it."""
+    h &= 0xFFFF
+    sign = (h >> 15) << 31
+    exp = (h >> 10) & 0x1F
+    frac = h & 0x03FF
+    if exp == 0x1F:
+        return sign | 0x7F800000 | (frac << 13)
+    if exp == 0 and frac:
+        b = frac.bit_length()
+        return sign | ((b + 102) << 23) | ((frac << (24 - b)) & 0x7FFFFF)
+    if exp == 0:
+        return sign
+    return sign | ((exp + 112) << 23) | (frac << 13)
+
+
 def decode_element(raw, widths, kind):
     """Decode one element (an int of sum(widths) bits) -> 4 result words; missing channels repeat (*c* mod *n*)."""
     from fractions import Fraction
@@ -145,8 +164,8 @@ def decode_element(raw, widths, kind):
             out.append((v - (1 << w) if v >> (w - 1) else v) & MASK32)
         elif w == 32:
             out.append(v)
-        else:                                           # FLOAT 16 -> f32 bits (exact)
-            out.append(struct.unpack("<I", struct.pack("<f", struct.unpack("<e", struct.pack("<H", v))[0]))[0])
+        else:                                           # FLOAT 16 -> f32 bits (exact, NaN payload kept)
+            out.append(f16_to_f32(v))
     n = len(out)
     while len(out) < 4:
         out.append(out[len(out) % n])
@@ -775,6 +794,10 @@ def self_test():
         RefMachine.word = real_word
     if status != "mismatch":
         print("canary FAILED: a corrupted reference was not caught")
+        return False
+    # The f16 reference keeps a NaN payload and its quiet bit, as gfx1036 does (tools/f16_widen_probe.py).
+    if decode_element(0x7DDB, [16], "FLOAT")[0] != 0x7FBB6000:
+        print("canary FAILED: the f16 NaN payload was not kept")
         return False
     print("canaries: match ok, mismatch detected")
     return True

@@ -641,7 +641,10 @@ instruction. The reference decodes elements from the GFX10 format *name* in `too
 MUBUF repeats missing channels (*c* mod *n*) and DST_SEL 1 gives integer 1 for UINT/SINT and 1.0f
 otherwise (SHADER-86, RX 6700). MTBUF loads return instruction-format channels in order, zero-fill
 missing channels and return zero for an INVALID V# format (native gfx1036, wave32 and wave64).
-Elements are naturally aligned.
+Elements are naturally aligned. A half NaN widens to f32 with its payload shifted into the f32 mantissa
+and its sign and quiet bit unchanged (`f16_to_f32`, bit-level so the Python version cannot change it);
+the translator used to canonicalise it, which is the one class this fuzzer found
+(`docs/shader_validation.md`, "Widening a 16-bit float NaN in a typed buffer load").
 
 Over 5,000 programs the reference and translator match bit for bit; breaking the `16_16_SNORM` kind, the
 `8_8_8_8_UINT` widths or the DST_SEL order in the translator makes 33, 37 and 191 of 300 programs fail.
@@ -1499,6 +1502,48 @@ Measured on an RX 6700 (gfx1031, AMD Windows driver 32.0.21045.29003, ROCm wheel
 `tests/test_d16_format_probe.py` checks the rules against the #489 counts and the descriptor bits. It checks that
 each value is staged once, and that the kernels assemble for gfx1031. A fake oracle plays the GPU to check the exit
 codes. On a GFX10 GPU the test runs UNORM8 and checks the controls.
+
+### Widening a 16-bit float NaN in a typed buffer load (`tools/f16_widen_probe.py`)
+
+A typed buffer load of a half NaN had never been measured: `tools/mem_diff.py` decoded 16_FLOAT with
+`struct`'s `'<e'` (payload kept from Python 3.14, canonical before) while the translator decoded it with
+`UnpackHalf2x16`, whose result for a NaN is undefined and which the mini interpreter canonicalises to
+0x7FC00000. The probe stages one half word with an untyped `buffer_store_dword`, waits, loads it with
+`buffer_load_format_*` / `tbuffer_load_format_*`, waits, and stores the f32 lanes back.
+
+```
+python -I tools/f16_widen_probe.py --json f16_widen.json    # 380 kernels of one thread (190 per wave); exit 77 without the oracle
+python -I tools/f16_widen_probe.py --self-test              # the three candidate rules, no GPU
+```
+
+- Formats 13 (`16_FLOAT`), 29 (`16_16_FLOAT`) and 71 (`16_16_16_16_FLOAT`), `buffer_` and `tbuffer_`
+  forms, `_x`/`_xy`/`_xyzw`, wave32 and wave64. Every NaN word came back the same in every component of
+  every format and form:
+
+  | half | f32 | |
+  | --- | --- | --- |
+  | 0x7ddb | 0x7fbb6000 | sNaN, payload kept, quiet bit still 0 |
+  | 0x7fe6 | 0x7ffcc000 | qNaN |
+  | 0x7fbb | 0x7ff76000 | |
+  | 0xffb2 | 0xfff64000 | negative, sign kept |
+  | 0x7fcb | 0x7ff96000 | |
+  | 0xff96 | 0xfff2c000 | |
+  | 0x7c01 | 0x7f802000 | sNaN, smallest payload |
+  | 0xfc01 | 0xff802000 | |
+  | 0x3c00 | 0x3f800000 | 1.0 |
+  | 0xc000 | 0xc0000000 | −2.0 |
+
+- The rule is `sign | 0x7F800000 | (payload << 13)`: the sign is kept, the 10-bit payload moves into the
+  f32 mantissa unchanged, and the quiet bit is **not** forced, so an sNaN stays signalling. The
+  negative NaNs (for example 0xffb2 and 0xff96) keep their sign.
+- `v_cvt_f32_f16` on the same halves (the instruction a driver lowers `UnpackHalf2x16` to) differs on an
+  sNaN: 0x7ddb gives 0x7ffb6000 (quieted, payload kept) and 0x7c01 gives 0x7fc02000, while every qNaN is
+  the same as the typed load. The translator therefore builds the NaN case from the bits with integer ops
+  and uses `UnpackHalf2x16` only for the other halves, whose conversion is exact.
+- Verdict: the hardware keeps the payload, so `mem_diff`'s Python 3.14 reference was right and the
+  canonicalising translator was wrong. `mem_diff` now pins the rule in `f16_to_f32` (bit-level, Python
+  version independent) and `tests/semantic/test_buffer_f16_widen_hw.py` pins the ten measured words for
+  MUBUF and MTBUF, formats 13/29/71.
 
 ### `image_get_resinfo` and `image_get_lod` (`tools/image_query_probe.py`, SHADER-388)
 
