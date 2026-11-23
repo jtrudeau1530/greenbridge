@@ -227,8 +227,10 @@ class Unsupported(Exception):
 
 
 class Gen:
-    def __init__(self, stage):
+    def __init__(self, stage, hoist_reg_ptrs=False):
         self.stage = stage
+        self.hoist_reg_ptrs = hoist_reg_ptrs
+        self.reg_ptrs = {}
         self.body = []
         self.consts = {}
         self.n = 0
@@ -381,10 +383,28 @@ class Gen:
                 self.x_gen += 1
 
     # ---- register access ----
-    def load_reg(self, kind, r):
+    def reg_ptr(self, kind, r):
+        """Return a pointer to element `r` of `%vgpr` or `%sgpr`.
+
+        When `hoist_reg_ptrs` is enabled (the default for `translate()`), emit one
+        `OpAccessChain` per distinct register in `%entry` (in `assemble()`) instead of
+        repeating it at every load/store; direct `Gen()` callers keep inline chains."""
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
-        p, t = self.tmp(), self.tmp()
+        if self.hoist_reg_ptrs:
+            key = (kind, r)
+            p = self.reg_ptrs.get(key)
+            if p is None:
+                self.cu(r)
+                p = f"%reg_{'v' if kind == 'vgpr' else 's'}{r}"
+                self.reg_ptrs[key] = p
+            return p
+        p = self.tmp()
         self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
+        return p
+
+    def load_reg(self, kind, r):
+        p = self.reg_ptr(kind, r)
+        t = self.tmp()
         self.emit(f"{t} = OpLoad %uint {p}")
         return t
 
@@ -394,9 +414,7 @@ class Gen:
             self.x_tok[("sgpr", r)] = val
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
-        arr = "%vgpr" if kind == "vgpr" else "%sgpr"
-        p = self.tmp()
-        self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
+        p = self.reg_ptr(kind, r)
         self.emit(f"OpStore {p} {val}")
 
     def imm_val(self, a):
@@ -1418,8 +1436,8 @@ class Gen:
             if self.write_all_lanes or (self.active_run and self.dpp_guard is None):
                 self.store_reg("vgpr", a["r"], val)
                 return
-            p, old, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a['r'])}")
+            p = self.reg_ptr("vgpr", a["r"])
+            old, r = self.tmp(), self.tmp()
             self.emit(f"{old} = OpLoad %uint {p}")
             if eager:
                 mask = self.exec_value()
@@ -7461,8 +7479,7 @@ class Gen:
                 self.emit(f"{me} = OpLoad %uint %sg_lane")
             self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
             self.emit(f"{eq} = OpIEqual %bool {me} {m}")
-            p = self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a[0]['r'])}")
+            p = self.reg_ptr("vgpr", a[0]["r"])
             self.emit(f"{old} = OpLoad %uint {p}")
             self.emit(f"{r} = OpSelect %uint {eq} {val} {old}")
             self.emit(f"OpStore {p} {r}")
@@ -14432,6 +14449,9 @@ def assemble(gen):
                    f"%vinb{reg}_{c} = OpCopyObject %uint %vinc{reg}_{c}",
                    f"%vinp{reg}_{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(vg)}",
                    f"OpStore %vinp{reg}_{c} %vinb{reg}_{c}"]
+    for (kind, r), p in gen.reg_ptrs.items():
+        arr = "%vgpr" if kind == "vgpr" else "%sgpr"
+        fn.append(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {gen.cu(r)}")
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
@@ -15599,7 +15619,7 @@ def translate(path):
             raise Unsupported("reachable instruction with normalized encoding")
     else:
         check_printed_encodings(path, info)
-    g = Gen(stage)
+    g = Gen(stage, hoist_reg_ptrs=True)
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
         g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
                            (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
