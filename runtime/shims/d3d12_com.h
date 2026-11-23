@@ -210,6 +210,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out,
 // proxy it also makes the proxy's IDXGIDevice1::GetAdapter return this layer's adapter (d3d12_xs_device.h).
 void set_device_outer(ID3D12Device* device, IUnknown* outer);
 
+// Console Xbox CreateDescriptorHeap takes a 16-byte PC D3D12_DESCRIPTOR_HEAP_DESC followed by address/size at
+// +0x10/+0x18 (issue #313 comment 7107265058). This helper creates a heap with that console ABI contract on a
+// device from create_vulkan_device*; it is intended for the Xbox device-proxy slot 14 path, not normal PC callers.
+HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                       D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
+                                       REFIID riid, void** out);
+
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 // The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.

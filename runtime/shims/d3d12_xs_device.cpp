@@ -1334,6 +1334,25 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
+static bool readable_range(const void* ptr, std::size_t bytes) {
+    if (!ptr || !bytes) return false;
+    const auto* p = static_cast<const std::uint8_t*>(ptr);
+    std::size_t remaining = bytes;
+    while (remaining) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+        const DWORD protect = mbi.Protect & 0xffu;
+        if (protect == PAGE_NOACCESS || protect == PAGE_GUARD || protect == PAGE_EXECUTE) return false;
+        const auto base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        const auto addr = reinterpret_cast<std::uintptr_t>(p);
+        const std::size_t avail = static_cast<std::size_t>(base + mbi.RegionSize - addr);
+        if (avail >= remaining) return true;
+        remaining -= avail;
+        p += avail;
+    }
+    return true;
+}
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1343,7 +1362,29 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
     void* created = nullptr;
-    HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+    HRESULT hr = E_INVALIDARG;
+    bool console_extended = false;
+    if (desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
+        (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
+        const void* tail = bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
+        if (readable_range(tail, sizeof(std::uint64_t) * 2)) {
+            std::uint64_t address = 0;
+            std::uint64_t size = 0;
+            std::memcpy(&address, tail, sizeof(address));
+            std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
+            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
+            // non-zero console VA is present; normal PC 16-byte descs never enter it.
+            if (address != 0) {
+                console_extended = true;
+                hr = rt::d3d12::create_console_descriptor_heap(
+                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
+                    __uuidof(ID3D12DescriptorHeap), &created);
+            }
+        }
+    }
+    if (!console_extended)
+        hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
