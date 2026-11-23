@@ -40,10 +40,8 @@ $log = Join-Path $env:TEMP d3d12.log
 python -I tools\boot_trace.py $trace --d3d12 $log
 ```
 
-Windows PowerShell 5.1 writes `2>` as UTF-16LE; the tool names that file instead of parsing it. Use
-`2>&1 | Out-File -Encoding utf8 $log` there, or PowerShell 7, which defaults to UTF-8. The tool strips the BOM that
-5.1 writes with `utf8`, and accepts the `program.exe : ` prefix 5.1 puts in front of the first stderr line when it
-turns it into an error record, so that call is not lost. `cmd /c` writes the lines unchanged.
+The tool reads UTF-8 and UTF-16 with a byte-order mark, including the UTF-16LE log that Windows PowerShell 5.1
+writes with `2>`. It also recognizes the `program.exe : ` prefix that PowerShell 5.1 adds to the first stderr line.
 
 Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifact; the backend must be Vulkan):
 
