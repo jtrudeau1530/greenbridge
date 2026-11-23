@@ -886,6 +886,12 @@ int check_xbox_slots() {
     EXPECT(mock->array[68][3] == ((static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR) << 32) |
                                   static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)));
 
+    // A count with a null descriptor array is refused with {UINT64_MAX, 0} and never reaches PC slot 68.
+    D3D12_RESOURCE_ALLOCATION_INFO null_ret{};
+    EXPECT(call_slot108_c_abi(&null_ret, device, 1, 2, nullptr, nullptr) == &null_ret);
+    EXPECT(null_ret.SizeInBytes == UINT64_MAX && null_ret.Alignment == 0);
+    EXPECT(mock->calls[68] == 3 && xs::device_slot_hits(108) == 4);
+
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);

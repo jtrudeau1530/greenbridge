@@ -1538,6 +1538,10 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     const auto count = static_cast<UINT>(a3);
     const auto* raw_descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4);
     auto* info1 = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
+    if (count > 0 && !raw_descs) {  // a count with no descriptor array: refuse like the other bad-input paths
+        *ret = {UINT64_MAX, 0};
+        return reinterpret_cast<std::uint64_t>(ret);
+    }
 
     std::vector<D3D12_RESOURCE_DESC1> cleaned;
     const D3D12_RESOURCE_DESC1* descs_to_pass = nullptr;
