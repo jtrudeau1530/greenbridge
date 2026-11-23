@@ -341,13 +341,21 @@ class BootTraceTests(unittest.TestCase):
             self.assertEqual(bt.main(["--d3d12", self.d3d12]), 2)
         self.assertIn("no [d3d12-trace] line", err.getvalue())
 
-    def test_utf16_log_is_named_before_parsing(self):
-        with open(self.d3d12, "wb") as f:
-            f.write(b"\xff\xfe" + "[d3d12-trace] #1 Foo ok\n".encode("utf-16-le"))
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(bt.main(["--d3d12", self.d3d12]), 2)
-        self.assertIn("UTF-16", err.getvalue())
+    def test_utf16_logs_keep_both_wrapped_and_unwrapped_calls(self):
+        lines = ("synthetic.exe : [d3d12-trace] #1 First called\r\n"
+                 "[d3d12-trace] #2 Second ok\r\n")
+        for encoding, bom in (("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff")):
+            with self.subTest(encoding=encoding):
+                with open(self.d3d12, "wb") as f:
+                    f.write(bom + lines.encode(encoding))
+                output = io.StringIO()
+                errors = io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    result = bt.main(["--d3d12", self.d3d12, "--json"])
+                self.assertEqual(result, 0, errors.getvalue())
+                trace = json.loads(output.getvalue())["d3d12"]
+                self.assertEqual(trace["calls"], 2)
+                self.assertEqual(trace["methods"], ["First", "Second"])
 
     def test_utf8_bom_is_stripped(self):
         with open(self.d3d12, "wb") as f:

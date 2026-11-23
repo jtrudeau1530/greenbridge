@@ -9,7 +9,7 @@ the D3D12 calls by outcome and the first call per method.
 The method field can contain spaces (`SetMarker/BeginEvent with unknown metadata`), so the parser takes the
 outcome as the last field instead of assuming a single-word method. PowerShell 5.1 wraps the first stderr line of
 a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a `<name> : ` prefix before the
-tag is accepted too; without it the first call of the run would be lost.
+tag is accepted too. The reader accepts UTF-8 and BOM-marked UTF-16, including PowerShell 5.1 stderr redirection.
 
 Usage:
     python -I boot_trace.py boot.jsonl [--d3d12 d3d12.log] [--json] [--limit N]
@@ -38,19 +38,11 @@ class TraceError(ValueError):
 
 
 def _open_text(path: str):
-    """Open a trace as UTF-8, naming the one encoding trap before any line is parsed."""
+    """Read UTF-8 or use the byte-order mark to decode a UTF-16 trace."""
     try:
         with open(path, "rb") as raw:
-            head = raw.read(3)
-    except OSError as e:
-        raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
-    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        raise TraceError(
-            f"{path} is UTF-16, which PowerShell 5.1 writes for `2>`; "
-            "use `2>&1 | Out-File -Encoding utf8` for the d3d12 log"
-        )
-    encoding = "utf-8-sig" if head == b"\xef\xbb\xbf" else "utf-8"
-    try:
+            head = raw.read(2)
+        encoding = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
         return open(path, encoding=encoding, errors="replace")
     except OSError as e:
         raise TraceError(f"cannot read {path}: {e.strerror or e}") from e
