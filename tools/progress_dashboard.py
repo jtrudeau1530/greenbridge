@@ -347,9 +347,9 @@ def group_of_test(name):
 
 
 # ----------------------------------------------------------------------------------------------- ctest / junit
-def parse_junit(text):
+def parse_junit(xml):
     """[(name, result, seconds, detail)] from CTest (--output-junit) or pytest (--junitxml) XML."""
-    root = ET.fromstring(text)
+    root = xml if isinstance(xml, ET.Element) else ET.fromstring(xml)
     suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
     out = []
     for suite in suites:
@@ -427,7 +427,7 @@ def collect_ctest(col, args):
     log = os.path.join(ROOT, "runtime", "build", "Testing", "Temporary", "LastTest.log")
     sets = []
     if os.path.isfile(log):
-        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log))]))
+        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log))], True))
         col.source("ctest_lasttest", log, "ok", len(sets[-1][2]))
     else:
         col.source("ctest_lasttest", log, "missing", note="no runtime/build CTest run on this machine")
@@ -436,20 +436,23 @@ def collect_ctest(col, args):
             col.source("junit", path, "missing")
             continue
         try:
-            rows = parse_junit(read_utf8(path))
+            root = ET.fromstring(read_utf8(path))
         except ET.ParseError as e:
             col.source("junit", path, "invalid", note=str(e))
             continue
-        sets.append(("junit:" + os.path.basename(path), path, rows))
+        # CTest writes a single testsuite with a disabled count and hostname. pytest wraps its suite in testsuites.
+        is_ctest = root.tag == "testsuite" and {"disabled", "hostname"} <= root.attrib.keys()
+        rows = parse_junit(root)
+        sets.append(("junit:" + os.path.basename(path), path, rows, is_ctest))
         col.source("junit", path, "ok", len(rows))
-    for label, path, rows in sets:
+    for label, path, rows, is_ctest in sets:
         ran = os.path.getmtime(path)
         for name, res, secs, detail in rows:
             if res == "fail":
                 fresh, status = "failed", "failed"
             elif res == "skip":
                 fresh, status = "unknown", "unknown"
-            elif runtime_changed and ran < runtime_changed and label == "ctest":
+            elif is_ctest and runtime_changed and ran < runtime_changed:
                 fresh, status = "revalidation_required", "partial"
             else:
                 fresh, status = "current", "verified"
@@ -459,7 +462,7 @@ def collect_ctest(col, args):
     if seen:
         ok = sum(1 for c in col.components if c["panel"] == "runtime" and c["status"] == "verified")
         col.metric("runtime.current", "runtime", "Runtime tests passing on the current code", ok, seen,
-                   "tests that passed after the last commit touching runtime/ / tests recorded")
+                   "passing tests, excluding CTest reports older than the last commit touching runtime/ / tests recorded")
 
 
 # ----------------------------------------------------------------------------------------------- GPU tests

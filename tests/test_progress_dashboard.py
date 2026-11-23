@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -161,6 +162,43 @@ class Freshness(unittest.TestCase):
     def test_code_edited_during_the_run_is_never_current(self):
         got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), None))
         self.assertEqual(got["test_progress_dashboard.py"], ("verified", "unknown"))
+
+    def test_ctest_junit_passes_age_like_lasttest_log(self):
+        ctest_suite = '<testsuite disabled="0" hostname="" timestamp="2026-11-22T10:00:00">{}</testsuite>'
+        sources = {
+            "runtime/build/Testing/Temporary/LastTest.log": (100, "1/1 Test: local\nTest Passed.\n"),
+            "before.xml": (100, ctest_suite.format(
+                '<testcase name="older" status="run"/><testcase name="failed" status="fail"/>'
+                '<testcase name="skipped" status="notrun"/>')),
+            "after.xml": (300, ctest_suite.format('<testcase name="newer" status="run"/>')),
+            "pytest.xml": (100, '<testsuites><testsuite name="pytest" hostname="host">'
+                           '<testcase name="unrelated"/></testsuite></testsuites>'),
+        }
+        with tempfile.TemporaryDirectory() as root:
+            junit = []
+            for name, (mtime, text) in sources.items():
+                path = os.path.join(root, *name.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                os.utime(path, (mtime, mtime))
+                if name.endswith(".xml"):
+                    junit.append(path)
+            col = pd.Collector()
+            with mock.patch.object(pd, "ROOT", root), mock.patch.object(pd, "last_commit_time", return_value=200):
+                pd.collect_ctest(col, SimpleNamespace(junit=junit))
+
+        outcomes = {c["name"]: (c["status"], c["freshness"]) for c in col.components}
+        self.assertEqual(outcomes, {
+            "local": ("partial", "revalidation_required"),
+            "older": ("partial", "revalidation_required"),
+            "failed": ("failed", "failed"),
+            "skipped": ("unknown", "unknown"),
+            "newer": ("verified", "current"),
+            "unrelated": ("verified", "current"),
+        })
+        metric = next(m for m in col.metrics if m["id"] == "runtime.current")
+        self.assertEqual((metric["numerator"], metric["denominator"]), (2, 6))
 
 
 class GpuLog(unittest.TestCase):
