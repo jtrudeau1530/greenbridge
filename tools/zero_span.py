@@ -13,7 +13,7 @@ _ZEROS = bytes(WINDOW)
 
 def all_zero(buf, start: int, end: int) -> bool:
     """True when buf[start:end] is empty or all zero bytes. Reads at most WINDOW bytes at a time."""
-    end = min(end, len(buf))
+    start, end, _ = slice(start, end).indices(len(buf))
     p = start
     while p < end:
         q = min(end, p + WINDOW)
@@ -27,7 +27,6 @@ def gap_split(buf, start: int, end: int) -> tuple[int, int]:
     """(zero_padding, unread) bytes for the gap buf[start:end], counted as the scanners always have: all of
     it is padding when every byte is zero, otherwise all of it is unread. The range is clipped to the buffer
     the way a slice is, so the counts match len(buf[start:end])."""
-    end = min(end, len(buf))
-    start = min(start, end)
-    n = end - start
+    start, end, _ = slice(start, end).indices(len(buf))
+    n = max(0, end - start)
     return (n, 0) if all_zero(buf, start, end) else (0, n)
