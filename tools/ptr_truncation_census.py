@@ -299,7 +299,7 @@ def positive_int(text: str) -> int:
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
     if value < 1:
-        raise argparse.ArgumentTypeError("must be at least 1")
+        raise argparse.ArgumentTypeError("must be at least 1 (a smaller value would silently scan fewer listings)")
     return value
 
 
@@ -311,8 +311,6 @@ def main(argv=None):
     ap.add_argument("--json", help="write the summary here")
     ap.add_argument("--index-out", help="write {number: {stage, user_sgpr_reads}} for tools/user_sgpr_census.py")
     a = ap.parse_args(argv)
-    if a.limit is not None and a.limit < 1:
-        ap.error("--limit must be at least 1 (a smaller value would silently scan fewer listings)")
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
         return 2
