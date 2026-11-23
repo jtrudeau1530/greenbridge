@@ -40,6 +40,7 @@ import json
 import os
 import struct
 import sys
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_geometry_check as C  # noqa: E402
@@ -81,19 +82,38 @@ def embeddings(signature, counts, cap, ordered=True):
 
     ordered: the picked indices must increase (a prefix is the common case); otherwise any order is allowed.
     """
+    if cap <= 0 or len(signature) > len(counts):
+        return []
+
+    latest = [len(counts) - 1] * len(signature)
+    if ordered:
+        # Match the signature backwards once. An index later than latest[i] leaves
+        # too few matching geometries for the rest of the signature.
+        k = len(counts) - 1
+        for i in reversed(range(len(signature))):
+            while k >= 0 and counts[k] != signature[i]:
+                k -= 1
+            if k < 0:
+                return []
+            latest[i] = k
+            k -= 1
+    elif Counter(signature) - Counter(counts):
+        # In any order, each triangle count just needs enough distinct geometries.
+        return []
+
     out = []
 
     def walk(i, j, acc):
-        if len(out) >= cap:
-            return
         if i == len(signature):
             out.append(list(acc))
             return
-        for k in (range(j, len(counts)) if ordered else range(len(counts))):
-            if counts[k] == signature[i] and k not in acc:
+        for k in range(j, latest[i] + 1):
+            if counts[k] == signature[i] and (ordered or k not in acc):
                 acc.append(k)
-                walk(i + 1, k + 1, acc)
+                walk(i + 1, k + 1 if ordered else 0, acc)
                 acc.pop()
+                if len(out) == cap:
+                    return
 
     walk(0, 0, [])
     return out

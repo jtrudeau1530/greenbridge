@@ -6,6 +6,7 @@ No game data is read.
 """
 import contextlib
 import io
+import itertools
 import json
 import os
 import struct
@@ -369,6 +370,43 @@ class TestPieces(unittest.TestCase):
         self.assertEqual(M.embeddings([3, 2], [2, 3, 3], 8), [])
         self.assertEqual(M.embeddings([3, 2], [2, 3, 3], 8, ordered=False), [[1, 0], [2, 0]])
         self.assertEqual(len(M.embeddings([1], [1] * 20, 5)), 5)          # the cap holds
+
+    def test_embeddings_prune_impossible_suffixes(self):
+        # Count triangle-count comparisons so the regression doesn't depend on machine speed.
+        class Count(int):
+            __hash__ = int.__hash__
+
+            def __eq__(self, other):
+                nonlocal comparisons
+                comparisons += 1
+                return int.__eq__(self, other)
+
+            def __ne__(self, other):
+                return not self == other
+
+        cases = [
+            (True, [1] * 8 + [2], [2] + [1] * 16, []),  # the only 2 comes too early
+            (False, [1] * 6 + [2, 2], [2] + [1] * 8, []),  # two distinct 2s are needed
+            (True, [1] * 8 + [2], [1] * 8 + [2] + [1] * 8, [list(range(9))]),
+        ]
+        for ordered, signature, counts, expected in cases:
+            with self.subTest(ordered=ordered, counts=counts):
+                comparisons = 0
+                self.assertEqual(M.embeddings(signature, list(map(Count, counts)), 2, ordered), expected)
+                self.assertLess(comparisons, 4096)
+
+    def test_embeddings_keep_first_matches_in_index_order(self):
+        counts = [7] * 8 + [1, 2, 1, 2, 1]
+        signature = [1, 2, 1]
+        for ordered in (True, False):
+            choices = itertools.combinations if ordered else itertools.permutations
+            expected = [list(indices) for indices in choices(range(len(counts)), len(signature))
+                        if [counts[i] for i in indices] == signature]
+            for cap in (0, 1, 3, len(expected) + 1):
+                with self.subTest(ordered=ordered, cap=cap):
+                    self.assertEqual(M.embeddings(signature, counts, cap, ordered), expected[:cap])
+            self.assertEqual(M.embeddings([], counts, 1, ordered), [[]])
+            self.assertEqual(M.embeddings([], counts, 0, ordered), [])
 
     def test_read_groups_rebases_faces_per_group(self):
         with tempfile.TemporaryDirectory() as directory:
