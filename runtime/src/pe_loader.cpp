@@ -944,6 +944,9 @@ struct RuntimeLoadScope {
 }  // namespace
 
 Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
+    std::vector<wchar_t> compat(32768);
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", compat.data(), static_cast<DWORD>(compat.size()));
+    if (n > 0 && n < compat.size()) compat_dir_ = std::filesystem::path(compat.data());
     shims::add_module_lookup(this, &lookup_in_loader);
     shims::add_bundled_loader(this, &kBundledOps);
 }
@@ -1563,9 +1566,40 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     return reinterpret_cast<void*>(p);
 }
 
+bool Loader::resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
+                            bool by_ordinal, void*& out) {
+    out = nullptr;
+    if (compat_dir_.empty() || key.empty() || key.find_first_of("/\\:") != std::string::npos) return false;
+    HMODULE h = nullptr;
+    if (auto it = compat_modules_.find(key); it != compat_modules_.end()) {
+        h = static_cast<HMODULE>(it->second);
+    } else {
+        const std::filesystem::path candidate = compat_dir_ / std::filesystem::path(dll);
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(candidate, ec)) return false;
+        // The full path, with the compat folder on the DLL's own search path for its dependencies; never the game
+        // folder. Windows maps it, so its CRT, TLS and SEH work as for any host DLL.
+        h = LoadLibraryExW(candidate.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!h)
+            throw std::runtime_error("LEONIDA_COMPAT_DIR: " + path_utf8(candidate) + " exists but Windows could not " +
+                                     "load it (error " + std::to_string(GetLastError()) + ")");
+        compat_modules_.emplace(key, h);
+        std::fprintf(stderr, "[rt] compat: %s -> %s\n", dll.c_str(), path_utf8(candidate).c_str());
+    }
+    out = reinterpret_cast<void*>(GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str()));
+    return true;
+}
+
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
     std::string key = lower(dll);
     std::string sym = by_ordinal ? "#" + std::to_string(ordinal) : name;
+
+    // Opt-in compat modules come first: a DLL the player put in LEONIDA_COMPAT_DIR owns all of its imports, so one
+    // console module is never served half by a shim and half by the drop-in (they would not share state).
+    if (void* p = nullptr; resolve_compat(key, dll, name, ordinal, by_ordinal, p)) {
+        m.imports.push_back({dll, sym, p ? Binding::Host : Binding::Unimplemented});
+        return p ? p : shims::make_unimplemented_thunk(dll, sym);
+    }
 
     if (void* p = shims::find(key, sym)) {
         m.imports.push_back({dll, sym, Binding::Shim});
