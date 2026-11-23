@@ -390,9 +390,9 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 
 `typeless_rtv_test` checks typed-view recording and replay without a GPU. It is registered in CTest.
 `d3d12_typeless_rtv_test` compares synthetic full and rectangular clears with Windows WARP through explicit
-UNORM/SRGB/UINT RTVs on a one-mip, one-layer, single-sample 2D RGBA8 typeless resource. It checks descriptor
+UNORM/SRGB/UINT RTVs on 2D RGBA8 typeless resources, including mip slices, array-layer ranges and 4x MSAA.
+SINT/SNORM clears are compared where both Vulkan and WARP report render-target support. It checks descriptor
 snapshots, alternating view formats, SRGB with UAV resource usage, and invalid view rejection.
-Other typeless families, typed-resource casts, SINT/SNORM, mip/array expansion, MSAA and 3D views are not added.
 
 ```powershell
 ctest --test-dir runtime/build -C RelWithDebInfo -R '^typeless_rtv$' --output-on-failure
@@ -415,14 +415,18 @@ $env:VK_VALIDATION_VALIDATE_SYNC = '1'
 .\runtime\build\RelWithDebInfo\d3d12_rgb96_test.exe
 ```
 
-RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT views of 2D mip slices and contiguous array-layer ranges, with sample count 1. Other format families, typed-resource casts, MSAA and 3D views are not expanded.
+RGBA8 typeless RTV clears support explicit UNORM/SRGB/UINT/SINT/SNORM views of 2D mip slices and contiguous
+array-layer ranges, and MSAA. Other typeless color families also accept same-family typed RTVs, subject to Vulkan
+color-attachment support. Typed-resource RTV casts are limited to R8G8B8A8_UNORM resources whose castable-format
+list allows the view. A 1D texture cannot be created as a render target or depth buffer (`CreateCommittedResource`
+refuses `ALLOW_RENDER_TARGET`/`ALLOW_DEPTH_STENCIL` on it), and 3D typeless view reinterpretation remains refused.
 
 ### Resource descriptions
 
 `d3d12_resource_desc_test` creates the same committed and reserved resources on the Vulkan-backed device and on
 Windows D3D12 (the default adapter and WARP, whichever exist) and compares every field of `ID3D12Resource::GetDesc`:
 the `Alignment` and `MipLevels` a description left at 0 must read back as the host fills them in. A description the
-host refuses is skipped, and one only the layer refuses (1D textures today) is listed and not compared. It needs a
+host refuses is skipped, and one only the layer refuses is listed and not compared. It needs a
 Vulkan GPU and runs explicitly.
 
 ```powershell
