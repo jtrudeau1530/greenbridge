@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -487,6 +488,22 @@ class CommandLineTest(unittest.TestCase):
         result = self.run_batch("--report", self.manifest)
         self.assertEqual(result.returncode, 2)
         self.assertTrue(json.loads(self.manifest.read_text())["pipelines"])
+
+    def test_existing_report_cannot_be_a_hard_link_to_an_input(self):
+        original = self.vs.read_bytes()
+        try:
+            os.link(self.vs, self.report)
+        except OSError as exc:
+            self.skipTest(f"hard links unavailable: {exc}")
+        result = self.command("check", "--vs", self.vs, "--ps", self.ps, "--report", self.report)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("report would overwrite an input file", result.stderr)
+        self.assertTrue(self.report.samefile(self.vs))
+        self.assertEqual(self.vs.read_bytes(), original)
+
+    def test_missing_report_path_still_cannot_match_an_input_path(self):
+        with self.assertRaisesRegex(ValueError, "report would overwrite an input file"):
+            link.ensure_report_is_separate(self.report, [self.report])
 
     def test_inspect_keeps_types_and_components(self):
         shader = self.module("with_component", input(location=3, component=2, components=2))
