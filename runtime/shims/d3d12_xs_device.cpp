@@ -3205,7 +3205,7 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
         return create_pc();
     }
     if (!(heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) std::memset(memory, 0, size);
-    HRESULT hr = handler(self->real, memory, desc, riid, out);
+    HRESULT hr = handler(self->real, memory, desc, 0xFFFFFFFFu, riid, out);
     if (SUCCEEDED(hr)) {
         static std::atomic<bool> logged{false};
         if (first_call(logged))
@@ -3431,7 +3431,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                      va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
                      xbox_flags, state);
     }
-    return handler(self->real, va, pc_desc, *riid, out);
+    return handler(self->real, va, pc_desc, state, *riid, out);
 }
 
 // Slot 74: the retail title calls it once with (pointer, u32, pointer) (kapitche, issue 7231). The PC slot 74 is

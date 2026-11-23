@@ -174,7 +174,11 @@ int check_import(ID3D12Device* device, bool supported) {
 // pattern is written after the buffer exists and read back through a READBACK buffer. Checked on a VirtualAlloc range
 // and on a view of a pagefile-backed section, the form xmem's physical pages are mapped in. A texture is E_NOTIMPL
 // and an address off the import alignment E_INVALIDARG.
-int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size) {
+// `may_refuse`: the driver is allowed to refuse importing these pages, and the layer then answers with its fallback.
+// RADV imports host memory through amdgpu userptr, which takes anonymous memory only, so it refuses a view of a
+// pagefile-backed section with EPERM (measured on an RX 9060 XT under Wine, found in review), while NVIDIA and
+// AMD's Windows driver import it. The fallback is checked to exist; the readback below needs the import.
+int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size, bool may_refuse = false) {
     const char* who = "vulkan slot-133 buffer";
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -183,7 +187,12 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     Ref<ID3D12Resource> buffer;
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, IID_PPV_ARGS(&buffer.p)), S_OK);
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
+    if (may_refuse && buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages)) {
+        std::printf("%s: %s, %llu bytes: this driver refused the import; the fallback resource answered\n", who, kind,
+                    static_cast<unsigned long long>(size));
+        return 0;
+    }
     EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
     auto* bytes = static_cast<std::uint8_t*>(pages);
     for (UINT64 i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(i * 131u + 7u);
@@ -225,11 +234,11 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     // A texture isn't placed on the pages yet: the title gets an ordinary committed texture instead of a refusal.
     Ref<ID3D12Resource> placed_texture;
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, IID_PPV_ARGS(&placed_texture.p)), S_OK);
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, 0x6u, IID_PPV_ARGS(&placed_texture.p)), S_OK);
     EXPECT(placed_texture.p != nullptr && placed_texture->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
     // An address off the buffer alignment can't be bound inside the import: the ordinary-buffer fallback answers.
     Ref<ID3D12Resource> fallback;
-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
     EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(bytes + 1));
     std::printf("%s: %s, %llu bytes: GPU VA is the address, a GPU copy reads the CPU's writes\n", who, kind,
                 static_cast<unsigned long long>(size));
@@ -249,13 +258,13 @@ int check_title_placed_all(ID3D12Device* device) {
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
     if (!view) return failures + 1;
-    failures += check_title_placed(device, "section view", view, size);
+    failures += check_title_placed(device, "section view", view, size, /*may_refuse=*/true);
     UnmapViewOfFile(view);
     CloseHandle(section);
 
-    // Not imported: a write-combined range (an RTX 5090 imported it but read wrong bytes back, found in review)
-    // falls back to an ordinary buffer, so the resource exists but is not at the pages' address; so does a range only
-    // partly committed.
+    // Cache-modified ranges are not imported (WC imports read wrong bytes on an RTX 5090 in review). Some Wine
+    // versions report a requested WC allocation as plain read-write memory; check the protection actually supplied.
+    // PAGE_NOCACHE also exercises the fallback on those hosts, rather than dropping the cache-protection check.
     const char* who = "vulkan slot-133 buffer";
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -263,24 +272,37 @@ int check_title_placed_all(ID3D12Device* device) {
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    void* combined = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
-    EXPECT(combined != nullptr);
-    {
-        Ref<ID3D12Resource> fallback;
-        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, combined, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
-        EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(combined));
+    for (DWORD modifier : {DWORD(PAGE_WRITECOMBINE), DWORD(PAGE_NOCACHE)}) {
+        void* cached_pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | modifier);
+        EXPECT(cached_pages != nullptr);
+        MEMORY_BASIC_INFORMATION region{};
+        EXPECT(VirtualQuery(cached_pages, &region, sizeof(region)) == sizeof(region));
+        const bool cache_modified = (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) != 0;
+        {
+            Ref<ID3D12Resource> buffer;
+            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, cached_pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
+            if (cache_modified) {
+                EXPECT(buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cached_pages));
+            } else {
+                EXPECT(region.Protect == PAGE_READWRITE);
+                EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cached_pages));
+            }
+        }
+        std::printf("%s: cache modifier 0x%lx, reported protection 0x%lx: %s\n", who, modifier, region.Protect,
+                    cache_modified ? "ordinary-buffer fallback verified"
+                                   : "modifier not reported; read-write import verified");
+        VirtualFree(cached_pages, 0, MEM_RELEASE);
     }
-    VirtualFree(combined, 0, MEM_RELEASE);
     char* partial = static_cast<char*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
     EXPECT(partial != nullptr && VirtualAlloc(partial, size / 2, MEM_COMMIT, PAGE_READWRITE) == partial);
     {
         // Pages not committed yet (xmem commits on first touch) are not imported either: the fallback answers.
         Ref<ID3D12Resource> fallback;
-        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
         EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(partial));
     }
     VirtualFree(partial, 0, MEM_RELEASE);
-    std::printf("%s: a write-combined range and a partly committed one fall back to an ordinary buffer\n", who);
+    std::printf("%s: a partly committed range falls back to an ordinary buffer\n", who);
     return failures;
 }
 
