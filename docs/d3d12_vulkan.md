@@ -405,6 +405,21 @@ What is implemented (all of it testable without the game):
     `d3d12_uav_clear_test`);
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
+  - `B5G5R5A1_UNORM` with `ALLOW_UNORDERED_ACCESS` on a GPU whose `VK_FORMAT_A1R5G5B5_UNORM_PACK16` lacks
+    `STORAGE_IMAGE` (for example NVIDIA) is backed the same way, by a mutable `VK_FORMAT_R16_UINT` image with
+    `{R16_UINT, A1R5G5B5_UNORM_PACK16}` in its format list (`Format::uint_backed`). Unlike `R9G9B9E5`, render
+    targets are kept: RTVs and clears go through an `A1R5G5B5` attachment view, SRVs through an `A1R5G5B5`
+    sampled view, and the UAV's storage view is `R16_UINT` in `as_uint`. SRV and UAV descriptors name the texture's
+    own T# format (`1_5_5_5_UNORM`, 134), so a shader store needs the translator to pack the 5-5-5-1 bits for that
+    view; until it does, `CheckFeatureSupport` does not advertise the typed UAV. Multisampled UAV textures are still
+    refused (`d3d12_b5g5r5a1_uav_test`);
+  - `R8G8B8A8_UNORM_SRGB` and `B8G8R8A8_UNORM_SRGB` with `ALLOW_UNORDERED_ACCESS`, which the host runtime sizes and
+    creates (RTX 4090 and WARP) and a retail title sizes as a 2048x2048, 12-mip render target, on a GPU whose sRGB
+    format lacks `STORAGE_IMAGE` (most): a mutable image of the UNORM format of the same order, with both formats in
+    its format list (`Format::uint_backed`). Its storage view is UNORM, as every D3D12 typed UAV of these textures
+    is, so shaders and `ClearUnorderedAccessViewFloat` write raw bytes; RTVs and SRVs are sRGB, so clears and
+    rendering encode and sampling decodes. BGRA8 needs `B8G8R8A8_UNORM` storage. Both clears match WARP byte for
+    byte; multisampled ones are still refused (`d3d12_srgb_uav_test`);
   - `B8G8R8X8_UNORM`, `_UNORM_SRGB` and `_TYPELESS` (D3D-87) are `B8G8R8A8` images: clears, copies and footprints
     keep all four bytes (WARP writes the clear's alpha into the X byte too), and shader views read alpha as 1. Its
     typeless family is its own, so views to or from `B8G8R8A8` are refused, unless the texture's castable-format

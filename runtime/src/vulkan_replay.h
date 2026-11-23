@@ -83,6 +83,9 @@ struct ResourceBinding {
     bool typeless = false;  // A TYPELESS color resource: views name a format of its family (D3D-275).
     bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
                                          // so views may reinterpret it as typeless resources do.
+    // A UAV texture stored as a mutable unsigned image because its format has no storage support (R16_UINT for
+    // A1R5G5B5): the format its render-target views use. UNDEFINED otherwise.
+    VkFormat uint_backed = VK_FORMAT_UNDEFINED;
     // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
     // (depth24.h) and clears quantise to 24 bits.
     bool depth24_as_float = false;
@@ -1208,6 +1211,7 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     if (target.format == ColorViewFormat::resource)
         return resource.typeless ? VK_FORMAT_UNDEFINED : resource.format;
     const auto format = static_cast<VkFormat>(target.format);
+    if (resource.uint_backed && format == resource.uint_backed) return format;  // its logical format, listed at creation
     const int family = typeless_view_family(format);
     if (!family) return VK_FORMAT_UNDEFINED;
     if (!resource.typeless && !resource.castable_view_formats)
