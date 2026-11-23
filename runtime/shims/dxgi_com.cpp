@@ -548,16 +548,11 @@ public:
             return nullptr;
         return dup;
     }
-    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F* matrix) override {
-        if (!matrix) return E_INVALIDARG;
-        matrix_transform_ = *matrix;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F* matrix) override {
-        if (!matrix) return E_INVALIDARG;
-        *matrix = matrix_transform_;
-        return S_OK;
-    }
+    // A matrix transform belongs to composition swapchains only (CreateSwapChainForComposition, E_NOTIMPL here).
+    // Host DXGI answers DXGI_ERROR_INVALID_CALL to both methods on an HWND swapchain, with a matrix or with null
+    // (Windows 11, RTX 5060 Ti, driver 621.14); every swapchain the layer creates gets that answer.
+    HRESULT STDMETHODCALLTYPE SetMatrixTransform(const DXGI_MATRIX_3X2_F*) override { return DXGI_ERROR_INVALID_CALL; }
+    HRESULT STDMETHODCALLTYPE GetMatrixTransform(DXGI_MATRIX_3X2_F*) override { return DXGI_ERROR_INVALID_CALL; }
 
     // IDXGISwapChain3
     UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override { return swapchain_.current_back_buffer_index(); }
@@ -627,7 +622,6 @@ private:
     std::atomic<LONGLONG> last_present_qpc_{0};
     std::atomic<UINT> max_frame_latency_{2};
     DXGI_RGBA background_color_{0, 0, 0, 0};
-    DXGI_MATRIX_3X2_F matrix_transform_{1, 0, 0, 1, 0, 0};
     DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
     VkExtent2D source_size_{0, 0};
 };

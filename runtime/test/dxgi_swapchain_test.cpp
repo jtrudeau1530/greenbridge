@@ -948,8 +948,8 @@ int main() {
         if (FAILED(sc->Present(0, 0))) return fail("Present (10-bit)");
     }
 
-    // IDXGISwapChain1::GetBackgroundColor and IDXGISwapChain2::GetMatrixTransform must return what their setters
-    // stored, with transparent black and the identity matrix as the defaults.
+    // IDXGISwapChain1::GetBackgroundColor must return what its setter
+    // stored, with transparent black as the default.
     {
         DXGI_RGBA background{};
         if (FAILED(sc->GetBackgroundColor(&background)) || background.r != 0 || background.g != 0 ||
@@ -963,18 +963,15 @@ int main() {
         if (sc->SetBackgroundColor(nullptr) != E_INVALIDARG || sc->GetBackgroundColor(nullptr) != E_INVALIDARG)
             return fail("Get/SetBackgroundColor(nullptr) should return E_INVALIDARG");
 
+        // A matrix transform is for composition swapchains only: host DXGI answers DXGI_ERROR_INVALID_CALL to both
+        // methods on this HWND swapchain, with a matrix and with null (Windows 11, RTX 5060 Ti, driver 621.14).
         DXGI_MATRIX_3X2_F matrix{};
-        if (FAILED(sc->GetMatrixTransform(&matrix)) || matrix._11 != 1 || matrix._12 != 0 || matrix._21 != 0 ||
-            matrix._22 != 1 || matrix._31 != 0 || matrix._32 != 0)
-            return fail("GetMatrixTransform default should be the identity");
         const DXGI_MATRIX_3X2_F wanted_matrix{2, 0, 0, 3, 4, 5};
-        if (FAILED(sc->SetMatrixTransform(&wanted_matrix)) || FAILED(sc->GetMatrixTransform(&matrix)) ||
-            matrix._11 != wanted_matrix._11 || matrix._12 != wanted_matrix._12 ||
-            matrix._21 != wanted_matrix._21 || matrix._22 != wanted_matrix._22 ||
-            matrix._31 != wanted_matrix._31 || matrix._32 != wanted_matrix._32)
-            return fail("SetMatrixTransform/GetMatrixTransform did not round-trip");
-        if (sc->SetMatrixTransform(nullptr) != E_INVALIDARG || sc->GetMatrixTransform(nullptr) != E_INVALIDARG)
-            return fail("Get/SetMatrixTransform(nullptr) should return E_INVALIDARG");
+        if (sc->SetMatrixTransform(&wanted_matrix) != DXGI_ERROR_INVALID_CALL ||
+            sc->GetMatrixTransform(&matrix) != DXGI_ERROR_INVALID_CALL ||
+            sc->SetMatrixTransform(nullptr) != DXGI_ERROR_INVALID_CALL ||
+            sc->GetMatrixTransform(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("Set/GetMatrixTransform on an HWND swapchain should be DXGI_ERROR_INVALID_CALL, as on the host");
 
         DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_ROTATE180;
         if (FAILED(sc->GetRotation(&rotation)) || rotation != DXGI_MODE_ROTATION_IDENTITY)
