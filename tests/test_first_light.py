@@ -299,6 +299,15 @@ class ProbeCoordinateTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, r"invalid uv_probes pixel coordinates \[99, -5\]"):
             check_image(self.image, manifest)
 
+    def test_null_uv_probes_are_optional_with_rgba(self):
+        manifest = self.manifest | {
+            "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
+            "uv_probes": None,
+        }
+        self.assertEqual(check_image(self.image, manifest)["covered"], 2)
+        with self.assertRaises(TypeError):
+            check_image(self.image, manifest | {"uv_probes": False})
+
     def test_check_reports_invalid_coordinates(self):
         def draw(command, **kwargs):
             Path(command[3]).write_bytes(self.image)

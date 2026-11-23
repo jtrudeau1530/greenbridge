@@ -477,7 +477,10 @@ def check_image(data: bytes, manifest: dict) -> dict:
                     raise AssertionError(
                         f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
                     )
-    for probe in manifest.get("uv_probes", []):
+    uv_probes = manifest.get("uv_probes")
+    if uv_probes is None:
+        uv_probes = []
+    for probe in uv_probes:
         i = pixel_offset(probe.get("pixel"), "uv_probes pixel")
         if rgba_probes is not None:
             continue
