@@ -2072,6 +2072,94 @@ class Gen:
             raise Unsupported("ds_swizzle " + kind)
         self.ds_lane_read(a[0], self.src_u(a[1]), src, lane)
 
+    # op: (bytes, store?, signed, VGPR half the data comes from / lands in: None = the whole register)
+    BUFFER_SUB16 = {  # the plain 8/16-bit loads are buffer_load_sub's (BUFFER_SUB)
+        "buffer_load_ubyte_d16": (1, False, False, 0), "buffer_load_ubyte_d16_hi": (1, False, False, 1),
+        "buffer_load_sbyte_d16": (1, False, True, 0), "buffer_load_sbyte_d16_hi": (1, False, True, 1),
+        "buffer_load_short_d16": (2, False, False, 0), "buffer_load_short_d16_hi": (2, False, False, 1),
+        "buffer_store_byte": (1, True, False, None), "buffer_store_byte_d16_hi": (1, True, False, 1),
+        "buffer_store_short": (2, True, False, None), "buffer_store_short_d16_hi": (2, True, False, 1)}
+
+    def buffer_sub(self, op, a, mods):
+        """The d16 8/16-bit MUBUF loads and the 8/16-bit stores (RDNA2 ISA); the plain buffer_load_{u,s}byte /
+        {u,s}short are buffer_load_sub's. The _d16 loads write one 16-bit half of vdata (ubyte / sbyte extended to 16 bits) and
+        keep the other; buffer_store_byte / short write the low 8 / 16 bits (the _d16_hi forms the high half). The
+        address is buffer_address's, and the bounds check covers the access's own size (1 or 2 bytes) as for a typed
+        element of that size: a load out of range gives 0 (in the half it writes, for d16), a store out of range
+        writes nothing. Each byte is its own access, so a 16-bit one that crosses a dword is exact (in a swizzled
+        buffer the next dword is `step` bytes on); a store merges each byte into its dword with atomic and / or, as
+        buffer byte format stores do. Inactive lanes neither load nor store."""
+        if any(m in mods for m in ("lds", "tfe")):
+            raise Unsupported(op + " form")
+        nbytes, store, signed, half = self.BUFFER_SUB16[op]
+        vd = a[0]
+        if vd["k"] != "vgpr" or vd.get("n", 1) != 1:
+            raise Unsupported(op + " data")
+        addr, _, in_b, step = self.buffer_address(a, mods, elem="fmt", fixed_fmt=1 if nbytes == 1 else 7)
+        old = self.load_reg("vgpr", vd["r"])
+        cond = self.tmp()
+        self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {in_b}")
+        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+        pre = self.current_label_placeholder()
+        self.emit(f"OpSelectionMerge {lbl_end} None")
+        self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+        self.emit(f"{lbl_do} = OpLabel")
+        value = None
+        for k in range(nbytes):
+            va = addr
+            if k:
+                va = self.tmp()
+                self.emit(f"{va} = OpIAdd %ulong {addr} {self.cl(k)}")
+                if step is not None:
+                    # the second byte of an access at byte 3 is in the access's next dword, `step` bytes on
+                    lo, b3, cross, s64, far, sel = (self.tmp() for _ in range(6))
+                    self.emit(f"{lo} = OpUConvert %uint {addr}")
+                    self.emit(f"{b3} = OpBitwiseAnd %uint {lo} {self.cu(3)}")
+                    self.emit(f"{cross} = OpIEqual %bool {b3} {self.cu(3)}")
+                    self.emit(f"{s64} = OpUConvert %ulong {step}")
+                    self.emit(f"{far} = OpIAdd %ulong {addr} {s64}")
+                    f2 = self.tmp()
+                    self.emit(f"{f2} = OpISub %ulong {far} {self.cl(3)}")
+                    self.emit(f"{sel} = OpSelect %ulong {cross} {f2} {va}")
+                    va = sel
+            p, sh = self.global_byte_ptr(va)
+            if store:
+                byte, mk, inv, vs, t1, t2 = (self.tmp() for _ in range(6))
+                self.emit(f"{byte} = OpBitFieldUExtract %uint {old} {self.cu(16 * (half or 0) + 8 * k)} {self.cu(8)}")
+                self.emit(f"{mk} = OpShiftLeftLogical %uint {self.cu(0xFF)} {sh}")
+                self.emit(f"{inv} = OpNot %uint {mk}")
+                self.emit(f"{vs} = OpShiftLeftLogical %uint {byte} {sh}")
+                self.emit(f"{t1} = OpAtomicAnd %uint {p} {self.cu(1)} {self.cu(0)} {inv}")
+                self.emit(f"{t2} = OpAtomicOr %uint {p} {self.cu(1)} {self.cu(0)} {vs}")
+            else:
+                w, b = self.tmp(), self.tmp()
+                self.emit(f"{w} = OpLoad %uint {p} Aligned 4")
+                self.emit(f"{b} = OpBitFieldUExtract %uint {w} {sh} {self.cu(8)}")
+                if value is None:
+                    value = b
+                else:
+                    hi8, v2 = self.tmp(), self.tmp()
+                    self.emit(f"{hi8} = OpShiftLeftLogical %uint {b} {self.cu(8)}")
+                    self.emit(f"{v2} = OpBitwiseOr %uint {value} {hi8}")
+                    value = v2
+        if not store and signed:
+            sx = self.tmp()
+            self.emit(f"{sx} = OpBitFieldSExtract %uint {value} {self.cu(0)} {self.cu(8 * nbytes)}")
+            value = sx
+        self.emit(f"OpBranch {lbl_end}")
+        self.emit(f"{lbl_end} = OpLabel")
+        if store:
+            return
+        got = self.tmp()
+        self.emit(f"{got} = OpPhi %uint {value} {lbl_do} {self.cu(0)} {pre}")   # out of range / inactive: 0
+        if half is None:
+            # a whole-register load: inactive lanes keep vdata (dst writes active lanes only)
+            self.dst(vd, got)
+        else:
+            new = self.tmp()
+            self.emit(f"{new} = OpBitFieldInsert %uint {old} {got} {self.cu(16 * half)} {self.cu(16)}")
+            self.dst(vd, new)
+
     def buffer_load(self, op, a, mods):
         """buffer_load_dword[xN] vD, vaddr, s[V#], soffset [offen|idxen] offset:N  -> buffer-device-address loads.
         addr = V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex * V#.stride : 0), byte exact.
@@ -2163,7 +2251,7 @@ class Gen:
             cross, idx1, w1, lo_part, hi_byte, hi_sh, crossed, raw = (self.tmp() for _ in range(8))
             self.emit(f"{cross} = OpIEqual %bool {b3} {self.cu(3)}")
             self.emit(f"{idx1} = OpSelect %uint {cross} {self.cu(1)} {self.cu(0)}")
-            p1 = self.buf_dword_ptr(ptr, host, step, idx1)
+            p1 = self.buf_dword_ptr(ptr, host, step, idx1, same_base=True)   # idx1 0: the dword p0 reads
             self.emit(f"{w1} = OpLoad %uint {p1} Aligned 4")
             self.emit(f"{lo_part} = OpShiftRightLogical %uint {w0} {sh}")
             self.emit(f"{hi_byte} = OpBitFieldUExtract %uint {w1} {self.cu(0)} {self.cu(8)}")
@@ -3435,15 +3523,24 @@ class Gen:
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
 
-    def buf_dword_ptr(self, arr, host, step, i):
+    def buf_dword_ptr(self, arr, host, step, i, same_base=False):
         """Pointer to dword i (a Python int or a uint id) of a buffer access whose first dword is at host address
         `host`, `arr` the same address as a PSB array: arr[i] for the linear layout (step None), else host + i * step
         in scratch-swizzle mode (SWIZZLE_ENABLE=1, idxen=0, ADD_TID_ENABLE=1), where dword k is 4 * index_stride
-        bytes after dword k - 1 (buffer_address)."""
+        bytes after dword k - 1 (buffer_address). `same_base` indexes `arr` by i * index_stride instead of converting a
+        second address to a pointer: on MoltenVK (Apple M4) a load through a second pointer converted from the same
+        address as one through `arr` returned wrong values (#1864, @sovljanskii: buffer_load_ushort at byte 2 of a
+        dword read 0)."""
         ix = self.cu(i) if isinstance(i, int) else i
         p = self.tmp()
         if step is None or i == 0:
             self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {ix}")
+            return p
+        if same_base:                       # step = 4 * index_stride: dword i is element i * index_stride of arr
+            q, k = self.tmp(), self.tmp()
+            self.emit(f"{q} = OpShiftRightLogical %uint {step} {self.cu(2)}")
+            self.emit(f"{k} = OpIMul %uint {ix} {q}")
+            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {k}")
             return p
         o, o64, h = self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{o} = OpIMul %uint {ix} {step}")
@@ -7764,6 +7861,8 @@ class Gen:
             self.emit(f"{old} = OpLoad %uint {p}")
             self.emit(f"{r} = OpSelect %uint {eq} {val} {old}")
             self.emit(f"OpStore {p} {r}")
+        elif op in self.BUFFER_SUB16:
+            self.buffer_sub(op, a, mods)
         elif op.startswith("buffer_store_dword") or op in ("buffer_store_format_x", "buffer_store_format_xy",
                                                             "buffer_store_format_xyz", "buffer_store_format_xyzw",
                                                             "buffer_store_format_d16_x", "buffer_store_format_d16_xy",
@@ -15387,7 +15486,8 @@ def read_before_write_vgprs(insns):
         if (base_op(op) in ("v_swap_b32", "v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8", "v_pk_fmac_f16",
                             "v_dot2c_f32_f16", "v_dot2c_i32_i16", "v_dot2c_u32_u16", "v_dot4c_u32_u8",
                             "v_dot8c_i32_i4", "v_dot8c_u32_u4") or
-                (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
+                (op.startswith(("global_load_", "buffer_load_")) and "_d16" in op and "format" not in op)) and \
+                a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
             if r not in written and r not in first:

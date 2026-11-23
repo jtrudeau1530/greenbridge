@@ -22,7 +22,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_sm
            "ps_fnan_med3_s2", "ps_f16_fnan_med3",   # v_med3 with a NaN in S2 or in two operands (the same rule)
            "ps_sdwa", "ps_ops", "ps_ops2", "ps_ops3", "ps_ops4", "ps_ops5", "ps_ops6", "ps_ops7", "ps_ops8",
            "ps_legacy_mul", "ps_vcc_x2", "ps_vcmpx_forms", "ps_vcmp_int32", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_fmt_sint32", "cs_fmt_int_narrow", "cs_fmt_d16_xyz", "cs_w64x_readlane",
-           "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w32_fcmpswap", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
+           "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
            "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
            "cs_wavemask", "cs_w32_permlane_fi", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2", "ps_outmods_f16",
            "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
