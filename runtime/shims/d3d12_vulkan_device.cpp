@@ -1917,6 +1917,15 @@ public:
         void* const base_address = reinterpret_cast<void*>(base);
         const VkDeviceSize offset = start - base;
         const VkDeviceSize bytes = (offset + desc_.Width + alignment - 1) & ~(alignment - 1);
+        // An imported buffer's VA is its host address, and it joins the same BufferVaIndex as default-heap buffers,
+        // whose VAs are offsets in [0, arena size). A host range that reaches into that window (low host addresses,
+        // as under Wine) would shadow arena buffers in the index's nearest-start lookup, so it takes the fallback
+        // (found in review).
+        if (start < device_.arena.size) {
+            log_once("a title-placed buffer's host address overlaps the arena's VA window; not imported, size",
+                     int(desc_.Width > INT_MAX ? INT_MAX : desc_.Width));
+            return E_NOTIMPL;
+        }
         // The whole imported range must be committed, possibly across several allocations (the retail buffer spans
         // three mapped windows); a page not committed yet (xmem commits on first touch) or a write-combined one (on
         // an RTX 5090 such an import succeeded but GPU reads returned wrong bytes, found in review) is not imported,
@@ -6972,14 +6981,17 @@ public:
             log_once("a title-placed texture (device slot 133) is an ordinary committed texture, not the title's pages; "
                      "dimension",
                      int(desc.Dimension));
-            // The initial state follows the title's barrier layout (slot 133's third argument, measured by
-            // @dracbat); a state the description refuses (or UNDEFINED) gives COMMON, so the title still gets it.
+            // The title's barrier layout (slot 133's third argument, measured by @dracbat) is checked against the
+            // description as CreateCommittedResource checks a state; one it refuses (or UNDEFINED) gives COMMON, so
+            // the title still gets its texture. The image itself starts undefined either way: the first command that
+            // uses it moves it to that command's layout (vulkan_replay.h, initialize), as for every texture here.
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
             const D3D12_RESOURCE_STATES initial = state_for_barrier_layout(layout);
-            HRESULT hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, 0, nullptr, riid, out);
+            HRESULT hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, nullptr,
+                                                    0, nullptr, riid, out);
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
-                hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
-                                      riid, out);
+                hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc,
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr, 0, nullptr, riid, out);
             return d3d12_trace::result(method, hr);
         }
         D3D12_HEAP_PROPERTIES heap{};

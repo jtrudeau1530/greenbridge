@@ -235,6 +235,18 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     Ref<ID3D12Resource> placed_texture;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, 0x6u, IID_PPV_ARGS(&placed_texture.p)), S_OK);
     EXPECT(placed_texture.p != nullptr && placed_texture->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
+    // The layout is validated as a CreateCommittedResource state: RENDER_TARGET (2) on a texture without
+    // ALLOW_RENDER_TARGET is refused, and the COMMON retry still gives the title its texture. A description the
+    // checks refuse outright (more mips than the size has) is refused, not created.
+    Ref<ID3D12Resource> target_layout;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, 0x2u, IID_PPV_ARGS(&target_layout.p)), S_OK);
+    EXPECT(target_layout.p != nullptr);
+    D3D12_RESOURCE_DESC too_many_mips = texture;
+    too_many_mips.MipLevels = 12;
+    Ref<ID3D12Resource> refused_texture;
+    EXPECT(FAILED(rt::d3d12::create_buffer_at_host_address(device, pages, too_many_mips, 0x6u,
+                                                           IID_PPV_ARGS(&refused_texture.p))) &&
+           refused_texture.p == nullptr);
     // An address off the buffer alignment can't be bound inside the import: the ordinary-buffer fallback answers.
     Ref<ID3D12Resource> fallback;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
