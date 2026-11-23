@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 from typing import Callable, Optional, TextIO
@@ -116,8 +117,14 @@ def load_manifest(path: str) -> dict[str, dict]:
     Rejects repeated JSON keys and normalizes relative paths to forward
     slashes and hashes to lowercase hex.
     """
-    if not os.path.isfile(path):
-        raise ManifestError(f"manifest file not found: {path}")
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        raise ManifestError(f"manifest file not found: {path}") from None
+    except OSError as err:
+        raise ManifestError(f"cannot read manifest {path}: {err}") from None
+    if not stat.S_ISREG(mode):
+        raise ManifestError(f"manifest path is not a regular file: {path}")
 
     def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
