@@ -610,8 +610,8 @@ How the pieces link, checked by name (case-insensitive) over the archive:
   and 14 `To` values are weather type names, and 13 pairs have both.
 - The two `WeatherCycles` names occur in other `common.rpf` documents (2 and 1 documents), not as weather types.
 
-Not measured here (hypothesis): what the `Mod*` axes do at runtime (they read as weather-app forecast
-attributes), how `TimeMult` scales a cycle, and what the `Honor*` values gate.
+Measured further in [weather.md](weather.md): the `Mod*` axes against the numeric fields, the exact-case
+vocabulary mismatches, `TimeMult`, and the `Honor*` values.
 
 ## `OceanSimPresets`
 
