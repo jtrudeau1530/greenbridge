@@ -51,6 +51,35 @@ class SpirvAsmUnitTests(unittest.TestCase):
                 words = _literal_words(spv, 7, 1)  # OpString result ID precedes its literal.
                 self.assertEqual(struct.pack(f"<{len(words)}I", *words), expected)
 
+    def test_literal_line_endings_preserve_bytes(self):
+        comment = '; An unmatched " in this comment is ordinary text.'
+        for ending in ("\r", "\r\n", "\n"):
+            with self.subTest(literal_ending=ending):
+                operand = f'first \\"; middle{ending}last'
+                expected = f'first "; middle{ending}last'.encode("utf-8")
+                asm = f'{comment}\r\n%str = OpString "{operand}"\r\nOpNop\r\n'
+                words = _literal_words(spirv_asm.assemble(asm), 7, 1)
+                self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], expected)
+
+    def test_error_line_after_multiline_literal_is_physical_line(self):
+        asm = '; comment\r\n%str = OpString "first\rsecond\r\nthird\nlast"\r\nOpNotReal\n'
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 6: unknown opcode"):
+            spirv_asm.assemble(asm)
+
+    def test_cli_preserves_literal_crlf_in_source_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            src = os.path.join(directory, "literal.spvasm")
+            dst = os.path.join(directory, "literal.spv")
+            literal = b"first\r\nsecond"
+            with open(src, "wb") as f:
+                f.write(b'%str = OpString "' + literal + b'"\nOpNop\n')
+            result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(dst, "rb") as f:
+                words = _literal_words(f.read(), 7, 1)
+            self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], literal)
+
     def test_reject_repeated_type_result_ids(self):
         declarations = (
             ("OpTypeInt 32 0", "OpTypeFloat 32"),

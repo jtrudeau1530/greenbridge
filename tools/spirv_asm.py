@@ -75,6 +75,36 @@ class SpirvAsmError(ValueError):
     """Raised when SPIR-V assembly text cannot be encoded."""
 
 
+# Leave an unterminated literal together so the tokenizer reports its opening line.
+_QUOTED_OR_COMMENT = r'"[^"\\]*(?:\\[\s\S][^"\\]*)*(?:"|(?:\\)?\Z)|;[^\r\n]*'
+_ASSEMBLY_TOKEN = re.compile(_QUOTED_OR_COMMENT)
+_ASSEMBLY_PART = re.compile(_QUOTED_OR_COMMENT + r'|(\r\n?|\n)')
+
+
+def _instruction_lines(text):
+    # Most modules have only single-line operands. Keep their bulk split on the fast path.
+    if not any("\r" in part[0] or "\n" in part[0] for part in _ASSEMBLY_TOKEN.finditer(text)):
+        return enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1)
+    return _multiline_instructions(text)
+
+
+def _multiline_instructions(text):
+    """Yield instruction text and its physical starting line, keeping quoted line endings."""
+    start = 0
+    instruction_line = physical_line = 1
+    for part in _ASSEMBLY_PART.finditer(text):
+        if part[1] is None:
+            token = part[0]
+            physical_line += token.count("\r") + token.count("\n") - token.count("\r\n")
+            continue
+        yield instruction_line, text[start:part.start()]
+        physical_line += 1
+        instruction_line = physical_line
+        start = part.end()
+    if start < len(text):
+        yield instruction_line, text[start:]
+
+
 def _tokenize_line(line: str, lineno: int) -> list[str]:
     """Split one assembly line into tokens, stripping ';' comments outside quoted strings."""
     if '"' not in line:
@@ -416,9 +446,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
         raise SpirvAsmError(f"line {lineno}: unsupported operand kind {kind!r}")
 
-    # Unicode separators such as U+2028 are ordinary characters inside a literal string.
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    for lineno, raw_line in enumerate(lines, 1):
+    for lineno, raw_line in _instruction_lines(text):
         toks = _tokenize_line(raw_line, lineno)
         if not toks:
             continue
@@ -555,7 +583,7 @@ def main(argv=None) -> int:
                     help="target SPIR-V / Vulkan environment (default: vulkan1.2)")
     args = ap.parse_args(argv)
     try:
-        with open(args.src, encoding="utf-8") as f:
+        with open(args.src, encoding="utf-8", newline="") as f:
             text = f.read()
         data = assemble(text, target_env=args.target_env)
         with open(args.out, "wb") as f:
