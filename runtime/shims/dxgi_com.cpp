@@ -228,6 +228,8 @@ public:
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, VkFormat vk_fmt) {
         hwnd_ = hwnd;
         flags_ = desc.Flags;
+        swap_effect_ = desc.SwapEffect;
+        buffer_usage_ = desc.BufferUsage;
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
@@ -336,11 +338,11 @@ public:
         desc->BufferDesc.Height = swapchain_.extent().height;
         desc->BufferDesc.Format = vk_to_dxgi_format(swapchain_.format());
         desc->SampleDesc.Count = 1;
-        desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc->BufferUsage = buffer_usage_;
         desc->BufferCount = swapchain_.image_count();
         desc->OutputWindow = hwnd_;
         desc->Windowed = TRUE;
-        desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc->SwapEffect = swap_effect_;
         desc->Flags = flags_;
         return S_OK;
     }
@@ -455,10 +457,10 @@ public:
         desc->Height = swapchain_.extent().height;
         desc->Format = vk_to_dxgi_format(swapchain_.format());
         desc->SampleDesc.Count = 1;
-        desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc->BufferUsage = buffer_usage_;
         desc->BufferCount = swapchain_.image_count();
         desc->Scaling = DXGI_SCALING_STRETCH;
-        desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc->SwapEffect = swap_effect_;
         desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
         desc->Flags = flags_;
         return S_OK;
@@ -618,6 +620,9 @@ private:
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
+    // As created: the host reports the creation SwapEffect and BufferUsage (FLIP_SEQUENTIAL, SHADER_INPUT, or 0).
+    DXGI_SWAP_EFFECT swap_effect_ = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    DXGI_USAGE buffer_usage_ = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
     std::atomic<UINT> present_count_{0};
