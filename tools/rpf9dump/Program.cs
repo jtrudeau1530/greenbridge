@@ -100,7 +100,8 @@ if (mode == "ttpf")
             int n = Interlocked.Increment(ref done);
             if (n % 5000 == 0) Console.WriteLine($"  {n}/{info.Textures.Count}");
         }
-        rows[i] = new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file };
+        rows[i] = new { t.Index, t.Name, t.Id, AssetKey = t.AssetKey.ToString("X16"), t.Width, t.Height,
+            t.Depth, t.Dimension, t.DxgiFormat, t.Mips, t.SourceMips, t.BaseMipLevel, Limitation = limitation, File = file };
     });
     // The manifest is the build's completion marker. Keep successful DDS for retry, but withdraw a stale marker.
     string manifest = Path.Combine(outDir, "manifest.json");
