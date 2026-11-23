@@ -66,6 +66,11 @@ std::atomic<bool> g_heap_first[kHeapSlots];
 // reset_device_proxy_stats, so the calls of a title, which reads no counter, write no shared counter.
 std::atomic<bool> g_count_hits{false};
 
+// For the readers and the reset. The flag is written one time only.
+void start_hit_counts() {
+    if (!g_count_hits.load(std::memory_order_relaxed)) g_count_hits.store(true, std::memory_order_relaxed);
+}
+
 void count_hit(std::atomic<std::uint64_t>& hits) {
     if (g_count_hits.load(std::memory_order_relaxed)) hits.fetch_add(1, std::memory_order_relaxed);
 }
@@ -1353,7 +1358,7 @@ unsigned long command_object_proxy_ref_count(const void* object) {
 
 std::uint64_t queue_slot_hits(unsigned slot) {
     using S = ChildStats<ChildKind::queue>;
-    g_count_hits.store(true, std::memory_order_relaxed);
+    start_hit_counts();
     return slot < S::kSlots ? S::hits[slot].load(std::memory_order_relaxed) : 0;
 }
 
@@ -1364,7 +1369,7 @@ bool queue_slot_first_call_seen(unsigned slot) {
 
 std::uint64_t fence_slot_hits(unsigned slot) {
     using S = ChildStats<ChildKind::fence>;
-    g_count_hits.store(true, std::memory_order_relaxed);
+    start_hit_counts();
     return slot < S::kSlots ? S::hits[slot].load(std::memory_order_relaxed) : 0;
 }
 
@@ -1392,7 +1397,7 @@ bool command_object_tables_guarded() {
 
 std::uint64_t allocator_slot_hits(unsigned slot) {
     using S = ChildStats<ChildKind::allocator>;
-    g_count_hits.store(true, std::memory_order_relaxed);
+    start_hit_counts();
     return slot < S::kSlots ? S::hits[slot].load(std::memory_order_relaxed) : 0;
 }
 
@@ -1410,7 +1415,7 @@ bool heap_slot_overridden(unsigned slot) {
 }
 
 std::uint64_t device_slot_hits(unsigned slot) {
-    g_count_hits.store(true, std::memory_order_relaxed);
+    start_hit_counts();
     return slot < kMaxSlots ? g_hits[slot].load(std::memory_order_relaxed) : 0;
 }
 
@@ -1424,7 +1429,7 @@ unsigned long device_proxy_ref_count(const void* device) {
 }
 
 std::uint64_t heap_slot_hits(unsigned slot) {
-    g_count_hits.store(true, std::memory_order_relaxed);
+    start_hit_counts();
     return slot < kHeapSlots ? g_heap_hits[slot].load(std::memory_order_relaxed) : 0;
 }
 
@@ -1433,7 +1438,7 @@ bool heap_slot_first_call_seen(unsigned slot) {
 }
 
 void reset_device_proxy_stats() {
-    g_count_hits.store(true, std::memory_order_relaxed);
+    start_hit_counts();
     for (unsigned slot = 0; slot < kMaxSlots; ++slot) {
         g_hits[slot].store(0, std::memory_order_relaxed);
         g_first[slot].store(false, std::memory_order_relaxed);
