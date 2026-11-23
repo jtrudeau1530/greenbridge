@@ -258,8 +258,10 @@ documents (on the queue's completion port, the process queue when none is given:
 none after, and the three `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
 `XUserImpl` (`runtime/shims/xgameruntime_user.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
-calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table), so its slots are **not measured** yet.
-The executable's first boot confirms them, or names the slots that differ.
+calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table). The executable links thunks for
+`IXUserImpl` slots 3-5, 7-14, 19-25 and 33-34 and `IXUserGamertagImpl` slot 3 (`tools/gdk_runtime_calls.py`, from the
+file alone): none of the slots logged on first use below, and of the offline failures only the token-and-signature
+trio (23-25). What the slots must answer is still **not measured**; that is the executable's first boot.
 - **Interfaces:** the class id doubles as `IXUserImpl`'s; `IXUserImpl2`-`6` answer with the same 50-slot vtable;
   `IXUserGamertagImpl` (`XUserGetGamertag`) is a second interface.
 - **The user:** one offline local user, always signed in. `XUserAddAsync` adds it with or without
@@ -334,15 +336,18 @@ on the executable, the rest is not:
   are no clients, and the connection-state registration hands out a token that never fires. Every per-client slot
   answers `E_GAMESTREAMING_NOT_INITIALIZED` (0x89245400), which a caller reading a bool sees as false (low byte
   0).
-- **ASSUMPTION:** the parameter lists of `XGameUiShowMessageDialogAsync` and
-  `XGameStreamingRegisterConnectionStateChanged`, from the GDK reference, not re-checked against the executable.
+- **Not reached by the executable:** the parameter lists of `XGameUiShowMessageDialogAsync` and
+  `XGameStreamingRegisterConnectionStateChanged` are the GDK reference's, and the executable has no caller to check
+  them against. `tools/gdk_runtime_calls.py` finds no thunk for the message dialog and none for any
+  `XGameStreamingImpl` or `XUserDeviceImpl` slot. Of `XGameUiImpl` it links slots 7-8 and 17-19 only: the profile
+  card and text entry, which fail before starting.
 
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
   closes). Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
   endpoint of its own (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
-  documented for desktop. **ASSUMPTION:** `APP_LOCAL_DEVICE_ID` is 32 bytes.
+  documented for desktop. `APP_LOCAL_DEVICE_ID` is taken to be 32 bytes; no caller in the executable confirms it.
 
 `xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with
 `LEONIDA_HDR=1`.
