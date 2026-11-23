@@ -8,7 +8,8 @@
 // list, which D3D12 orders on the queue and needs an explicit dependency for on Vulkan. Part H copies depth to colour
 // and back (D32_FLOAT <-> R32_FLOAT), which the replay stages through a scratch buffer. Part I resolves a depth
 // rectangle (MIN) and checks that the texels around it keep their values. Part J copies between disjoint regions
-// of one texture subresource.
+// of one texture subresource. Part K samples a depth texture in DEPTH_READ | NON_PIXEL_SHADER_RESOURCE from a compute
+// shader whose descriptor is in GENERAL, as set 0 writes it, which the validation layer checks against the image.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -1265,6 +1266,199 @@ int part_j(vktest::Device& d) {
     return 0;
 }
 
+// Part K: a D32 texture cleared to 0.25 as a depth buffer, then moved to DEPTH_READ | NON_PIXEL_SHADER_RESOURCE, the
+// legacy state in which D3D12 lets one draw test against it and sample it. Its binding has sampled_in_general, as
+// every texture has with the bindless set 0, whose descriptors are written in GENERAL; this one is a plain set with
+// the same layout. A compute shader reads its 16 texels. The image has to be in GENERAL when it runs
+// (VUID-vkCmdDispatch-None-09600); in DEPTH_STENCIL_READ_ONLY_OPTIMAL, the validation layer (1.4.363) reports
+// VUID-vkCmdDispatch-imageLayout-00344 at submit.
+//
+//   #version 450
+//   #extension GL_EXT_samplerless_texture_functions : require
+//   layout(local_size_x = 16) in;
+//   layout(set = 0, binding = 0) uniform texture2D depth;
+//   layout(set = 0, binding = 1) writeonly buffer Out { float texels[]; };
+//   void main() {
+//       uint i = gl_LocalInvocationIndex;
+//       texels[i] = texelFetch(depth, ivec2(i % 4u, i / 4u), 0).r;
+//   }
+//
+// glslang 16.6.0: glslangValidator -V --target-env vulkan1.0 -Os, then spirv-opt --strip-debug (SPIRV-Tools 2026.4).
+constexpr std::uint32_t cs_depth_fetch_spirv[] = {
+    0x07230203u, 0x00010000u, 0x0008000bu, 0x0000002bu, 0x00000000u, 0x00020011u, 0x00000001u, 0x0006000bu,
+    0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u,
+    0x0006000fu, 0x00000005u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x0000000au, 0x00060010u, 0x00000004u,
+    0x00000011u, 0x00000010u, 0x00000001u, 0x00000001u, 0x00040047u, 0x0000000au, 0x0000000bu, 0x0000001du,
+    0x00040047u, 0x0000000du, 0x00000006u, 0x00000004u, 0x00030047u, 0x0000000eu, 0x00000003u, 0x00040048u,
+    0x0000000eu, 0x00000000u, 0x00000019u, 0x00050048u, 0x0000000eu, 0x00000000u, 0x00000023u, 0x00000000u,
+    0x00030047u, 0x00000010u, 0x00000019u, 0x00040047u, 0x00000010u, 0x00000021u, 0x00000001u, 0x00040047u,
+    0x00000010u, 0x00000022u, 0x00000000u, 0x00040047u, 0x00000016u, 0x00000021u, 0x00000000u, 0x00040047u,
+    0x00000016u, 0x00000022u, 0x00000000u, 0x00040047u, 0x0000002au, 0x0000000bu, 0x00000019u, 0x00020013u,
+    0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00040015u, 0x00000006u, 0x00000020u, 0x00000000u,
+    0x00040020u, 0x00000009u, 0x00000001u, 0x00000006u, 0x0004003bu, 0x00000009u, 0x0000000au, 0x00000001u,
+    0x00030016u, 0x0000000cu, 0x00000020u, 0x0003001du, 0x0000000du, 0x0000000cu, 0x0003001eu, 0x0000000eu,
+    0x0000000du, 0x00040020u, 0x0000000fu, 0x00000002u, 0x0000000eu, 0x0004003bu, 0x0000000fu, 0x00000010u,
+    0x00000002u, 0x00040015u, 0x00000011u, 0x00000020u, 0x00000001u, 0x0004002bu, 0x00000011u, 0x00000012u,
+    0x00000000u, 0x00090019u, 0x00000014u, 0x0000000cu, 0x00000001u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000001u, 0x00000000u, 0x00040020u, 0x00000015u, 0x00000000u, 0x00000014u, 0x0004003bu, 0x00000015u,
+    0x00000016u, 0x00000000u, 0x0004002bu, 0x00000006u, 0x00000019u, 0x00000004u, 0x00040017u, 0x0000001fu,
+    0x00000011u, 0x00000002u, 0x00040017u, 0x00000021u, 0x0000000cu, 0x00000004u, 0x00040020u, 0x00000025u,
+    0x00000002u, 0x0000000cu, 0x00040017u, 0x00000027u, 0x00000006u, 0x00000003u, 0x0004002bu, 0x00000006u,
+    0x00000028u, 0x00000010u, 0x0004002bu, 0x00000006u, 0x00000029u, 0x00000001u, 0x0006002cu, 0x00000027u,
+    0x0000002au, 0x00000028u, 0x00000029u, 0x00000029u, 0x00050036u, 0x00000002u, 0x00000004u, 0x00000000u,
+    0x00000003u, 0x000200f8u, 0x00000005u, 0x0004003du, 0x00000006u, 0x0000000bu, 0x0000000au, 0x0004003du,
+    0x00000014u, 0x00000017u, 0x00000016u, 0x00050089u, 0x00000006u, 0x0000001au, 0x0000000bu, 0x00000019u,
+    0x0004007cu, 0x00000011u, 0x0000001bu, 0x0000001au, 0x00050086u, 0x00000006u, 0x0000001du, 0x0000000bu,
+    0x00000019u, 0x0004007cu, 0x00000011u, 0x0000001eu, 0x0000001du, 0x00050050u, 0x0000001fu, 0x00000020u,
+    0x0000001bu, 0x0000001eu, 0x0007005fu, 0x00000021u, 0x00000022u, 0x00000017u, 0x00000020u, 0x00000002u,
+    0x00000012u, 0x00050051u, 0x0000000cu, 0x00000024u, 0x00000022u, 0x00000000u, 0x00060041u, 0x00000025u,
+    0x00000026u, 0x00000010u, 0x00000012u, 0x0000000bu, 0x0003003eu, 0x00000026u, 0x00000024u, 0x000100fdu,
+    0x00010038u,
+};
+
+int part_k(vktest::Device& d) {
+    if (!d.depth_format_usable(VK_FORMAT_D32_SFLOAT)) {
+        std::printf("K: skipped, no D32_SFLOAT\n");
+        return 0;
+    }
+    constexpr std::uint32_t width = 4, height = 4, texels = width * height;
+    constexpr VkImageLayout descriptor_layout = VK_IMAGE_LAYOUT_GENERAL;  // as set 0 writes every sampled view
+    const VkImage image =
+        d.image(VK_FORMAT_D32_SFLOAT, width, height, 1,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    void* out_mapped = nullptr;
+    const VkBuffer out = d.buffer(VkDeviceSize(texels) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out_mapped);
+    EXPECT(image && out);
+
+    ResourceBinding binding{};
+    binding.image = image;
+    binding.format = VK_FORMAT_D32_SFLOAT;
+    binding.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
+    binding.width = width;
+    binding.height = height;
+    binding.sampled = true;
+    binding.sampled_in_general = true;
+    constexpr ResourceId id = 60;
+    const auto resolve = [&](ResourceId r) -> const ResourceBinding* { return r == id ? &binding : nullptr; };
+    LayoutTracker tracker(true);
+    tracker.track(id, binding, VK_IMAGE_LAYOUT_UNDEFINED);
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.clear_depth_stencil_image = d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
+    vk.separate_depth_stencil_layouts = true;  // matches LayoutTracker
+
+    CommandList list;
+    EXPECT(list.clear_depth_stencil({id, 0, 0, 1}, clear_depth, 0.25f, 0));
+    EXPECT(list.transition({id, 0, s::depth_write, s::depth_read | s::non_pixel_shader_resource}));
+    EXPECT(list.close());
+
+    const VkDevice device = d.device;
+    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = VK_FORMAT_D32_SFLOAT;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    VkImageView view = VK_NULL_HANDLE;
+    EXPECT(d.fn<PFN_vkCreateImageView>("vkCreateImageView")(device, &view_info, nullptr, &view) == VK_SUCCESS);
+
+    const VkDescriptorSetLayoutBinding set_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    };
+    VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    set_info.bindingCount = 2;
+    set_info.pBindings = set_bindings;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    EXPECT(d.fn<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(device, &set_info, nullptr,
+                                                                                &set_layout) == VK_SUCCESS);
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &set_layout;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    EXPECT(d.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device, &layout_info, nullptr,
+                                                                      &pipeline_layout) == VK_SUCCESS);
+    VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    module_info.codeSize = sizeof(cs_depth_fetch_spirv);
+    module_info.pCode = cs_depth_fetch_spirv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    EXPECT(d.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device, &module_info, nullptr, &module) ==
+           VK_SUCCESS);
+    VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    EXPECT(d.fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                                                          nullptr, &pipeline) == VK_SUCCESS);
+    const VkDescriptorPoolSize pool_sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1},
+                                               {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = pool_sizes;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    EXPECT(d.fn<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(device, &pool_info, nullptr, &pool) ==
+           VK_SUCCESS);
+    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocate.descriptorPool = pool;
+    allocate.descriptorSetCount = 1;
+    allocate.pSetLayouts = &set_layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    EXPECT(d.fn<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(device, &allocate, &set) == VK_SUCCESS);
+    const VkDescriptorImageInfo image_info{VK_NULL_HANDLE, view, descriptor_layout};
+    const VkDescriptorBufferInfo buffer_info{out, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    writes[0].dstSet = set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[0].pImageInfo = &image_info;
+    writes[1].dstSet = set;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].pBufferInfo = &buffer_info;
+    d.fn<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(device, 2, writes, 0, nullptr);
+
+    const unsigned errors_before = d.validation_errors();
+    const bool ok = d.run([&](VkCommandBuffer cb) {
+        if (replay(list, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
+        d.fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        d.fn<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                                     pipeline_layout, 0, 1, &set, 0, nullptr);
+        d.fn<PFN_vkCmdDispatch>("vkCmdDispatch")(cb, 1, 1, 1);
+        VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                               VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0,
+                                                               nullptr);
+        return true;
+    });
+    const VkImageLayout tracked = tracker.layout(id, 0);
+    d.fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(device, pipeline, nullptr);
+    d.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device, module, nullptr);
+    d.fn<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(device, pool, nullptr);
+    d.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device, pipeline_layout, nullptr);
+    d.fn<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(device, set_layout, nullptr);
+    d.fn<PFN_vkDestroyImageView>("vkDestroyImageView")(device, view, nullptr);
+    EXPECT(ok);
+    if (tracked != descriptor_layout) {
+        std::fprintf(stderr, "K: DEPTH_READ | NON_PIXEL_SHADER_RESOURCE tracked as layout %d, the descriptor's is %d\n",
+                     int(tracked), int(descriptor_layout));
+        ++g_mismatches;
+    }
+    const auto* read = static_cast<const std::uint8_t*>(out_mapped);
+    for (std::uint32_t i = 0; i < texels; ++i) expect_depth("K sampled depth", read, i, 0.25f);
+    const unsigned errors = d.validation_errors() - errors_before;
+    std::printf("K: a D32 texture in DEPTH_READ | NON_PIXEL_SHADER_RESOURCE, %u texels sampled through a GENERAL "
+                "descriptor%s\n",
+                texels, d.validation ? (errors ? ": validation errors" : ", no validation errors") : " (validation off)");
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1276,7 +1470,7 @@ int main() {
     }
     EXPECT(status == vktest::DeviceStatus::ready);
     if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
-        part_g(device) || part_h(device) || part_i(device) || part_j(device))
+        part_g(device) || part_h(device) || part_i(device) || part_j(device) || part_k(device))
         return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {

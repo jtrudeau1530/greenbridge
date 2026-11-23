@@ -110,7 +110,8 @@ inline constexpr VkImageAspectFlags depth_stencil_aspects = VK_IMAGE_ASPECT_DEPT
 
 // Maps a legacy D3D12_RESOURCE_STATES combination to the Vulkan layout, accesses and stages that cover it.
 // Read-only combinations share one layout when every bit agrees on it (depth_read with shader reads stays in
-// DEPTH_STENCIL_READ_ONLY_OPTIMAL, which can be sampled); otherwise they fall back to GENERAL.
+// DEPTH_STENCIL_READ_ONLY_OPTIMAL, which can be sampled); otherwise they fall back to GENERAL. A texture whose set 0
+// views are written in GENERAL takes the overload below that names its binding.
 // Buffer-only and extension states map to GENERAL with conservative memory access.
 // conditional_rendering: VK_EXT_conditional_rendering is enabled. PREDICATION shares its bit with
 // INDIRECT_ARGUMENT, and conditional rendering reads the predicate in a stage of its own, so the bit covers both.
@@ -192,6 +193,19 @@ inline VulkanAccess vulkan_access(std::uint32_t states, bool presentable, bool c
         out.access |= VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT;
         out.stages |= VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT;
     }
+    return out;
+}
+
+// The same for one resource. When set 0 names its views in GENERAL (sampled_in_general), a shader-resource bit
+// wants GENERAL, and so does DEPTH_READ combined with one: D3D12 lets that state test against the depth buffer and
+// sample it in the same draw, and a shader reads the image in its descriptor's layout (VUID-vkCmdDraw-None-09600).
+// DEPTH_READ alone keeps DEPTH_STENCIL_READ_ONLY_OPTIMAL.
+inline VulkanAccess vulkan_access(std::uint32_t states, const ResourceBinding& resource,
+                                  bool conditional_rendering = false) {
+    VulkanAccess out = vulkan_access(states, resource.presentable, conditional_rendering);
+    constexpr std::uint32_t shader_resource =
+        d3d12_state::non_pixel_shader_resource | d3d12_state::pixel_shader_resource;
+    if (resource.sampled_in_general && (states & shader_resource)) out.layout = VK_IMAGE_LAYOUT_GENERAL;
     return out;
 }
 
@@ -3483,8 +3497,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             command);
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
-            const VulkanAccess from = vulkan_access(transition->before, p.binding.presentable, predicates);
-            const VulkanAccess to = vulkan_access(transition->after, p.binding.presentable, predicates);
+            const VulkanAccess from = vulkan_access(transition->before, p.binding, predicates);
+            const VulkanAccess to = vulkan_access(transition->after, p.binding, predicates);
             if (!p.binding.image) {
                 detail::memory_barrier(vk, command_buffer, from.access, from.stages, to.access, to.stages);
                 continue;

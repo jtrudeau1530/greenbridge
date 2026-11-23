@@ -693,9 +693,12 @@ side inwards:
   4.3). So with the bindless set, a texture's shader-resource states use `GENERAL` too
   (`ResourceBinding::sampled_in_general`), and every descriptor is written with `GENERAL`. This follows from the
   Vulkan rule that a descriptor's layout matches the image's; no test here can see it broken, because the
-  validation layer does not follow which element of a runtime array a shader reads. A depth texture sampled
-  while it is also bound read-only (`DEPTH_READ` with a shader-resource state) is in
-  `DEPTH_STENCIL_READ_ONLY_OPTIMAL` and is not handled.
+  validation layer does not follow which element of a runtime array a shader reads. A depth texture in `DEPTH_READ`
+  with a shader-resource state, which D3D12 lets one draw test against and sample, is in `GENERAL` as well
+  (`vulkan_access` with the binding); `DEPTH_READ` alone keeps `DEPTH_STENCIL_READ_ONLY_OPTIMAL`, and so does the
+  enhanced-barrier layout `DEPTH_STENCIL_READ`, which takes no shader-resource access. `replay_depth_read_layout_test`
+  checks the layouts, and part K of `vk_command_replay_test` samples such a texture through a plain descriptor in
+  `GENERAL`, where the validation layer does compare the layouts.
 
 A typed single-sampled 3D texture can use a default SRV or an explicit `TEXTURE3D` SRV of the same format.
 An `R8G8B8A8_TYPELESS` volume supports explicit `R8G8B8A8_UNORM` and `R8G8B8A8_UNORM_SRGB` SRVs.
