@@ -1,6 +1,7 @@
 """scripts/run_gpu_tests.py: how it judges the output of a compute "dump" test (no device needed)."""
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import struct
@@ -603,8 +604,12 @@ class FmaFusedSuite(unittest.TestCase):
     """run_gpu_tests.py runs cs_fma_fused under --filter, honoring LEONIDA_FMA=khr vs default glsl."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
 
-    def run_fma(self, rc, msg, fma_env=None):
+    def run_fma(self, rc, msg, fma_env=None, fma_mode=None):
         with tempfile.TemporaryDirectory() as tmp:
+            if fma_mode:
+                (Path(tmp) / "spirv").mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / "spirv" / "index.json").write_text(
+                    json.dumps({"cs_fma_fused": {"fma": fma_mode}}), encoding="utf-8")
             args = SimpleNamespace(filter="cs_fma_fused", build=tmp, llvm_mc="unused")
 
             def fake_run(cmd, env=None, gpu=True):
@@ -635,11 +640,26 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("FAIL  cs_fma_fused", out)
 
+    def test_recorded_exact_mode_makes_the_gpu_suite_strict(self):
+        # TEST-1147: run_gpu_tests must read the same index field as check.py, or an exact build judged
+        # in a fresh shell accepts split words that the GPU driver really produced.
+        import check
+        rc, out = self.run_fma(0, dump(check.FMA_FUSED), fma_mode="exact")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_mode="exact")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL  cs_fma_fused", out)
+
+    def test_recorded_glsl_mode_ignores_stale_exact_env(self):
+        rc, out = self.run_fma(0, dump(self.RADV_SPLIT), fma_mode="glsl", fma_env="exact")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("5/7 split", out)
+
     def test_khr_fused_passes_and_exit_77_skips(self):
         import check
         rc, out = self.run_fma(0, dump(check.FMA_FUSED), fma_env="khr")
         self.assertEqual(rc, 0, out)
-        self.assertIn("8/8 fused exact (OpFmaKHR)", out)
+        self.assertIn("8/8 fused exact (single-rounded FMA: OpFmaKHR or --fma exact)", out)
         rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
         self.assertEqual(rc, 0, out)
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)

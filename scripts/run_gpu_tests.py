@@ -1012,9 +1012,17 @@ def run_suite(a, work: str) -> int:
             elif rc != 0:
                 results.append((name, False, msg))
             else:
-                khr = os.environ.get("LEONIDA_FMA") == "khr"
-                exact = os.environ.get("LEONIDA_FMA") == "exact"   # SHADER-497: as strict as khr
-                ok, detail = judge_fma_fused(dump_words(msg), khr=khr, exact=exact)
+                # TEST-1147: judge by the mode the translator recorded in index.json, as check.py does.
+                # --fma exact has no KHR capability, so capability/env alone used to accept split words here.
+                meta = index.get("cs_fma_fused") or {}
+                mode = meta.get("fma") or ""
+                if mode:
+                    # The recorded mode wins over a stale LEONIDA_FMA, as in check.py.
+                    strict = mode in ("khr", "exact")
+                else:
+                    strict = ("shaderFmaFloat32" in (meta.get("features") or ())
+                              or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
+                ok, detail = judge_fma_fused(dump_words(msg), khr=strict)
                 results.append((name, ok, detail))
         elif name == "cs_wavemask":
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.

@@ -936,19 +936,32 @@ def shader_features(spirv, name):
         return set()
 
 
+def shader_fma_mode(spirv, name):
+    """How the translator emitted fused multiply-adds for a shader ('glsl', 'khr' or 'exact'), or '' if unrecorded.
+
+    Older indexes have no field: callers must fall back to the capability and LEONIDA_FMA as before.
+    """
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            mode = json.load(f).get(name, {}).get("fma") or ""
+            return mode if mode in ("glsl", "khr", "exact") else ""
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
 def judge_fma_fused(words, khr, exact=False):
-    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr and --fma exact (SHADER-497: the single rounding
-    built from plain f32 ops) every word must be exact fused; under --fma glsl each of the 7 f32 words may be either
-    fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the f16 round-to-odd word out[7] must
-    always be exact 0x00007351."""
+    """Judge cs_fma_fused's 8 words: (ok, detail). Under --fma khr every word must be exact fused; under --fma glsl
+    each of the 7 f32 words may be either fused or exact split (Vulkan allows splitting GLSL.std.450 Fma), while the
+    f16 round-to-odd word out[7] must always be exact 0x00007351."""
     if not words or len(words) < 8:
         return False, "missing out[0..7] dump"
     if khr or exact:
         label = "OpFmaKHR" if khr else "--fma exact"
         for i, (got, want) in enumerate(zip(words, FMA_FUSED)):
             if got != want:
-                return False, f"word {i}: got {got:#010x}, want fused {want:#010x} ({label})"
-        return True, f"8/8 fused exact ({label})"
+                return False, (f"word {i}: got {got:#010x}, want fused {want:#010x} "
+                               "(single-rounded FMA: OpFmaKHR or --fma exact)")
+        return True, "8/8 fused exact (single-rounded FMA: OpFmaKHR or --fma exact)"
     if words[7] != FMA_FUSED[7]:
         return False, f"word 7 (f16): got {words[7]:#010x}, want {FMA_FUSED[7]:#010x}"
     n_split = 0
@@ -969,9 +982,16 @@ def fma_fused_test(tools, spirv):
     """Run cs_fma_fused and judge against FMA_FUSED (strict under --fma khr and --fma exact, fused-or-split f32 under
     --fma glsl)."""
     shader = os.path.join(spirv, "cs_fma_fused.spv")
-    khr = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
-           or os.environ.get("LEONIDA_FMA") == "khr")
-    exact = os.environ.get("LEONIDA_FMA") == "exact"
+    # --fma exact also guarantees single rounding (built from NoContraction ops), but records no KHR capability.
+    # Without the index field a fresh shell cannot tell it from the default GLSL Fma (TEST-1147).
+    mode = shader_fma_mode(spirv, "cs_fma_fused")
+    if mode:
+        # A recorded mode is authoritative: a stale LEONIDA_FMA from the build shell must not override it.
+        strict = mode in ("khr", "exact")
+    else:
+        # An older index has no mode field: capability and environment are the only remaining signals.
+        strict = ("shaderFmaFloat32" in shader_features(spirv, "cs_fma_fused")
+                  or os.environ.get("LEONIDA_FMA") in ("khr", "exact"))
     code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
                     env=dict(os.environ, **FMA_FUSED_ENV))
     if code == UNSUPPORTED:
@@ -983,7 +1003,7 @@ def fma_fused_test(tools, spirv):
     if not m:
         return failure(code, out, 2)
     words = [int(x) for x in m.group(1).split()]
-    ok, detail = judge_fma_fused(words, khr=khr, exact=exact)
+    ok, detail = judge_fma_fused(words, khr=strict)
     return "" if ok else detail
 
 

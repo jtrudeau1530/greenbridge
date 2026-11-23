@@ -16845,6 +16845,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "DrawParameters": "shaderDrawParameters",
              "FMAKHR": "shaderFmaFloat32"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
+         # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
+         # but --fma exact has no capability to distinguish it from the default GLSL Fma (TEST-1147).
+         "fma": "exact" if FMA_EXACT else "khr" if FMA_KHR else "glsl",
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))} |
                             {{"subgroup": "shaderSubgroupClock", "device": "shaderDeviceClock"}[k]
