@@ -1196,7 +1196,40 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
         d->button_info[b].mappedInputKinds = GameInputKindGamepad;
         d->button_info[b].legacyHidIndex = static_cast<uint16_t>(b);
         d->button_info[b].legacyDInputIndex = static_cast<uint16_t>(b);
+        d->button_info[b].label = GameInputLabelUnknown;  // paddles, touchpad, misc: no gamepad meaning to name
     }
+    // Labels. Every pad is presented as an Xbox One pad (docs/gameinput.md), so every control carries the Xbox label
+    // of its position, whatever is printed on the pad in the player's hands. A stick axis has no label in v0, so
+    // only the triggers are named. UI navigation names the controls read_pad reads it from; scrolling is the right
+    // stick, which has none.
+    const GameInputLabel face[4] = {GameInputLabelXboxA, GameInputLabelXboxB, GameInputLabelXboxX,
+                                    GameInputLabelXboxY};
+    const GameInputLabel menu = GameInputLabelXboxMenu, view = GameInputLabelXboxView;
+    const GameInputLabel up = GameInputLabelXboxDPadUp, down = GameInputLabelXboxDPadDown;
+    const GameInputLabel left = GameInputLabelXboxDPadLeft, right = GameInputLabelXboxDPadRight;
+    const GameInputLabel lb = GameInputLabelXboxLeftShoulder, rb = GameInputLabelXboxRightShoulder;
+    const GameInputLabel ls = GameInputLabelXboxLeftStickButton, rs = GameInputLabelXboxRightStickButton;
+    const GameInputLabel lt = GameInputLabelXboxLeftTrigger, rt = GameInputLabelXboxRightTrigger;
+    const GameInputLabel none = GameInputLabelNone;
+    d->gamepad_info = {menu, view, face[0], face[1], face[2], face[3], up, down, left, right, lb, rb, ls, rs};
+    d->ui_info = {menu, view, face[0], face[1], up, down, left, right, face[2], face[3], ls, rs, lt, rt, lb, rb,
+                  none, none, none, none, GameInputLabelXboxGuide};
+    d->axis_info[4].label = lt;
+    d->axis_info[5].label = rt;
+    const struct {
+        SDL_GamepadButton sdl;
+        GameInputLabel label;
+    } labelled[] = {
+        {SDL_GAMEPAD_BUTTON_SOUTH, face[0]},    {SDL_GAMEPAD_BUTTON_EAST, face[1]},
+        {SDL_GAMEPAD_BUTTON_WEST, face[2]},     {SDL_GAMEPAD_BUTTON_NORTH, face[3]},
+        {SDL_GAMEPAD_BUTTON_BACK, view},        {SDL_GAMEPAD_BUTTON_GUIDE, GameInputLabelXboxGuide},
+        {SDL_GAMEPAD_BUTTON_START, menu},       {SDL_GAMEPAD_BUTTON_LEFT_STICK, ls},
+        {SDL_GAMEPAD_BUTTON_RIGHT_STICK, rs},   {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, lb},
+        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, rb}, {SDL_GAMEPAD_BUTTON_DPAD_UP, up},
+        {SDL_GAMEPAD_BUTTON_DPAD_DOWN, down},   {SDL_GAMEPAD_BUTTON_DPAD_LEFT, left},
+        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, right},
+    };
+    for (const auto& l : labelled) d->button_info[l.sdl].label = l.label;
     i.controllerAxisInfo = d->axis_info;
     i.controllerButtonInfo = d->button_info;
     i.gamepadInfo = &d->gamepad_info;
