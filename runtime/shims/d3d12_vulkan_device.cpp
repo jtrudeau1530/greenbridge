@@ -1723,6 +1723,18 @@ public:
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
+        if (host_import_) {
+            // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
+            // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
+            // the deferred queue (freed after the *next* submission retires): wait for what was submitted, then
+            // free it now (found in review).
+            device_.context->wait_retire_ticket(device_.context->submitted_retire_ticket());
+            auto& vk = device_.context->vk;
+            if (buffer_) vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            if (memory_) vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+            buffer_ = VK_NULL_HANDLE;
+            memory_ = VK_NULL_HANDLE;
+        }
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_ && !sparse_image_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
@@ -1897,6 +1909,21 @@ public:
         if (!address || !desc_.Width || (start & (alignment - 1)) || desc_.Width > UINT64_MAX - alignment)
             return E_INVALIDARG;
         const VkDeviceSize bytes = (desc_.Width + alignment - 1) & ~(alignment - 1);
+        // The whole imported range must be committed, possibly across several allocations (the retail buffer spans
+        // three mapped windows): anything else is undefined in Vulkan, so it is E_INVALIDARG here (found in review).
+        // A write-combined page is not imported: on an RTX 5090 such an import succeeded but GPU reads returned
+        // wrong bytes (found in review), so it takes the ordinary-buffer fallback instead.
+        bool write_combined = false;
+        for (VkDeviceSize at = 0; at < bytes;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(static_cast<const char*>(address) + at, &region, sizeof(region)) ||
+                region.State != MEM_COMMIT)
+                return E_INVALIDARG;
+            if (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) write_combined = true;
+            const auto region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+            at = region_end - start;
+        }
+        if (write_combined) return E_NOTIMPL;
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -1945,6 +1972,7 @@ public:
         if (!memory_) return E_OUTOFMEMORY;
         if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS) return E_OUTOFMEMORY;
         mapped_ = address;
+        host_import_ = true;
         va_ = start;
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -2494,6 +2522,7 @@ private:
     VkImageAspectFlags aspects_ = 0;
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
+    bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
