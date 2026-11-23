@@ -142,6 +142,18 @@ class IidScan(unittest.TestCase):
         self.assertEqual(data["iids"], 2)
         self.assertEqual(data["images"][0]["possible_iid_imports"], ["#30"])
 
+    def test_cli_unreadable_image_fails_cleanly(self):
+        good = self.image("h.dll", b"MZ")
+        report = os.path.join(self.tmp.name, "report.json")
+        for bad in (os.path.join(self.tmp.name, "missing.dll"), self.tmp.name):   # missing, and a folder
+            with self.subTest(bad=bad):
+                p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), good, bad,
+                                    "--header", self.header, "--json", report], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(f"ERROR: cannot read {bad}", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse(os.path.exists(report))
+
     def test_cli_missing_header_fails_cleanly(self):
         dll = self.image("e.dll", b"MZ")
         p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_iid_scan.py"), dll,

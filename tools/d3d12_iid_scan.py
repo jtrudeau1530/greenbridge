@@ -152,14 +152,22 @@ def main(argv: list[str] | None = None) -> int:
     if not header or not os.path.isfile(header):
         print("ERROR: d3d12.h not found; pass --header", file=sys.stderr)
         return 2
-    iids = read_iids(header)
+    try:
+        iids = read_iids(header)
+    except OSError as e:
+        print(f"ERROR: cannot read {header}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if not iids:
         print(f"ERROR: no ID3D12 MIDL_INTERFACE declarations in {header}", file=sys.stderr)
         return 2
     print(f"{len(iids)} ID3D12 IIDs from {header}")
     results = []
     for path in args.images:
-        r = scan(path, iids)
+        try:
+            r = scan(path, iids)
+        except OSError as e:  # a missing, locked or folder image used to end the run in a traceback
+            print(f"ERROR: cannot read {path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         results.append(r)
         absent = [n for n, present in r["focus"].items() if not present]
         print(f"== {r['image']}: {len(r['found'])} found")
