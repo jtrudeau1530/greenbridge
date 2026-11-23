@@ -186,6 +186,10 @@ def read_obj(
                     raise SystemExit(f"{path}: invalid texture coordinates: {line.strip()!r}") from None
                 if not (math.isfinite(u) and math.isfinite(v)):
                     raise SystemExit(f"{path}: non-finite texture coordinates: {line.strip()!r}")
+                try:
+                    struct.pack("<2f", u, v)  # Validate the mesh encoding before opening the output.
+                except OverflowError:
+                    raise SystemExit(f"{path}: texture coordinates exceed the binary32 range: {line.strip()!r}") from None
                 uvs.append((u, v))
             elif p[0] == "f":
                 face = []
