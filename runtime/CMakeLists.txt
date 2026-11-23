@@ -108,6 +108,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/xmem.cpp
+    shims/xg_xs.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -211,6 +212,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
+
+  # xg_xs shim: the two exports and the texture computer's slots against the measured call shapes.
+  add_executable(xg_xs_test
+    test/xg_xs_test.cpp
+    shims/xg_xs.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xg_xs_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xg_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -997,6 +1009,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+  endif()
+  if(WIN32 AND TARGET xg_xs_test)
+    add_test(NAME xg_xs COMMAND xg_xs_test)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
