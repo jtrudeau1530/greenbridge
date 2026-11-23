@@ -167,8 +167,9 @@ def _instruction_tokens(text: str):
                 yield start_line, tokens
                 start_line, tokens = previous_line, [result_id]
             elif (tokens and tokens[-1] != "=" and token.startswith("Op")
-                  and len(token) > 2 and "A" <= token[2] <= "Z"):
-                # Opcodes are distinct from bare operand spellings, %IDs and quoted strings.
+                  and len(token) > 2 and "A" <= token[2] <= "Z"
+                  and not (len(tokens) == 4 and tokens[2] == "OpSpecConstantOp")):
+                # OpSpecConstantOp also accepts an Op-prefixed mnemonic as its first operand.
                 yield start_line, tokens
                 tokens = []
             if not tokens:

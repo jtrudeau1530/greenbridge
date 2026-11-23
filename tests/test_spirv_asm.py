@@ -108,6 +108,12 @@ class SpirvAsmUnitTests(unittest.TestCase):
         self.assertEqual(assembled, spirv_asm.assemble(canonical))
         _validate(assembled)
 
+    def test_prefixed_specialization_mnemonic_can_start_a_physical_line(self):
+        prefix = "%int = OpTypeInt 32 1\n%one = OpSpecConstant %int 1\n"
+        canonical = prefix + "%two = OpSpecConstantOp %int IAdd %one %one\nOpNop\n"
+        wrapped = prefix + "%two = OpSpecConstantOp %int\nOpIAdd %one\n%one OpNop\n"
+        self.assertEqual(spirv_asm.assemble(wrapped), spirv_asm.assemble(canonical))
+
     def test_result_id_starts_instruction_on_its_physical_line(self):
         text = '%str = OpString "first\r\nlast" %x\r=\nOpNotReal\n'
         with self.assertRaisesRegex(spirv_asm.SpirvAsmError, r"line 2: unknown opcode"):
