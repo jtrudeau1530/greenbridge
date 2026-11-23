@@ -509,17 +509,9 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("is a folder, not a report file", err.getvalue())
 
-    def test_overwrite_check_fails_on_an_unlistable_sub_folder(self):
-        # os.walk skips a folder it cannot list unless onerror stops it, so the report check used to pass over
-        # it and a report file inside it could be overwritten. Forcing os.scandir to raise for one folder gives
-        # the PermissionError os.walk hits for real, also on Windows where chmod cannot lock a folder.
-        locked = os.path.join(self.dir, "locked")
-        os.makedirs(locked)
-        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
-            f.write(bvh_payload(4))
-        out = os.path.join(self.dir, "report.json")
-        with open(out, "w", encoding="utf-8") as f:
-            f.write("previous report")
+    def _run_with_locked_folder(self, locked, out):
+        # Forcing os.scandir to raise for one folder gives the PermissionError os.walk hits for real, also on
+        # Windows where chmod cannot lock a folder.
         real_scandir = os.scandir
         target = os.path.normcase(os.path.abspath(locked))
 
@@ -531,14 +523,45 @@ class ScanTest(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.object(bvh_index.os, "scandir", scandir):
             with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaises(SystemExit) as cm:
-                    bvh_index.main([self.dir, "--out", out])
-        self.assertEqual(cm.exception.code, 2, err.getvalue())
-        self.assertIn("--out cannot be checked against the inputs", err.getvalue())
-        self.assertIn(locked, err.getvalue())
-        self.assertNotIn("Traceback", err.getvalue())
+                try:
+                    code = bvh_index.main([self.dir, "--out", out])
+                except SystemExit as e:
+                    code = e.code
+        return code, err.getvalue()
+
+    def test_overwrite_check_refuses_a_report_inside_an_unlistable_sub_folder(self):
+        # os.walk skips a folder it cannot list unless onerror stops it, so the report check used to pass over
+        # it and a report file inside it could be an input that gets overwritten.
+        locked = os.path.join(self.dir, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        out = os.path.join(locked, "report.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("previous report")
+        code, err = self._run_with_locked_folder(locked, out)
+        self.assertEqual(code, 2, err)
+        self.assertIn("--out cannot be checked against the inputs", err)
+        self.assertIn(locked, err)
+        self.assertNotIn("Traceback", err)
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), "previous report")
+
+    def test_unlistable_sub_folder_gives_the_same_result_whether_or_not_the_report_exists(self):
+        # A report outside the unlistable folder is not refused: both runs go to the scan, which names the
+        # folder and reports the run as incomplete (exit 1). The second run used to be refused only because
+        # the first one had written the report.
+        locked = os.path.join(self.dir, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(4))
+        out = os.path.join(self.dir, "report.json")
+        for run in (1, 2):
+            code, err = self._run_with_locked_folder(locked, out)
+            self.assertEqual(code, 1, f"run {run}: {err}")
+            self.assertIn("the report is incomplete", err)
+            self.assertNotIn("cannot be checked against the inputs", err)
+            self.assertTrue(os.path.isfile(out), f"run {run}")
 
 
 class MissingTargetTest(unittest.TestCase):

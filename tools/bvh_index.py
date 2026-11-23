@@ -507,6 +507,15 @@ def same_output_path(first, second):
         return False
 
 
+def _inside(path, folder):
+    """True when `path` is `folder` or lies below it, compared as the report check compares paths."""
+    path, folder = _path_key(path), _path_key(folder)
+    try:
+        return os.path.commonpath([path, folder]) == folder
+    except ValueError:   # different drives on Windows
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="RPF9 archive or a directory of .rpf/.bin payloads")
@@ -530,10 +539,13 @@ def main(argv=None):
         manifest = os.path.join(a.target, "index.json")
 
         def unlistable(error):
-            # os.walk skips a folder it cannot list unless onerror stops it, and then a report path that is a file
-            # in that folder would pass this check and be overwritten. Refuse rather than guess.
-            ap.error(f"{flag} cannot be checked against the inputs: cannot list {error.filename or a.target}: "
-                     f"{error.strerror or error}")
+            # os.walk skips a folder it cannot list unless onerror stops it. A report path inside that folder could
+            # then be an input this check never saw, so refuse it. Any other unlistable folder is left to the scan,
+            # which names it and reports the run as incomplete (exit 1).
+            folder = error.filename or a.target
+            if _inside(path, folder):
+                ap.error(f"{flag} cannot be checked against the inputs: cannot list {folder}: "
+                         f"{error.strerror or error}")
 
         for flag, path in (("--out", a.out), ("--csv", a.csv)):
             if not path:
