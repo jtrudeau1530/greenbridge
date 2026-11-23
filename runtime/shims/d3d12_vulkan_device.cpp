@@ -44,6 +44,7 @@
 #include <atomic>
 #include <bit>
 #include <cctype>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <filesystem>
@@ -57,6 +58,7 @@
 #include <string>
 #include <type_traits>
 #include <cwchar>
+#include <smmintrin.h>
 #include <vector>
 
 namespace rt::d3d12 {
@@ -119,6 +121,56 @@ void log_once(const char* what, int value) {
     SrwGuard lock(g_log_once_lock);
     if (!g_log_once_seen) g_log_once_seen = new std::set<std::pair<std::string, int>>;
     if (g_log_once_seen->insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+}
+
+// memcpy that a page fault ends instead of killing the process: the title may decommit a page between the
+// VirtualQuery that saw it committed and the read. No C++ objects here: it is a __try frame.
+// `streaming` reads with MOVNTDQA, for write-combined pages: ordinary loads from them are not cached, and memcpy
+// read 64 MiB of them in 253 ms on a Core i9-13900K (253 MiB/s), MOVNTDQA in 13 to 17 ms (4 to 5 GiB/s). Paid at every submission.
+#if defined(__clang__) && defined(_M_X64)
+__attribute__((target("sse4.1")))
+#endif
+bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
+    __try {
+        if (streaming) {
+            const std::size_t head = std::min<std::size_t>(bytes, (0 - reinterpret_cast<std::uintptr_t>(from)) & 63);
+            std::memcpy(to, from, head);
+            to += head, from += head, bytes -= head;
+            for (; bytes >= 64; to += 64, from += 64, bytes -= 64) {
+                const auto* in = reinterpret_cast<const __m128i*>(from);
+                const __m128i a = _mm_stream_load_si128(in), b = _mm_stream_load_si128(in + 1);
+                const __m128i c = _mm_stream_load_si128(in + 2), d = _mm_stream_load_si128(in + 3);
+                auto* out = reinterpret_cast<__m128i*>(to);
+                _mm_storeu_si128(out, a), _mm_storeu_si128(out + 1, b);
+                _mm_storeu_si128(out + 2, c), _mm_storeu_si128(out + 3, d);
+            }
+        }
+        std::memcpy(to, from, bytes);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Copies [from, from + bytes) of the title's address space to `to`, for a slot-133 shadow buffer. Only committed,
+// readable pages are read (xmem commits on first touch, and a read of a reserved page faults); the rest is zero.
+void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    for (std::size_t at = 0; at < bytes;) {
+        MEMORY_BASIC_INFORMATION region{};
+        std::size_t run = bytes - at;
+        bool read = false;
+        if (VirtualQuery(from + at, &region, sizeof(region))) {
+            const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+            run = std::min<std::size_t>(run, end - reinterpret_cast<std::uintptr_t>(from + at));
+            read = region.State == MEM_COMMIT && (region.Protect & readable) &&
+                   !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+        }
+        if (!read || !copy_guarded(to + at, from + at, run, (region.Protect & PAGE_WRITECOMBINE) != 0))
+            std::memset(to + at, 0, run);
+        at += run;
+    }
 }
 
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
@@ -700,6 +752,45 @@ struct DeviceState {
     PFN_vkTransitionImageLayoutEXT transition_image_layout = nullptr;
     // VK_EXT_external_memory_host; null unless info.host_pointer_alignment is set and the entry point loaded.
     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
+
+    // The live shadow buffers of Xbox device slot 133 (Resource::create_shadow_buffer): title-placed buffers whose
+    // pages the driver would not import. Each is re-copied from the title's pages before every submission of
+    // command lists (VulkanContext::set_before_execute), since nothing says which pages the title wrote. The first
+    // per-submission copy of each buffer size is timed and logged, so the cost shows in a run's log.
+    struct Shadow {
+        const std::uint8_t* pages;  // the title's
+        std::uint8_t* mapped;       // the shadow's memory
+        std::size_t size;
+    };
+    std::mutex shadow_mutex;  // a leaf: nothing else is taken under it
+    std::vector<Shadow> shadows;
+    std::set<std::size_t> shadow_sizes_logged;
+
+    void add_shadow(const Shadow& shadow) {
+        std::lock_guard lock(shadow_mutex);
+        shadows.push_back(shadow);
+    }
+    void remove_shadow(const std::uint8_t* mapped) {
+        std::lock_guard lock(shadow_mutex);
+        std::erase_if(shadows, [mapped](const Shadow& s) { return s.mapped == mapped; });
+    }
+    void refresh_shadows() {
+        std::lock_guard lock(shadow_mutex);
+        for (const Shadow& s : shadows) {
+            if (!shadow_sizes_logged.insert(s.size).second) {
+                copy_title_pages(s.mapped, s.pages, s.size);
+                continue;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            copy_title_pages(s.mapped, s.pages, s.size);
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "[rt] d3d12: slot-133 shadow buffer of %llu KiB: copied from the title's pages in "
+                                 "%.3f ms (%.0f MiB/s), paid at every submission\n",
+                         static_cast<unsigned long long>(s.size / 1024), ms,
+                         ms > 0 ? double(s.size) / (1024.0 * 1024.0) / (ms / 1000.0) : 0.0);
+        }
+    }
 
     // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
     // the device's VkQueue and waited for. Created on first use.
@@ -1827,6 +1918,8 @@ public:
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
         if (title_alias_) device_.context->remove_resource(id() | 1);
+        // Before the memory goes to the deferred queue: no submission copies into it after this.
+        if (shadow_) device_.remove_shadow(shadow_);
         if (host_import_) {
             // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
             // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
@@ -2109,6 +2202,69 @@ public:
         if ((id() & 1) || !device_.context->alias_buffer(id(), id() | 1, va)) return false;
         title_alias_ = true;
         return true;
+    }
+
+    // The fallback of create_host_buffer, for pages the driver will not import: write-combined or uncached ones (in
+    // retail 74 MiB of the title's 182 MiB range), pages not committed yet, a device without
+    // VK_EXT_external_memory_host, or a driver past its import budget (an RTX 3070 Ti answers
+    // VK_ERROR_OUT_OF_DEVICE_MEMORY after about 64 MiB of imports). The buffer has its own host-visible memory, a
+    // shadow of the title's pages, but keeps the title's VA as its console VA, so the descriptors and views the title
+    // builds from that VA still find it (an ordinary buffer here had another VA and none of the data: slot 70 wrote
+    // a null SRV and the UI draws sampled nothing). It is filled from the pages now and again before every
+    // submission of command lists (DeviceState::refresh_shadows).
+    // One way only: what the GPU writes to the shadow is NOT copied back to the title's pages, and the next
+    // submission's copy overwrites it. A title that reads GPU output at `address` needs the import.
+    HRESULT create_shadow_buffer(void* address) {
+        auto& vk = device_.context->vk;
+        if (!address || !desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+            return E_INVALIDARG;
+        const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = desc_.Width;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        device_.share(info);
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
+        // As an upload buffer (D3D-96): the CPU writes it at every submission and the GPU reads it, so VRAM through
+        // Resizable BAR where there is one, system memory otherwise.
+        memory_ = device_.allocate(requirements,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                   device_.upload_in_vram ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0, &memory_flags_,
+                                   need_bda);
+        void* shadow = nullptr;
+        if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS ||
+            vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &shadow) != VK_SUCCESS)
+            return E_OUTOFMEMORY;
+        shadow_ = static_cast<std::uint8_t*>(shadow);
+        const auto* pages = static_cast<const std::uint8_t*>(address);
+        copy_title_pages(shadow_, pages, std::size_t(desc_.Width));
+        // Map() answers the title's own pages, as the imported buffer does: a write to the shadow's memory would be
+        // overwritten by the next copy.
+        mapped_ = address;
+        va_ = reinterpret_cast<std::uintptr_t>(address);
+        if (need_bda && vk.vkGetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            bda.buffer = buffer_;
+            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            gpu_va_ = buffer_va_;
+        }
+        device_.log_va("title-placed buffer (shadow)", va_, desc_.Width);
+        leonida::ResourceBinding binding{};
+        binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        // CPU-side reads take the shadow, not the title's pages: it is as fresh as what the GPU reads and every byte
+        // of it can be read, which the pages do not promise. Not host_readable: GPU writes are not handed back.
+        binding.host = shadow_;
+        binding.va = va_;
+        device_.context->add_resource(id(), binding);
+        device_.add_shadow({pages, shadow_, std::size_t(desc_.Width)});
+        return S_OK;
     }
 
     HRESULT create_sparse_buffer() {
@@ -2646,6 +2802,7 @@ private:
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
     bool title_alias_ = false;  // also registered at the title's VA as id() | 1 (alias_title_va)
+    std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -5109,6 +5266,7 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->set_before_execute([this] { state_.refresh_shadows(); });
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -7147,13 +7305,25 @@ public:
         if (FAILED(hr)) {
             // The driver would not import these pages: RADV refuses a view of a pagefile-backed section, the form
             // xmem's physical pages take (found in review on an RX 9070 XT under Wine), and a device without
-            // VK_EXT_external_memory_host has no import at all. The boot goes on with an ordinary DEFAULT buffer
-            // of the same description, as #6915's stand-in did: the title gets a resource, but its writes at
-            // `address` do not reach it.
+            // VK_EXT_external_memory_host has no import at all; write-combined and uncommitted pages are not tried,
+            // and some drivers stop importing after a budget (create_shadow_buffer). The title then gets a shadow
+            // buffer at its VA, copied from its pages before every submission.
             resource->Release();
-            log_once("a title-placed buffer (device slot 133) could not import its pages, so it is an ordinary buffer "
-                     "the title's writes do not reach, found at the title's VA too; HRESULT",
-                     int(hr));
+            resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
+            resource->attach_device(identity());
+            const HRESULT shadow = resource->create_shadow_buffer(address);
+            if (SUCCEEDED(shadow)) {
+                log_once("a title-placed buffer (device slot 133) could not import its pages, so it is a shadow "
+                         "copied from them before every submission; HRESULT",
+                         int(hr));
+                return d3d12_trace::result(method, hand_out(resource, riid, out));
+            }
+            // No memory for the shadow either: an ordinary DEFAULT buffer, also found at the title's VA so draws
+            // resolve; the title's writes at `address` do not reach it.
+            resource->Release();
+            log_once("a title-placed buffer (device slot 133) could neither import its pages nor get a shadow, so it "
+                     "is an ordinary buffer the title's writes do not reach, found at the title's VA; HRESULT",
+                     int(shadow));
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
             const HRESULT created = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
                                                      D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out);

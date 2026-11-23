@@ -236,12 +236,86 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     Ref<ID3D12Resource> placed_texture;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, 0x6u, IID_PPV_ARGS(&placed_texture.p)), S_OK);
     EXPECT(placed_texture.p != nullptr && placed_texture->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
-    // An address off the buffer alignment can't be bound inside the import: the ordinary-buffer fallback answers.
+    // An address off the buffer alignment can't be bound inside the import: a shadow buffer answers, at the same VA
+    // (a driver whose buffer alignment is 1 imports it; the VA is the address either way).
     Ref<ID3D12Resource> fallback;
+    desc.Width = size - 1;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
-    EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(bytes + 1));
+    EXPECT(fallback->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(bytes + 1));
     std::printf("%s: %s, %llu bytes: GPU VA is the address, a GPU copy reads the CPU's writes\n", who, kind,
                 static_cast<unsigned long long>(size));
+    return 0;
+}
+
+std::uint8_t pattern_byte(UINT64 i, unsigned seed) {
+    return static_cast<std::uint8_t>(i * 131u + (i >> 8) * 7u + seed);
+}
+
+// The shadow fallback of slot 133: pages the driver does not import (write-combined, uncached, not all committed)
+// still give a buffer whose GPU VA is the address. It is a copy of the pages, made again before every submission:
+// a pattern written to the first `committed` bytes after the buffer exists is what a GPU copy in the next
+// ExecuteCommandLists reads, and so is a second pattern in the submission after. Bytes past `committed` are not
+// committed: they are never read, and the GPU sees zeros there. The same holds where the range was imported after
+// all (a Wine that drops the cache modifier), so the caller need not know which path answered.
+int check_title_placed_shadow(ID3D12Device* device, const char* kind, void* pages, UINT64 committed, UINT64 size) {
+    const char* who = "vulkan slot-133 shadow";
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Ref<ID3D12Resource> buffer;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
+    EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+    D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> readback;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&readback.p))));
+    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(list->Close()));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(done != nullptr);
+    auto* bytes = static_cast<std::uint8_t*>(pages);
+    UINT64 fence_value = 0;
+    for (const unsigned seed : {7u, 93u}) {
+        // Written after the buffer exists (and, the second time, after a submission read the first pattern).
+        for (UINT64 i = 0; i < committed; ++i) bytes[i] = pattern_byte(i, seed);
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->CopyBufferRegion(readback.p, 0, buffer.p, 0, size);
+        EXPECT(SUCCEEDED(list->Close()));
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, ++fence_value)));
+        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(fence_value, done)));
+        EXPECT(WaitForSingleObject(done, 30000) == WAIT_OBJECT_0);
+        void* mapped = nullptr;
+        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        const auto* got = static_cast<const std::uint8_t*>(mapped);
+        UINT64 wrong = size;
+        for (UINT64 i = 0; i < size && wrong == size; ++i)
+            if (got[i] != (i < committed ? pattern_byte(i, seed) : 0)) wrong = i;
+        readback->Unmap(0, nullptr);
+        if (wrong != size)
+            std::fprintf(stderr, "%s: %s: pattern %u: first wrong byte at %llu\n", who, kind, seed,
+                         static_cast<unsigned long long>(wrong));
+        EXPECT(wrong == size);
+    }
+    CloseHandle(done);
+    std::printf("%s: %s, %llu bytes (%llu committed): GPU VA is the address, each submission reads the pages' "
+                "latest bytes\n",
+                who, kind, static_cast<unsigned long long>(size), static_cast<unsigned long long>(committed));
     return 0;
 }
 
@@ -262,47 +336,43 @@ int check_title_placed_all(ID3D12Device* device) {
     UnmapViewOfFile(view);
     CloseHandle(section);
 
-    // Cache-modified ranges are not imported (WC imports read wrong bytes on an RTX 5090 in review). Some Wine
-    // versions report a requested WC allocation as plain read-write memory; check the protection actually supplied.
-    // PAGE_NOCACHE also exercises the fallback on those hosts, rather than dropping the cache-protection check.
+    // Cache-modified ranges are not imported (WC imports read wrong bytes on an RTX 5090 in review): a shadow buffer
+    // answers at the same VA. Some Wine versions report a requested WC allocation as plain read-write memory; check
+    // the protection actually supplied. PAGE_NOCACHE also exercises the fallback on those hosts, rather than
+    // dropping the cache-protection check.
     const char* who = "vulkan slot-133 buffer";
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = size;
-    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     for (DWORD modifier : {DWORD(PAGE_WRITECOMBINE), DWORD(PAGE_NOCACHE)}) {
         void* cached_pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | modifier);
         EXPECT(cached_pages != nullptr);
         MEMORY_BASIC_INFORMATION region{};
         EXPECT(VirtualQuery(cached_pages, &region, sizeof(region)) == sizeof(region));
         const bool cache_modified = (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) != 0;
-        {
-            Ref<ID3D12Resource> buffer;
-            EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, cached_pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
-            if (cache_modified) {
-                EXPECT(buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cached_pages));
-            } else {
-                EXPECT(region.Protect == PAGE_READWRITE);
-                EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cached_pages));
-            }
-        }
+        if (!cache_modified) EXPECT(region.Protect == PAGE_READWRITE);
+        const int failed = check_title_placed_shadow(device, modifier == PAGE_WRITECOMBINE ? "write-combined range"
+                                                                                           : "uncached range",
+                                                     cached_pages, size, size);
         std::printf("%s: cache modifier 0x%lx, reported protection 0x%lx: %s\n", who, modifier, region.Protect,
-                    cache_modified ? "ordinary-buffer fallback verified"
-                                   : "modifier not reported; read-write import verified");
+                    failed ? "FAILED"
+                           : cache_modified ? "shadow buffer verified"
+                                            : "modifier not reported; read-write import verified");
+        failures += failed;
         VirtualFree(cached_pages, 0, MEM_RELEASE);
+    }
+    {
+        // A larger write-combined range, so the per-submission copy the layer logs is measured on more than a few
+        // pages (retail places 182 MiB, 74 MiB of it write-combined).
+        constexpr SIZE_T large = 64u << 20;
+        void* large_pages = VirtualAlloc(nullptr, large, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
+        EXPECT(large_pages != nullptr);
+        failures += check_title_placed_shadow(device, "64 MiB write-combined range", large_pages, large, large);
+        VirtualFree(large_pages, 0, MEM_RELEASE);
     }
     char* partial = static_cast<char*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
     EXPECT(partial != nullptr && VirtualAlloc(partial, size / 2, MEM_COMMIT, PAGE_READWRITE) == partial);
-    {
-        // Pages not committed yet (xmem commits on first touch) are not imported either: the fallback answers.
-        Ref<ID3D12Resource> fallback;
-        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
-        EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(partial));
-    }
+    // Pages not committed yet (xmem commits on first touch) are not imported either: the shadow copies the committed
+    // half and never reads the other, which a GPU copy sees as zeros.
+    failures += check_title_placed_shadow(device, "half-committed range", partial, size / 2, size);
     VirtualFree(partial, 0, MEM_RELEASE);
-    std::printf("%s: a partly committed range falls back to an ordinary buffer\n", who);
     return failures;
 }
 

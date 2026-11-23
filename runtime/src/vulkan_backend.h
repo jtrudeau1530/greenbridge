@@ -1392,6 +1392,11 @@ public:
     // and records what the set needs first. When it fails, nothing of that call is executed.
     void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
 
+    // `before` is called at the start of every submission of command lists (a held batch: when it is released),
+    // before any lock here is taken: the device re-copies its slot-133 shadow buffers from the title's pages there.
+    // Set once, before the first queue exists.
+    void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
+
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::unique_lock lock(resource_mutex_);
         bindless_prepare_ = std::move(prepare);
@@ -1701,6 +1706,7 @@ private:
     std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
         resolve_passes_;
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
+    std::function<void()> before_execute_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::function<VkDescriptorSet()> bindless_current_;
     bool bindless_upload_pending_ = false;  // tracker_mutex_
@@ -2189,6 +2195,7 @@ private:
 
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
+        if (context_.before_execute_) context_.before_execute_();
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())
