@@ -477,6 +477,22 @@ def save_slot(folder):
     return meta.get('save_directory') or os.path.basename(os.path.normpath(folder)), payload, slot, title
 
 
+CONTAINER_PATH_CHARS = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_/')
+CONTAINER_FILE_CHARS = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-')
+
+
+def valid_container_name(name):
+    """XGameSaveCreateContainer's documented rule, as runtime/shims/xgameruntime_gamesave.cpp checks it: at most 256
+    characters; a path part (up to the last '/') of [A-Za-z0-9_/], then a non-empty file part of [A-Za-z0-9_.-] that
+    does not end in '.' nor hold '..'. The runtime lists any folder, but the game can only open one by a valid name."""
+    if not name or len(name) > 256:
+        return False
+    path, _, file = name.rpartition('/')
+    if path and not set(path + '/') <= CONTAINER_PATH_CHARS:
+        return False
+    return bool(file) and not file.endswith('.') and '..' not in file and set(file) <= CONTAINER_FILE_CHARS
+
+
 def import_saves(args):
     flags = {'--out', '--map', '--with-packed', '--force', '--dry-run'}
     for option, following in zip(args, args[1:]):
@@ -536,6 +552,9 @@ def import_saves(args):
                                         'sha256': hashlib.sha256(data).hexdigest()})
             print(f'{sd:34} {src_name:24} -> container {container!r:12} blob {blob_name!r:24} {len(data):>9} bytes'
                   f'  ({title})')
+            if not valid_container_name(container):
+                print(f'warning: container {container!r} breaks XGameSaveCreateContainer\'s naming rule, so the game '
+                      f'cannot open it by that name; give it another with --map {sd}=NAME', file=sys.stderr)
     dsts = [d.lower() for _, d in plan]
     if len(set(dsts)) != len(dsts):
         raise SystemExit('import: two payloads map to the same container/blob (names are case-insensitive on '
