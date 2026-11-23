@@ -2234,6 +2234,15 @@ The trace will enumerate them.
   ones). For console-form calls or descriptors explicitly using layout `0x101`, the proxy strips Xbox-only flags and
   translates layout `0x101` to ROW_MAJOR for buffers or UNKNOWN for textures. Other PC-form descriptors reach the host
   unchanged for validation (`d3d12_xs_desc_clean.h`; #6982 section 3.7).
+  A committed resource made through slots 76 and 127 also allocates its console size (the whole tiles above for a
+  listed render-target shape, never a larger PC answer; otherwise the PC size) through the title's
+  `__XMemAllocationHooks__`, as the console runtime's `XMemAlloc` for the resource does, and frees it when the
+  resource is destroyed (a lease kept with `SetPrivateDataInterface`; the bytes are not used). The retail title
+  budgets its first full-screen render targets with such a hook: it bump-allocates the allocations whose XALLOC
+  page-size field is 2 out of a range it reserved and asserts that less than 2 MiB is left (RT-5 stop 17); two
+  3840 x 2160 RGBA8 targets are 2 x 510 tiles of a 64 MiB range, and AMD's 513 x 64 KiB answer would overrun it. The
+  lease's attribute word (allocator ID 0x80, page-size field 2, object type 0) is an **assumption**; the measured
+  hook reads only the page-size field.
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
   adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
   621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.
