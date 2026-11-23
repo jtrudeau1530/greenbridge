@@ -24,6 +24,7 @@ class FirstLookShimReportTest(unittest.TestCase):
             loader = root / "runtime/build/gta6rt.exe"
             loader.parent.mkdir(parents=True)
             loader.touch()
+            loader.with_name("gta6rt_tls_host.dll").touch()
             (root / "fixture.exe").write_bytes(build_image().replace(b"xmem.dll", b"demo.dll"))
             # The report depends on the real PE inspection. Echo the dry-run arguments
             # in place of a native loader so the test needs no runtime build.
