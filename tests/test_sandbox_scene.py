@@ -141,6 +141,9 @@ class TestCliErrors(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(len(err.strip().splitlines()), 1)
         self.assertTrue(err.startswith("ERROR:"))
+        # the refusal is up front and says why, not a repr'd OSError with doubled backslashes
+        self.assertIn("is a folder, not a scene file", err)
+        self.assertNotIn("[Errno", err)
 
     def test_out_under_a_regular_file_is_one_error_line(self):
         reg = os.path.join(self.tmp.name, "reg")

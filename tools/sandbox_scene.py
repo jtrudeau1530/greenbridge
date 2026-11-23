@@ -169,8 +169,12 @@ def main(argv=None):
     ap.add_argument("--max-props", type=int, default=400, help="entities to place, nearest first (each can be several draws)")
     ap.add_argument("--tex-size", type=int, default=256)
     ap.add_argument("--out", required=True)
+    args = ap.parse_args(argv)
+    if os.path.isdir(args.out):
+        print(f"ERROR: --out is a folder, not a scene file: {args.out}", file=sys.stderr)
+        return 2
     try:
-        stats = build(ap.parse_args(argv))
+        stats = build(args)
     except OSError as e:
         # An unreadable --entities/--models or an unwritable --out used to end in a traceback.
         print(f"ERROR: {e}", file=sys.stderr)
