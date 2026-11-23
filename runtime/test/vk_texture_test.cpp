@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
@@ -56,7 +57,32 @@ static std::vector<uint32_t> read_spv(const char* p) {
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 
+static bool cube_texel_matches(const float* pixel, int tx, int ty, int face) {
+    return std::fabs(pixel[0] - tx * 32 / 255.f) < 1e-3f &&
+           std::fabs(pixel[1] - ty * 32 / 255.f) < 1e-3f &&
+           std::fabs(pixel[2] - (6 + face) * 20 / 255.f) < 1e-3f &&
+           std::fabs(pixel[3] - 1.0f) < 1e-3f;  // The cube upload stores opaque alpha.
+}
+
+static int cube_alpha_self_test() {
+    float pixel[4] = {64.0f / 255.0f, 96.0f / 255.0f, 200.0f / 255.0f, 1.0f};
+    if (!cube_texel_matches(pixel, 2, 3, 4)) {
+        std::fprintf(stderr, "cube alpha self-test: rejected the expected RGBA texel\n");
+        return 1;
+    }
+    for (const float alpha : {0.0f, std::numeric_limits<float>::quiet_NaN()}) {
+        pixel[3] = alpha;
+        if (cube_texel_matches(pixel, 2, 3, 4)) {
+            std::fprintf(stderr, "cube alpha self-test: accepted incorrect alpha %g\n", alpha);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--self-test-cube-alpha") == 0)
+        return cube_alpha_self_test();
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
     const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
@@ -559,8 +585,7 @@ int main(int argc, char** argv) {
                 for (float ds : {-1e-3f, 1e-3f})
                     for (float dt : {-1e-3f, 1e-3f}) {
                         const int tx = std::min(int(TW) - 1, int(s + ds)), ty = std::min(int(TW) - 1, int(t + dt));
-                        ok |= std::fabs(p[0] - tx * 32 / 255.f) < 1e-3f && std::fabs(p[1] - ty * 32 / 255.f) < 1e-3f &&
-                              std::fabs(p[2] - (6 + face) * 20 / 255.f) < 1e-3f;
+                        ok |= cube_texel_matches(p, tx, ty, face);
                     }
                 checked++;
                 wrong += !ok;
