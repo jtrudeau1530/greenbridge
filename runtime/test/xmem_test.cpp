@@ -458,6 +458,34 @@ void test_physical_pages(const PhysicalApi& api) {
 }
 
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
+// A run longer than one host view is mapped as capped views, so unmapping one page inside it only remaps the rest of
+// that view; every other page keeps its contents.
+void test_long_run(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 1100;  // more than the 1024-page view cap
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    std::vector<uint64_t> pages(kPages);
+    uint64_t count = kPages;
+    check(window && api.allocate(0x280, &count, pages.data()) == TRUE, "a long run's window and pages are allocated");
+    if (!window || count != kPages) return;
+    check(api.map(window, kPages, pages.data()) == window, "a run longer than the view cap maps");
+    MEMORY_BASIC_INFORMATION info{};
+    VirtualQuery(window, &info, sizeof(info));
+    check(info.State == MEM_COMMIT && info.RegionSize == 1024 * kPage64k, "it is mapped as views of at most 1024 pages");
+    for (uint64_t i = 0; i < kPages; ++i) fill_page(window + i * kPage64k, static_cast<uint32_t>(i + 1));
+    void* const hole = window + 10 * kPage64k;
+    check(api.scatter(&hole, 1, nullptr) == TRUE && reserved_only(hole), "a page inside the first view unmaps");
+    bool kept = true;
+    for (uint64_t i = 0; i < kPages; ++i) {
+        if (i != 10) kept &= page_holds(window + i * kPage64k, static_cast<uint32_t>(i + 1));
+    }
+    check(kept, "every other page of the run keeps its contents");
+    check(api.map(window, kPages, nullptr) == window && reserved_only(window) &&
+              reserved_only(window + (kPages - 1) * kPage64k),
+          "the whole run unmaps");
+    check(api.free_pages(kPages, pages.data()) == TRUE, "the long run's pages are freed");
+}
+
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
         api.virtual_alloc(nullptr, 6 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
@@ -735,6 +763,7 @@ int main() {
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
+        test_long_run(physical);
         test_placeholders(physical);
     }
 

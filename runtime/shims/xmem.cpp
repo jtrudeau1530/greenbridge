@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -436,7 +437,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 
 // With g_phys_mutex held. Maps `view` at the 64 KiB-aligned `address`, which holds no mapped page. MEM_REPLACE_PLACEHOLDER
 // needs the view to fill one placeholder exactly, and earlier partial unmaps can leave several host placeholders in one
-// run, so the run is mapped as one view per placeholder it spans (one view for a fresh window).
+// run, so the run is mapped as one view per placeholder it spans. Views are capped at kMaxViewPages so that unmapping a
+// page inside a long run only remaps the rest of one capped view, not the whole run.
+constexpr uint64_t kMaxViewPages = 1024;  // 64 MiB
+
 bool map_view(uintptr_t address, const View& view) {
     for (uint64_t mapped = 0; mapped < view.count;) {
         const uintptr_t base = address + mapped * kPhysicalPageSize;
@@ -449,7 +453,7 @@ bool map_view(uintptr_t address, const View& view) {
         }
         const uint64_t available = info.RegionSize / kPhysicalPageSize;
         const uint64_t remaining = view.count - mapped;
-        const uint64_t count = available < remaining ? available : remaining;
+        const uint64_t count = (std::min)({available, remaining, kMaxViewPages});
         const SIZE_T size = static_cast<SIZE_T>(count * kPhysicalPageSize);
         const uint64_t offset = view.offset + mapped * kPhysicalPageSize;
         if (!isolate_placeholder(target, size)) return false;
