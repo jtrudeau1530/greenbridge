@@ -304,6 +304,7 @@ struct Scenario {
     const char* name;
     Recorder record;
     const char* expected;  // null: print only
+    bool warp_oracle_only = false;  // native hardware drivers may disagree with WARP about zero-count scissors
 };
 
 constexpr auto strip = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
@@ -450,7 +451,7 @@ std::vector<Scenario> scenarios() {
                      l->SetPipelineState(r.pso_a.p);
                      l->RSSetScissorRects(0, nullptr);
                      l->DrawInstanced(4, 1, 0, 0);
-                 }, BLANK4 " " BLANK4});
+                 }, BLANK4 " " BLANK4, true});
     s.push_back({"scissor zero then one: restores new rectangle for draw",
                  [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
                      parent_state(r, l, strip);
@@ -467,7 +468,7 @@ std::vector<Scenario> scenarios() {
                      const D3D12_RECT unused{0, 0, LONG(target_px), LONG(target_px)};
                      l->RSSetScissorRects(0, &unused);
                      l->DrawInstanced(4, 1, 0, 0);
-                 }, BLANK4 " " BLANK4});
+                 }, BLANK4 " " BLANK4, true});
     s.push_back({"scissor zero on parent suppresses inherited bundle draw",
                  [parent_state](Rig& r, ID3D12GraphicsCommandList* l) {
                      auto* b = r.bundle(r.pso_a.p, [](ID3D12GraphicsCommandList* b) {
@@ -477,7 +478,7 @@ std::vector<Scenario> scenarios() {
                      parent_state(r, l, strip);
                      l->RSSetScissorRects(0, nullptr);
                      r.execute(l, b);
-                 }, BLANK4 " " BLANK4});
+                 }, BLANK4 " " BLANK4, true});
     return s;
 }
 
@@ -834,8 +835,9 @@ int main() {
         std::fprintf(stderr, "no HLSL compiler: the host is not run\n");
     }
 
-    // Every grid, the layer's against the table and each host's against it too. A host that is unavailable or
-    // Wine's vkd3d (which answers differently, see host_wine.h) is not compared; the table still holds the layer.
+    // WARP is the reference for zero-count scissors. An AMD Windows D3D12 driver (RX 6700 XT, 26.11.2) keeps the
+    // old scissor after count zero, while WARP and other tested drivers disable it. Record that native divergence
+    // without failing the layer or WARP correctness test; all other default-adapter cases remain strict.
     unsigned failures = 0, compared = 0;
     const auto verdict = [&](const char* who, const Scenario& scenario, const std::string& grid, HRESULT close) {
         const bool ok = grid == scenario.expected && close == S_OK;
@@ -857,6 +859,15 @@ int main() {
         verdict("the layer", list[i], layer_grids[i], layer_closes[i]);
         for (const auto& host : hosts) {
             if (!host.ran) continue;
+            if (&host == &hosts[0] && list[i].warp_oracle_only) {
+                if (host.closes[i] != S_OK) {
+                    verdict(host.name, list[i], host.grids[i], host.closes[i]);
+                } else if (host.grids[i] != list[i].expected) {
+                    std::printf("NOTE %s on %s differs from WARP: %s\n", list[i].name, host.name,
+                                host.grids[i].c_str());
+                }
+                continue;
+            }
             verdict(host.name, list[i], host.grids[i], host.closes[i]);
             ++compared;
         }
