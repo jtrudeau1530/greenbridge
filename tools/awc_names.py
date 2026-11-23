@@ -33,6 +33,7 @@ A JSON inventory from ``awc_manifest.py`` can also supply the bank names and str
 
 Standard library only. The output names game files: it is a local work product and must not be committed or
 attached to an issue. The tests use synthetic banks and words.
+Usage: `python -I tools/awc_names.py --help` lists the options.
 """
 import argparse
 import collections

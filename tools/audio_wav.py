@@ -17,6 +17,7 @@ end. For chained streams, ffmpeg handles each link's timing. ffmpeg must be on P
 
 For PCM copies of the AWC banks' Opus streams, first repackage the banks with awc_opus.py, then run this tool on
 its output (make_game.py does both, the second only with --wav).
+Usage: `python -I tools/audio_wav.py --help` lists the options.
 """
 import argparse
 import concurrent.futures

@@ -11,6 +11,7 @@ per-channel frame count is `samples / packet_channels`. The output is
 
 This tool never re-encodes: the selected Opus packets are repacked into Ogg Opus exactly as stored.
 It does not transcribe or classify the clips; that is a separate analysis step.
+Usage: `python -I tools/awc_shorts.py --help` lists the options.
 """
 import argparse
 import csv

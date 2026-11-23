@@ -7,6 +7,7 @@ resources") with `RIG` + a version byte at +0x70 instead of the pack array. Its 
 path. Each value points at +0x20 to a `RIG` block, which holds tables of 8-byte `(hash, word)` items. `--rigs`
 takes the JSON `anim_index.py --rigs` writes and resolves every rig-set entry (source = rig dictionary name,
 rig = key). The output holds counts and one row per rig dictionary, no item values.
+Usage: `python -I tools/anim_rigs.py --help` lists the options.
 """
 import argparse
 import collections

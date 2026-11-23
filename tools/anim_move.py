@@ -19,6 +19,7 @@ One resource in anim.rpf (at 0x105a7d000, 71,099 bytes) exceeds RPF9's 64 KiB st
 consecutive 16-byte-aligned zlib streams (65,536 + 5,563 bytes). After the 10-byte preamble tail sits the root
 state container (`Type 1` = StateMachine, `Type 3` = InlinedStateMachine, `Type 22` = MotionTree), whose child
 states, transitions and length-prefixed parameter blocks recurse through signed 32-bit self-relative offsets.
+Usage: `python -I tools/anim_move.py --help` lists the options.
 """
 import argparse
 import collections

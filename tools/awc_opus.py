@@ -26,6 +26,7 @@ and the descriptor's `samples` counts interleaved samples across those packet ch
 Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each bank's relative path.
 
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
+Usage: `python -I tools/awc_opus.py --help` lists the options.
 """
 import argparse
 import functools

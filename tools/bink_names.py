@@ -34,6 +34,7 @@ The source is read with ``bink_index.py`` (an archive or directory is scanned; a
 directory, or any directory of files; only payloads that mention ``$(common)/movies/`` are used. A list longer than
 one zlib stream is rebuilt whole by ``gamedata_index.py``. The output names game files: it is a local work product and must not be
 committed or attached to an issue. The tests use synthetic headers and lists only.
+Usage: `python -I tools/bink_names.py --help` lists the options.
 """
 import argparse
 import csv

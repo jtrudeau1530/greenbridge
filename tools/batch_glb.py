@@ -10,6 +10,7 @@ model failed.
 
 Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
+Usage: `python -I tools/batch_glb.py --help` lists the options.
 """
 from __future__ import annotations
 

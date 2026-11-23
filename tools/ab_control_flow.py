@@ -17,6 +17,7 @@ What the comparison needs to mean anything, each learned from a run that looked 
     finish back with --names.
 The heap is zeros, so most images are a single colour: this shows the two forms take the same path to the same
 result, not that the result is right. Outcomes go to <out dir>/outcomes.tsv.
+Usage: `python -I tools/ab_control_flow.py --help` lists the options.
 """
 import argparse
 import collections

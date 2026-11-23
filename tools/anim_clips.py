@@ -24,6 +24,7 @@ Usage:
 
 `--decode` prints one dictionary's clips and the decoded track values (first N frames, default 4) as JSON on
 stdout, for local inspection. It writes no file.
+Usage: `python -I tools/anim_clips.py --help` lists the options.
 """
 import argparse
 import collections

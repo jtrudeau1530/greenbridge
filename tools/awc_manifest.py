@@ -20,6 +20,7 @@ look inconsistent (zero/odd rate, data-size mismatch, implausible duration).
 A streamed-music descriptor contributes one row per channel group; `channels` is the packet channel count read
 from the Opus TOC stereo bit, and `declared_samples`/`duration_s` are per channel (the descriptor stores the
 interleaved count). `data_offset`/`size` is the shared data tag.
+Usage: `python -I tools/awc_manifest.py --help` lists the options.
 """
 import argparse
 import csv

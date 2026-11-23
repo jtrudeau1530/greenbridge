@@ -18,6 +18,7 @@ In an RPF9 archive the last ``u32 +12`` bytes of the file are a block of their o
 (``docs/rpf.md``), so when the gap after the last stream reaches EOF and is at least
 that long, those bytes are counted as ``rpf_trailer`` and only the rest of the gap is
 split into zero padding and unread bytes.
+Usage: `python -I tools/bink_index.py --help` lists the options.
 """
 import argparse
 import csv

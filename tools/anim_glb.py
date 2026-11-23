@@ -39,6 +39,7 @@ Usage:
 Offsets are the resources' zlib stream offsets in the archive (the `0x...` offsets rpf9dump and skin_streams
 report). `--part` takes a drawable, a fragment or a drawable dictionary; `:<child>` picks a dictionary child.
 `--coverage` writes counts only: how many clip-dictionary bone tracks name a joint of the skeleton.
+Usage: `python -I tools/anim_glb.py --help` lists the options.
 """
 import argparse
 import collections
