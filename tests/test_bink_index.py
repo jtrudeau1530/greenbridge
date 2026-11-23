@@ -370,6 +370,42 @@ class TestCommandLine(unittest.TestCase):
         self.assertEqual(summaries[0]["files_scanned"], 1)
         self.assertEqual(summaries[0]["streams"], 1)
 
+    def test_a_single_named_file_that_is_not_a_stream_or_rpf_is_refused(self):
+        path = os.path.join(self.tmp.name, "junk.bin")
+        with open(path, "wb") as fh:
+            fh.write(b"not a movie" * 64)
+        out = os.path.join(self.tmp.name, "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([path, "--out", out]), 2)
+        self.assertIn("not a Bink 2 stream or an RPF archive", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_scanned_directory_with_no_stream_still_reports_empty(self):
+        # The refusal is for one named file: an empty folder scan is a valid "0 streams" answer.
+        folder = os.path.join(self.tmp.name, "movies")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "notes.bin"), "wb") as fh:
+            fh.write(b"not a movie" * 64)
+        err = io.StringIO()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            self.assertEqual(bink.main([folder]), 0)
+        self.assertIn("0 Bink 2 streams", err.getvalue())
+        self.assertTrue(out.getvalue().splitlines())
+
+    def test_an_rpf_archive_with_no_stream_is_still_indexed(self):
+        # A named file with an RPF header is an archive, even if it holds no Bink 2 stream.
+        path = os.path.join(self.tmp.name, "empty.rpf")
+        with open(path, "wb") as fh:
+            fh.write(b"9FPR" + struct.pack("<III", 0x40, 0x30, 0) + bytes(0x30))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([path]), 0)
+        self.assertIn("0 Bink 2 streams", err.getvalue())
+        self.assertNotIn("not a Bink 2 stream", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

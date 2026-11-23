@@ -13,6 +13,9 @@ Usage:
 With ``--probe`` each stream is written to a temporary file and passed to
 ``ffprobe``; the extra columns say only whether that ffprobe build can decode
 the stream. A missing ffprobe leaves the base columns unchanged.
+A single named file that is neither a Bink 2 stream nor an RPF archive is an
+error (exit 2), not an empty index; a directory scan still reports 0 streams
+when nothing matches.
 
 In an RPF9 archive the last ``u32 +12`` bytes of the file are a block of their own
 (``docs/rpf.md``), so when the gap after the last stream reaches EOF and is at least
@@ -306,6 +309,16 @@ def write_json(path, target, rows, summary, probe):
                   fh, indent=1)
 
 
+def is_rpf_archive(path):
+    """True when *path* starts with an RPF header (``?FPR``)."""
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(16)
+    except OSError:
+        return False
+    return len(header) >= 16 and header[1:4] == b"FPR"
+
+
 def same_output_path(first, second):
     """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
     if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
@@ -351,6 +364,11 @@ def main(argv=None):
     except OSError as error:
         path = error.filename or a.target
         print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+        return 2
+    if not rows and not os.path.isdir(a.target) and not is_rpf_archive(a.target):
+        # A named file with no Bink 2 stream and no RPF header is a wrong path or
+        # format, not an empty index; a directory scan still reports 0 streams.
+        print(f"bink_index: error: {a.target}: not a Bink 2 stream or an RPF archive", file=sys.stderr)
         return 2
     probe = False
     if a.probe:
