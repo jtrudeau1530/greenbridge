@@ -316,7 +316,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT buffer, REFIID riid, void** surface) override {
-        if (!surface) return E_POINTER;
+        if (!surface) return DXGI_ERROR_INVALID_CALL;  // host-measured, not E_POINTER
         *surface = nullptr;
         if (buffer >= buffers_.size()) return DXGI_ERROR_INVALID_CALL;
         return buffers_[buffer]->QueryInterface(riid, surface);
@@ -357,8 +357,16 @@ public:
             vk_fmt = dxgi_to_vk_format(fmt);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return E_INVALIDARG;
         }
+        // Host-measured on a chain created with flags 0 (RTX 5070 Ti and WARP, Windows 11): NONPREROTATED,
+        // FULLSCREEN_VIDEO and every bit from 0x4000 up are DXGI_ERROR_INVALID_CALL; FOREGROUND_LAYER, YUV_VIDEO and
+        // 0x2000 are E_INVALIDARG, as a waitable or tearing flag the chain wasn't created with is.
+        constexpr UINT refused_flags = ~0x3fffu | DXGI_SWAP_CHAIN_FLAG_NONPREROTATED |
+                                       DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO;
+        if (flags & refused_flags) return DXGI_ERROR_INVALID_CALL;
         constexpr UINT creation_only_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
-                                             DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+                                             DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING |
+                                             DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER | DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO |
+                                             0x2000u;
         if ((flags & creation_only_flags) != (flags_ & creation_only_flags)) return E_INVALIDARG;
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
@@ -442,7 +450,7 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* p) override {
-        if (!p) return E_INVALIDARG;
+        if (!p) return DXGI_ERROR_INVALID_CALL;  // host-measured
         *p = present_count_.load(std::memory_order_relaxed);
         return S_OK;
     }
@@ -469,7 +477,11 @@ public:
         desc->Windowed = TRUE;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override { if (!out) return E_INVALIDARG; *out = hwnd_; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override {
+        if (!out) return DXGI_ERROR_INVALID_CALL;  // host-measured
+        *out = hwnd_;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID, void** out) override {
         if (!out) return DXGI_ERROR_INVALID_CALL;
         *out = nullptr;
@@ -479,15 +491,13 @@ public:
         return Present(sync, flags);
     }
     BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
+    // Host-measured: a chain created without an output answers S_OK with a null output, and a null pointer is
+    // DXGI_ERROR_INVALID_CALL.
     HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput** out) override {
-        if (!out) return E_INVALIDARG;
-        if (restrict_to_output_) {
-            *out = restrict_to_output_;
-            restrict_to_output_->AddRef();
-            return S_OK;
-        }
-        *out = nullptr;
-        return DXGI_ERROR_NOT_FOUND;
+        if (!out) return DXGI_ERROR_INVALID_CALL;
+        *out = restrict_to_output_;
+        if (restrict_to_output_) restrict_to_output_->AddRef();
+        return S_OK;
     }
     void set_restrict_to_output(IDXGIOutput* out) {
         if (restrict_to_output_) restrict_to_output_->Release();
@@ -1048,7 +1058,7 @@ private:
 };
 
 
-// Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
+// Vulkan-backed IDXGIAdapter4 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
 
 // The adapter's user-mode driver version, as DXGI's CheckInterfaceSupport(IDXGIDevice) reports it: what
@@ -1082,7 +1092,7 @@ LARGE_INTEGER umd_driver_version(LUID luid) {
     return version;
 }
 
-class Adapter final : public IDXGIAdapter3 {
+class Adapter final : public IDXGIAdapter4 {
 public:
     Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical)
         : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical) {
@@ -1109,8 +1119,9 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIAdapter) ||
-            riid == __uuidof(IDXGIAdapter1) || riid == __uuidof(IDXGIAdapter2) || riid == __uuidof(IDXGIAdapter3)) {
-            *out = static_cast<IDXGIAdapter3*>(this);
+            riid == __uuidof(IDXGIAdapter1) || riid == __uuidof(IDXGIAdapter2) || riid == __uuidof(IDXGIAdapter3) ||
+            riid == __uuidof(IDXGIAdapter4)) {
+            *out = static_cast<IDXGIAdapter4*>(this);
             AddRef();
             return S_OK;
         }
@@ -1254,6 +1265,26 @@ public:
         return S_OK;
     }
     void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(DWORD) override {}
+
+    // IDXGIAdapter4 (host DXGI answers it since Windows 10 1803). DXGI_ADAPTER_FLAG3_SOFTWARE is the same bit as
+    // DXGI_ADAPTER_FLAG_SOFTWARE; a null description is E_INVALIDARG, as on the host.
+    HRESULT STDMETHODCALLTYPE GetDesc3(DXGI_ADAPTER_DESC3* desc) override {
+        if (!desc) return E_INVALIDARG;
+        std::memset(desc, 0, sizeof(*desc));
+        std::memcpy(desc->Description, desc_.Description, sizeof(desc->Description));
+        desc->VendorId = desc_.VendorId;
+        desc->DeviceId = desc_.DeviceId;
+        desc->SubSysId = desc_.SubSysId;
+        desc->Revision = desc_.Revision;
+        desc->DedicatedVideoMemory = desc_.DedicatedVideoMemory;
+        desc->DedicatedSystemMemory = desc_.DedicatedSystemMemory;
+        desc->SharedSystemMemory = desc_.SharedSystemMemory;
+        desc->AdapterLuid = desc_.AdapterLuid;
+        desc->Flags = static_cast<DXGI_ADAPTER_FLAG3>(desc_.Flags);
+        desc->GraphicsPreemptionGranularity = desc_.GraphicsPreemptionGranularity;
+        desc->ComputePreemptionGranularity = desc_.ComputePreemptionGranularity;
+        return S_OK;
+    }
 
 private:
     void populate_desc() {
