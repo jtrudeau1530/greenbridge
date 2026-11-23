@@ -145,7 +145,8 @@ void restrict_to_output(const Side& s, Results& r) {
 // (d) ResizeBuffers with flag bits the host refuses, each on a fresh chain created with flags 0, and 0x2000 kept on
 // a chain created with it. A sweep of all 32 bits on the host refused exactly these and accepted the rest.
 void resize_flags(const Side& s, Results& r) {
-    for (const UINT bit : {0x1u, 0x80u, 0x100u, 0x200u, 0x2000u, 0x4000u, 0x8000u, 0x10000u, 0x80000000u}) {
+    for (const UINT bit : {0x1u, 0x40u, 0x80u, 0x100u, 0x200u, 0x800u, 0x2000u, 0x4000u, 0x8000u, 0x10000u,
+                           0x80000000u}) {
         Chain c(s);
         char key[64];
         std::snprintf(key, sizeof(key), "swap chain: ResizeBuffers flags 0x%x", bit);
@@ -154,6 +155,22 @@ void resize_flags(const Side& s, Results& r) {
     Chain c(s, 0x2000u);
     r["swap chain: created with 0x2000, ResizeBuffers flags 0x2000"] =
         SUCCEEDED(c.hr) ? hx(c.sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0x2000u)) : "create " + hx(c.hr);
+
+    // Host-measured precedence: a creation-dependent flag absent from the original desc returns E_INVALIDARG even
+    // alongside one or several flags that independently return DXGI_ERROR_INVALID_CALL. Each probe gets an untouched
+    // chain created with flags 0 and no GetBuffer references; Chain releases it before the next case.
+    constexpr UINT refused[] = {0x1u, 0x100u, 0x4000u, 0x101u, 0x4001u, 0x4100u, 0x4101u};
+    constexpr UINT creation_only[] = {0x40u, 0x80u, 0x200u, 0x800u, 0x2000u};
+    for (UINT bad : refused) {
+        for (UINT creation : creation_only) {
+            Chain fresh(s);
+            const UINT flags = bad | creation;
+            char key[64];
+            std::snprintf(key, sizeof(key), "swap chain: ResizeBuffers mixed flags 0x%x", flags);
+            r[key] = SUCCEEDED(fresh.hr) ? hx(fresh.sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, flags))
+                                         : "create " + hx(fresh.hr);
+        }
+    }
 }
 
 // (f) Null out-pointers on the swap chain, adapter and output that no other change covers.

@@ -357,17 +357,18 @@ public:
             vk_fmt = dxgi_to_vk_format(fmt);
             if (vk_fmt == VK_FORMAT_UNDEFINED) return E_INVALIDARG;
         }
-        // Host-measured on a chain created with flags 0 (RTX 5070 Ti and WARP, Windows 11): NONPREROTATED,
-        // FULLSCREEN_VIDEO and every bit from 0x4000 up are DXGI_ERROR_INVALID_CALL; FOREGROUND_LAYER, YUV_VIDEO and
-        // 0x2000 are E_INVALIDARG, as a waitable or tearing flag the chain wasn't created with is.
-        constexpr UINT refused_flags = ~0x3fffu | DXGI_SWAP_CHAIN_FLAG_NONPREROTATED |
-                                       DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO;
-        if (flags & refused_flags) return DXGI_ERROR_INVALID_CALL;
+        // DXGI first checks creation-dependent flags against the chain's original flags. If one is missing, this
+        // E_INVALIDARG wins even when the same call also includes flags that independently return INVALID_CALL.
         constexpr UINT creation_only_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
                                              DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING |
                                              DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER | DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO |
                                              0x2000u;
         if ((flags & creation_only_flags) != (flags_ & creation_only_flags)) return E_INVALIDARG;
+        // On a chain whose creation flags match, NONPREROTATED, FULLSCREEN_VIDEO and every bit from 0x4000 up are
+        // DXGI_ERROR_INVALID_CALL (host-measured on Windows 11 with the RTX 5070 Ti and WARP).
+        constexpr UINT refused_flags = ~0x3fffu | DXGI_SWAP_CHAIN_FLAG_NONPREROTATED |
+                                       DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO;
+        if (flags & refused_flags) return DXGI_ERROR_INVALID_CALL;
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
             if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
