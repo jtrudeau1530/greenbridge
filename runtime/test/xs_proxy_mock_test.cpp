@@ -278,6 +278,36 @@ HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPE
     return mock_query(child, riid, out);
 }
 
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+// PC ID3D12Device10::CreateCommittedResource3 (PC slot 76) for slot 133's Device10 path: ten words after `this`.
+struct Committed3Call {
+    unsigned calls;
+    D3D12_HEAP_PROPERTIES heap;
+    D3D12_RESOURCE_DESC1 desc;
+    std::uint32_t layout;
+    const D3D12_CLEAR_VALUE* clear;
+    const void* session;
+    UINT castable_count;
+    const IID* riid;
+};
+Committed3Call g_committed3_133{};
+
+HRESULT WINAPI mock_committed_resource3_for_133(Mock* self, const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS,
+                                                const D3D12_RESOURCE_DESC1* desc, std::uint32_t layout,
+                                                const D3D12_CLEAR_VALUE* clear, const void* session,
+                                                UINT castable_count, const DXGI_FORMAT*, const IID* riid, void** out) {
+    ++g_committed3_133.calls;
+    if (heap) g_committed3_133.heap = *heap;
+    if (desc) g_committed3_133.desc = *desc;
+    g_committed3_133.layout = layout;
+    g_committed3_133.clear = clear;
+    g_committed3_133.session = session;
+    g_committed3_133.castable_count = castable_count;
+    g_committed3_133.riid = riid;
+    return mock_create(self, Kind::resource, reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out));
+}
+#endif
+
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
@@ -289,6 +319,9 @@ void** mock_vtable() {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
         table[27] = reinterpret_cast<void*>(&mock_create_committed_resource);
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+        table[76] = reinterpret_cast<void*>(&mock_committed_resource3_for_133);
+#endif
         return true;
     }();
     (void)filled;
@@ -744,8 +777,9 @@ int check_placed_resource_x() {
     constexpr std::uint64_t kVa = 0x7f0000000000ull;  // any address: the stand-in does not touch it
     constexpr auto kXboxFlag = static_cast<D3D12_RESOURCE_FLAGS>(0x20000);  // a bit above every PC flag
 
-    // A buffer with an Xbox flag bit, a non-PC layout word and the all-ones state: PC flags only, ROW_MAJOR, COMMON,
-    // no clear value, DEFAULT heap, and the caller's IID.
+    // The fourth word is a D3D12_BARRIER_LAYOUT. On this device (no ID3D12Device10) it becomes the legacy state.
+    // A buffer with an Xbox flag bit, a non-PC layout word and the all-ones layout (UNDEFINED): PC flags only,
+    // ROW_MAJOR, COMMON, no clear value, DEFAULT heap, and the caller's IID.
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     buffer.Width = 1 << 20;
@@ -768,23 +802,28 @@ int check_placed_resource_x() {
     EXPECT(g_committed.riid == &kResourceIid);
     EXPECT(release(resource) == 0);
 
-    // A render-target texture in a PC state keeps the state and its clear value; the layout becomes UNKNOWN.
+    // A render-target texture in the RENDER_TARGET layout (2) gets that state and its clear value; the texture layout
+    // becomes UNKNOWN.
     D3D12_RESOURCE_DESC target = buffer;
     target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     target.Width = 64;
     target.Height = 32;
     target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag);
-    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), D3D12_RESOURCE_STATE_RENDER_TARGET, word(&clear),
-                      word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 2, word(&clear), word(&kResourceIid), word(&resource))) == S_OK);
     EXPECT(mock->calls[27] == 2 && g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
     EXPECT(g_committed.state == D3D12_RESOURCE_STATE_RENDER_TARGET && g_committed.clear == &clear);
     EXPECT(release(resource) == 0);
-    // The same texture in the all-ones state is created in COMMON.
+    // The same texture in the all-ones layout (UNDEFINED) is created in COMMON.
     EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 0xFFFFFFFFu, 0, word(&kResourceIid), word(&resource))) ==
            S_OK);
     EXPECT(mock->calls[27] == 3 && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
+    EXPECT(release(resource) == 0);
+    // The SHADER_RESOURCE layout (6), which the title passes for its 1x1 targets, is the shader-resource states, not
+    // INDEX_BUFFER | RENDER_TARGET.
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 6, 0, word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(mock->calls[27] == 4 && g_committed.state == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     EXPECT(release(resource) == 0);
 
     // Refusals before the device is called; the output is cleared.
@@ -794,18 +833,40 @@ int check_placed_resource_x() {
     resource = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, 0, word(&resource))) == E_POINTER && !resource);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), 0)) == E_POINTER);
-    EXPECT(mock->calls[27] == 3);
+    EXPECT(mock->calls[27] == 4);
 
     // A failed creation is returned as it is, with no object.
     mock->create_result = E_OUTOFMEMORY;
     resource = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), word(&resource))) ==
            E_OUTOFMEMORY);
-    EXPECT(!resource && mock->calls[27] == 4);
+    EXPECT(!resource && mock->calls[27] == 5);
     mock->create_result = S_OK;
 
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: device slot 133 places a resource as a committed DEFAULT one (PC flags, COMMON for all-ones, "
+
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    // A PC device with ID3D12Device10: CreateCommittedResource3 with the layout as given, never CreateCommittedResource.
+    Mock* mock10 = nullptr;
+    void* device10 = make_device(mock10, 10, true);
+    EXPECT(device10);
+    g_committed3_133 = {};
+    EXPECT(hr_of(raw6(device10, 133, kVa, word(&target), 6, word(&clear), word(&kResourceIid), word(&resource))) ==
+           S_OK);
+    EXPECT(resource && g_committed3_133.calls == 1 && mock10->calls[27] == 0);
+    EXPECT(g_committed3_133.layout == 6 && g_committed3_133.clear == &clear && !g_committed3_133.session &&
+           g_committed3_133.castable_count == 0 && g_committed3_133.riid == &kResourceIid);
+    EXPECT(g_committed3_133.heap.Type == D3D12_HEAP_TYPE_DEFAULT);
+    EXPECT(g_committed3_133.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET &&
+           g_committed3_133.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN && g_committed3_133.desc.Width == 64);
+    EXPECT(release(resource) == 0);
+    // A buffer goes in UNDEFINED whatever word it came with.
+    EXPECT(hr_of(raw6(device10, 133, kVa, word(&buffer), 2, 0, word(&kResourceIid), word(&resource))) == S_OK);
+    EXPECT(g_committed3_133.calls == 2 && g_committed3_133.layout == 0xFFFFFFFFu && !g_committed3_133.clear);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(device10) == 0 && mock10->refs == 0);
+#endif
+    std::printf("%s: device slot 133 places a resource as a committed DEFAULT one (PC flags, its barrier layout, "
                 "clear value for targets only), past a 76-slot device\n", g_label);
     return 0;
 }

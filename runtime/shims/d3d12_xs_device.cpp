@@ -1487,12 +1487,31 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
 // Device slot 133 places a resource at a virtual address: (va, desc, initial_state, clear_value, riid, out), the
 // shape of the console's CreatePlacedResourceX. Measured locally at a title's call sites: riid is ID3D12Resource, va is
 // the start of a range the title has just reserved for physical pages, desc is a 56-byte D3D12_RESOURCE_DESC with
-// Xbox bits in Flags above the PC flags, and initial_state is all ones, which is no PC state. The PC has no call that
-// puts a resource at a caller's address, so this creates a committed DEFAULT-heap resource from the cleaned
-// description: the PC flags only, slot 76's layout rule, COMMON for a buffer or an all-ones state, and the clear value
-// only for a render target or depth texture. The resource is not backed by the memory at va: what the title writes
-// there does not reach it. Backing it needs the physical-page mapper; until then this gets the title past the call.
+// Xbox bits in Flags above the PC flags. The fourth word is a D3D12_BARRIER_LAYOUT, not a resource state: the title
+// passes all ones (D3D12_BARRIER_LAYOUT_UNDEFINED) for its first buffer and 6 (SHADER_RESOURCE) for 1x1 render-target
+// and depth textures, which read as a state would be INDEX_BUFFER | RENDER_TARGET (refused for a texture). The PC has
+// no call that puts a resource at a caller's address, so this creates a committed DEFAULT-heap resource from the
+// cleaned description (the PC flags only, slot 76's layout rule, the clear value only for a render target or depth
+// texture): through ID3D12Device10::CreateCommittedResource3 with the layout as given (UNDEFINED for a buffer), or on
+// an older PC device through CreateCommittedResource with the legacy state of that layout (COMMON for UNDEFINED and
+// for layouts without one). The resource is not backed by the memory at va: what the title writes there does not reach
+// it. Backing it needs the physical-page mapper; until then this gets the title past the call.
 constexpr std::uint32_t kPcResourceFlags = 0x3FF;  // D3D12_RESOURCE_FLAG_* up to USE_TIGHT_ALIGNMENT (0x200)
+constexpr unsigned kPcCreateCommittedResource3Slot = 76;  // ID3D12Device10's CreateCommittedResource3
+
+D3D12_RESOURCE_STATES legacy_state_for_layout(std::uint32_t layout, bool buffer) {
+    if (buffer) return D3D12_RESOURCE_STATE_COMMON;
+    switch (layout) {
+        case 2: return D3D12_RESOURCE_STATE_RENDER_TARGET;     // D3D12_BARRIER_LAYOUT_RENDER_TARGET
+        case 3: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;  // UNORDERED_ACCESS
+        case 4: return D3D12_RESOURCE_STATE_DEPTH_WRITE;       // DEPTH_STENCIL_WRITE
+        case 5: return D3D12_RESOURCE_STATE_DEPTH_READ;        // DEPTH_STENCIL_READ
+        case 6: return D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;  // SHADER_RESOURCE
+        case 7: return D3D12_RESOURCE_STATE_COPY_SOURCE;       // COPY_SOURCE
+        case 8: return D3D12_RESOURCE_STATE_COPY_DEST;         // COPY_DEST
+        default: return D3D12_RESOURCE_STATE_COMMON;           // UNDEFINED, COMMON and the rest
+    }
+}
 
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
                                        std::uint32_t initial_state, const D3D12_CLEAR_VALUE* clear_value,
@@ -1507,23 +1526,40 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    const auto state = (buffer || initial_state == 0xFFFFFFFFu) ? D3D12_RESOURCE_STATE_COMMON
-                                                                 : static_cast<D3D12_RESOURCE_STATES>(initial_state);
     const bool clearable =
         !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
 
     static std::atomic<bool> logged{false};
     if (first_call(logged))
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 133 places a resource at a VA: dimension=%d flags=0x%x -> 0x%x, state=0x%x; "
+                     "[rt] d3d12_xs: slot 133 places a resource at a VA: dimension=%d flags=0x%x -> 0x%x, layout=0x%x; "
                      "created committed, not backed by the VA\n",
                      static_cast<int>(pc_desc.Dimension), xbox_flags, static_cast<unsigned>(pc_desc.Flags),
                      initial_state);
     (void)va;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
-    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, state,
-                                               clearable ? clear_value : nullptr, *riid, out);
+    const D3D12_CLEAR_VALUE* const clear = clearable ? clear_value : nullptr;
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    void* device10 = nullptr;
+    if (self->slot_count > kPcCreateCommittedResource3Slot &&
+        SUCCEEDED(self->real->QueryInterface(__uuidof(ID3D12Device10), &device10)) && device10) {
+        D3D12_RESOURCE_DESC1 desc1{};
+        std::memcpy(&desc1, &pc_desc, sizeof(pc_desc));  // DESC1 is DESC plus SamplerFeedbackMipRegion (zero)
+        const std::uint32_t layout = buffer ? 0xFFFFFFFFu : initial_state;  // a buffer is created UNDEFINED
+        using Fn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC1*,
+                                    std::uint32_t, const D3D12_CLEAR_VALUE*, void*, UINT, const DXGI_FORMAT*,
+                                    const IID*, void**);
+        const auto create =
+            reinterpret_cast<Fn>((*reinterpret_cast<void***>(device10))[kPcCreateCommittedResource3Slot]);
+        const HRESULT hr = create(device10, &heap, D3D12_HEAP_FLAG_NONE, &desc1, layout, clear, nullptr, 0, nullptr,
+                                  riid, out);
+        static_cast<IUnknown*>(device10)->Release();
+        return hr;
+    }
+#endif
+    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc,
+                                               legacy_state_for_layout(initial_state, buffer), clear, *riid, out);
 }
 
 template <unsigned Slot>
