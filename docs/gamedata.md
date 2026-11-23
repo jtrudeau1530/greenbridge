@@ -1204,6 +1204,46 @@ Four representative roots in the world/navigation/map category (826,397 B across
   `CAIConditionGatorPit` [36], `CAIConditionAmbientEventDirection` [5], `CAIConditionOr` [1], `CAIConditionAnd` [1]).
   All **18 of 18** non-empty transition target `<Node>` references resolve to one of the 20 `CHazardNode` keys.
 
+## Door interaction, ped loadouts, climbing, lasso and AI rule schemas
+
+Fourteen previously undocumented well-formed `common.rpf` documents span **1,682,656 inflated bytes** across **32**
+streams. Counts, schemas, `type` classes and internal/cross-document key resolutions only; no entry names or values:
+
+### `CDoorInteractionDataList` (404,957 B, 7 streams, 5,831 elements)
+
+Fourteen top-level keyed sections (all 14 named across the reference paths and target sections below; `372` `key=` attributes, `979` `type=` attributes across `31` classes, `44` `content="matrix34"` transforms, `133` vectors, `791` `value=` scalars) form a self-contained internal lookup graph:
+
+| Section / reference path | Count | Resolves to / notes |
+|---|---:|---|
+| `DoorTypeToDataSetCollectionsMapping` / `List/Item` | 7 / 80 | `CDoorAssetList`; **80 of 80** resolve to `DataSetCollections` (`18` distinct) |
+| `DataSetCollections` / `List/Item` | 21 / 60 | `CDoorAssetList`; **60 of 60** resolve to `DoorInteractionDataSets` (`56` of `56` sets) |
+| `DoorInteractionDataSets` (`key=`, `type="CDoorInteractionDataSet"`) | 56 | `40` carry `parentPath`, all **40 of 40** resolving via `../Item[@key='...']` (`gamedata_graph.md`); `DoorType` (**20 of 20** → `DoorTypeToDataSetCollectionsMapping`), `OverlayDataSet` (**9 of 9** → `DoorInteractionAnimOverlayDataSets`), `PedHeadingData` (**11 of 11** non-empty → `DoorInteractionHeadingDatas`), `Interactions/Item` (**93 of 93** → `DoorInteractionDatas`), `PostAlignInteractions/Item` (**11 of 11** → `DoorInteractionPostAlignDatas`) |
+| `DoorInteractionDatas` (`91`) & `DoorInteractionPostAlignDatas` (`11`) | 102 | `DoorType` (**91 of 91** on interactions), `BreakoutData` (**91 of 91** + **11 of 11** → `DoorInteractionBreakoutDatas` [`6`]), `UpperbodyRequestData` (**91 of 91** + **11 of 11** → `DoorInteractionUpperbodyPoseDatas` [`8`]), `MTHWeightData` (**73 of 73** non-empty → `DoorInteractionMTHDatas` [`3`]), `InterruptToIdleBlendout` (**7 of 7** → `DoorInteractionBodyBlendOutDatas` [`1`]), `PedHeadingData` (**11 of 11** on interactions; **73 of 73** non-empty across all `.//PedHeadingData` → `DoorInteractionHeadingDatas` [`5`]), `AnimData/UpperbodyBodyBlendFilterTemplateOrSelector` (**4 of 4** → `HashSelectors` [`1`]) |
+| `DoorInteractionAnimOverlayDataSets` (`1`) & `DoorInteractionAnimOverlayDatas` (`8`) | 9 | `OverlayDatas/Item`: **8 of 8** resolve to `DoorInteractionAnimOverlayDatas` |
+| `DoorInteractionUpperbodyPoseDatas` (`8`) & `UpperbodyPoseRequiredBlackboardVariables` (`4`) | 12 | `WeaponData1H/DesiredPose` (**8 of 8**) and `WeaponData2H/DesiredPose` (**8 of 8**) resolve to `UpperbodyPoseRequiredBlackboardVariables` |
+
+### Ped loadouts, task tuning, headbob, speeds, motivation and motion prediction
+
+| Root | Inflated B (streams) | Measured schema and key resolution |
+|---|---:|---|
+| `CPedInventoryLoadOutManager` | 411,101 (7) | `8,103` elements, `5` `type` classes (`1,692` nested `Items/Item` across the document): `LoadOuts/Item` × `569` (`Name`, `Items`, holding `1,013` direct items: `601` `CLoadOutWeapon`, `302` `CLoadOutRef`, `110` `CLoadOutRandom`) and `NamedLoadoutItems/Item` × `191` (`key=`: `136` `CLoadOutRandom`, `45` `CLoadOutWeapon`, `10` `CLoadOutRef`). `DefaultLoadout` resolves **1 of 1** to `LoadOuts`, and **521 of 521** `CLoadOutRef/Name` elements (`184` distinct) resolve case-insensitively to `NamedLoadoutItems` (`518 of 521` / `185` distinct under exact case); `CLoadOutWeapon` carries `551` `WeaponRecipe` and `546` `WeaponPreset` (`231` distinct) fields |
+| `CTaskDataInfoManager` | 192,988 (3) | `3,532` elements (`2,990` `value=`): `aTaskData/Item` × `49` (`type="CTaskDataInfo"`, `27` distinct child fields) and `DefaultSet ref` (**1 of 1** → `aTaskData`). In `FleeStyleSets/{Base,InVehicle,OnMount}`, **47 of 49** entries each (`41` of `42` distinct) resolve case-insensitively to `aTaskData` (`16 of 49` / `13 of 42` under exact case) |
+| `STPedNavigationPredictiontPresetContainer` | 92,999 (2) | `1,648` elements (`1,597` `value=`; preserves `Predictiont` spelling): `mapPredictionPresets/Item` × `14` (`key=`), holding `21` `arPredictionSetConfigs/Item` blocks (`1..8` per preset, `71..75` fields each, `81` distinct field names across the 21 blocks covering collision, capsule, drops, step-ups, walls, cover shadows, corners, slope and climb flags) |
+| `STPedMotionPredictionSetContainer` | 50,327 (1) | `898` elements (`864` `value=`): `mapPredictionPresets/Item` × `10` (`key=`), holding `12` `arPredictionSets/Item` blocks (`1..3` per preset, `67` fields each from the same prediction-flag schema) |
+| `CPedHeadbobSettingsManager` → `CHeadbobConditionManager` | 88,190 (2) + 16,610 (1) | `CPedHeadbobSettingsManager` (`1,347` elements) defines `OnFootSettings` (`12` `IntensitySettingsMap/Item`, `6` `BodyBlendSettingsMap/Item`) and `InTransportSettings` (`12` and `0`) across `CPedHeadbobSettings` (`2`), `CPedHeadbobIntensitySettings` (`24`) and `CPedHeadbobBodyBlendSettings` (`6`). All **84 of 84** `pCondition ref` links (`15` distinct) resolve **across documents** to `CHeadbobConditionManager/Conditions/Item/@key` (`18` `CHeadbobCondition` entries built from `CAICondition*` condition trees) |
+| `CPedSpeedDataBlock` | 86,390 (2) | `2,248` elements (`1,455` `value=`, `0` `type=`): `Data/Item` × `16` (distinct `Name` entries, each with `WanderSpeeds`, `Default`, `Combat`, `Flee` over `{Walk,Jog,Run,Sprint}{Min,Max}` plus `QuadBike`, `EScooter`, `MobScooter`, `Caddy` × `16` and `Bike` × `15`, and `1` `ItemSpeeds/Item`) plus `DefaultItemSpeeds/Item` × `1` |
+| `CPedMotivationInfoManager` | 32,388 (1) | `872` elements (`499` `value=`): `EventMotivationImpactProfiles/Item` × `7` (`key=`, `35` `EventTypes/Item` across `5` keys, `51` `MotivationImpacts/Item` pairs `{Motivation, ImpactParams}`), `PedMotivationDefinitions/Item` × `14`, and `aFearResponseProfiles/Item` × `4`; `DefaultFearProfileName` resolves **1 of 1** to `aFearResponseProfiles` |
+
+### Lasso, climbing, animal attack behaviours, relationships and AI search POIs
+
+| Root | Inflated B (streams) | Measured schema and key resolution |
+|---|---:|---|
+| `CLassoDataManager` | 126,639 (2) | `2,718` elements across `11` top-level sections (`99` `key=`, `692` `value=`, `380` 3D vectors with `7` `w`): `LassoHogtieFlagSets/Item` (`8`, referenced **24 of 24** by `ModelToLassoHogtieFlagsKey` plus all **3** default flag fields), `EntityLassoAttachInfo/Item` (`18`, referenced **26 of 26** by `ModelNameToEntityLassoAttachInfo` plus `DefaultHumanEnityLassoAttachInfo` and `DefaultHorseEnityLassoAttachInfo` [`Enity` preserved in XML]), and `LassoAttachments/Item` (`23`, referenced **18 of 18** by `DefaultAttachment` and **20 of 20** by `Attachments/Item`), plus `LassoWeaponLoopBoneTags/Item` × `15` |
+| `CAnimalAttackBehaviours` | 55,388 (1) | `877` elements (`378` `type=`): `Behaviours/Item` × `6` (`type="CAnimalAttackBehaviour"`, `{Name, AnimalTuning, Task, Triggers}`) holding `64` `CAnimalAttackTrigger` entries, `58` gated by `CAICondition*` boolean trees (`308` nodes across `32` condition classes, led by `CAIConditionAnd` [`53`], `CAIConditionNot` [`31`], `CAIConditionDistanceBetweenEntities` [`21`]) |
+| `CClimbTuneMgr` | 54,137 (1) | `1,102` elements across `12` top-level sections (`TraversalData`, `LandData`, `PlayerClimbData` [20 scalars], `PlayerStepUpData` [15 scalars], `PlayerLedgeGrabData` [16 entries], `PlayerJumpData` [11 entries], `AnimalJumpData` [11 scalars], `InputControlData` [4 scalars], `aClimbParams/Item` × `2` [`CClimbParams`], `aDropdownDetectorParams/Item` × `2` [`CDropDownDetectorParams`, with `matOverride` `content="matrix34"`]); `DefaultClimbParams ref` and `DefaultDropDownParams ref` resolve **1 of 1** each |
+| `Relationships__GroupsData` | 35,555 (1) | `554` elements: `Groups/Item` × `64` (`key=`) containing `423` `Relationships/Item` entries across `4` relationship-level text values (`62` distinct targets); all **423 of 423** resolve internally to `Groups/Item/@key` |
+| `CSearchPointOfInterestRuleSet` | 34,987 (1) | `684` elements (`47` `CAICondition*` nodes across `14` classes): `PointOfInterestDefinitions/PointOfInterest` × `12` (`key=`) and `SearchSituations/Situation` × `13` (`key=`). All **112 of 112** `AllowedPointsOfInterest/Type/@key` (`12` of `12` POIs) resolve to `PointOfInterestDefinitions`, and all **7 of 7** non-empty `NextSituation` links (`6` distinct) resolve to `SearchSituations` |
+
 ## No-sharing rule
 
 The archive, every carved `.bin`, `index.json` (its `head`/`pre` fields contain payload bytes), XML
