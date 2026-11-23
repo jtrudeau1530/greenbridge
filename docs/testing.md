@@ -196,11 +196,44 @@ runtime/build/windows` takes a folder made by hand like a Windows build). CMake 
 looked up only inside the SDK folder, so a Windows SDL3 for the GameInput shim is passed as `-DSDL3_DIR=<its
 cmake folder>` (`CMAKE_PREFIX_PATH` is not searched here).
 
-For Proton, start any program once with `proton run` (with `STEAM_COMPAT_DATA_PATH` and
-`STEAM_COMPAT_CLIENT_INSTALL_PATH` set), so that it puts vkd3d-proton and DXVK into the prefix, then configure with
-`-DCMAKE_CROSSCOMPILING_EMULATOR="<Proton>/files/bin/wine"` and run `ctest` with
-`WINEPREFIX=$STEAM_COMPAT_DATA_PATH/pfx WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n"`. `proton run` itself doesn't
-pass the program's output on, so the tests can't run through it.
+### Proton's wine
+
+Proton's wine runs the suite against the D3D12 a Proton game gets: the prefix's vkd3d-proton and DXVK. Start any
+program once with `proton run` so that it lays down the prefix libraries; the `STEAM_COMPAT_DATA_PATH` folder has to
+exist first, because Proton opens `<data>/pfx.lock` in it:
+
+```sh
+mkdir -p ~/.local/share/leonida-proton
+STEAM_COMPAT_DATA_PATH="$HOME/.local/share/leonida-proton" \
+STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam" \
+  "$HOME/.local/share/Steam/steamapps/common/Proton 11.0/proton" run cmd /c exit 0
+cmake -S runtime -B runtime/build/proton --toolchain "$PWD/runtime/cmake/clang-cl-xwin.cmake" \
+      -DXWIN_DIR="$HOME/.local/share/xwin-sdk" \
+      -DCMAKE_CROSSCOMPILING_EMULATOR="$HOME/.local/share/Steam/steamapps/common/Proton 11.0/files/bin/wine"
+cmake --build runtime/build/proton --parallel 2
+WINEPREFIX="$HOME/.local/share/leonida-proton/pfx" WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n" \
+      WINEDEBUG=-all ctest --test-dir runtime/build/proton
+```
+
+`proton run` itself doesn't pass the program's output on, so the tests can't run through it. `WINEPREFIX` must be
+the prefix the emulator made: a prefix from another wine version fails every test with "wine client error: version
+mismatch". The tests need a real display here as well.
+
+Measured on 2026-11-23 with Proton 11.0 (wine-11.0, vkd3d-proton 3.0) on an RX 7600 XT (radv): 155 tests
+registered, 154 run, 127 passed, 20 skipped, one disabled and seven failed. The skips are the usual ones (game data,
+`LEONIDA_FIRST_LIGHT_DIR`, no independent Vulkan queue for `d3d12_queue_wait`, and so on). All seven failures are in
+the comparisons with the host D3D12, which is vkd3d-proton here:
+
+- `d3d12_fence_timing`, `d3d12_private_data`, `d3d12_sampler2` and `d3d12_subresource_copy` disagree with
+  vkd3d-proton on a return value or a field it writes (`GetCustomHeapProperties` of a custom heap type,
+  `SetName(nullptr)`, unknown sampler flags, CPU-copy boxes).
+- `d3d12_r9g9b9e5_uav` compares a clear with WARP, and Proton's dxgi answers `EnumWarpAdapter` with the first
+  hardware adapter ("WARP not supported"), so the compared value is the hardware's.
+- `d3d12_compute` and `d3d12_method_variants` crash with an access violation inside `d3d12core.dll` on their
+  null-argument checks, not on device creation: `GetCachedBlob(nullptr)` and `CreateCommandQueue1(nullptr, ...)`
+  are not validated by vkd3d-proton (filed upstream as vkd3d-proton issues 3512 and 3513; Wine's builtin d3d12
+  crashes on the queue one too). `d3d12_compute` passes with only `WINEDLLOVERRIDES="dxgi=n"`, where the host is
+  Wine's own d3d12 and the comparison skips.
 
 The host's D3D12 here is Wine's vkd3d or vkd3d-proton, not Microsoft's runtime, and Proton's `EnumWarpAdapter`
 returns the hardware adapter, so "WARP" is vkd3d-proton on the GPU. Most tests that compare with the host or WARP
