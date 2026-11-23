@@ -42,6 +42,7 @@ method, scope and caveats. No game data is included.
 | [story.md](story.md) | `story000.rpf` 18.65 GiB mixed: 264 Bink 2 streams / 3.33 GB, 225,281 `RSC8` headers, 442 nested RPF9; `story000_script` PSIN, `shared_minigame` mixed content. |
 | [restofworld.md](restofworld.md) | Six rest-of-world/script archives, 1.57 GB total: `core_restofworld` 1.21 GB (11 Bink 2, 37 models, 958 graphics pages), `story000_script` PSIN, small `appdata0`/licences. |
 | [movies.md](movies.md) | Bink 2 streams and audio tracks; decode through the real loader and `Bink2Scarlett.dll`; stream names from the mount lists. |
+| [pso_cache.md](pso_cache.md) | The PSO/shader cache: 0x80 header, 25,471 graphics and 2,693 compute records, two 8-byte index tables, meta chunk types 0x41/0x42/0x43 and 26,092 `s_endpgm`; `tools/psocache_extract.py` carves it, `tools/psocache_inspect.py --meta` decodes the chunks and `tools/psocache_usersig.py` maps the graphics user data to root parameters. |
 
 ## Audio
 
