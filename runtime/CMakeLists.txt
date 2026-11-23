@@ -940,6 +940,21 @@ if(BUILD_TESTING)
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
 
+    # TLS-slot-0 safety for library_loader.cpp and d3d12_trace.h: exercises first-use and concurrent calls while
+    # TEB->ThreadLocalStoragePointer[0] points to a zeroed scratch page (simulating a mapped guest owning slot 0).
+    add_executable(library_loader_tls_safe_test
+      test/library_loader_tls_safe_test.cpp
+      shims/library_loader.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(library_loader_tls_safe_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(library_loader_tls_safe_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(library_loader_tls_safe_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(library_loader_tls_safe_test PRIVATE /OPT:NOREF)
+    add_test(NAME library_loader_tls_safe COMMAND library_loader_tls_safe_test)
+
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
     # the machine to run (the test skips with 77 only when Windows cannot load GameInput.dll). No game files.
