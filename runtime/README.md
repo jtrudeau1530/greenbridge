@@ -298,6 +298,10 @@ does not carry). The next `--stages shaders` run translates whatever it finds th
 carve uses - `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` - and adds the module to the library, so the run
 gets past that pipeline.
 
+A compute program that is a bare FSPX payload (the slot-67 form) is reported, not captured: the step translates
+FSSM programs, and an FSPX payload written out as a `.dxbc` is not something `fssm_unpack.py` can read. Carrying its
+kind-0 state and translating it is a separate piece of work.
+
 Off by default (`src/shader_capture.h`, tested by `shader_capture_test`). The captures are game data: keep the folder
 in your work directory, never in the repository, and never attach one to an issue or a pull request
 (`CONTRIBUTING.md`). A program already in the library is skipped, so the step costs nothing once a tree has caught up.

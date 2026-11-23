@@ -25,6 +25,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <windows.h>
 
 namespace leonida {
@@ -44,20 +45,23 @@ inline std::filesystem::path shader_capture_directory() {
 }
 
 // Writes `container` for the program whose SHA-256 is `program_sha256`, with its stage, when the switch is on.
-// Returns true when the container is on disk (written now or by an earlier call), false when nothing was written.
-// Never throws: the D3D12 shim runs inside the title, and a capture that fails must not turn into an exception.
+// Returns true when the container is on disk (written now or by an earlier call to the same folder), false when
+// nothing was written. Never throws: the D3D12 shim runs inside the title, and a capture that fails must not turn
+// into an exception.
 inline bool capture_unresolved_shader(std::span<const std::uint8_t> container, std::string_view stage,
                                       const std::string& program_sha256) {
-    const std::filesystem::path& dir = shader_capture_directory();
+    const std::filesystem::path dir = shader_capture_directory();
     if (dir.empty() || container.empty() || program_sha256.empty()) return false;
-    // One file per program per run: the same container comes back for every pipeline that uses it.
+    // One file per program per folder per run: the same container comes back for every pipeline that uses it. A
+    // program is remembered only once both files are on disk, and the folder is part of the key, so a failed write
+    // is retried by the next call and a capture redirected to another folder is written there too.
     static std::mutex mutex;
-    static std::set<std::string> seen;
-    {
-        const std::lock_guard lock(mutex);
-        if (!seen.insert(program_sha256).second) return true;
-    }
+    static std::set<std::pair<std::filesystem::path, std::string>> written;
     try {
+        {
+            const std::lock_guard lock(mutex);
+            if (written.contains({dir, program_sha256})) return true;
+        }
         std::error_code error;
         std::filesystem::create_directories(dir, error);
         if (!std::filesystem::is_directory(dir, error)) return false;
@@ -75,6 +79,10 @@ inline bool capture_unresolved_shader(std::span<const std::uint8_t> container, s
             if (!out) return false;
             out << "{\"stage\":\"" << std::string(stage) << "\"}\n";
             if (!out) return false;
+        }
+        {
+            const std::lock_guard lock(mutex);
+            written.insert({dir, program_sha256});
         }
         std::fprintf(stderr,
                      "[rt] d3d12: captured the unresolved %s container as %s (game data: keep this folder local)\n",

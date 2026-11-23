@@ -101,7 +101,7 @@ class CapturedShadersTest(unittest.TestCase):
         library = self.library_now()
         self.assertIn("existing_shader", library, "the library's own entries survive")
         added = [name for name in library if name.startswith("captured_")]
-        self.assertEqual(added, ["captured_" + digest[:8]])
+        self.assertEqual(added, ["captured_" + digest[:16]])
         self.assertEqual(library[added[0]]["stage"], "cs")
         self.assertTrue((self.spirv / (added[0] + ".spv")).is_file(), "the module is copied beside the index")
         self.assertFalse((self.work / "shaders" / "captured_work").exists(), "the staging folder is removed")
@@ -136,14 +136,30 @@ class CapturedShadersTest(unittest.TestCase):
         self.assertIsNotNone(staging_index, "fssm_unpack.py ran on the staging folder")
         # The stub rewrote nothing: captured_shaders() wrote the index the translator reads, and the merged entry
         # carries that same stage.
-        self.assertEqual(self.library_now()["captured_" + digest[:8]]["stage"], "ps")
+        self.assertEqual(self.library_now()["captured_" + digest[:16]]["stage"], "ps")
+
+    def test_two_captures_sharing_a_prefix_both_land(self):
+        """A capture's name comes from its file name, so two that agree on their first 8 characters must not collide.
+
+        The runtime names captures after their program, so this is a hand-renamed pair rather than something it
+        writes; the step still has to keep both.
+        """
+        self.caught.mkdir(parents=True, exist_ok=True)
+        first, second = "abcdef01" + "1" * 11 + "x", "abcdef01" + "2" * 11 + "y"
+        for stem, body, stage in ((first, CONTAINER + b"one", "vs"), (second, CONTAINER + b"two", "cs")):
+            (self.caught / (stem + ".dxbc")).write_bytes(body)
+            (self.caught / (stem + ".json")).write_text(json.dumps({"stage": stage}), encoding="utf-8")
+        self.run_step()
+        added = sorted(n for n in self.library_now() if n.startswith("captured_"))
+        self.assertEqual(added, sorted(["captured_" + first[:16], "captured_" + second[:16]]),
+                         "both captures land, and neither overwrites the other's staging file")
 
     def test_two_captures_both_land(self):
         one = self.write_capture("f" * 64, stage="vs")
         two = self.write_capture("1" * 64, stage="cs")
         self.run_step()
         added = sorted(n for n in self.library_now() if n.startswith("captured_"))
-        self.assertEqual(added, sorted(["captured_" + one[:8], "captured_" + two[:8]]))
+        self.assertEqual(added, sorted(["captured_" + one[:16], "captured_" + two[:16]]))
 
 
 if __name__ == "__main__":

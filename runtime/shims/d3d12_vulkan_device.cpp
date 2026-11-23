@@ -3798,12 +3798,14 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                              fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                              leonida::sha256_hex(program.bytes).c_str());
-            // A missing translation is capturable; an ambiguous FSPX program is a choice the layer cannot
-            // make.
-            if (!ambiguous)
+            // Only an FSSM program has a translation path in the build step: a bare FSPX payload from slot 67
+            // would be written as a .dxbc the step cannot unpack, so it is reported instead of captured.
+            if (!ambiguous && program.kind == leonida::ComputeProgram::Kind::fssm)
                 leonida::capture_unresolved_shader(
                     {static_cast<const std::uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength},
                     "cs", leonida::sha256_hex(program.bytes));
+            else if (!ambiguous)
+                log_once("an FSPX program is not capturable yet: the build step translates FSSM only", 0);
             return E_INVALIDARG;
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose

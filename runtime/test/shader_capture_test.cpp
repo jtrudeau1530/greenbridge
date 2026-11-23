@@ -86,6 +86,31 @@ int main() {
     check(!leonida::capture_unresolved_shader(container, "cs", ""), "a program without a hash writes nothing");
     check(!std::filesystem::exists(dir / (std::string(kOtherHash) + "0.dxbc")), "no file for either refusal");
 
+    // A failed write must not be remembered: point the switch at a path that cannot be a folder, then at a good one.
+    const std::filesystem::path blocked = dir / "a-file-where-the-folder-goes";
+    {
+        std::ofstream out(blocked, std::ios::binary);
+        out << "x";
+    }
+    const std::string third = std::string(kHash) + "2";
+    ::SetEnvironmentVariableW(L"LEONIDA_SHADER_CAPTURE", blocked.wstring().c_str());
+    check(!leonida::capture_unresolved_shader(container, "cs", third),
+          "a folder that cannot be created reports no capture");
+    ::SetEnvironmentVariableW(L"LEONIDA_SHADER_CAPTURE", dir.wstring().c_str());
+    check(leonida::capture_unresolved_shader(container, "cs", third),
+          "the same program is written once the folder works: a failed write is not remembered");
+
+    // The folder is part of what was written: redirecting the switch writes the same program again, there.
+    const std::filesystem::path second_dir =
+        std::filesystem::temp_directory_path() / ("leonida_capture_b_" + std::to_string(::GetCurrentProcessId()));
+    std::filesystem::remove_all(second_dir, error);
+    ::SetEnvironmentVariableW(L"LEONIDA_SHADER_CAPTURE", second_dir.wstring().c_str());
+    check(leonida::capture_unresolved_shader(container, "cs", kHash),
+          "a second folder receives the same program");
+    check(read_bytes(second_dir / (std::string(kHash) + ".dxbc")) == container,
+          "and the file there is the container");
+    std::filesystem::remove_all(second_dir, error);
+
     // Off again in the same process: the read is not cached, so turning the switch off stops new captures.
     ::SetEnvironmentVariableW(L"LEONIDA_SHADER_CAPTURE", nullptr);
     check(!leonida::capture_unresolved_shader(container, "cs", std::string(kHash) + "1"),

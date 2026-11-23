@@ -1376,8 +1376,17 @@ def captured_shaders(work: str, jobs: "int | None" = None) -> None:
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging)
     entries = []
+    used = set()
     for path, stage in containers:
-        name = "captured_" + os.path.splitext(os.path.basename(path))[0][:8]
+        stem = os.path.splitext(os.path.basename(path))[0]
+        # 16 characters of the program's hash: a collision needs two programs agreeing on 64 bits, and the name is
+        # checked anyway so a hand-renamed capture cannot overwrite another one's staging file.
+        name = "captured_" + stem[:16]
+        suffix = 1
+        while name in used:
+            suffix += 1
+            name = f"captured_{stem[:16]}_{suffix}"
+        used.add(name)
         shutil.copyfile(path, os.path.join(staging, name + ".dxbc"))
         entries.append({"file": name + ".dxbc", "stage": stage})
 
