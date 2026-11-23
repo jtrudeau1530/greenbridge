@@ -1754,6 +1754,10 @@ public:
 
     bool ok() const { return ok_; }
 
+    // Entries kept between executions. Execute only uses the first lists.size(); a larger count is retained storage,
+    // not work the next submission will replay (vk_queue_test checks both halves of that contract).
+    std::size_t prepared_entries() const { return prepared_.size(); }
+
     template<typename GetHeap>
     bool update_tiles(ResourceId id, std::span<const TileRegion> regions,
                       std::span<const TileRange> ranges, GetHeap&& get_heap) {
@@ -2093,7 +2097,10 @@ private:
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
         auto& prepared = prepared_;
-        prepared.resize(lists.size());
+        // Keep the storage from a larger batch. resize() down would destroy the unused entries and their vectors, so
+        // a queue that sees 8 lists and then 1 in every frame would rebuild them on each execution. The loops below
+        // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
+        if (prepared.size() < lists.size()) prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
@@ -2229,7 +2236,8 @@ private:
         if (has_queries && !tracker_lock.owns_lock()) tracker_lock.lock();
         QueryReplay queries;
         std::uint32_t base = 0, statistics_base = 0;
-        for (auto& list : prepared) {
+        for (std::size_t i = 0; i < lists.size(); ++i) {
+            auto& list = prepared[i];
             const auto result = queries.plan(list, physical, base, can_resolve_occlusion, statistics, statistics_base);
             if (result != ReplayResult::success) return result;
             base += list.segment_count;
@@ -2349,7 +2357,8 @@ private:
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
-        for (const auto& list : prepared) {
+        for (std::size_t i = 0; i < lists.size(); ++i) {
+            const auto& list = prepared[i];
             emit(list, command_buffer, replay, &next_tracker, &open_labels);
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;

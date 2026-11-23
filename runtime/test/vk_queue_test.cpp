@@ -145,17 +145,19 @@ int main() {
 
     // Buffers: an upload source, a GPU-side destination and a readback, all host-visible for the test.
     void *upload_map = nullptr, *mid_map = nullptr, *readback_map = nullptr, *tex_readback_map = nullptr;
+    void* stale_src_map = nullptr;
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VkBuffer upload = d.buffer(kSize, usage, &upload_map);
     VkBuffer mid = d.buffer(kSize, usage, &mid_map);
     VkBuffer readback = d.buffer(kSize, usage, &readback_map);
     VkBuffer tex_readback = d.buffer(kTex * kTex * 4, usage, &tex_readback_map);
+    VkBuffer stale_src = d.buffer(kSize, usage, &stale_src_map);
     VkImage texture = d.image(VK_FORMAT_R8G8B8A8_UNORM, kTex, kTex, 1, VK_IMAGE_USAGE_SAMPLED_BIT);
-    EXPECT(upload && mid && readback && tex_readback && texture);
+    EXPECT(upload && mid && readback && tex_readback && stale_src && texture);
     auto* up = static_cast<std::uint8_t*>(upload_map);
     for (std::uint32_t i = 0; i < kSize; ++i) up[i] = pattern(i, 7);
 
-    const ResourceId upload_id = 1, mid_id = 2, readback_id = 3, tex_id = 4, tex_readback_id = 5;
+    const ResourceId upload_id = 1, mid_id = 2, readback_id = 3, tex_id = 4, tex_readback_id = 5, stale_src_id = 7;
     auto add_buffer = [&](ResourceId id, VkBuffer b, VkDeviceSize size) {
         ResourceBinding r;
         r.buffer = b;
@@ -166,6 +168,7 @@ int main() {
     add_buffer(mid_id, mid, kSize);
     add_buffer(readback_id, readback, kSize);
     add_buffer(tex_readback_id, tex_readback, kTex * kTex * 4);
+    add_buffer(stale_src_id, stale_src, kSize);
     ResourceBinding tex;
     tex.image = texture;
     tex.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -231,6 +234,40 @@ int main() {
     bad = 0;
     for (std::uint32_t i = 0; i < kSize; ++i) bad += rb[i] != pattern(i, 99);
     std::printf("direct -> compute: %u bad bytes\n", bad);
+    EXPECT(bad == 0);
+
+    // 3b. A smaller ExecuteCommandLists must keep the prepared storage but must not replay stale entries.
+    // Eight lists, each copying a non-overlapping chunk from a source that stays at 0xaa, grow prepared_ to eight.
+    // A one-list submission then copies only its own chunk from the upload source, now 0xbb. With resize() down and
+    // range-for over all entries, the seven stale copies run after that one and put 0xaa back into mid.
+    constexpr std::uint32_t kChunk = kSize / 8;
+    auto* old = static_cast<std::uint8_t*>(stale_src_map);
+    std::memset(old, 0xaa, kSize);
+    CommandList stale[8];
+    const CommandList* many[8];
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        EXPECT(stale[i].copy_buffer({mid_id, i * kChunk, stale_src_id, i * kChunk, kChunk}));
+        EXPECT(stale[i].close());
+        many[i] = &stale[i];
+    }
+    EXPECT(direct.execute(many) == ReplayResult::success);
+    EXPECT(direct.signal(fence.semaphore(), 10));
+    EXPECT(fence.wait(10, 5'000'000'000ull));
+    auto* md = static_cast<std::uint8_t*>(mid_map);
+    std::memset(md, 0, kSize);
+    for (std::uint32_t i = 0; i < kSize; ++i) up[i] = 0xbb;
+    CommandList final_copy;
+    EXPECT(final_copy.copy_buffer({mid_id, 7 * kChunk, upload_id, 7 * kChunk, kChunk}));
+    EXPECT(final_copy.close());
+    const CommandList* one[1] = {&final_copy};
+    EXPECT(direct.execute(one) == ReplayResult::success);
+    EXPECT(direct.signal(fence.semaphore(), 11));
+    EXPECT(fence.wait(11, 5'000'000'000ull));
+    EXPECT(direct.prepared_entries() == 8);
+    bad = 0;
+    for (std::uint32_t i = 0; i < kSize; ++i)
+        bad += md[i] != (i >= 7 * kChunk ? 0xbb : 0x00);
+    std::printf("prepared storage: %zu entries kept, %u stale bytes\n", direct.prepared_entries(), bad);
     EXPECT(bad == 0);
 
     // 4. A copy queue refuses a render-target clear and submits nothing.
