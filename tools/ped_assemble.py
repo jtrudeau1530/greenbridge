@@ -1065,6 +1065,10 @@ def part_to_dict(part: MeshPart) -> dict:
         }
         if part.material.alpha_cutoff is not None:
             mat["alpha_cutoff"] = part.material.alpha_cutoff
+        for slot in ("base_color_png", "normal_png", "metallic_roughness_png"):
+            payload = getattr(part.material, slot)
+            if payload is not None:
+                mat[slot] = "base64:" + base64.b64encode(payload).decode("ascii")
         out["material"] = mat
     return out
 
