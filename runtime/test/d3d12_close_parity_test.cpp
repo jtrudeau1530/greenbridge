@@ -365,11 +365,12 @@ std::vector<Case> cases() {
                e.list->OMSetRenderTargets(9, h, FALSE, nullptr))},
         {"OMSetRenderTargets(0, nullptr, depth)", true, match,
          CALLS(e.list->OMSetRenderTargets(0, nullptr, FALSE, &e.dsv))},
-        // Draws, dispatches and root arguments with nothing set
-        {"DrawInstanced(3) with nothing set", true, stricter, CALLS(e.list->DrawInstanced(3, 1, 0, 0))},
-        {"DrawInstanced(0) with nothing set", true, stricter, CALLS(e.list->DrawInstanced(0, 1, 0, 0))},
-        {"Dispatch(1, 1, 1) with nothing set", true, stricter, CALLS(e.list->Dispatch(1, 1, 1))},
-        {"Dispatch(0, 0, 0) with nothing set", true, stricter, CALLS(e.list->Dispatch(0, 0, 0))},
+        // Draws, dispatches and root arguments with nothing set. A draw or dispatch with no pipeline state bound is
+        // ignored by D3D12 without the debug layer, and the list closes and runs (record_draw/record_dispatch skip it).
+        {"DrawInstanced(3) with nothing set", true, match, CALLS(e.list->DrawInstanced(3, 1, 0, 0))},
+        {"DrawInstanced(0) with nothing set", true, match, CALLS(e.list->DrawInstanced(0, 1, 0, 0))},
+        {"Dispatch(1, 1, 1) with nothing set", true, match, CALLS(e.list->Dispatch(1, 1, 1))},
+        {"Dispatch(0, 0, 0) with nothing set", true, match, CALLS(e.list->Dispatch(0, 0, 0))},
         // A root argument with no root signature bound has nowhere to go: the runtime closes the list and drops the
         // call, on the graphics and the compute bind point alike.
         {"SetGraphicsRoot32BitConstant before a root signature", true, match,

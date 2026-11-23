@@ -559,9 +559,10 @@ int main() {
                                                    IID_PPV_ARGS(&list.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
-        // Misuse is reported by Close: a dispatch without a pipeline, a root view set on a constants parameter.
+        // A dispatch with no compute pipeline state bound dispatches nothing, and the list still closes and runs
+        // (d3d12_close_parity_test measures that on WARP). A root view set on a constants parameter is still refused.
         list->Dispatch(1, 1, 1);
-        EXPECT(list->Close() == E_INVALIDARG);
+        EXPECT(SUCCEEDED(list->Close()));
         EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->SetComputeRootSignature(root.p);
         list->SetComputeRootUnorderedAccessView(0, va_a);

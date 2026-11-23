@@ -1429,7 +1429,11 @@ private:
     }
 
     void record_dispatch(UINT x, UINT y, UINT z) {
-        if (!compute_pipeline_ || !compute_.layout) return check(false);
+        // No compute pipeline state bound: D3D12 without the debug layer runs the rest of the list, and the dispatch
+        // draws nothing (d3d12_close_parity_test measures that on WARP). Failing the list would drop the whole
+        // submission for a call D3D12 ignores.
+        if (!compute_pipeline_) return note_once("a dispatch with no compute pipeline state bound dispatches nothing");
+        if (!compute_.layout) return check(false);
         note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
     }
@@ -1449,7 +1453,10 @@ private:
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        // A dispatch's rule (above): no graphics pipeline state bound draws nothing on D3D12 without the debug
+        // layer, and the list still closes and runs.
+        if (!graphics_pipeline_) return note_once("a draw with no graphics pipeline state bound draws nothing");
+        if (!graphics_.layout || !topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
