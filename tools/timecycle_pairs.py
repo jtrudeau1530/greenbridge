@@ -283,6 +283,19 @@ def main(argv: list[str] | None = None) -> int:
                 ap.error(f"--out would overwrite carve index: {args.out}")
 
     try:
+        if args.out:
+            for p in args.paths:
+                if not os.path.isdir(p):
+                    continue
+                # Directory arguments also own the XML files or carved chunks
+                # read below. A report must not replace one of those sources.
+                carved = os.path.isfile(os.path.join(p, "index.json"))
+                extensions = (".bin", ".bk2") if carved else (".xml",)
+                with os.scandir(p) as entries:
+                    for entry in entries:
+                        if (entry.name.lower().endswith(extensions) and entry.is_file()
+                                and same_report_path(args.out, entry.path)):
+                            ap.error(f"--out would overwrite input: {args.out}")
         docs = load_documents(args.paths)
         summary = summarize_documents(docs)
         if args.out:

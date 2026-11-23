@@ -16,6 +16,7 @@ contain element values, entry names or payload bytes, so the CSV/JSON can be rev
 game data. Non-XML payloads follow the 64 KiB block rule; a file whose inflated size is an exact multiple of
 64 KiB can merge with the next stream. XML documents close on their root element, so their grouping is exact.
 The tool is standard library only and never writes outside the requested output files.
+Usage: `python -I tools/gamedata_index.py --help` lists the options.
 """
 from __future__ import annotations
 
@@ -195,7 +196,7 @@ class DirectorySource:
 
     def __init__(self, directory: str):
         self.directory = directory
-        with open(os.path.join(directory, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(directory, "index.json"), encoding="utf-8-sig") as f:
             self.index = json.load(f)
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
 
@@ -226,7 +227,7 @@ class ArchiveSource:
                                capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 raise RuntimeError((r.stdout + r.stderr).strip() or "rpf9_carve.py failed")
-        with open(os.path.join(index_dir, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(index_dir, "index.json"), encoding="utf-8-sig") as f:
             self.index = json.load(f)
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
         self._fh = open(archive, "rb")

@@ -210,6 +210,7 @@ public:
         return type_;
     }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
+    bool invalid() const { return invalid_; }
 
     // E_INVALIDARG when a call during recording was invalid, or a query was begun and not ended, as D3D12's Close
     // reports it.
@@ -250,6 +251,7 @@ public:
 
     void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* command_list) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ExecuteBundle");
+        if (list_.closed()) return;
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         GraphicsCommandList* bundle = from(command_list);
         if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ ||
@@ -281,6 +283,7 @@ public:
 
     void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPipelineState");
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.set_pipeline(state); })) return hold(state);
         set_pipeline(state);
     }
@@ -367,14 +370,18 @@ public:
         record_dispatch(x, y, z);
     }
 
-    // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
+    // ClearState returns every piece of list state to its default, as Reset does (stencil references and predication
+    // included).
     void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override {
+        if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (!list_.closed()) check(list_.set_predication({0, 0, 0}));
         reset_state(state);
     }
 
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.topology_ = u(topology); })) return;
         topology_ = u(topology);
     }
@@ -393,6 +400,7 @@ public:
     }
 
     void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
+        if (list_.closed()) return;
         const std::optional<D3D12_INDEX_BUFFER_VIEW> copy = view ? std::optional(*view) : std::nullopt;
         if (defer([=](GraphicsCommandList& l) { l.set_index_buffer(copy ? &*copy : nullptr); })) return;
         set_index_buffer(view);
@@ -440,6 +448,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
+        if (list_.closed()) return;
         const std::array<float, 4> value = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
                                                   : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
         if (defer([=](GraphicsCommandList& l) { l.blend_factor_ = value; })) return;
@@ -447,6 +456,7 @@ public:
     }
 
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.front_stencil_ref_ = l.back_stencil_ref_ = reference; })) return;
         front_stencil_ref_ = back_stencil_ref_ = reference;
     }
@@ -662,10 +672,24 @@ public:
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
     }
 
-    // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles may not set it.
+    // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles and copy lists may not set it.
+    // Recording-time checks match live Windows 11 WARP and RTX 5090 D3D12: null buffer requires offset 0 and
+    // EQUAL_ZERO; a non-null resource must be a non-READBACK buffer with an 8-byte aligned in-bounds range.
     void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buffer, UINT64 offset, D3D12_PREDICATION_OP op) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetPredication");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
+        if (!buffer) {
+            if (offset != 0 || op != D3D12_PREDICATION_OP_EQUAL_ZERO) return check(false);
+            return check(list_.set_predication({0, 0, 0}));
+        }
+        const auto desc = buffer->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return check(false);
+        if (offset % leonida::predication_alignment != 0 || offset > desc.Width ||
+            desc.Width - offset < leonida::predication_alignment)
+            return check(false);
+        D3D12_HEAP_PROPERTIES heap{};
+        if (SUCCEEDED(buffer->GetHeapProperties(&heap, nullptr)) && heap.Type == D3D12_HEAP_TYPE_READBACK)
+            return check(false);
         check(list_.set_predication({resource_id(buffer), offset, u(op)}));
     }
 
@@ -1002,14 +1026,67 @@ private:
         allocator_ = nullptr;
     }
 
+    static UINT subresource_count(const D3D12_RESOURCE_DESC& desc) {
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return 1;
+        const UINT mips = desc.MipLevels ? desc.MipLevels : 1u;
+        const UINT layers = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                ? 1u
+                                : (desc.DepthOrArraySize ? desc.DepthOrArraySize : 1u);
+        UINT planes = 1;
+        switch (desc.Format) {
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        case DXGI_FORMAT_NV12:
+        case DXGI_FORMAT_P010:
+        case DXGI_FORMAT_P016:
+            planes = 2;
+            break;
+        default:
+            break;
+        }
+        return mips * layers * planes;
+    }
+
     void atomic_copy(std::uint32_t bytes, ID3D12Resource* dst, UINT64 dst_offset, ID3D12Resource* src,
                      UINT64 src_offset, UINT count, ID3D12Resource* const* resources,
                      const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || (count && (!resources || !ranges))) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !dst || !src || (count && (!resources || !ranges)))
+            return check(false);
+        const auto dst_desc = dst->GetDesc();
+        const auto src_desc = src->GetDesc();
+        if (dst_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+            src_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+            return check(false);
+        if (dst_offset % bytes != 0 || src_offset % bytes != 0 || dst_offset > dst_desc.Width ||
+            dst_desc.Width - dst_offset < bytes || src_offset > src_desc.Width || src_desc.Width - src_offset < bytes)
+            return check(false);
         leonida::AtomicCopyBuffer copy{resource_id(dst), dst_offset, resource_id(src), src_offset, bytes, {}};
-        for (UINT i = 0; i < count; ++i)
-            copy.dependencies.push_back(
-                {resource_id(resources[i]), ranges[i].Subresource, ranges[i].Range.Begin, ranges[i].Range.End});
+        copy.dependencies.reserve(count);
+        for (UINT i = 0; i < count; ++i) {
+            ID3D12Resource* dep = resources[i];
+            if (!dep) return check(false);
+            const auto dep_desc = dep->GetDesc();
+            const auto& r = ranges[i];
+            UINT64 begin = r.Range.Begin;
+            UINT64 end = r.Range.End;
+            if (dep_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                if (r.Subresource != 0) return check(false);
+                if (begin >= end || (end != UINT64_MAX && end > dep_desc.Width))
+                    return check(false);
+            } else {
+                const UINT total_subresources = subresource_count(dep_desc);
+                if (r.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && r.Subresource >= total_subresources)
+                    return check(false);
+                if (begin != 0 || end != UINT64_MAX) return check(false);
+            }
+            copy.dependencies.push_back({resource_id(dep), r.Subresource, begin, end});
+        }
         check(list_.atomic_copy(copy));
     }
 
@@ -1513,6 +1590,12 @@ public:
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
         std::lock_guard lock(mutex_);
+        if (count > 0 && !lists) {
+            note_once("ExecuteCommandLists: null command list array with non-zero count");
+            last_result_ = leonida::ReplayResult::unsupported;
+            d3d12_trace::record(method, "failed");
+            return;
+        }
         std::vector<const leonida::CommandList*> recorded;
         std::vector<const GraphicsCommandList*> graphics;
         for (UINT i = 0; i < count; ++i) {
@@ -1529,6 +1612,13 @@ public:
             if (list->type() != desc_.Type) {
                 std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u has type %d, the queue type %d\n", i,
                              int(list->type()), int(desc_.Type));
+                last_result_ = leonida::ReplayResult::unsupported;
+                d3d12_trace::record(method, "failed");
+                return;
+            }
+            // A list whose recording failed (Close returned E_INVALIDARG) must not replay its earlier commands.
+            if (list->invalid()) {
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists: list %u is invalid; refusing batch\n", i);
                 last_result_ = leonida::ReplayResult::unsupported;
                 d3d12_trace::record(method, "failed");
                 return;

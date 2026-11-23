@@ -41,6 +41,7 @@ def make_bank(names, flags=0, extra_ids=()):
         out += bytes(4 * (n + 1))
     # a non-zero tag count in bits 31:29 must not leak into the id
     out += b"".join(struct.pack("<I", (1 << 29) | i) for i in ids)
+    struct.pack_into("<I", out, 12, len(out))
     return bytes(out)
 
 
@@ -91,6 +92,28 @@ class TestBanks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(os.path.join(tmp, "t.awc"), make_bank(["a", "b"])[:-3])
             with self.assertRaises(ValueError):
+                A.bank_ids(path)
+
+    def test_stream_table_outside_declared_header(self):
+        # The file is long enough, but the declared header cannot hold the stream table; the canonical
+        # rsc8_audio parser rejects the same bytes.
+        table = struct.pack("<II", 0x11223344, 0x55667788)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad.awc")
+            for header_size in (8, 16, 23):
+                with self.subTest(header_size=header_size):
+                    with open(path, "wb") as fh:
+                        fh.write(b"ADAT" + struct.pack("<III", 0, 2, header_size) + table)
+                    with self.assertRaisesRegex(ValueError, "declared header"):
+                        A.bank_ids(path)
+
+    def test_declared_header_past_the_file(self):
+        # The stream table fits in the file and in the declared header, but the header itself does not fit in
+        # the file; the canonical rsc8_audio parser rejects the same bytes.
+        raw = b"ADAT" + struct.pack("<IIII", 0, 1, 21, 7)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "bad.awc"), raw)
+            with self.assertRaisesRegex(ValueError, "declared header"):
                 A.bank_ids(path)
 
     def test_truncated_stream_table_reads_only_header(self):
