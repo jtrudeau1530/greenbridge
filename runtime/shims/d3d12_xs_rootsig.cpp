@@ -151,12 +151,28 @@ bool copy_rts0_blob_clear_xbox_flags(const void* data, size_t size, std::vector<
             static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags)));
         if (cleared == flags) return false;  // no Xbox high byte
 
+        uint32_t total_size = 0;
+        std::memcpy(&total_size, bytes + 24, sizeof(total_size));
+        if (total_size != size) return false;
+
+        // Do not forge a valid hash for a corrupted container: host d3d12.dll accepts a matching
+        // DXBC checksum or an all-zero checksum, and rejects any other checksum with E_INVALIDARG.
+        constexpr uint8_t kZeroHash[16] = {};
+        const bool zero_hash = std::memcmp(bytes + 4, kZeroHash, sizeof(kZeroHash)) == 0;
+        if (!zero_hash) {
+            uint32_t expected[4];
+            dxbc_checksum(bytes, size, expected);
+            if (std::memcmp(bytes + 4, expected, sizeof(expected)) != 0) return false;
+        }
+
         out.assign(bytes, bytes + size);
         std::memcpy(out.data() + off + 8 + 20, &cleared, sizeof(cleared));
         // The host deserializer checks the container hash (bytes 4..19), so a stale one is E_INVALIDARG.
-        uint32_t hash[4];
-        dxbc_checksum(out.data(), out.size(), hash);
-        std::memcpy(out.data() + 4, hash, sizeof(hash));
+        if (!zero_hash) {
+            uint32_t hash[4];
+            dxbc_checksum(out.data(), out.size(), hash);
+            std::memcpy(out.data() + 4, hash, sizeof(hash));
+        }
         return true;
     }
     return false;
