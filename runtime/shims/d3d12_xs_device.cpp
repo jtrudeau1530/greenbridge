@@ -24,6 +24,11 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "startup_trace.h"
+#include <algorithm>
+#include <mutex>
+#include <vector>
+#include <intrin.h>
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
@@ -129,6 +134,10 @@ struct HeapProxy {
     SIZE_T custom_byte_size;
     SIZE_T real_cpu_start;
     DescriptorHeapBackingFree custom_free;
+    // A console heap at an address the title chose (desc +0x10 address, +0x18 size): CPU handles are the title's
+    // memory, and its bytes are copied into the PC heap's storage before each ExecuteCommandLists.
+    std::uint8_t* title_cpu = nullptr;
+    std::uint64_t title_bytes = 0;
 };
 
 struct DescriptorRange {
@@ -206,6 +215,18 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D1
         }
     }
     return handle;
+}
+
+// The heaps with title memory, for the copy before a submission.
+std::mutex g_title_heaps_mutex;
+std::vector<HeapProxy*> g_title_heaps;
+
+void sync_title_heaps() {
+    const std::lock_guard lock(g_title_heaps_mutex);
+    for (HeapProxy* h : g_title_heaps) {
+        auto* dst = reinterpret_cast<std::uint8_t*>(h->real->GetCPUDescriptorHandleForHeapStart().ptr);
+        if (dst && h->title_cpu && dst != h->title_cpu) std::memcpy(dst, h->title_cpu, static_cast<std::size_t>(h->title_bytes));
+    }
 }
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -668,6 +689,10 @@ unsigned long heap_release(HeapProxy* self) {
         const DescriptorHeapBackingFree free_fn = self->custom_free;
         ID3D12DescriptorHeap* real = self->real;
         DeviceProxy* device = self->device;
+        if (self->title_cpu) {
+            const std::lock_guard lock(g_title_heaps_mutex);
+            g_title_heaps.erase(std::remove(g_title_heaps.begin(), g_title_heaps.end(), self), g_title_heaps.end());
+        }
         delete self;
         if (real) real->Release();
         if (device) proxy_release(device);
@@ -768,6 +793,7 @@ std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t 
         return reinterpret_cast<std::uint64_t>(
             reinterpret_cast<Fn>(self->real_vtable[8])(self->real, reinterpret_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(a1)));
     } else if constexpr (Slot == 9) {
+        if (self->title_cpu) return reinterpret_cast<std::uint64_t>(self->title_cpu);
         return static_cast<std::uint64_t>(heap_get_cpu_handle(self).ptr);
     } else if constexpr (Slot == 10) {
         return static_cast<std::uint64_t>(heap_get_gpu_handle(self).ptr);
@@ -1760,6 +1786,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandLists) {
+            sync_title_heaps();
             return queue_execute_command_lists(self, a1, a2);
         }
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait))
@@ -2908,6 +2935,14 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     }
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
+    // The console description goes on past the 16 PC bytes: +0x10 is a CPU address the title chose, +0x18 its size
+    // (docs/retail_boot_chain.md section 3.5). The title asserts that the heap's CPU start is that address.
+    const auto* words = reinterpret_cast<const std::uint64_t*>(desc);
+    const std::uint64_t title_address = words[2], title_size = words[3];
+    MEMORY_BASIC_INFORMATION mbi{};
+    const bool title_heap = title_address && title_size && title_size < (1ull << 34) &&
+                            VirtualQuery(reinterpret_cast<void*>(title_address), &mbi, sizeof(mbi)) &&
+                            mbi.State == MEM_COMMIT;
     SIZE_T custom_cpu_start = 0;
     SIZE_T custom_byte_size = 0;
     SIZE_T real_cpu_start = 0;
@@ -2918,7 +2953,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
         alloc_fn = g_heap_alloc;
         free_fn = g_heap_free;
     }
-    if (alloc_fn && desc && desc->NumDescriptors > 0) {
+    if (!title_heap && alloc_fn && desc && desc->NumDescriptors > 0) {
         const UINT inc = self->real->GetDescriptorHandleIncrementSize(desc->Type);
         if (inc > 0 && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc) {
             const SIZE_T byte_size = static_cast<SIZE_T>(desc->NumDescriptors) * static_cast<SIZE_T>(inc);
@@ -2942,6 +2977,23 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
         heap->Release();
         if (custom_cpu_start && free_fn)
             free_fn(reinterpret_cast<void*>(custom_cpu_start), kXmemDescriptorHeapAttributes);
+        return hr;
+    }
+    if (title_heap) {
+        const UINT increment = self->real->GetDescriptorHandleIncrementSize(desc->Type);
+        const std::uint64_t pc_bytes = std::uint64_t(desc->NumDescriptors) * increment;
+        auto* proxy = static_cast<HeapProxy*>(*out);
+        proxy->title_cpu = reinterpret_cast<std::uint8_t*>(title_address);
+        proxy->title_bytes = title_size < pc_bytes ? title_size : pc_bytes;
+        {
+            const std::lock_guard lock(g_title_heaps_mutex);
+            g_title_heaps.push_back(proxy);
+        }
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: descriptor heap at the title's address 0x%llx (%llu bytes, %u descriptors of %u); "
+                     "copied to the PC heap before each submission\n",
+                     static_cast<unsigned long long>(title_address), static_cast<unsigned long long>(title_size),
+                     desc->NumDescriptors, increment);
     }
     return hr;
 }
@@ -3982,7 +4034,18 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
         std::uint64_t routed = 0;
         if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        if (Slot >= self->slot_count) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 3)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: device slot %u beyond the PC table: args 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx "
+                             "0x%llx, returns to %s\n",
+                             Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                             static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6),
+                             rt::startup_trace::where(reinterpret_cast<std::uint64_t>(_ReturnAddress())).c_str());
+            return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        }
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.

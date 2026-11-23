@@ -6612,7 +6612,21 @@ public:
         pipeline->attach_device(identity());
         if (const HRESULT hr = pipeline->create_compute(*desc); FAILED(hr)) {
             pipeline->Release();
-            return hr;
+            // LEONIDA_PLACEHOLDER_PSO=1 (a boot diagnostic): a compute program with no translation (the BVH builder's
+            // embedded DXIL, a shader missing from the index) gets a pipeline object with no Vulkan pipeline, so the
+            // caller's constructor goes on; a dispatch with it records nothing.
+            static const bool placeholder = [] {
+                const char* v = std::getenv("LEONIDA_PLACEHOLDER_PSO");
+                return v && *v == '1';
+            }();
+            if (!placeholder) return hr;
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12: compute pipeline (%zu bytes) failed with 0x%08lx; placeholder handed out\n",
+                             static_cast<std::size_t>(desc->CS.BytecodeLength), static_cast<unsigned long>(hr));
+            auto* empty = new PipelineState(state_);
+            empty->attach_device(identity());
+            return hand_out(empty, riid, out);
         }
         pipeline->set_cache_key(std::move(key));
         return hand_out(pipeline, riid, out);

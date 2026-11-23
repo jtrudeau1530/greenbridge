@@ -19,6 +19,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -318,6 +320,28 @@ int wmain(int argc, wchar_t** argv) {
             }, nullptr, 0, nullptr);
         }
         std::fflush(stdout);
+        // LEONIDA_BREAKPOINTS=continue: an int3 inside the main image is stepped over, as a debugger's "continue"
+        // would, and logged (address, count). The console title's asserts are an int3 followed by the code that
+        // carries on; without a debugger a PC ends the process there. A diagnostic: off by default.
+        if (const char* bp = std::getenv("LEONIDA_BREAKPOINTS"); bp && std::string(bp) == "continue") {
+            static std::uint64_t image_lo = 0, image_hi = 0;
+            image_lo = reinterpret_cast<std::uint64_t>(main_module.base);
+            image_hi = image_lo + main_module.size;
+            AddVectoredExceptionHandler(0, [](EXCEPTION_POINTERS* info) -> LONG {
+                static std::atomic<int> logged{0};
+                const auto* r = info->ExceptionRecord;
+                const auto at = reinterpret_cast<std::uint64_t>(r->ExceptionAddress);
+                if (r->ExceptionCode != EXCEPTION_BREAKPOINT || at < image_lo || at >= image_hi ||
+                    *reinterpret_cast<const unsigned char*>(at) != 0xCC)
+                    return EXCEPTION_CONTINUE_SEARCH;
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
+                    std::fprintf(stderr, "[rt] breakpoints: int3 at main+0x%llx stepped over\n",
+                                 static_cast<unsigned long long>(at - image_lo));
+                info->ContextRecord->Rip = at + 1;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            });
+            std::printf("LEONIDA_BREAKPOINTS=continue: int3 in the main image is stepped over\n");
+        }
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
