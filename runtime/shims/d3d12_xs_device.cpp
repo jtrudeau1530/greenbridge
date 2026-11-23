@@ -105,6 +105,7 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_interval_us{0};
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
+    std::atomic<std::uint32_t> frame_event_offset_us{0};
     std::atomic<std::uint64_t> frame_next_token{1};
 };
 
@@ -1419,6 +1420,18 @@ PresentState* present_state_for(DeviceProxy* device) {
         return state;
     }
     state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
+    // The title registers its interval and origin event before the first PresentX builds this.
+    if (const std::uint32_t interval = device->frame_interval_us.load(std::memory_order_relaxed)) {
+        const HRESULT set = state->xbox->SetFrameIntervalX(nullptr, interval,
+                                                           device->frame_latency.load(std::memory_order_relaxed), 0);
+        const HRESULT armed = device->frame_event_scheduled.load(std::memory_order_relaxed)
+                                  ? state->xbox->ScheduleFrameEventX(
+                                        rt::d3d12::xbox_frame_event_origin,
+                                        device->frame_event_offset_us.load(std::memory_order_relaxed), 0)
+                                  : S_FALSE;
+        std::fprintf(stderr, "[rt] d3d12_xs: frame interval %u us replayed (0x%08lx), origin event (0x%08lx)\n",
+                     interval, static_cast<unsigned long>(set), static_cast<unsigned long>(armed));
+    }
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
     return state;
 }
@@ -2371,6 +2384,7 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
 // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
+    self->frame_event_offset_us.store(static_cast<std::uint32_t>(offset_us), std::memory_order_relaxed);
     self->frame_event_scheduled.store(true, std::memory_order_relaxed);
     if (auto* presentation = device_presentation(self))
         return presentation->ScheduleFrameEventX(static_cast<UINT>(event), static_cast<UINT>(offset_us),

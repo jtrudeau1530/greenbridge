@@ -99,6 +99,8 @@ private:
 
 // Provisional definitions of ours: the real constants and layouts of the console API are unmeasured.
 inline constexpr std::uint32_t frame_event_origin = 0;
+// WaitFrameEventX flag 2 with timeout 0 is the retail title's poll for the current token, which it asserts succeeds.
+inline constexpr std::uint32_t wait_flag_current_token = 0x2;
 // Statistics types (bit mask). Interval and render entries are never produced here.
 inline constexpr std::uint32_t stat_frame_interval = 0x01;
 inline constexpr std::uint32_t stat_frame_event = 0x02;
@@ -199,9 +201,9 @@ public:
     // alone then. invalid_state when nothing is registered, the pacer is suspended, or one of those happens while waiting.
     std::int32_t wait_frame_event(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
                                   std::uint64_t* token) {
-        (void)flags;
         if (event != frame_event_origin || !token) return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
+        if (flags & wait_flag_current_token) return current_token_locked(token);
         ++waiters_;
         const std::int32_t result = wait_locked(lock, timeout_ms, token);
         if (--waiters_ == 0) cv_.notify_all();
@@ -393,6 +395,25 @@ private:
                 }
             pending_.pop_front();
         }
+    }
+
+    // Never blocks: a fresh token for the newest passed origin, with no wait for the next origin or the latency.
+    std::int32_t current_token_locked(std::uint64_t* token) {
+        if (shutdown_ || suspended_) return pacer_hr::invalid_state;
+        *token = ++issued_;
+        if (!interval_set_ || !armed_) return pacer_hr::ok;
+        const std::uint64_t now = clock_.now_us();
+        retire_locked(now);
+        const std::uint64_t first = epoch_us_ + offset_us_;
+        const std::int64_t newest = now >= first ? std::int64_t((now - first) / period_us_) : 0;
+        last_origin_ = std::max(last_origin_, newest);
+        Record record;
+        record.token = *token;
+        record.origin_us = first + std::uint64_t(last_origin_) * period_us_;
+        record.due_us = record.origin_us - offset_us_ + period_us_;
+        records_.push_back(record);
+        if (records_.size() > 64) records_.pop_front();
+        return pacer_hr::ok;
     }
 
     std::int32_t wait_locked(std::unique_lock<std::mutex>& lock, std::uint32_t timeout_ms, std::uint64_t* token) {
