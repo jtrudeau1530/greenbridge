@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_clips  # noqa: E402
 import anim_index  # noqa: E402
 import glb_writer  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 import skin_streams  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -707,7 +708,7 @@ def coverage(args):
         groups, _unresolved, _gaps = anim_clips.group(m, rows)
     segments = [[anim_clips.segment(rows, k) for k in parts] for _root, parts in groups]
     hashes = sorted({j["hash"] for j in joints})
-    jobs = max(1, args.jobs)
+    jobs = process_workers(max(1, args.jobs))   # a pool takes at most 61 workers on Windows
     slices = [(args.anim, segments[i::jobs], hashes) for i in range(jobs)]
     total = collections.Counter()
     if jobs == 1:
