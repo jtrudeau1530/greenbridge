@@ -812,6 +812,38 @@ class SmemHardwareRuleTests(unittest.TestCase):
         self.assertEqual(sorted({hex(r) for r in got_reads}), sorted({hex(w) for w in want if w is not None}), line)
 
     # s_load: 64-bit pointer, no bound
+    def test_s_load_vcc_base_reads_both_pointer_dwords(self):
+        class VccEvaluator(SmemBodyEvaluator):
+            def _value(self, name):
+                if name == "%vcc":
+                    return "sgpr", 24
+                if name == "%vcc_hi":
+                    return "sgpr", 25
+                return super()._value(name)
+
+        ptr = self.REGION + 1  # nonzero high dword; the low two address bits are truncated
+        memory = PatternMemory(self.REGION)
+        for wave64 in (False, True):
+            for count in (4, 8):
+                with self.subTest(wave64=wave64, count=count):
+                    dest = count * 2
+                    ins = parse_line(f"s_load_dwordx{count} s[{dest}:{dest + count - 1}], vcc, 0x7")
+                    gen = rdna2spirv.Gen("cs")
+                    gen.wave64 = wave64
+                    gen.scalar_load(ins["op"], ins["args"], ins["mods"])
+                    result = VccEvaluator(gen, {24: ptr & MASK32, 25: ptr >> 32}, memory)
+                    offsets = [4 + 4 * i for i in range(count)]
+                    self.assertEqual(result.reads, [self.REGION + offset for offset in offsets])
+                    self.assertEqual([result.sgpr[dest + i] for i in range(count)],
+                                     [memory.data(offset) for offset in offsets])
+
+    def test_s_load_vcc_base_refuses_tracked_masks(self):
+        ins = parse_line("s_load_dwordx4 s[8:11], vcc, 0")
+        gen = rdna2spirv.Gen("cs")
+        gen.cur_masks = {"vcc"}
+        with self.assertRaises(rdna2spirv.Unsupported):
+            gen.scalar_load(ins["op"], ins["args"], ins["mods"])
+
     def test_s_load_truncates_pointer_and_offsets(self):
         # p0-k1[0]: ptr & 3 = 1, imm 1 -> data@+0; p0-k1[6]: soffset 3 + imm 3 -> data@+0; p0-k1[8]: 8 + 4 -> +0xc
         self.check("s_load_dword s12, s[24:25], 0x1", {}, [0x0], [0x0], pointer=True, base_low=1)

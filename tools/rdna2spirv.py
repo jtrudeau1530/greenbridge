@@ -11663,6 +11663,11 @@ class Gen:
         slist_dst = d["k"] == "slist" and len(d["r"]) == n
         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
                       else list(base["r"]) if base["k"] == "slist" else None)
+        if base["k"] == "special" and base.get("t") == "vcc":
+            # GFX10 can encode VCC as the two-word SMEM base. Read scalar data, not per-invocation lane bits.
+            base_slots = ("vcc_lo", "vcc_hi")
+            if any(self.holds_lane_mask({"k": "special", "t": part}) for part in base_slots):
+                raise Unsupported(op + " VCC base holds a lane mask")
         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
 
