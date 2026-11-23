@@ -100,9 +100,12 @@ def census(index, base=None):
 
 def load_index(path):
     """The index as {name: entry}. ValueError with a one-line reason when the file cannot be read, is not JSON or
-    is not the shape census() reads; the wording follows tools/root_sig_contract.py, which reads the same file."""
+    is not the shape census() reads; the wording follows tools/root_sig_contract.py, which reads the same file.
+
+    utf-8-sig: a BOM left by a Windows editor is not a JSON error.
+    """
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError, RecursionError) as e:   # ValueError: not JSON, or not UTF-8
         reason = getattr(e, "strerror", None) or e
