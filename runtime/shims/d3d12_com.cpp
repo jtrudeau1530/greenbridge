@@ -1761,7 +1761,11 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
         wait.semaphoreCount = count;
         wait.pSemaphores = semaphores.data();
         wait.pValues = values;
-        return context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX) == VK_SUCCESS ? S_OK : E_FAIL;
+        const VkResult result = context.vk.vkWaitSemaphores(context.device(), &wait, UINT64_MAX);
+        // Unlike a single fence's blocking SetEventOnCompletion, this path invokes Vulkan directly.
+        // A lost device must wake its other registered fence waiters and reject later submissions.
+        if (result == VK_ERROR_DEVICE_LOST) context.mark_device_lost();
+        return result == VK_SUCCESS ? S_OK : E_FAIL;
     }
     // Each fence's own waiter thread counts the shared waiter down; no thread of its own.
     const auto waiter = std::make_shared<FenceWaiter>(event, any ? 1u : count);

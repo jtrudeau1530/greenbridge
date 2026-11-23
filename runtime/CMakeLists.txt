@@ -1478,6 +1478,12 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_fence_events_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_fence_events COMMAND d3d12_fence_events_test)
     set_tests_properties(d3d12_fence_events PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(d3d12_fence_device_lost_counter_test test/d3d12_fence_device_lost_counter_test.cpp)
+    target_link_libraries(d3d12_fence_device_lost_counter_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_fence_device_lost_counter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_fence_device_lost_counter_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_fence_device_lost_counter COMMAND d3d12_fence_device_lost_counter_test)
+    set_tests_properties(d3d12_fence_device_lost_counter PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
     # Xbox-ABI queue and fence proxies behind the device proxy, on the host runtime (WARP, a hardware adapter) and
     # on the Vulkan device: forwarding, refusal past the public chain, fence unwrapping. 77: no device at all.
     add_executable(queue_proxy_test test/queue_proxy_test.cpp)
