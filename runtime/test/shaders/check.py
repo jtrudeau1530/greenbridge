@@ -533,6 +533,7 @@ PIXEL_ENV = {"ps_vcc_x2": {"VKH_SGPRS": "0x1000,0,16,0", "VKH_HEAP": "0x1000=0x1
 # texture); the expected channels are derived in the .asm header.
 TEXTURE_CONSTANTS = {
     "ps_gather_wrap": (5090733.0, 14942181.0, 258623.0, 9702309.0),
+    "ps_gather_unorm": (3.0, 5.0, 4.0, 3.0),
     "ps_gather_border": (32776.0, 34935.0, 34680.0, 28679.0),  # SHADER-348: border modes 6 and 7, derived in the .asm
     "ps_gather4_c_l": (6.0, 9.0, 17459.0, 9.0),  # image_gather4_c_l / _c_l_o / _cl / _c_b_cl_o d16
     "ps_array_resinfo": (8.0, 8.0, 12.0, 1.0),  # binding 3, index 1: two 6-face cubes, one mip

@@ -12598,10 +12598,11 @@ class Gen:
                 # (CLAMP_X/CLAMP_Y, see gather_addr_modes / gather_addr).
                 if bin(dmask).count("1") != 1 or ncoord != 2 or len(f) < 3:
                     raise Unsupported("image_gather4_l form")
-                modes = self.gather_addr_modes(a[3])
+                unorm = "unorm" in mods
+                modes = self.gather_addr_modes(a[3], unorm=unorm)
                 self.uses_query = True
                 ch = dmask.bit_length() - 1
-                lv, lvm, rl, mi, mc, mz, sz, uvf, szf, st, half, flo, i0, one2, i1 = (self.tmp() for _ in range(15))
+                lv, lvm, rl, mi, mc, mz, sz, uvf, half, flo, i0, one2, i1 = (self.tmp() for _ in range(13))
                 # Size and level-count queries read view properties; only the texel fetches need a typed alias.
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
@@ -12621,8 +12622,12 @@ class Gen:
                 self.emit(f"{mc} = OpExtInst %int %glsl SMin {mz} {lvm}")
                 self.emit(f"{sz} = OpImageQuerySizeLod %v2int {img} {mc}")
                 self.emit(f"{uvf} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-                self.emit(f"{szf} = OpConvertSToF %v2float {sz}")
-                self.emit(f"{st} = OpFMul %v2float {uvf} {szf}")
+                if unorm:
+                    st = uvf
+                else:
+                    szf, st = self.tmp(), self.tmp()
+                    self.emit(f"{szf} = OpConvertSToF %v2float {sz}")
+                    self.emit(f"{st} = OpFMul %v2float {uvf} {szf}")
                 self.emit(f"{half} = OpCompositeConstruct %v2float %fhalf_g %fhalf_g")
                 sub = self.tmp()
                 self.emit(f"{sub} = OpFSub %v2float {st} {half}")
