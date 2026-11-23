@@ -1734,10 +1734,33 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
 
 
 # ---------------------------------------------------------------- runtime
-WINE_LAUNCHER = """#!/bin/sh
+def wine_launcher(out: str, work: str, image: str) -> str:
+    shaders = os.path.abspath(os.path.join(work, "shaders", "spirv"))
+    # The runtime reads shader_path.txt. Its absolute path needs updating only if the whole port moved.
+    moved_catalog = ""
+    if os.path.commonpath([os.path.abspath(out), shaders]) == os.path.abspath(out):
+        relative = shlex.quote(os.path.relpath(shaders, out))
+        moved_catalog = f"""    if [ "$here" != {shlex.quote(os.path.realpath(out))} ]; then
+        shaders="$here"/{relative}
+        export LEONIDA_SHADERS="${{LEONIDA_SHADERS:-Z:$shaders}}"
+    fi
+"""
+    return f"""#!/bin/sh
 # Starts the Windows build of the loader with Wine. WINE picks another one, e.g. a Proton build's bin/wine.
 here=$(dirname "$(readlink -f "$0")")
-exec "${WINE:-wine}" "$here/gta6rt.exe" "$@"
+if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
+    game=$(cat "$here/game_path.txt" && printf .) || exit 1
+    cd "${{game%.}}" || exit 1
+    image={shlex.quote(image)}
+    if [ ! -f "./$image" ]; then
+        printf 'Missing game executable: %s/%s\\n' "$PWD" "$image" >&2
+        exit 1
+    fi
+    # Wine maps the Unix filesystem root to Z:. The game reads from its package and writes to the port's overlay.
+{moved_catalog}    export LEONIDA_D3D12="${{LEONIDA_D3D12:-vulkan}}"
+    set -- "$1" "./$image" --overlay "Z:$here/overlay"
+fi
+exec "${{WINE:-wine}}" "$here/gta6rt.exe" "$@"
 """
 
 
@@ -1826,7 +1849,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     if os.name != "nt":
         start = os.path.join(out, "gta6rt.sh")
         with open(start, "w", encoding="utf-8", newline="\n") as f:
-            f.write(WINE_LAUNCHER)
+            f.write(wine_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]))
         os.chmod(start, os.stat(start).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     image = os.path.join(game, v["expected_exe"])
     if not os.path.isfile(image):
@@ -1839,9 +1862,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         log("runtime: built. Inspect the game's imports in PowerShell:\n"
             f"  & {ps_literal(start)} --dry-run {ps_literal(image)}")
     else:
-        # Wine inherits the package directory; the image argument needs no host-to-Windows path conversion.
-        command = shlex.join([start, "--dry-run", "./" + v["expected_exe"]])
-        log(f"runtime: built. Inspect the game's imports with Wine:\n  (cd {shlex.quote(game)} && {command})")
+        log(f"runtime: built. Inspect the game's imports with Wine:\n  {shlex.join([start, '--dry-run'])}")
 
 
 def positive_int(text: str) -> int:
