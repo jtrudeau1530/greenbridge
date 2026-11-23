@@ -361,6 +361,24 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(with_numpy["sum_max"], without_numpy["sum_max"])
         self.assertAlmostEqual(struct.unpack_from("<4f", with_numpy["w0"], 0)[0], 64 / 255, delta=1e-6)
 
+    def test_only_weighted_joint_indices_must_fit_unsigned_short(self):
+        backends = [None] if skinned_glb._np is None else [None, skinned_glb._np]
+        palette = [65536, 65535]
+        for backend in backends:
+            with self.subTest(backend=backend), mock.patch.object(skinned_glb, "_np", backend):
+                for second_set in (False, True):
+                    w0, w1 = bytes([255, 0, 0, 0]), bytes(4)
+                    if second_set:
+                        w0, w1 = w1, w0
+                    with self.subTest(second_set=second_set):
+                        with self.assertRaisesRegex(skinned_glb.SkinError, "UNSIGNED_SHORT"):
+                            skinned_glb.normalise_weights(bytes(4), bytes(4), w0, w1, 1, 2, palette, 65537)
+                        joints = bytes([1, 0, 0, 0])
+                        out = skinned_glb.normalise_weights(joints, joints, w0, w1, 1, 2, palette, 65537)
+                        weighted, unused = ("j1", "j0") if second_set else ("j0", "j1")
+                        self.assertEqual(struct.unpack("<4H", out[weighted]), (65535, 0, 0, 0))
+                        self.assertEqual(out[unused], bytes(8))
+
     def test_full_export_without_numpy(self):
         skeleton = _skeleton_dir(self.root)
         component = _component(self.root)

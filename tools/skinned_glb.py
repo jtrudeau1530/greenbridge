@@ -595,6 +595,14 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
         if len(row) != expected:
             raise SkinError("skin stream is shorter than the vertex count")
 
+    oversized = {slot for slot, joint in enumerate(local_to_joint) if joint > 0xFFFF}
+    if oversized:
+        for indices, weights in ((j0, w0), (j1, w1)):
+            if any(weight and index in oversized for index, weight in zip(indices, weights)):
+                raise SkinError("a weighted joint index exceeds the glTF UNSIGNED_SHORT limit (65535)")
+        # NumPy converts the entire palette, including entries no weighted slot uses.
+        local_to_joint = [0 if slot in oversized else joint for slot, joint in enumerate(local_to_joint)]
+
     if _np is not None:
         indices = _np.concatenate(
             [_np.frombuffer(j0, dtype=_np.uint8).reshape(count, 4),
