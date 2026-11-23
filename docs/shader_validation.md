@@ -2016,6 +2016,50 @@ pixel stage (`RADV_PERFTEST=pswave32`) and GFX11+ exit 77. Not measured: wave32,
 - **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
 
 
+### Real pixel shaders on two GPUs (`tools/ps_sweep.py`, `runtime/test/vk_ps_sweep.cpp`)
+
+The oracles above run hand-written programs. This one draws translated corpus pixel shaders, to find what only real
+shaders trigger. `ps_sweep.py sample` takes a fixed-seed stratified sample of the translated pixel shaders (strata:
+needs barycentrics, descriptor bindings none / 0-3 only / any above 3, control-flow style; at least 10 per stratum,
+the rest in proportion). `vk_ps_sweep` draws one of them with a generated vertex shader (a viewport-covering triangle
+and a vec4 at every input location), the runtime's bindless set 0 with only its fallbacks, a zeroed 1 MiB heap, the
+push-constant block and 32x32 `RGBA32F` targets cleared to -1. Everything is identical on every GPU, so the same
+sample can be run on each and compared; `ps_sweep.py compare` classifies each shader: OK on both, differs beyond
+tolerance (1e-3 absolute plus relative), NaN or all-zero on one GPU only, fails on one GPU, fails on both, timeout.
+Variant `t` (`VKS_TEX=1`) replaces the fallback images with an 8x8 gradient (2D, 2D array, 1D, 3D) and a linear
+sampler so sampled values are not all zero.
+
+RTX 4080 SUPER and Intel UHD 770 (32.0.101.6129), Windows 11, 480 of 12,101 pixel shaders (seed 20261122):
+
+| class | variant z (fallback images) | variant t (gradient textures) |
+|---|---|---|
+| OK on both | 262 | 260 |
+| differs beyond tolerance | 0 | 1 |
+| NaN or zero on one GPU only | 0 | 0 |
+| fails on one GPU | 214 | 215 |
+| fails on both | 0 | 0 |
+| timeout (both) | 4 | 4 |
+
+- **Fails on one GPU, Intel (210 in both variants):** the module needs `fragmentShaderBarycentric` (206) or
+  `shaderResourceMinLod` (3) or both (1), and the UHD 770 has neither feature. The runtime's barycentric fallback is not
+  part of this sweep. 5,298 of the 12,101 pixel shaders need barycentrics and 29 need MinLod.
+- **Fails on one GPU, NVIDIA (4 in z, 5 in t):** `VK_ERROR_DEVICE_LOST` after a few seconds while the Intel GPU
+  returns at once with every pixel unwritten. All are tier C shaders; in the one disassembled, a scalar loop reads a
+  list from a buffer until an entry's low 16 bits are `0xffff`, and the zeroed heap has no terminator, so the loop
+  never ends. A 10-line GLSL
+  fragment shader with the same loop (`while ((heap[i] & 0xffff) != 0xffff) i++;` on a zeroed buffer reached through
+  its device address) hangs the same way. The synthetic input, not the translation, is the cause; a real heap holds the
+  terminator.
+- **Timeout (4, both GPUs, 40 s):** large `dispatch loop` shaders; not root-caused.
+- **Differs beyond tolerance (1, variant t):** a tier C shader (`wave64_graphics` C), 92 of 4,096 values of one target
+  (about 2 % of the pixels), differences up to 0.06. It is identical with a constant texture and with a NEAREST sampler,
+  so the cause is the two GPUs' linear-filter weights, not the translation.
+- The 262 / 260 shaders that run on both agree to 4.9e-4 at most; 239 of the 260 in variant t are bit-identical.
+  Of those, 107 write non-zero values and 153 write only zeros or nothing (a shader whose descriptors come from a
+  zeroed heap mostly samples zero or discards). That is the limit of the synthetic inputs: a
+  seeded heap was tried and abandoned, because a pointer read from float data is a wild address and takes NVIDIA's
+  device down.
+
 ## Coverage plan and cost
 
 Start with straight-line scalar/vector ALU because it is deterministic, needs no descriptors and
