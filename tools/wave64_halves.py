@@ -416,6 +416,41 @@ class Analysis:
                     else:
                         st[key].pop(r, None)
 
+    def literal_sgpr(self, n, i, r):
+        """The 32-bit literal SGPR `r` holds before instruction `i` of block `n`: the one an s_mov_b32 (of an
+        immediate, or of an SGPR that is itself such a literal) wrote earlier in this basic block, as rdna2spirv's
+        `sgpr_imm`. None when the last writer is anything else, or there is none in the block (a run-time value)."""
+        for j in range(i - 1, -1, -1):
+            ins = self.blocks[n][j]
+            if ("s", r) not in [x for d in operands(ins)[0] for x in _regs(d)]:
+                continue
+            a = ins["args"]
+            if base_op(ins["op"]) != "s_mov_b32" or len(a) != 2 or a[1].get("abs") or a[1].get("neg"):
+                return None
+            if a[1].get("k") == "imm":
+                return a[1]["v"] & 0xFFFFFFFF
+            if a[1].get("k") == "sgpr" and a[1].get("n", 1) == 1:
+                return self.literal_sgpr(n, j, a[1]["r"])
+            return None
+        return None
+
+    def add_tid_lane(self, n, i, a, mods):
+        """LANE when a MUBUF/MTBUF access (vdata, vaddr, V#, ...) has no idxen and its V# word3 is a literal with
+        ADD_TID_ENABLE (bit 23) set: the effective index is then the wave lane (idxen ignores the bit), so the
+        result or the address is the lane id. A run-time V# cannot be judged here: tiers A and B assume the bit is
+        0 there (docs/design.md, SHADER-10)."""
+        if "idxen" in mods or len(a) < 3:
+            return 0
+        rsrc = a[2]
+        if rsrc.get("k") == "sgpr" and rsrc.get("n") == 4:
+            w3 = rsrc["r"] + 3
+        elif rsrc.get("k") == "slist" and len(rsrc["r"]) == 4 and isinstance(rsrc["r"][3], int):
+            w3 = rsrc["r"][3]
+        else:
+            return 0
+        lit = self.literal_sgpr(n, i, w3)
+        return LANE if lit is not None and lit >> 23 & 1 else 0
+
     def transfer(self, n, i, ins, st, ev):
         op, a = base_op(ins["op"]), ins["args"]
         mods = ins.get("mods") or []
@@ -502,6 +537,8 @@ class Analysis:
             at = 0
             for x in addr:
                 at |= self.rd(st, ins, x)
+            if op.startswith(("buffer_store", "tbuffer_store")):
+                at |= self.add_tid_lane(n, i, a, mods)
             bits_violation(dt)
             bits_violation(at, BASE | RNK)
             if at & RNK and at & BASE:
@@ -541,6 +578,8 @@ class Analysis:
             addr_t = 0
             for x in addr_ops:
                 addr_t |= self.rd(st, ins, x)
+            if op.startswith("buffer_atomic"):
+                addr_t |= self.add_tid_lane(n, i, a, mods)
             elected = bool(st["xg"] and st["xg"][0] == "elect")
             bits_violation(addr_t, ELECT if elected else 0)
             if data_t & CNT:
@@ -575,6 +614,8 @@ class Analysis:
                         x.get("k") == "special" and x.get("t") in ("vcc", "exec") and self.is_mask(ins, x)):
                     md |= MASKD | X
         t_src |= md
+        if op.startswith(("buffer_load", "tbuffer_load")):
+            t_src |= self.add_tid_lane(n, i, a, mods)
 
         # --- lane masks and counts
         if op in ("s_bcnt1_i32_b64", "s_ff1_i32_b64") and len(a) == 2 and self.is_mask(ins, a[1]):
