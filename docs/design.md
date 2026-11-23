@@ -37,7 +37,6 @@ tools/       Python analysis tools (no game data inside)
   pe_inspect.py   PE headers, sections, entropy, imports sorted by where they resolve, .pdata, TLS
   rpf_probe.py    RPF header survey of a game folder
   manifest.py     SHA-256 manifest of a game folder (create), plus a verify subcommand
-  manifest.py     SHA-256 manifest of a game folder, plus a --verify mode
   inline_scan.py  inline command-list writes in an image, and whether each checks the cursor limit first
 scripts/
   first_look.ps1  run once the exe arrives: the full report set for it
