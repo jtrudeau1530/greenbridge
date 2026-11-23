@@ -517,9 +517,19 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
   **`ds_cmpstore_rtn_b32` takes the value to store before the compare value**, the reverse of GFX10's
   `ds_cmpst_rtn_b32 vdst, vaddr, cmp, store`; llvm-mc encodes both spellings of the same text identically, so only
   the operand order says which. Unswapped, every program with a `cmpst` failed on gfx1150 (each minimized to that one
-  op); swapped, none does. This is measured on GFX11 only: on gfx12xx the programs with a `cmpst` are skipped with
-  that reason. The model keeps the GFX10 order. Nothing else the generator emits is missing on GFX11, so no other
-  program is skipped for its semantics; an assembler rejection is counted as `rejected`, never as a pass.
+  op); swapped, none does. GFX12 takes the same order (measured on an RX 9070 XT, gfx1201: with 7 in the dword and
+  data `v1 = 9`, `v2 = 7` it becomes 9, with `v1 = 7`, `v2 = 9` it stays 7, for `ds_cmpstore_rtn_b32` and
+  `ds_cmpstore_b32`; gfx1036's `ds_cmpst` does the opposite), and with `--perturb cmpst_swap` 275 of 1,000 wave32
+  programs mismatch there. The model keeps the GFX10 order. Nothing else the generator emits is missing on GFX11, so
+  no other program is skipped for its semantics; an assembler rejection is counted as `rejected`, never as a pass.
+- **GFX12** (`hw_oracle/asm.py` `sync_lines`): there is no `s_barrier` (a workgroup barrier is
+  `s_barrier_signal -1` then `s_barrier_wait -1`), and the LDS wait is `s_wait_dscnt 0` instead of the legacy
+  `s_waitcnt lgkmcnt(0)`. **A wave64 `ds_bpermute_b32` reaches all 64 lanes on GFX12**, while RDNA2 (and gfx1150)
+  keep each 32-lane half separate: with every lane asking for lane `(l + 32) mod 64`, the RX 9070 XT returns lane
+  `l ^ 32` and a gfx1036 iGPU returns lane `l`. The model describes RDNA2, so on gfx12xx a wave64 program with a
+  `ds_bpermute` is skipped with that reason; under `--perturb bpermute_wave64_cross` all 1,000 wave64 programs of
+  seed 1 match there. RX 9070 XT, AMD 26.11.2, `--programs 1000`, seeds 1 and 2: wave32 1,000/1,000 match; wave64
+  537 and 506 match, 0 mismatch, the rest skipped for that reason. The gfx1036 iGPU gives 1,000/1,000 in both.
 - **Wider op mix**, opt-in so that a seed keeps its programs: `--permute` (`ds_permute_b32`), `--swizzle-exec`
   (`ds_swizzle_b32` under EXEC masks), `--threads`, `--extended` (all three). `ds_permute_b32` and a masked
   `ds_swizzle_b32` carry a hypothesis (the model's reading of the ISA text); on the hardware a failing one is a

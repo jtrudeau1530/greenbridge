@@ -314,7 +314,7 @@ GFX11_VALU_RENAMED = {
 # the GFX10 spelling of all of them on gfx1150 except ds_cmpst_rtn_b32 ("instruction not supported on this GPU"), and
 # takes the GFX11 spelling on gfx1030 for none. The new spelling is used on GFX11/GFX12 so the program text is what
 # the target names, not what an alias happens to accept. ds_cmpstore_rtn_b32 also takes its two data operands in the
-# other order (ds_line).
+# other order (ds_line), and GFX12 spells the barrier and the LDS wait differently (sync_lines).
 DS_RENAMED_GFX11 = {
     "ds_wrxchg_rtn_b32": "ds_storexchg_rtn_b32",
     "ds_cmpst_rtn_b32": "ds_cmpstore_rtn_b32",
@@ -337,30 +337,46 @@ def ds_mnemonic(op, arch):
 
 
 def ds_line(line, arch):
-    """A whole instruction line (GFX10 spelling and operand order in) respelled for the architecture. On GFX11
-    (measured on gfx1150; GFX12 is not measured, lds_fuzz skips it) ds_cmpstore_rtn_b32 takes the value to store first and the compare value second, the reverse of GFX10's
+    """A whole instruction line (GFX10 spelling and operand order in) respelled for the architecture. On GFX11 and
+    GFX12 ds_cmpstore_rtn_b32 takes the value to store first and the compare value second, the reverse of GFX10's
     ds_cmpst_rtn_b32 vdst, vaddr, cmp, store (measured on gfx1150: tools/lds_fuzz.py --oracle hw, and it is what LLVM's
-    cmpxchg selection does for GFX11); llvm-mc encodes both spellings of the same text identically, so only the
+    cmpxchg selection does for GFX11; measured on gfx1201, an RX 9070 XT: with M = 7 at the address, data v1 = 9 and
+    v2 = 7 the dword becomes 9 and with v1 = 7, v2 = 9 it stays 7, for the rtn and the non-returning form, while
+    gfx1036's ds_cmpst does the opposite); llvm-mc encodes both spellings of the same text identically, so only the
     operand order tells them apart."""
     op, sep, rest = line.partition(" ")
-    if op == "ds_cmpst_rtn_b32" and family(arch) == "gfx11":
+    if op == "ds_cmpst_rtn_b32" and family(arch) in ("gfx11", "gfx12"):
         m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
         if not m:
             raise ValueError(f"cannot swap the operands of {line!r}")
         dst, addr, cmp_, store, tail = m.groups()
         rest = f"{dst}, {addr}, {store}, {cmp_}{tail}"
-    elif op == "ds_cmpst_b32" and family(arch) == "gfx11":
+    elif op == "ds_cmpst_b32" and family(arch) in ("gfx11", "gfx12"):
         # The non-returning form is renamed as well, and its two data operands swap the same way: GFX10's
         # ds_cmpst_b32 vaddr, cmp, store is GFX11's ds_cmpstore_b32 vaddr, store, cmp (measured on gfx1100: with
-        # M = 7, vaddr = 0 and data v1 = 9, v2 = 7 the dword becomes 9, so the store operand is v1). The rename is
-        # done here rather than in DS_RENAMED_GFX11 because the swap is only measured on GFX11, and renaming
-        # without swapping on GFX12 would silently compare and store the wrong way round.
+        # M = 7, vaddr = 0 and data v1 = 9, v2 = 7 the dword becomes 9, so the store operand is v1; the same on
+        # gfx1201). The rename is done here rather than in DS_RENAMED_GFX11 so that it never happens without the
+        # swap, which would silently compare and store the wrong way round.
         m = re.fullmatch(r"(v\d+),\s*(v\d+),\s*(v\d+)(.*)", rest)
         if not m:
             raise ValueError(f"cannot swap the operands of {line!r}")
         addr, cmp_, store, tail = m.groups()
         return f"ds_cmpstore_b32 {addr}, {store}, {cmp_}{tail}"
     return ds_mnemonic(op, arch) + sep + rest
+
+
+def sync_lines(line, arch):
+    """A wait or barrier line (GFX10/GFX11 spelling in) as the instructions that do it on this architecture. GFX12 has
+    no s_barrier (AMD LLVM 23: "instruction not supported on this GPU (gfx1201)"); a workgroup barrier there is
+    s_barrier_signal -1 then s_barrier_wait -1. It also split lgkmcnt into dscnt (LDS) and kmcnt (scalar memory), so
+    a wait for the LDS is s_wait_dscnt 0 rather than the legacy s_waitcnt encoding the assembler still takes."""
+    if family(arch) == "gfx12":
+        text = line.strip()
+        if text == "s_barrier":
+            return ["s_barrier_signal -1", "s_barrier_wait -1"]
+        if text == "s_waitcnt lgkmcnt(0)":
+            return ["s_wait_dscnt 0"]
+    return [line]
 
 
 def valu_skip_reason(op, arch):
