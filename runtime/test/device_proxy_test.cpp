@@ -532,8 +532,34 @@ int main(int argc, char** argv) {
             check(gpu_pc.ptr == gpu.ptr, "proxy GPU handle equals the PC heap's hidden-pointer result");
         }
 
+        check(rt::d3d12_xs::heap_slot_overridden(8), "heap slot 8 is the console-ABI GetDesc override");
+        {
+            using ConsoleHeapGetDescFn = D3D12_DESCRIPTOR_HEAP_DESC*(WINAPI*)(D3D12_DESCRIPTOR_HEAP_DESC*, void*);
+            auto console_get_desc = reinterpret_cast<ConsoleHeapGetDescFn>(proxy_heap_vtbl[8]);
+            struct PaddedHeapDesc {
+                D3D12_DESCRIPTOR_HEAP_DESC value;
+                std::uint8_t after[64];
+            } padded;
+            std::memset(&padded, 0xA5, sizeof(padded));
+            const std::uint64_t hits_before = rt::d3d12_xs::heap_slot_hits(8);
+            const D3D12_DESCRIPTOR_HEAP_DESC* returned = console_get_desc(&padded.value, heap.Get());
+            const D3D12_DESCRIPTOR_HEAP_DESC want = real_heap ? real_heap->GetDesc() : D3D12_DESCRIPTOR_HEAP_DESC{};
+            bool canary_intact = true;
+            for (const std::uint8_t byte : padded.after) canary_intact = canary_intact && byte == 0xA5;
+            check(returned == &padded.value, "heap slot 8 console form returns the buffer address");
+            check(real_heap && std::memcmp(&padded.value, &want, sizeof(want)) == 0 &&
+                      padded.value.NumDescriptors == heap_desc.NumDescriptors,
+                  "heap slot 8 console form matches real heap GetDesc");
+            check(canary_intact, "heap slot 8 console form writes nothing past the struct");
+            check(rt::d3d12_xs::heap_slot_hits(8) == hits_before + 1, "heap slot 8 console form increments hit counter");
+            check(rt::d3d12_xs::is_heap_proxy(heap.Get()) && rt::d3d12_xs::heap_proxy_real_heap(heap.Get()) == real_heap,
+                  "heap proxy stays intact after console-form GetDesc");
+        }
+        const std::uint64_t heap_desc_hits_before_pc = rt::d3d12_xs::heap_slot_hits(8);
         const D3D12_DESCRIPTOR_HEAP_DESC got_desc = heap->GetDesc();
-        check(got_desc.NumDescriptors == heap_desc.NumDescriptors, "heap slot 8 forwards GetDesc");
+        check(got_desc.NumDescriptors == heap_desc.NumDescriptors &&
+                  rt::d3d12_xs::heap_slot_hits(8) == heap_desc_hits_before_pc + 1,
+              "heap slot 8 PC form still forwards GetDesc");
         check(rt::d3d12_xs::heap_slot_hits(9) >= 1, "heap slot 9 hit counter moves");
         check(rt::d3d12_xs::heap_slot_hits(10) >= 1, "heap slot 10 hit counter moves");
         check(rt::d3d12_xs::heap_slot_first_call_seen(9), "heap slot 9 first-call flag is set");
@@ -844,6 +870,29 @@ int main(int argc, char** argv) {
             ComPtr<ID3D12Device> owner;
             check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
                   "the queue proxy's GetDevice is the device the shim returned");
+            ID3D12CommandQueue* real_queue = rt::d3d12_xs::queue_proxy_real_queue(queue.Get());
+            void** queue_vtbl = *reinterpret_cast<void***>(queue.Get());
+            using ConsoleQueueGetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(D3D12_COMMAND_QUEUE_DESC*, void*);
+            struct PaddedQueueDesc {
+                D3D12_COMMAND_QUEUE_DESC value;
+                std::uint8_t after[64];
+            } padded;
+            std::memset(&padded, 0xA5, sizeof(padded));
+            const std::uint64_t qhits_before = rt::d3d12_xs::queue_slot_hits(18);
+            const D3D12_COMMAND_QUEUE_DESC* returned =
+                reinterpret_cast<ConsoleQueueGetDescFn>(queue_vtbl[18])(&padded.value, queue.Get());
+            const D3D12_COMMAND_QUEUE_DESC want = real_queue ? real_queue->GetDesc() : D3D12_COMMAND_QUEUE_DESC{};
+            bool canary_intact = true;
+            for (const std::uint8_t byte : padded.after) canary_intact = canary_intact && byte == 0xA5;
+            check(returned == &padded.value && real_queue && std::memcmp(&padded.value, &want, sizeof(want)) == 0 &&
+                      canary_intact && rt::d3d12_xs::queue_slot_hits(18) == qhits_before + 1 &&
+                      rt::d3d12_xs::is_queue_proxy(queue.Get()) &&
+                      rt::d3d12_xs::queue_proxy_real_queue(queue.Get()) == real_queue,
+                  "queue slot 18 console form matches real queue GetDesc");
+            const D3D12_COMMAND_QUEUE_DESC pc_queue_desc = queue->GetDesc();
+            check(real_queue && std::memcmp(&pc_queue_desc, &want, sizeof(want)) == 0 &&
+                      rt::d3d12_xs::queue_slot_hits(18) == qhits_before + 2,
+                  "queue slot 18 PC form still forwards GetDesc");
         }
     }
 

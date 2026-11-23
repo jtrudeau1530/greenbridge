@@ -70,6 +70,8 @@ static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
 static_assert(sizeof(D3D12_RESOURCE_DESC) == 56, "the measured Xbox description prefix is 56 bytes");
+static_assert(sizeof(D3D12_DESCRIPTOR_HEAP_DESC) == 16 && sizeof(D3D12_COMMAND_QUEUE_DESC) == 16,
+              "GetDesc structs exceed 8 bytes and use the hidden return pointer");
 
 struct DeviceProxy {
     void** vtable;          // offset 0: the caller's ID3D12Device* points here
@@ -696,6 +698,17 @@ D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
     return handle.ptr != kUnset ? handle : returned;
 }
 
+// Heap slot 8 (ID3D12DescriptorHeap::GetDesc): D3D12_DESCRIPTOR_HEAP_DESC is 16 bytes, so console x64 C-ABI callers
+// pass the hidden return buffer in RCX and the heap proxy in RDX instead of PC C++ (this, out). When RDX holds a heap
+// proxy and RCX does not, translate to PC call order and return the buffer address in RAX.
+D3D12_DESCRIPTOR_HEAP_DESC* heap_get_desc_console(D3D12_DESCRIPTOR_HEAP_DESC* out, HeapProxy* self) {
+    note_heap_slot(8);
+    if (!out) return nullptr;
+    using Fn = D3D12_DESCRIPTOR_HEAP_DESC*(WINAPI*)(ID3D12DescriptorHeap*, D3D12_DESCRIPTOR_HEAP_DESC*);
+    reinterpret_cast<Fn>(self->real_vtable[8])(self->real, out);
+    return out;
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -711,6 +724,15 @@ std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t 
     } else if constexpr (Slot == 7) {
         return hr_to_u64(heap_get_device(self, reinterpret_cast<const IID*>(a1),
                                          reinterpret_cast<void**>(a2)));
+    } else if constexpr (Slot == 8) {
+        if (!is_heap_proxy(self) && is_heap_proxy(reinterpret_cast<const void*>(a1))) {
+            return reinterpret_cast<std::uint64_t>(heap_get_desc_console(
+                reinterpret_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(self), reinterpret_cast<HeapProxy*>(a1)));
+        }
+        note_heap_slot(8);
+        using Fn = D3D12_DESCRIPTOR_HEAP_DESC*(WINAPI*)(ID3D12DescriptorHeap*, D3D12_DESCRIPTOR_HEAP_DESC*);
+        return reinterpret_cast<std::uint64_t>(
+            reinterpret_cast<Fn>(self->real_vtable[8])(self->real, reinterpret_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(a1)));
     } else if constexpr (Slot == 9) {
         return static_cast<std::uint64_t>(heap_get_cpu_handle(self).ptr);
     } else if constexpr (Slot == 10) {
@@ -1385,6 +1407,19 @@ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::ui
 
 #endif
 
+// Queue slot 18 (ID3D12CommandQueue::GetDesc): D3D12_COMMAND_QUEUE_DESC is 16 bytes, so console x64 C-ABI callers pass
+// the hidden return buffer in RCX and the queue proxy in RDX instead of PC C++ (this, out). When RDX holds a queue
+// proxy and RCX does not, translate to PC call order and return the buffer address in RAX. PC-order calls (queue proxy
+// in RCX) are left to the standard queue slot forwarding / layout-detection path.
+D3D12_COMMAND_QUEUE_DESC* queue_get_desc_console(D3D12_COMMAND_QUEUE_DESC* out, ChildProxy* self) {
+    note_child_slot<ChildKind::queue>(18);
+    d3d12_trace::record(child_trace_name<ChildKind::queue>(18));
+    if (!out) return nullptr;
+    using Fn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(IUnknown*, D3D12_COMMAND_QUEUE_DESC*);
+    reinterpret_cast<Fn>(self->real_vtable[18])(self->real, out);
+    return out;
+}
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1408,6 +1443,13 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot));
         return fence_completed_value_address(self, a1, a2, a3);
     } else {
+        if constexpr (K == ChildKind::queue && Slot == 18) {
+            if (!is_child_proxy<ChildKind::queue>(self) &&
+                is_child_proxy<ChildKind::queue>(reinterpret_cast<const void*>(a1))) {
+                return reinterpret_cast<std::uint64_t>(queue_get_desc_console(
+                    reinterpret_cast<D3D12_COMMAND_QUEUE_DESC*>(self), reinterpret_cast<ChildProxy*>(a1)));
+            }
+        }
         note_child_slot<K>(Slot);
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
             d3d12_trace::record(child_trace_name<K>(Slot));
@@ -4088,7 +4130,7 @@ std::uint64_t allocator_table_overruns() {
 }
 
 bool heap_slot_overridden(unsigned slot) {
-    return slot <= 2 || slot == 7 || slot == 9 || slot == 10;
+    return slot <= 2 || slot == 7 || slot == 8 || slot == 9 || slot == 10;
 }
 
 std::uint64_t device_slot_hits(unsigned slot) {

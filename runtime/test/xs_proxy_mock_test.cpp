@@ -84,6 +84,11 @@ constexpr UINT kHeapMarker = 0x26262626;  // the VisibleNodeMask a mock device's
 constexpr SIZE_T kMockHeapCpuStart = 0x55550000ull;
 constexpr UINT64 kMockHeapGpuStart = 0x66660000ull;
 constexpr UINT kMockDescriptorInc = 32;
+constexpr D3D12_DESCRIPTOR_HEAP_DESC kMockHeapDesc{
+    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 64, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0x3u};
+constexpr D3D12_COMMAND_QUEUE_DESC kMockQueueDesc{
+    D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_QUEUE_PRIORITY_HIGH, D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT,
+    0x5u};
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
 constexpr GUID kExtraIid{0x5d1e0c4a, 0x2b7f, 0x4e61, {0x9a, 0x3d, 0x8c, 0x4b, 0x2f, 0x1e, 0x6a, 0x70}};
 
@@ -414,6 +419,16 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         const auto base = reinterpret_cast<std::uintptr_t>(g_pool);
         const bool is_mock = at >= base && at < base + sizeof(g_pool) && (at - base) % sizeof(Mock) == 0;
         if (!is_mock) *reinterpret_cast<UINT64*>(a1) = 1000000;
+    }
+    if (m->kind == Kind::heap && slot == 8) {                         // PC GetDesc(this, &out)
+        auto* out = reinterpret_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(a1);
+        if (out) *out = kMockHeapDesc;
+        return a1;
+    }
+    if (m->kind == Kind::queue && slot == 18) {                       // PC GetDesc(this, &out)
+        auto* out = reinterpret_cast<D3D12_COMMAND_QUEUE_DESC*>(a1);
+        if (out) *out = kMockQueueDesc;
+        return a1;
     }
     return S_OK;
 }
@@ -2406,6 +2421,117 @@ int check_descriptor_heap_hooks() {
     return 0;
 }
 
+// ---- 10. Console C-ABI GetDesc (out in RCX, proxy in RDX) on heap slot 8 and queue slot 18 ----
+
+int check_get_desc_c_abi() {
+    EXPECT(xs::heap_slot_overridden(8));
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    const unsigned long device_refs = xs::device_proxy_ref_count(device);
+
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    void* heap = nullptr;
+    EXPECT(hr_of(raw(device, 14, word(&kMockHeapDesc), word(&heap_iid), word(&heap))) == S_OK);
+    EXPECT(xs::is_heap_proxy(heap));
+    Mock* const heap_mock = reinterpret_cast<Mock*>(xs::heap_proxy_real_heap(heap));
+    EXPECT(heap_mock && heap_mock->kind == Kind::heap);
+
+    void* queue = make_queue(device);
+    EXPECT(xs::is_queue_proxy(queue));
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    EXPECT(queue_mock && queue_mock->kind == Kind::queue);
+
+    xs::reset_device_proxy_stats();
+
+    // Heap slot 8: console C-ABI (out in RCX, proxy in RDX) + null out + PC C++ ABI (proxy in RCX, out in RDX).
+    {
+        void* const* heap_vtbl = *reinterpret_cast<void* const* const*>(heap);
+        using ConsoleHeapGetDescFn = D3D12_DESCRIPTOR_HEAP_DESC*(WINAPI*)(D3D12_DESCRIPTOR_HEAP_DESC*, void*);
+        using PcHeapGetDescFn = D3D12_DESCRIPTOR_HEAP_DESC*(WINAPI*)(void*, D3D12_DESCRIPTOR_HEAP_DESC*);
+        auto console_get_desc = reinterpret_cast<ConsoleHeapGetDescFn>(heap_vtbl[8]);
+        auto pc_get_desc = reinterpret_cast<PcHeapGetDescFn>(heap_vtbl[8]);
+
+        struct PaddedHeapDesc {
+            D3D12_DESCRIPTOR_HEAP_DESC value;
+            std::uint8_t after[64];
+        } padded;
+        std::memset(&padded, 0xA5, sizeof(padded));
+        EXPECT(console_get_desc(&padded.value, heap) == &padded.value);
+        EXPECT(std::memcmp(&padded.value, &kMockHeapDesc, sizeof(kMockHeapDesc)) == 0);
+        for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+        EXPECT(heap_mock->calls[8] == 1 && heap_mock->args[8][0] == word(&padded.value));
+        EXPECT(xs::heap_slot_hits(8) == 1 && xs::heap_slot_first_call_seen(8));
+        EXPECT(xs::is_heap_proxy(heap) &&
+               reinterpret_cast<Mock*>(xs::heap_proxy_real_heap(heap)) == heap_mock);
+
+        EXPECT(console_get_desc(nullptr, heap) == nullptr);
+        EXPECT(heap_mock->calls[8] == 1 && xs::heap_slot_hits(8) == 2);
+
+        D3D12_DESCRIPTOR_HEAP_DESC pc_out{};
+        EXPECT(pc_get_desc(heap, &pc_out) == &pc_out);
+        EXPECT(std::memcmp(&pc_out, &kMockHeapDesc, sizeof(kMockHeapDesc)) == 0);
+        EXPECT(heap_mock->calls[8] == 2 && heap_mock->args[8][0] == word(&pc_out));
+        EXPECT(xs::heap_slot_hits(8) == 3);
+    }
+
+    // Queue slot 18: console C-ABI (out in RCX, proxy in RDX) translates to GetDesc; PC-order (proxy in RCX) falls
+    // through to the generic queue slot path rather than being intercepted by a GetDesc-only branch (so queue layout
+    // detection can answer GetTimestampFrequency on undetected queues and full arguments are preserved).
+    {
+        void* const* queue_vtbl = *reinterpret_cast<void* const* const*>(queue);
+        using ConsoleQueueGetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(D3D12_COMMAND_QUEUE_DESC*, void*);
+        using PcQueueGetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(void*, D3D12_COMMAND_QUEUE_DESC*);
+        auto console_get_desc = reinterpret_cast<ConsoleQueueGetDescFn>(queue_vtbl[18]);
+        auto pc_get_desc = reinterpret_cast<PcQueueGetDescFn>(queue_vtbl[18]);
+
+        struct PaddedQueueDesc {
+            D3D12_COMMAND_QUEUE_DESC value;
+            std::uint8_t after[64];
+        } padded;
+        std::memset(&padded, 0xA5, sizeof(padded));
+        EXPECT(console_get_desc(&padded.value, queue) == &padded.value);
+        EXPECT(std::memcmp(&padded.value, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
+        for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+        EXPECT(queue_mock->calls[18] == 1 && queue_mock->args[18][0] == word(&padded.value));
+        EXPECT(xs::queue_slot_hits(18) == 1 && xs::queue_slot_first_call_seen(18));
+        EXPECT(xs::is_queue_proxy(queue) &&
+               reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue)) == queue_mock);
+
+        EXPECT(console_get_desc(nullptr, queue) == nullptr);
+        EXPECT(queue_mock->calls[18] == 1 && xs::queue_slot_hits(18) == 2);
+
+        D3D12_COMMAND_QUEUE_DESC pc_out{};
+        EXPECT(pc_get_desc(queue, &pc_out) == &pc_out);
+        EXPECT(std::memcmp(&pc_out, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
+        EXPECT(queue_mock->calls[18] == 2 && queue_mock->args[18][0] == word(&pc_out));
+        EXPECT(xs::queue_slot_hits(18) == 3);
+
+        // Regression: PC-order slot 18 must fall through to the generic queue forwarder (preserving all forwarded
+        // argument words rather than short-circuiting through a 2-argument GetDesc-only branch).
+        D3D12_COMMAND_QUEUE_DESC pc_passthrough_out{};
+        constexpr std::uint64_t kTag2 = 0x1122334455667788ull;
+        constexpr std::uint64_t kTag3 = 0x2233445566778899ull;
+        constexpr std::uint64_t kTag4 = 0x33445566778899aaull;
+        constexpr std::uint64_t kTag5 = 0x445566778899aabbull;
+        EXPECT(raw(queue, 18, word(&pc_passthrough_out), kTag2, kTag3, kTag4, kTag5) == word(&pc_passthrough_out));
+        EXPECT(std::memcmp(&pc_passthrough_out, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
+        EXPECT(queue_mock->calls[18] == 3);
+        EXPECT(queue_mock->args[18][0] == word(&pc_passthrough_out) && queue_mock->args[18][1] == kTag2 &&
+               queue_mock->args[18][2] == kTag3 && queue_mock->args[18][3] == kTag4 &&
+               queue_mock->args[18][4] == kTag5);
+        EXPECT(xs::queue_slot_hits(18) == 4);
+    }
+
+    EXPECT(release(heap) == 0 && heap_mock->refs == 0);
+    EXPECT(release(queue) == 0 && queue_mock->refs == 0);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: heap slot 8 and queue slot 18 answer console C-ABI (out, proxy) and PC C++ (proxy, out) GetDesc\n",
+                g_label);
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -2999,7 +3125,8 @@ int main(int argc, char** argv) {
         check_render_target_layout() || check_xbox_slots() || check_xbox_queue_slots() || check_custom_heap_properties() ||
         check_slot70() || check_slot70_raw_buffer() || check_descriptor_heap_hooks() || check_committed_resource3_x() ||
         check_committed_resource3_xmem_hook() || check_committed_buffers_on_xmem() || check_slot74() ||
-        check_view_heap_cap() || check_lists() || check_signalx_detection() || check_list_tail_names())
+        check_view_heap_cap() || check_lists() || check_signalx_detection() || check_list_tail_names() ||
+        check_get_desc_c_abi())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

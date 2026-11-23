@@ -336,14 +336,37 @@ int check_slots(const Backend& b) {
         before = qhits(18);
         EXPECT(queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT);  // struct through the hidden pointer
         EXPECT(qhits(18) == before + 1);
-        D3D12_COMMAND_QUEUE_DESC compute_desc{};
-        compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-        compute_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-        Ref<ID3D12CommandQueue> compute;
-        EXPECT(SUCCEEDED(device->CreateCommandQueue(&compute_desc, IID_PPV_ARGS(&compute.p))));
-        const D3D12_COMMAND_QUEUE_DESC compute_back = compute->GetDesc();
-        EXPECT(xs::is_queue_proxy(compute.p) && compute_back.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE);
-        EXPECT(compute_back.Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
+        {
+            using ConsoleQueueGetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(D3D12_COMMAND_QUEUE_DESC*, void*);
+            auto check_console_queue_desc = [&](ID3D12CommandQueue* q) -> bool {
+                ID3D12CommandQueue* real_q = xs::queue_proxy_real_queue(q);
+                if (!real_q) return false;
+                void* const* vtable = *reinterpret_cast<void* const* const*>(q);
+                struct PaddedQueueDesc {
+                    D3D12_COMMAND_QUEUE_DESC value;
+                    std::uint8_t after[64];
+                } padded;
+                std::memset(&padded, 0xA5, sizeof(padded));
+                const std::uint64_t hits_before = qhits(18);
+                const D3D12_COMMAND_QUEUE_DESC* returned =
+                    reinterpret_cast<ConsoleQueueGetDescFn>(vtable[18])(&padded.value, q);
+                const D3D12_COMMAND_QUEUE_DESC want = real_q->GetDesc();
+                if (returned != &padded.value || std::memcmp(&padded.value, &want, sizeof(want)) != 0) return false;
+                for (const std::uint8_t byte : padded.after)
+                    if (byte != 0xA5) return false;
+                return qhits(18) == hits_before + 1 && xs::is_queue_proxy(q) && xs::queue_proxy_real_queue(q) == real_q;
+            };
+            EXPECT(check_console_queue_desc(queue.p));
+            D3D12_COMMAND_QUEUE_DESC compute_desc{};
+            compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            compute_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+            Ref<ID3D12CommandQueue> compute;
+            EXPECT(SUCCEEDED(device->CreateCommandQueue(&compute_desc, IID_PPV_ARGS(&compute.p))));
+            const D3D12_COMMAND_QUEUE_DESC compute_back = compute->GetDesc();
+            EXPECT(xs::is_queue_proxy(compute.p) && compute_back.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            EXPECT(compute_back.Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
+            EXPECT(check_console_queue_desc(compute.p));
+        }
 
         // Every public fence slot.
         before = fhits(4);
