@@ -8,7 +8,7 @@ import unittest
 from fractions import Fraction
 
 import support
-from spirv_mini_interp import run_fragment
+from spirv_mini_interp import half_to_float, run_fragment
 
 import rdna2spirv
 
@@ -34,7 +34,9 @@ def reference(code):
         elif kind == "sint":
             out.append(signed & 0xFFFFFFFF)
         elif kind == "f16":
-            out.append(f32_bits(struct.unpack("<e", struct.pack("<H", v))[0]))
+            # The interpreter's pinned f16 -> f32 rule (a NaN half widens to the canonical quiet NaN with its sign),
+            # not struct's '<e', whose NaN payload depends on the Python version (CPython gh-130317).
+            out.append(f32_bits(half_to_float(v)))
         elif kind == "unorm":
             out.append(f32_bits(float(Fraction(v, (1 << w) - 1))))
         elif kind == "snorm":
