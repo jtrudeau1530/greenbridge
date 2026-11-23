@@ -219,6 +219,8 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   refused with `ERROR_ACCESS_DENIED` before writing a deletion marker. An overlay copy supplies its own attributes,
   so a writable overlay can still be deleted when the package file underneath is read-only. The native A/W controls
   in `file_system_test` cover these cases and mixed hidden, system and archive attributes.
+- Console file shims support resolved Windows paths beyond `MAX_PATH`. A short `GAME:`, `G:` or `T:` name can
+  reach a file under a deep package or overlay root, with the same overlay and listing rules.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
   name, and hides deleted names, the marker folder and the copy folder.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
