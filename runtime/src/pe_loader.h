@@ -121,6 +121,10 @@ public:
     // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
     void* find_loaded_module(const std::string& dll_lower) const;
     void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
+    // The same by the module's native basename (any Unicode name, matched case-insensitively as Windows matches
+    // module names), for the W entries of LoadLibrary / GetModuleHandle.
+    void* find_loaded_module_w(const std::wstring& basename) const;
+    void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
 
@@ -128,6 +132,9 @@ private:
     void initialise(Module& m);
     static void set_initialised(Module& m, bool value);
     Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_
+    Module* find_wide_module(const std::wstring& basename) const;    // caller holds mutex_
+    void* load_runtime_candidate(Module* existing, const std::filesystem::path& candidate, uint32_t flags,
+                                 const std::string& display);        // caller holds mutex_
     Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
     void initialize_tls(Module& m);
     void bind_imports(Module& m);

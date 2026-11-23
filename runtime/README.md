@@ -108,11 +108,13 @@ are deduped by basename, so an import graph that reaches the same DLL twice maps
 key uses the filesystem's native path representation with ASCII case folded; it does not require a
 Windows filename to fit the ANSI code page. A lossless legacy narrow filename alias retains the existing
 bytewise case behavior for narrow API and import-name lookups. `Module::name`, mapped address labels,
-and path diagnostics use UTF-8. This does not add Unicode case folding or change the separately defined
-`LoadLibrary`/`GetModuleHandle` API conversions.
+and path diagnostics use UTF-8. The `LoadLibrary*`/`GetModuleHandle*` shims look a wide name up by its native
+basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, `load_runtime_module_w`), and
+module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
+compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
 
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
-reuse, existing ACP aliases, export execution, and path errors. On native Windows with Python available,
+reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
 and `--run`, including a Unicode parent directory and an ACP-named imported DLL. It checks strict UTF-8
 trace names and unchanged fixture bytes. Both tests use only locally built synthetic images.
