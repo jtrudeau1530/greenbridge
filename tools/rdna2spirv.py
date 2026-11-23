@@ -15206,11 +15206,20 @@ def reg_reads_writes(insns):
     return rr, ww
 
 
+def shader_container(path, name):
+    """The DXBC container next to the .s file's folder (<folder>/../<name>.dxbc). A pipeline-library program whose
+    source isn't in the carve has none (docs/shader_library.md): Unsupported for that shader, where the bare open()
+    raised FileNotFoundError and stopped the whole run."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc"), "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        raise Unsupported("no shader container (signatures, PSV0)") from None
+
+
 def input_signature_full(path, name):
     """ISG1 elements as (system value, declared mask, read/write mask)."""
-    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    with open(dxbc, "rb") as f:
-        d = f.read()
+    d = shader_container(path, name)
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"ISG1":
@@ -15223,9 +15232,7 @@ def input_signature_full(path, name):
 
 def input_signature(path, name):
     """ISG1 elements of the shader's DXBC container: (register, mask, system value, component type)."""
-    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    with open(dxbc, "rb") as f:
-        d = f.read()
+    d = shader_container(path, name)
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"ISG1":
@@ -15325,9 +15332,7 @@ def restore_mix_literal(ins, raw, literal):
 
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
-    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    with open(dxbc, "rb") as f:
-        d = f.read()
+    d = shader_container(path, name)
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"OSG1":
@@ -15429,9 +15434,7 @@ def mesh_psv(path, name):
     """PSV0 runtime info of a mesh shader: MSInfo (GroupSharedBytesUsed, GroupSharedViewIDDependentBytes,
     PayloadSizeInBytes, u16 MaxOutputVertices, u16 MaxOutputPrimitives), wave lane counts, then PSVRuntimeInfo1
     (stage, UsesViewID, u8 SigPrimVectors, u8 MeshOutputTopology, ...) and PSVRuntimeInfo2 NumThreadsX/Y/Z."""
-    dxbc = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), name + ".dxbc")
-    with open(dxbc, "rb") as f:
-        d = f.read()
+    d = shader_container(path, name)
     for k in range(struct.unpack_from("<I", d, 28)[0]):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if d[off:off + 4] == b"PSV0":
