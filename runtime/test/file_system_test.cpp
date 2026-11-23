@@ -944,6 +944,49 @@ int main() {
                   GetLastError() == ERROR_INVALID_NAME,
               "T:\\.. cannot climb out of the scratch folder into the package");
 
+        // The overlay's own folders (.gta6rt-deleted, .gta6rt-temp, .gta6rt-copy) are hidden from GAME:\ listings and,
+        // as an explicit GAME: or G: path, refused like any other invalid name, in every spelling parse_console()
+        // normalises (RT-294). T:\ still names the scratch folder, and an ordinary dotted name is not reserved.
+        write_path(overlay / ".gta6rt-temp" / "runtime.tmp", "runtime");
+        write_path(overlay / ".gta6rt-deleted" / "data" / "gone.txt", "");
+        write_path(overlay / ".gta6rt-other" / "ok.txt", "ok");
+        for (const wchar_t* reserved : {L"GAME:\\.gta6rt-temp\\runtime.tmp", L"GAME:\\.GTA6RT-TEMP\\runtime.tmp",
+                                        L"game:/.gta6rt-temp/runtime.tmp", L"GAME:\\.\\.gta6rt-temp\\runtime.tmp",
+                                        L"GAME:\\data\\..\\.gta6rt-temp\\runtime.tmp", L"G:\\.gta6rt-temp\\runtime.tmp",
+                                        L"GAME:\\.gta6rt-deleted\\data\\gone.txt", L"GAME:\\.gta6rt-copy\\x.bin",
+                                        L"GAME:\\.gta6rt-temp"}) {
+            SetLastError(0);
+            const HANDLE h = create_w(reserved, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+                  "an explicit GAME: path into a reserved overlay folder is refused (CreateFileW)");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+            SetLastError(0);
+            check(attributes_w(reserved) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_INVALID_NAME,
+                  "and has no attributes (GetFileAttributesW)");
+        }
+        WIN32_FIND_DATAW marker_data{};
+        SetLastError(0);
+        const HANDLE markers = first_w(L"GAME:\\.gta6rt-deleted\\data\\*", &marker_data);
+        check(markers == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+              "deletion markers cannot be listed through GAME:\\.gta6rt-deleted");
+        if (markers != INVALID_HANDLE_VALUE) find_close(markers);
+        SetLastError(0);
+        const HANDLE probe = create_w(L"GAME:\\.gta6rt-temp\\probe.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(probe == INVALID_HANDLE_VALUE && !std::filesystem::exists(overlay / ".gta6rt-temp" / "probe.txt"),
+              "a write through GAME:\\.gta6rt-temp creates nothing in the scratch folder");
+        if (probe != INVALID_HANDLE_VALUE) ::CloseHandle(probe);
+        check(mkdir_w(L"GAME:\\.gta6rt-copy\\sub", nullptr) == FALSE && !std::filesystem::exists(overlay / ".gta6rt-copy" / "sub"),
+              "CreateDirectoryW refuses a reserved folder");
+        check(delete_w(L"GAME:\\.gta6rt-deleted\\data\\gone.txt") == FALSE &&
+                  std::filesystem::exists(overlay / ".gta6rt-deleted" / "data" / "gone.txt"),
+              "DeleteFileW cannot remove a deletion marker through GAME:");
+        HANDLE through = create_w(L"T:\\runtime.tmp", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(through != INVALID_HANDLE_VALUE && read_handle(through) == "runtime", "T:\\ still reaches the scratch folder");
+        if (through != INVALID_HANDLE_VALUE) ::CloseHandle(through);
+        through = create_w(L"GAME:\\.gta6rt-other\\ok.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(through != INVALID_HANDLE_VALUE && read_handle(through) == "ok", "an ordinary dotted name under GAME: is not reserved");
+        if (through != INVALID_HANDLE_VALUE) ::CloseHandle(through);
+
         // A package that itself sits on drive G: is reached by host paths, which must stay host paths.
         rt::fs::configure(L"G:\\leonida_missing_package", L"G:\\leonida_missing_overlay");
         SetLastError(0);

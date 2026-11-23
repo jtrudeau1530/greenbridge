@@ -178,7 +178,12 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
             part.push_back(c);
         }
     }
-    return flush() ? Parsed::Console : Parsed::Refused;
+    if (!flush()) return Parsed::Refused;
+    // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
+    // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
+    // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
+    if (drive == Drive::Game && !parts.empty() && internal_dir(parts.front().c_str())) return Parsed::Refused;
+    return Parsed::Console;
 }
 
 std::filesystem::path join(const std::filesystem::path& root, const std::vector<std::wstring>& parts) {
