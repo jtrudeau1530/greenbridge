@@ -769,6 +769,43 @@ bool all_released(const uint8_t* base, size_t pages) {
     return true;
 }
 
+void test_title_virtual_free_two_holes(const PhysicalApi& api, TitleVirtualAllocFn title_alloc,
+                                       HostVirtualFreeFn title_free) {
+    auto* const base = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 5 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
+    check(base != nullptr, "a placeholder reservation for two holes");
+    if (!base) return;
+
+    uint8_t* const holes[] = {base + kPage64k, base + 3 * kPage64k};
+    constexpr uint8_t kSentinels[] = {0x6b, 0xa4};
+    for (size_t i = 0; i < std::size(holes); ++i) {
+        auto* const hole = holes[i];
+        void* const carved = api.virtual_alloc(
+            hole, kPage64k, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27, PAGE_READWRITE);
+        const bool freed = carved == hole && title_free(hole, 0, MEM_RELEASE) == TRUE;
+        check(freed, "carve and release a hole in the reservation");
+        if (!freed) continue;
+        void* const refill = title_alloc(hole, kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check(refill == hole, "VirtualAlloc refills the hole");
+        if (refill == hole) *hole = kSentinels[i];
+    }
+
+    check(title_free(base, 0, MEM_RELEASE) == TRUE &&
+              released(base) && released(base + 2 * kPage64k) && released(base + 4 * kPage64k),
+          "releasing the outer reservation frees its own pages");
+    for (size_t i = 0; i < std::size(holes); ++i) {
+        auto* const hole = holes[i];
+        MEMORY_BASIC_INFORMATION info{};
+        const bool committed =
+            VirtualQuery(hole, &info, sizeof(info)) && info.State == MEM_COMMIT && info.AllocationBase == hole;
+        check(committed, "the refill remains committed after releasing the outer reservation");
+        if (committed) {
+            check(*hole == kSentinels[i], "the refill keeps its sentinel byte");
+            check(title_free(hole, 0, MEM_RELEASE) == TRUE && released(hole), "the refill releases on its own");
+        }
+    }
+}
+
 // The title releases its physical-page reservations with kernel32!VirtualFree(base, 0, MEM_RELEASE). Once pages are
 // mapped, a reservation is one placeholder per page plus views, which the host would release only the first of.
 void test_title_virtual_free(const PhysicalApi& api) {
@@ -864,6 +901,8 @@ void test_title_virtual_free(const PhysicalApi& api) {
         }
         check(title_free(hole, 0, MEM_RELEASE) == TRUE && all_released(hole, 2), "the hole's allocation releases");
     }
+
+    test_title_virtual_free_two_holes(api, title_alloc, title_free);
 
     // Everything else is the host's.
     void* const plain = VirtualAlloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
