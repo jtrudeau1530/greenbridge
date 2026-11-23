@@ -23,6 +23,7 @@ remain in the existing unreadable count. DXIL permits InnerCoverage outside the 
 so ISG1 absence is not evidence of non-use. These counts do not identify an Xbox input VGPR.
 
 Standard library only. Nothing from the game is printed or written: names, code and data stay in the work folder.
+Usage: `python -I tools/feature_scan.py --help` lists the options.
 """
 import argparse
 import json
@@ -524,7 +525,7 @@ def scan_spirv(spirv_index: str) -> dict:
             continue
         stage = stage_name(m)
         total[stage] += 1
-        code_base[stage] += bool(m.get("uses_code_base"))
+        code_base[stage] += (m.get("uses_code_base") is True)
     return {"translated": dict(total), "uses_code_base": {k: v for k, v in code_base.items() if v}}
 
 

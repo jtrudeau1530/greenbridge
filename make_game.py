@@ -510,7 +510,8 @@ def find_dumps(containers: list | None = None) -> list:
             if v:
                 found[real] = (d, v)
                 return
-        if depth == 0:
+        # At the last level, inspect packaged files there without visiting any subfolders.
+        if depth == 0 and containers is None:
             return
         try:
             with os.scandir(d) as it:
@@ -520,7 +521,7 @@ def find_dumps(containers: list | None = None) -> list:
         subs = []
         for e in entries:
             try:
-                if e.is_dir(follow_symlinks=False):
+                if depth > 0 and e.is_dir(follow_symlinks=False):
                     if e.name.lower() not in skip and not e.name.startswith((".", "$")):
                         subs.append(e.path)
                 elif containers is not None and e.name.lower().endswith(CONTAINER_SUFFIXES) \
@@ -1344,13 +1345,20 @@ def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[s
 
 
 def fspx_cache_complete(spirv: str) -> bool:
-    """Check that the FSPX translation index names at least one program and that its named modules are present.
-    A translation that produced no modules writes a bare `{}`, which must not be cached as a finished step."""
+    """Require a runtime-addressable compute program and all of the modules in the saved translation index."""
     try:
         index = json.loads(read_shader_setting(os.path.join(spirv, "index.json")))
     except ValueError:
         return False
-    return isinstance(index, dict) and bool(index) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
+    if not isinstance(index, dict):
+        return False
+    # The translator can write a module with an error-only metadata row. Such a module has no runtime lookup key.
+    has_compute_key = any(
+        isinstance(meta, dict) and meta.get("stage") == "cs"
+        and isinstance(meta.get("fspx_code_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", meta["fspx_code_sha256"])
+        for meta in index.values()
+    )
+    return has_compute_key and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
 
 
 def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
@@ -1675,6 +1683,23 @@ def barycentric_fallback_override():
     if v in ("0", "false", "no", "off"):
         return False
     return None
+
+
+# VkDriverId of Intel's Windows Vulkan driver (igvk64.dll).
+VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS = 5
+
+
+def runtime_gpu_mesh_draws_crash():
+    """True where the GPU the runtime would use is on Intel's Windows Vulkan driver with VK_EXT_mesh_shader: there
+    vkCmdDrawMeshTasksEXT crashes (0xC0000409 in igvk64.dll) for a mesh shader with a live push-constant load at
+    byte offset 32 or more, which every corpus mesh shader has (BUILD-2202, measured on an Arc A770 with driver
+    32.0.101.9175; --mesh-compute is exact there). No fixed driver version is known, so every one counts. False
+    for any other GPU or one without mesh shaders, None when tools/vk_subgroup_info.py can't tell."""
+    info = runtime_gpu_info()
+    if not info or "driver_id" not in info:
+        return None
+    return info.get("driver_id") == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS and \
+        info.get("mesh_in_supported_stages") is True
 
 
 def runtime_gpu_max_push_constants():
@@ -2313,6 +2338,13 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         log(f"runtime: built. Inspect the game's imports with Wine:\n  {shlex.join([start, '--dry-run'])}")
 
 
+def nonempty_path(text: str) -> str:
+    """--game/--out/--work/--runtime-build: an empty value would read as 'not given' and fall back to a default."""
+    if text.strip() == "":
+        raise argparse.ArgumentTypeError("must not be empty")
+    return text
+
+
 def positive_int(text: str) -> int:
     """--jobs: 0 or less would start no translation shard and merge an empty index as if the step had finished."""
     try:
@@ -2342,7 +2374,7 @@ def require_translated_shaders(work: str) -> str:
     if not os.path.isfile(index):
         fail("No translated shaders yet: run the shaders stage first.")
     try:
-        with open(index, encoding="utf-8") as f:
+        with open(index, encoding="utf-8-sig") as f:
             translated = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"The translated shader index {index} is unreadable ({getattr(e, 'strerror', None) or e}): "
@@ -2489,7 +2521,7 @@ def pipeline_names(spirv: str) -> "list[str]":
     """The checker's name-sorted index (byte order, as its std::map); ranges and diagnostic probes share it."""
     path = os.path.join(spirv, "index.json")
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"pipelines: cannot read {path}: {getattr(e, 'strerror', None) or e}")
@@ -2650,12 +2682,12 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
-    ap.add_argument("--game", help="your package folder (found automatically if left out; a share path "
+    ap.add_argument("--game", type=nonempty_path, help="your package folder (found automatically if left out; a share path "
                                     "\\\\server\\share\\... goes here)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
-    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
+    ap.add_argument("--out", type=nonempty_path, help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
                                   "whose Documents iCloud syncs)")
-    ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
+    ap.add_argument("--work", type=nonempty_path, help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
@@ -2663,7 +2695,7 @@ def main() -> int:
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
-    ap.add_argument("--runtime-build", metavar="DIR",
+    ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
                          "on Windows, also use vk_pipeline_check.exe from DIR if present")
@@ -2687,7 +2719,11 @@ def main() -> int:
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
-                         "without VK_EXT_mesh_shader")
+                         "without VK_EXT_mesh_shader; on by itself on Intel's Windows Vulkan driver, whose mesh "
+                         "draws crash on the corpus' mesh shaders (BUILD-2202)")
+    ap.add_argument("--native-mesh", action="store_true",
+                    help="keep native mesh shaders on Intel's Windows Vulkan driver instead of turning on "
+                         "--mesh-compute (for a driver that fixes BUILD-2202's crash)")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -2755,6 +2791,14 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
+    if "shaders" in stages and not a.mesh_compute and not a.native_mesh:
+        crash = runtime_gpu_mesh_draws_crash()
+        if crash:
+            log("shaders: the GPU the runtime would use is on Intel's Windows Vulkan driver, whose mesh draws crash on "
+                "these mesh shaders (BUILD-2202): translating with --mesh-compute (--native-mesh keeps them native)")
+            a.mesh_compute = True
+        elif crash is None:
+            a.mesh_compute = keep_recorded_fallback("--mesh-compute", work)
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback:

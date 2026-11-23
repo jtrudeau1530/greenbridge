@@ -58,6 +58,8 @@ All 16 DLLs in the package map at their preferred base `0x180000000` with no rel
 | `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 | exit 0 |
 | `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 | exit 0 |
 
+The 12 Microsoft-signed DLLs in this table (the 10 VC++ runtime DLLs, `XCurl.dll` and `libHttpClient.GDK.dll`) report an Authenticode hash mismatch as shipped, because the Xbox packaging fills the load-config `CodeIntegrity` field of all 16 DLLs after signing; this is expected in every copy of the package and is not a sign of tampering ([jasontheminions's finding](https://github.com/ItsNotRexed/Leonida/issues/8504#issuecomment-7110985774)).
+
 Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged. `DisableThreadLibraryCalls` is served the same way: a mapped module gets `TRUE` (the real function refuses a module the Windows loader did not map, which failed the `DllMain` of the four `msvcp140_*` satellite DLLs), and any other handle goes to the real function.
 
 The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. `abort()` raises `SIGABRT` when the guest installed a handler (the guest's `signal()` import binds to the host CRT, so its table is the one raised here); with the default or ignore disposition, or a handler that returns, the run still ends with code 3. `run_tiny_game_abort_exit_codes` compares that with a native run of the stand-in image. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
@@ -161,6 +163,16 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 | `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
 
+The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
+`XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
+(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). The runtime has no model of the console
+resource layout, so `runtime/shims/xg_xs.cpp` computes none: both return `E_NOTIMPL` and write no layout. Two of the
+four `XGCreateTextureComputer` callers ignore the HRESULT and call through the object at once, so the shim still stores
+a static object in the out pointer; its slot 1 (read as `Release`) does nothing, and every other slot up to 31 logs its
+index and caller once and returns `E_NOTIMPL` without writing its arguments. The call shapes and the reasoning are at
+the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
+The table above was measured before this shim and still lists these two as unimplemented; they are served now.
+
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
 `xapu.dll`, `AcpHal.dll`) with no shim at all.
@@ -209,6 +221,8 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   refused with `ERROR_ACCESS_DENIED` before writing a deletion marker. An overlay copy supplies its own attributes,
   so a writable overlay can still be deleted when the package file underneath is read-only. The native A/W controls
   in `file_system_test` cover these cases and mixed hidden, system and archive attributes.
+- Console file shims support resolved Windows paths beyond `MAX_PATH`. A short `GAME:`, `G:` or `T:` name can
+  reach a file under a deep package or overlay root, with the same overlay and listing rules.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
   name, and hides deleted names, the marker folder and the copy folder.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
@@ -286,8 +300,8 @@ mostly correspond one to one to the `xgameruntime.lib` functions. The executable
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`) with a
-pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`, `gameinput.dll`)
+with a pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
@@ -448,8 +462,14 @@ on the executable, the rest is not:
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
-  closes). Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
-  endpoint of its own (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
+  closes). `XUserRegisterForDeviceAssociationChanged` (slot 4) and
+  `XUserRegisterForDefaultAudioEndpointUtf16Changed` (7) keep each registration (its queue, duplicated, its context
+  and callback) under a token unique across both kinds and never 0; a null callback or token is `E_INVALIDARG`, and
+  queue and context are optional. The matching unregister (5, 8) removes it at once, with or without `wait`, and
+  returns true for every token, as `XUserUnregisterForChangeEvent` does: a token already removed, never handed out or
+  of the other kind changes nothing. Offline the device association and the default audio endpoint never change, so
+  no event is raised and no callback is ever queued or called. The user has no audio endpoint of its own
+  (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
   documented for desktop. `APP_LOCAL_DEVICE_ID` is taken to be 32 bytes; no caller in the executable confirms it.
 
 `xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with

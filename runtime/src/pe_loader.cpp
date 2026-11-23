@@ -342,6 +342,8 @@ struct ThreadTlsSlot {
     void* saved = nullptr;
     void* block = nullptr;
     uint32_t index = kNoTlsIndex;
+    void** ga_view = nullptr;           // the thread's slot-0 view for a /GA EXE (Module::tls_ga_slot)
+    uint32_t ga_slot = kNoTlsIndex;
 };
 
 // Per-thread installation state for each reserved TLS slot.
@@ -370,6 +372,10 @@ void release_thread_slot(size_t slot) {
     if (slot >= kMaxMappedTlsModules) return;
     ThreadTlsSlot& entry = g_thread_tls_slots[slot];
     if (!entry.module && !entry.block) return;
+    if (entry.ga_view) {
+        if (TlsGetValue(entry.ga_slot) == entry.ga_view) TlsSetValue(entry.ga_slot, nullptr);
+        VirtualFree(entry.ga_view, 0, MEM_RELEASE);
+    }
     if (entry.block) {
         void** slots = module_tls_slots();
         if (slots && entry.index < kMaxModuleTlsSlots && slots[entry.index] == entry.block)
@@ -391,6 +397,8 @@ struct ExistingThreadBlock {
     void*** vector = nullptr;  // that thread's TEB->ThreadLocalStoragePointer field; the array itself can be replaced
     void* saved = nullptr;     // what the block replaced
     void* block = nullptr;
+    void** ga_cell = nullptr;  // that thread's TEB->TlsSlots[tls_ga_slot]: inline in the TEB, so it never moves
+    void* ga_view = nullptr;   // the /GA view that cell points at (Module::tls_ga_slot)
 };
 
 // Immortal, like the thread events that use them. `ended` holds the ids of threads whose DLL_THREAD_DETACH has run:
@@ -416,6 +424,17 @@ bool has_existing_thread_block(DWORD thread, const Module& m) {
     for (const auto& b : existing_threads().blocks)
         if (b.thread == thread && b.module == &m && b.generation == m.tls_generation) return true;
     return false;
+}
+
+// The /GA view a thread's TlsSlots[Module::tls_ga_slot] points at: [0] and [tls_index] are this thread's block.
+// Null when it cannot be allocated.
+void** make_ga_view(const Module& m, void* block) {
+    auto* view = static_cast<void**>(
+        VirtualAlloc(nullptr, kMaxModuleTlsSlots * sizeof(void*), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!view) return nullptr;
+    view[0] = block;
+    view[m.tls_index] = block;
+    return view;
 }
 
 void install_thread_block(Module& m) {
@@ -451,6 +470,17 @@ void install_thread_block(Module& m) {
     if (m.tls_zero_fill)
         std::memset(static_cast<uint8_t*>(block) + m.tls_raw_size, 0, m.tls_zero_fill);
 
+    void** view = nullptr;
+    if (m.tls_ga_slot != kNoTlsIndex) {
+        // The /GA view: [0] and [tls_index] are this thread's block, the rest stays null (the image reads no other).
+        view = make_ga_view(m, block);
+        if (!view) {
+            VirtualFree(block, 0, MEM_RELEASE);
+            throw std::runtime_error(m.name + ": TLS view allocation failed");
+        }
+        TlsSetValue(m.tls_ga_slot, view);
+    }
+
     void* saved = slots[m.tls_index];
     slots[m.tls_index] = block;
     entry.module = &m;
@@ -458,6 +488,45 @@ void install_thread_block(Module& m) {
     entry.saved = saved;
     entry.block = block;
     entry.index = m.tls_index;
+    entry.ga_view = view;
+    entry.ga_slot = m.tls_ga_slot;
+}
+
+// Rewrites a /GA EXE's slot-0 TLS reads (Module::tls_ga_slot): every `mov r64, gs:[58h]` (65 REX.W 8B /r with
+// mod=00, r/m=100, SIB=25, disp32=58h; REX 48 or 4C for r8-r15) in an executable section becomes the same
+// instruction with disp32 = 1480h + 8 * slot, TEB->TlsSlots[slot]. Same length, so nothing else moves. The 9-byte
+// form, with its segment prefix, SIB 25 and that displacement, is not something code or tables produce by accident.
+// Must run before protect_sections() and before any of the image's code (its TLS callbacks included).
+size_t patch_ga_tls_reads(Module& m, uint32_t slot) {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    const uint32_t disp = 0x1480u + 8u * slot;
+    size_t sites = 0;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const uint32_t size = (std::min)(sec->Misc.VirtualSize, sec->SizeOfRawData);
+        if (sec->VirtualAddress > m.size || size > m.size - sec->VirtualAddress || size < 9) continue;
+        uint8_t* p = m.base + sec->VirtualAddress;
+        for (uint32_t k = 0; k + 9 <= size; ++k) {
+            if (p[k] != 0x65 || (p[k + 1] != 0x48 && p[k + 1] != 0x4C) || p[k + 2] != 0x8B) continue;
+            const uint8_t modrm = p[k + 3];
+            if ((modrm & 0xC7) != 0x04 || p[k + 4] != 0x25) continue;
+            uint32_t d;
+            std::memcpy(&d, p + k + 5, 4);
+            if (d != 0x58) continue;
+            std::memcpy(p + k + 5, &disp, 4);
+            ++sites;
+            k += 8;
+        }
+    }
+    return sites;
+}
+
+bool ga_tls_patch_enabled() {
+    char v[8] = {};
+    size_t n = 0;
+    return !(getenv_s(&n, v, "LEONIDA_TLS_GA_PATCH") == 0 && n == 2 && v[0] == '0');
 }
 
 void uninstall_thread_block(Module& m) {
@@ -551,6 +620,16 @@ void*** running_thread_tls_vector(HANDLE thread) {
     return reinterpret_cast<void***>(static_cast<uint8_t*>(info.teb) + 0x58);
 }
 
+// That thread's TEB->TlsSlots[slot] cell (0x1480 + 8 * slot): inline in the TEB, so it cannot be replaced while the
+// thread runs. Null when the thread is gone.
+void** running_thread_tls_cell(HANDLE thread, uint32_t slot) {
+    ThreadBasicInfo info{};
+    const QueryThreadFn query = query_thread_fn();
+    if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof info, nullptr) < 0) return nullptr;
+    if (info.exit_status != STILL_ACTIVE || !info.teb) return nullptr;
+    return reinterpret_cast<void**>(static_cast<uint8_t*>(info.teb) + 0x1480 + 8 * slot);
+}
+
 // Another thread's TLS array and one entry of it, read through its TEB. False when the memory is not there any more
 // (the thread was terminated). No C++ objects in these three: they are __try frames.
 bool read_thread_slot(void*** vector, uint32_t index, void**& slots, void*& value) noexcept {
@@ -583,10 +662,32 @@ void restore_thread_slot(void*** vector, uint32_t index, void* block, void* save
     }
 }
 
+// Writes one TlsSlots cell of another thread; false when the thread's TEB is gone already.
+bool write_tls_cell(void** cell, void* value) noexcept {
+    __try {
+        *cell = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Empties a TlsSlots cell that still holds `view` (a thread that ended may hold another value).
+void restore_tls_cell(void** cell, void* view) noexcept {
+    __try {
+        if (*cell == view) *cell = nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 // Takes a block out of its slot and frees it. The existing-threads lock is held; b.vector is null when the thread
 // is gone.
 void remove_existing_block(const ExistingThreadBlock& b) {
     if (b.vector && b.index < kMaxModuleTlsSlots) restore_thread_slot(b.vector, b.index, b.block, b.saved);
+    if (b.ga_view) {
+        if (b.ga_cell) restore_tls_cell(b.ga_cell, b.ga_view);
+        VirtualFree(b.ga_view, 0, MEM_RELEASE);
+    }
     VirtualFree(b.block, 0, MEM_RELEASE);
 }
 
@@ -681,7 +782,26 @@ void install_on_existing_threads(Module& m) {
                                  m.name.c_str());
                 continue;
             }
-            state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block});
+            void** ga_cell = nullptr;
+            void* ga_view = nullptr;
+            if (m.tls_ga_slot != kNoTlsIndex) {
+                // The /GA view this thread's rewritten index-0 TLS reads go through, as install_thread_block gives
+                // a thread started after load(). Without it those reads dereference null on this thread.
+                ga_cell = running_thread_tls_cell(c.handle, m.tls_ga_slot);
+                if (ga_cell) ga_view = make_ga_view(m, block);
+                if (!ga_view || !write_tls_cell(ga_cell, ga_view)) {
+                    if (ga_view) VirtualFree(ga_view, 0, MEM_RELEASE);
+                    ga_cell = nullptr;
+                    ga_view = nullptr;
+                    static std::atomic<bool> logged_view{false};
+                    if (!logged_view.exchange(true))
+                        std::fprintf(stderr, "[rt] loader: %s: a running thread did not take its /GA TLS view; "
+                                             "index-0 TLS reads in it have no block\n",
+                                     m.name.c_str());
+                }
+            }
+            state.blocks.push_back(
+                {c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block, ga_cell, ga_view});
         }
     }
 }
@@ -701,6 +821,7 @@ void remove_from_existing_threads(Module& m) {
         const HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, b.thread);
         if (!h || running_thread_tls_vector(h) != b.vector) b.vector = nullptr;
         if (h) CloseHandle(h);
+        if (!b.vector) b.ga_cell = nullptr;  // the TEB went with the thread
         remove_existing_block(b);
     }
 }
@@ -717,6 +838,7 @@ void forget_ended_thread_id() {
             continue;
         }
         VirtualFree(it->block, 0, MEM_RELEASE);
+        VirtualFree(it->ga_view, 0, MEM_RELEASE);
         it = state.blocks.erase(it);
     }
 }
@@ -944,6 +1066,9 @@ struct RuntimeLoadScope {
 }  // namespace
 
 Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
+    std::vector<wchar_t> compat(32768);
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", compat.data(), static_cast<DWORD>(compat.size()));
+    if (n > 0 && n < compat.size()) compat_dir_ = std::filesystem::path(compat.data());
     shims::add_module_lookup(this, &lookup_in_loader);
     shims::add_bundled_loader(this, &kBundledOps);
 }
@@ -1445,6 +1570,26 @@ void Loader::initialize_tls(Module& m) {
         // VirtualProtect dance.
         if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = index;
     }
+    {
+        // An EXE's code may read its TLS at index 0 directly (/GA); index 0 is gta6rt.exe's here (pe_loader.h,
+        // tls_ga_slot). Patched before any of the image's code runs, TLS callbacks included.
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + dos->e_lfanew);
+        if (!(nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && total && index != 0 && ga_tls_patch_enabled()) {
+            static const DWORD ga_slot = TlsAlloc();
+            if (ga_slot == TLS_OUT_OF_INDEXES || ga_slot >= 64) {
+                std::fprintf(stderr, "[rt] loader: %s: no TlsAlloc slot below 64 for its index-0 TLS reads\n",
+                             m.name.c_str());
+            } else {
+                m.tls_ga_sites = patch_ga_tls_reads(m, ga_slot);
+                if (m.tls_ga_sites) m.tls_ga_slot = ga_slot;
+                std::fprintf(stderr,
+                             "[rt] loader: %s: %zu index-0 TLS reads (gs:[58h]) now read its own TLS (TlsSlots[%lu]); "
+                             "its module TLS index is %u\n",
+                             m.name.c_str(), m.tls_ga_sites, static_cast<unsigned long>(ga_slot), index);
+            }
+        }
+    }
     try {
         install_thread_block(m);
     } catch (...) {
@@ -1563,9 +1708,40 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     return reinterpret_cast<void*>(p);
 }
 
+bool Loader::resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
+                            bool by_ordinal, void*& out) {
+    out = nullptr;
+    if (compat_dir_.empty() || key.empty() || key.find_first_of("/\\:") != std::string::npos) return false;
+    HMODULE h = nullptr;
+    if (auto it = compat_modules_.find(key); it != compat_modules_.end()) {
+        h = static_cast<HMODULE>(it->second);
+    } else {
+        const std::filesystem::path candidate = compat_dir_ / std::filesystem::path(dll);
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(candidate, ec)) return false;
+        // The full path, with the compat folder on the DLL's own search path for its dependencies; never the game
+        // folder. Windows maps it, so its CRT, TLS and SEH work as for any host DLL.
+        h = LoadLibraryExW(candidate.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!h)
+            throw std::runtime_error("LEONIDA_COMPAT_DIR: " + path_utf8(candidate) + " exists but Windows could not " +
+                                     "load it (error " + std::to_string(GetLastError()) + ")");
+        compat_modules_.emplace(key, h);
+        std::fprintf(stderr, "[rt] compat: %s -> %s\n", dll.c_str(), path_utf8(candidate).c_str());
+    }
+    out = reinterpret_cast<void*>(GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str()));
+    return true;
+}
+
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
     std::string key = lower(dll);
     std::string sym = by_ordinal ? "#" + std::to_string(ordinal) : name;
+
+    // Opt-in compat modules come first: a DLL the player put in LEONIDA_COMPAT_DIR owns all of its imports, so one
+    // console module is never served half by a shim and half by the drop-in (they would not share state).
+    if (void* p = nullptr; resolve_compat(key, dll, name, ordinal, by_ordinal, p)) {
+        m.imports.push_back({dll, sym, p ? Binding::Host : Binding::Unimplemented});
+        return p ? p : shims::make_unimplemented_thunk(dll, sym);
+    }
 
     if (void* p = shims::find(key, sym)) {
         m.imports.push_back({dll, sym, Binding::Shim});

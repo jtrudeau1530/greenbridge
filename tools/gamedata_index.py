@@ -16,6 +16,7 @@ contain element values, entry names or payload bytes, so the CSV/JSON can be rev
 game data. Non-XML payloads follow the 64 KiB block rule; a file whose inflated size is an exact multiple of
 64 KiB can merge with the next stream. XML documents close on their root element, so their grouping is exact.
 The tool is standard library only and never writes outside the requested output files.
+Usage: `python -I tools/gamedata_index.py --help` lists the options.
 """
 from __future__ import annotations
 
@@ -40,7 +41,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 CARVER = os.path.join(ROOT, "rpf9_carve.py")
 BOM = b"\xef\xbb\xbf"
 XML_DECL = re.compile(rb"<\?xml[^>]*\?>")
-XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
+# Require a name delimiter so an unsupported character cannot turn a longer root into an ASCII prefix.
+XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)(?=[ \t\r\n/>])")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
 # Tag-like text inside these cannot open or close an element.
 XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
@@ -195,7 +197,7 @@ class DirectorySource:
 
     def __init__(self, directory: str):
         self.directory = directory
-        with open(os.path.join(directory, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(directory, "index.json"), encoding="utf-8-sig") as f:
             self.index = json.load(f)
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
 
@@ -226,7 +228,7 @@ class ArchiveSource:
                                capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 raise RuntimeError((r.stdout + r.stderr).strip() or "rpf9_carve.py failed")
-        with open(os.path.join(index_dir, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(index_dir, "index.json"), encoding="utf-8-sig") as f:
             self.index = json.load(f)
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
         self._fh = open(archive, "rb")
@@ -273,6 +275,8 @@ def build_rows(rows: list, source) -> list:
                 if nk in ("decl", "bink2", "rbf0", "psin", "other", "binary"):
                     break
                 blob += nxt
+                if not root:  # the opening name or its delimiter may span streams
+                    root = xml_root(blob)
                 group.append(j)
                 j += 1
             out.append(row_for("xml", rows, group, root=root, header=True,
@@ -316,6 +320,8 @@ def build_rows(rows: list, source) -> list:
                         break
                     if chunks is not None:
                         chunks.append(nxt)
+                        if not start_root:
+                            start_root = xml_root(b"".join(chunks))
                     group.append(j)
                     j += 1
                     if chunks is not None and start_root and tail_root(nxt) == start_root and xml_complete(start_root, b"".join(chunks)):
