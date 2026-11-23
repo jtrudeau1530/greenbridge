@@ -706,7 +706,7 @@ struct ShaderEntry {
     // "workgroup" for a shader translated with --wave64-emulate: it uses no subgroup operation and is exact on any
     // subgroup size. Empty for a native translation.
     std::string wave64_exchange;
-    bool emulated() const { return !wave64_exchange.empty(); }
+    bool emulated() const { return wave64_exchange == "workgroup"; }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
