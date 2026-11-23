@@ -273,6 +273,50 @@ struct View {
 };
 std::map<uintptr_t, View> g_views;  // view base -> view
 
+// Splitting a view (unmap_range) unmaps it whole and maps its remainders again, so for that moment pages the caller
+// did not name are unmapped. On the console they stay mapped, and another thread may be reading them. The span being
+// split is published here, and a vectored handler makes a thread that faults inside it wait for the remap, then
+// retries the access.
+std::atomic<uintptr_t> g_split_begin{0};
+std::atomic<uintptr_t> g_split_end{0};
+bool g_split_handler = false;  // with g_phys_mutex held
+
+LONG CALLBACK wait_for_split(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD& record = *info->ExceptionRecord;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const ULONG_PTR access = record.ExceptionInformation[0];  // 0 read, 1 write, 8 execute
+    const uintptr_t address = record.ExceptionInformation[1];
+    if (access != 0 && access != 1) return EXCEPTION_CONTINUE_SEARCH;
+    for (;;) {
+        const uintptr_t begin = g_split_begin.load(std::memory_order_acquire);
+        if (!begin || address < begin || address >= g_split_end.load(std::memory_order_acquire)) break;
+        SwitchToThread();
+    }
+    // Retry only an access the page now allows: the fault may have come in during a split that has since finished.
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        mbi.Type != MEM_MAPPED) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const DWORD protect = mbi.Protect & 0xff;
+    const bool allowed = access == 1 ? protect == PAGE_READWRITE : protect == PAGE_READWRITE || protect == PAGE_READONLY;
+    return allowed ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// With g_phys_mutex held: publishes [begin, end) as being split until it goes out of scope.
+struct SplitGuard {
+    SplitGuard(uintptr_t begin, uintptr_t end) {
+        if (!g_split_handler) g_split_handler = AddVectoredExceptionHandler(1, &wait_for_split) != nullptr;
+        g_split_end.store(end, std::memory_order_release);
+        g_split_begin.store(begin, std::memory_order_release);
+    }
+    ~SplitGuard() { g_split_begin.store(0, std::memory_order_release); }
+    SplitGuard(const SplitGuard&) = delete;
+    SplitGuard& operator=(const SplitGuard&) = delete;
+};
+
 // With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
 // kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
 void record_window(void* base, SIZE_T size, DWORD protect) {
@@ -480,6 +524,7 @@ bool unmap_range(uintptr_t start, uintptr_t end) {
         const uintptr_t base = it->first;
         const View view = it->second;
         const uintptr_t view_end = base + view.count * kPhysicalPageSize;
+        const SplitGuard guard(base, view_end);
         if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(base),
                                            MEM_PRESERVE_PLACEHOLDER)) {
             return false;

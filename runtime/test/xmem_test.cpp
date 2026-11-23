@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "shims.h"
 #include "startup_trace.h"
@@ -460,6 +462,39 @@ void test_physical_pages(const PhysicalApi& api) {
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
 // A run longer than one host view is mapped as capped views, so unmapping one page inside it only remaps the rest of
 // that view; every other page keeps its contents.
+// Splitting a view briefly unmaps the view's other pages; a thread reading one of them meanwhile must not fault.
+void test_split_under_reader(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 2048;  // two capped views
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    std::vector<uint64_t> pages(kPages);
+    uint64_t count = kPages;
+    check(window && api.allocate(0x280, &count, pages.data()) == TRUE && count == kPages &&
+              api.map(window, kPages, pages.data()) == window,
+          "a 2,048-page run maps for the split test");
+    if (!window || count != kPages) return;
+    fill_page(window + 11 * kPage64k, 0x11000u);
+    std::atomic<bool> done{false};
+    std::atomic<uint64_t> reads{0}, wrong{0};
+    std::thread reader([&] {
+        while (!done.load(std::memory_order_relaxed)) {
+            wrong += read_u32(window + 11 * kPage64k, 0) != 0x11000u;
+            ++reads;
+        }
+    });
+    void* const page = window + 10 * kPage64k;
+    bool remapped = true;
+    for (int i = 0; i < 2000; ++i) {
+        remapped &= api.scatter(&page, 1, nullptr) == TRUE && api.scatter(&page, 1, &pages[10]) == TRUE;
+    }
+    done = true;
+    reader.join();
+    check(remapped, "a page next to a reader unmaps and maps again 2,000 times");
+    check(reads.load() > 0 && wrong.load() == 0, "the reader of the neighbouring page never faults or misreads");
+    api.map(window, kPages, nullptr);
+    api.free_pages(kPages, pages.data());
+}
+
 void test_long_run(const PhysicalApi& api) {
     constexpr uint64_t kPages = 1100;  // more than the 1024-page view cap
     auto* const window = static_cast<uint8_t*>(
@@ -777,6 +812,7 @@ int main() {
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
         test_long_run(physical);
+        test_split_under_reader(physical);
         test_placeholders(physical);
     }
 
