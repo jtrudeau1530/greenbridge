@@ -23,6 +23,7 @@
 // Only images mapped by the loader see these: they are bound through the registry, the runtime's own code calls the
 // host directly.
 #include <windows.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cstring>
@@ -39,6 +40,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace rt::fs {
 namespace {
@@ -413,9 +415,13 @@ Target write_target(const std::wstring& path, bool copy_up) {
         std::filesystem::create_directories(staging, ec);
         const std::filesystem::path tmp =
             staging / (std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(++s_copies));
-        if (!ec) std::filesystem::copy_file(package_path, tmp, std::filesystem::copy_options::overwrite_existing, ec);
+        // Use CopyFileW for staging because MSVC's std::filesystem::copy_file calls CopyFile2, which Wine 9 lacks.
         if (ec) {
             t.error = static_cast<DWORD>(ec.value());
+        } else if (!::CopyFileW(package_path.c_str(), tmp.c_str(), FALSE)) {
+            t.error = ::GetLastError();
+        }
+        if (t.error) {
             std::filesystem::remove(tmp, ec);
             return t;
         }
@@ -629,6 +635,25 @@ std::filesystem::path overlay_dir() {
     return g_overlay_dir;
 }
 
+// gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
+// path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
+// file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
+void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* caller) {
+    if (!rt::startup_trace::enabled()) return;
+    static std::atomic<int> left{256};
+    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    std::string utf8;
+    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
+        utf8.resize(static_cast<size_t>(n) - 1);
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+    }
+    rt::startup_trace::event(
+        "file_open_failed",
+        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) +
+            ",\"error\":" + std::to_string(error) + ",\"caller\":" +
+            rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
+}
+
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
@@ -637,10 +662,17 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
     }
     const Target t = open_target(name, access, disposition);
     if (t.error) {
+        note_open_failure("CreateFileW", name, t.error, _ReturnAddress());
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    return ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        note_open_failure("CreateFileW", name, error, _ReturnAddress());
+        SetLastError(error);
+    }
+    return h;
 }
 
 HANDLE WINAPI create_file_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
@@ -661,10 +693,17 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
     }
     const Target t = open_target(name, access, disposition);
     if (t.error) {
+        note_open_failure("CreateFile2", name, t.error, _ReturnAddress());
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    return ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    const HANDLE h = ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        note_open_failure("CreateFile2", name, error, _ReturnAddress());
+        SetLastError(error);
+    }
+    return h;
 }
 
 DWORD WINAPI get_file_attributes_w(LPCWSTR name) {

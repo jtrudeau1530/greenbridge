@@ -58,8 +58,13 @@ python -I tools/shader_link_check.py check --ms <mesh.spv> --ps <pixel.spv>
 python -I tools/shader_link_check.py inspect <shader.spv>
 ```
 
+Direct checks use `main` for every stage unless `--entry` sets another shared default.
+Use a stage-specific override for modules with different entry names, for example
+`check --vs vertex.spv --vs-entry Vertex --ps pixel.spv --ps-entry Fragment`.
+
 To audit a batch, give it the shader names from your local translation directory in a JSON file. A stage can
-use a string or a `shader` and `entry` object. Names refer to `<name>.spv` in `--shader-dir`.
+use a string or a `shader` and `entry` object. Names refer to `<name>.spv` in `--shader-dir`. The manifest is read as
+UTF-8 with or without the byte order mark, so a copy saved by Notepad or `Out-File -Encoding utf8` is taken as is.
 
 ```json
 {
@@ -220,8 +225,11 @@ modules and pipelines with **0 failures** and a 3.81 GB cache; see the "Full-cor
 compile-time stall, not a project-wide limit.
 
 The recurring slow family at every shard tail was a set of 6.7-7.2 MB ray-tracing resolve compute
-shaders. One observed single-module stall exceeded 27 minutes. The tool has no per-shader timer, so
-these are lower bounds, not exact compile times.
+shaders. One observed single-module stall exceeded 27 minutes, read from the run's progress output.
+The tool times each pipeline: `--slow SEC` prints `SLOW <stage> <name> (w<N>, <sec>s)` for a pipeline
+that takes longer than SEC, and each stage's summary ends with
+`compile time: <total>s total, <mean>s mean, slowest <name> (<sec>s)`. A run with `--slow 0` therefore
+reports such a stall with its duration, not as a lower bound.
 
 ## Bounded guaranteed-finish sample
 

@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <initializer_list>
 #include <string>
 #include <thread>
@@ -19,6 +21,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace {
 
@@ -247,6 +250,40 @@ void run_checks(const std::filesystem::path& root) {
         h = create_a("GAME:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         check(h != INVALID_HANDLE_VALUE, "CreateFileA takes the same path");
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
+    // --trace: a failed open of a guest path is a "file_open_failed" event, a successful one is not, and with the
+    // trace off nothing is written.
+    {
+        const std::wstring trace = (root / "open_trace.jsonl").wstring();
+        const auto events = [&] {
+            std::ifstream in(std::filesystem::path(trace), std::ios::binary);
+            std::stringstream text;
+            text << in.rdbuf();
+            return text.str();
+        };
+        const auto count = [](const std::string& hay, const std::string& needle) {
+            int n = 0;
+            for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) ++n;
+            return n;
+        };
+        HANDLE h = create_w(L"GAME:\\data\\absent_off.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND, "a missing open fails with the trace off");
+        check(rt::startup_trace::open(trace.c_str()), "open the startup trace file");
+        h = create_w(L"GAME:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "an open that succeeds");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(count(events(), "file_open_failed") == 0, "a successful open writes no file_open_failed event");
+        h = create_w(L"GAME:\\data\\absent_on.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "a missing open still fails the same way with the trace on");
+        rt::startup_trace::close();
+        const std::string log = events();
+        check(count(log, "\"kind\":\"file_open_failed\"") == 1, "one file_open_failed event");
+        check(log.find("\"path\":\"GAME:\\\\data\\\\absent_on.txt\"") != std::string::npos, "the event names the path");
+        check(log.find("\"error\":2,") != std::string::npos, "the event carries error 2");
+        check(log.find("\"caller\":\"host:") != std::string::npos, "the event names a caller");
+        check(count(log, "absent_off") == 0, "nothing was traced before the trace was opened");
     }
 
     // Attributes, wide and narrow.
@@ -543,7 +580,12 @@ void run_checks(const std::filesystem::path& root) {
                 check(std::filesystem::exists(overlay_file) == (has_overlay && readonly),
                       "a refused delete keeps its overlay and never copies the package up");
                 if (readonly) {
-                    check(attributes_w(logical.c_str()) == visible_attributes,
+                    // The host's answer for a real file given the same attributes, which survived its refused
+                    // delete: Windows reads back exactly what was set, while Wine 9 adds ARCHIVE and keeps neither
+                    // HIDDEN nor SYSTEM without its xattr support (0x21 for every read-only case here).
+                    const DWORD native_attributes = ::GetFileAttributesW(native_file.c_str());
+                    check(native_attributes != INVALID_FILE_ATTRIBUTES &&
+                              attributes_w(logical.c_str()) == native_attributes,
                           "a refused delete retains the visible attributes");
                     const HANDLE retained = create_w(logical.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                                      OPEN_EXISTING, 0, nullptr);
@@ -794,6 +836,10 @@ void run_checks(const std::filesystem::path& root) {
                           HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
                       !std::filesystem::exists(out / "cancelled.txt"),
                   ("a cancel flag set before the copy cancels it" + mode).c_str());
+            cancel = FALSE;
+            check(copy2(L"GAME:\\misc\\keep.txt", to(L"cancelled.txt").c_str(), &block) == S_OK &&
+                      read_path(out / "cancelled.txt") == "keep",
+                  ("clearing the cancel flag allows a retry" + mode).c_str());
             block.pfCancel = nullptr;
             if (fallback) {
                 // A flag that changes what the copy produces, and which CopyFileExW can't do, is refused before
