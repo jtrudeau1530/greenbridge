@@ -414,6 +414,10 @@ def check_image(data: bytes, manifest: dict) -> dict:
 
     tests/test_first_light.py imports this function, so the test and ``--check`` agree.
     """
+    def check_rgba_shape(values: object, field: str) -> None:
+        if not isinstance(values, (list, tuple)) or len(values) != 4:
+            raise AssertionError(f"{field} must contain exactly four RGBA values")
+
     width, height = manifest["width"], manifest["height"]
     if len(data) != width * height * 16:
         raise AssertionError(
@@ -442,6 +446,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
         centre = manifest.get("centre_pixel") or [width // 2, height // 2]
         i = (centre[1] * width + centre[0]) * 4
         tol = manifest.get("rgba_tolerance", 0.02)
+        check_rgba_shape(rgba, "centre_rgba")
         for c, want in enumerate(rgba):
             if abs(pixels[i + c] - want) > tol:
                 raise AssertionError(
@@ -461,6 +466,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
             px, py = probe["pixel"]
             i = (py * width + px) * 4
             want_rgba = probe["rgba"]
+            check_rgba_shape(want_rgba, "rgba_probes[].rgba")
             for c, want in enumerate(want_rgba):
                 if abs(pixels[i + c] - want) > tol:
                     raise AssertionError(
