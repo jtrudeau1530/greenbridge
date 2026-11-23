@@ -675,7 +675,9 @@ private:
         f.HResult = E_DSTORAGE_QUEUE_CLOSED;
         describe(e, f);
         record_failure(f);
-        log_once("closed", "an entry was enqueued on a closed queue (E_DSTORAGE_QUEUE_CLOSED); it never completes");
+        if (e.type == Entry::Type::Status && SUCCEEDED(e.enqueue_error))
+            e.status->complete(e.index, E_DSTORAGE_QUEUE_CLOSED);
+        log_once("closed", "an entry was enqueued on a closed queue (E_DSTORAGE_QUEUE_CLOSED)");
         release_references(e);
     }
 
