@@ -1,5 +1,7 @@
 #include "xbox_present.h"
 
+#include "d3d12_trace.h"
+
 #include "../src/vulkan_present.h"
 
 #include <cerrno>
@@ -119,6 +121,13 @@ HRESULT XboxPresentation::GetFrameStatisticsX(std::uint64_t token, UINT type_mas
 
 HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                    const XboxPresentParameters* params) {
+    // One trace line per present, whatever path the call takes out of present_x: the queue proxy's PresentX slot is
+    // past the PC chain, so nothing else records it, and a frame loop's presents could not be counted from a trace.
+    return d3d12_trace::result("XboxPresentation::PresentX", present_x(plane_count, planes, params));
+}
+
+HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlaneParameters* planes,
+                                    const XboxPresentParameters* params) {
     std::lock_guard serialise(present_mutex_);
     if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
     if (pacer_.suspended()) return from_pacer(hr::invalid_state);

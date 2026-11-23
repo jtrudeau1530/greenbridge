@@ -23,7 +23,8 @@ Two traces are written independently:
 * **startup trace** (`--trace FILE`): one JSON object per line, flushed per event, so it survives a crash. Kinds
   and fields are in [`runtime/README.md`](../runtime/README.md) ("Startup trace").
 * **D3D12 trace** (`--trace-d3d12`): one `[d3d12-trace] #<seq> <method> <outcome>` line per call, on stderr. The
-  ordinary `[rt]` diagnostics stay separate.
+  ordinary `[rt]` diagnostics stay separate. A present is one `XboxPresentation::PresentX` line (`ok` or `failed`),
+  so the presents of a run are a count of those lines.
 
 `tools/boot_trace.py` reads both and prints the triage units: modules, unimplemented calls and callers,
 DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12 calls by outcome and first call
