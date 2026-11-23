@@ -2021,9 +2021,17 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device, ID3D12PipelineState* initial_state) {
     if (out) *out = nullptr;
     CommandAllocator* command_allocator = CommandAllocator::from(allocator);
-    if (!command_allocator || command_allocator->type() != type) return E_INVALIDARG;
+    static std::atomic<int> refusals{0};
+    const auto refuse = [&](const char* why) {
+        if (refusals.fetch_add(1, std::memory_order_relaxed) < 6)
+            std::fprintf(stderr, "[rt] d3d12: CreateCommandList refused: %s (list type %d, allocator %p type %d)\n", why,
+                         int(type), static_cast<void*>(allocator), command_allocator ? int(command_allocator->type()) : -1);
+        return E_INVALIDARG;
+    };
+    if (!command_allocator) return refuse("not a Leonida allocator");
+    if (command_allocator->type() != type) return refuse("type differs from the allocator's");
     // A list is created open, so the allocator must be free: E_INVALIDARG as on the PC runtime (D3D-51).
-    if (command_allocator->recording()) return E_INVALIDARG;
+    if (command_allocator->recording()) return refuse("the allocator is recording");
     // A null output only after the arguments, as the host runtime answers ("command list:" cases).
     if (!out) return E_UNEXPECTED;
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
