@@ -722,9 +722,10 @@ Covered: 2D `image_load`, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, `R32G32B32A32
 and `R8G8B8A8_UINT`/`SINT`, all as sampled images, as the runtime binds a read-only texture (integer formats are
 read through the translator's uint/sint aliases of the sampled array). The shader converts the loaded 8-bit integer values to float for
 readback; every such value is exactly representable, including signed negatives. Wider integers are not covered.
-Texture sizes divide the 64x64 draw (8/16/32/64), so every texel is read at least once. The nonzero masks cycle from
-`0xf` through `0x1`–`0xe`; 90 programs cover all 15 masks for each of the six default formats. Selected channels
-are packed into consecutive destination registers, while unwritten registers keep initialized sentinel values.
+Texture sizes divide the 64x64 draw (8/16/32/64), so every texel is read at least once. The mask cycle starts with
+`0xf` and `0x5`, so the default eight programs already exercise packing across a gap. With 90 programs, each of the
+six default formats exercises all 15 nonzero masks. Selected channels are packed into consecutive destination
+registers, while unwritten registers keep initialized sentinel values.
 The packing model follows the image VGPR usage description in AMD's
 [RDNA 1.0 ISA guide](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna-shader-instruction-set-architecture.pdf);
 the Vulkan test compares translated shaders on the host GPU, not native RDNA2 execution.
