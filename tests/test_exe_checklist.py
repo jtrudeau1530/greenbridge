@@ -66,6 +66,26 @@ class ExeChecklist(unittest.TestCase):
         self.assertEqual(demo[1]["text"], "nothing compares it.")
         self.assertEqual(demo[0]["classes"], [SAVE_CLASS])
 
+    def test_one_class_scan_per_file_with_several_notes(self):
+        many = "".join(f"// ASSUMPTION: note {i}\nint value;\n" for i in range(4))
+        with open(os.path.join(self.root, "runtime/shims/many.cpp"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(SHIM + many)
+        seen, real = [], ec.served_classes
+
+        def counting(source):
+            seen.append(source)
+            return real(source)
+
+        ec.served_classes = counting
+        try:
+            notes = [n for n in ec.collect(self.root) if n["file"] == "runtime/shims/many.cpp"]
+        finally:
+            ec.served_classes = real
+        self.assertEqual(len(seen), 3)      # one scan per file with notes (demo.cpp, other.cpp, many.cpp)
+        self.assertEqual(sum(1 for s in seen if "note 0" in s), 1)   # not once per note
+        self.assertEqual(len(notes), 6)     # two in the header, four added
+        self.assertEqual({tuple(n["classes"]) for n in notes}, {(SAVE_CLASS,)})
+
     def test_doc_notes_are_the_list_item_or_paragraph(self):
         docs = [n for n in ec.collect(self.root) if n["file"] == "docs/demo.md"]
         self.assertEqual([(n["line"], n["kind"]) for n in docs], [(6, "VERIFY"), (9, "ASSUMPTION")])

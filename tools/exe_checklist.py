@@ -105,10 +105,15 @@ def collect(root: str) -> list[dict]:
                 if name.endswith(SOURCE_EXTS):
                     path = os.path.join(dirpath, name)
                     rel = os.path.relpath(path, root).replace(os.sep, "/")
-                    for n in code_notes(path, rel):
-                        with open(path, encoding="utf-8", errors="replace") as f:
-                            n["classes"] = sorted(served_classes(f.read()))
-                        notes.append(n)
+                    found = code_notes(path, rel)
+                    if not found:
+                        continue
+                    # The classes belong to the file, so parse them once and give every note from it the same list.
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        classes = sorted(served_classes(f.read()))
+                    for n in found:
+                        n["classes"] = classes
+                    notes += found
     docs = os.path.join(root, "docs")
     if os.path.isdir(docs):
         for name in sorted(os.listdir(docs)):
