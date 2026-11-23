@@ -483,7 +483,11 @@ therefore traverse to the right triangle (docs/design.md, Ray tracing row; `test
 Its four triangle words are the ones native RDNA2 returns (docs/design.md, Ray tracing row; measured on an RX 6800
 with the kernels `tools/bvh_tri_probe.py` builds, `tests/semantic/test_image_bvh_tri_hw.py`): k·(T, det, b_i, b_j)
 with k = |d[kz]|³ on a hit, and on a miss copysign(inf, k·det) in word 0 with the other three kept, where the step
-above returns (inf, 1, 0, 0).
+above returns (inf, 1, 0, 0). A ray exactly on an edge or a vertex follows RDNA2's tie rule (docs/design.md, Ray
+tracing row): the zero edge from P to Q passes when ty = 0 ? sign(det)·tx > 0 : sign(d[kz])·sign(det)·ty > 0, with
+(tx, ty) = Q′ − P′ sheared and the d[kz] < 0 swap undone. It was read off measured x/y-dominant rows and then predicted
+the z-dominant rows before they ran; the step above and RADV break those ties differently. Measured on gfx1030 only,
+with dyadic inputs.
 
 **GPU builder.** `runtime/src/xdxr_build.comp` with `xdxr_build.h` writes the same layout on the GPU, straight into
 the destination buffer:
