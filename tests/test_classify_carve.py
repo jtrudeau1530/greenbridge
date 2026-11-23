@@ -64,6 +64,16 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(carve.classify({"head": "ff" + RBF0_HEAD, "size": 1}), "other:ff524246")
 
 
+class BomIndexTests(unittest.TestCase):
+    def test_utf8_bom_index_is_accepted(self):
+        rows = [{"head": RBF0_HEAD, "size": 1}]
+        with tempfile.TemporaryDirectory() as root:
+            index = os.path.join(root, "index.json")
+            with open(index, "w", encoding="utf-8-sig") as f:
+                json.dump({"files": rows}, f)
+            self.assertEqual(list(carve.index_rows(index)), rows)
+
+
 class SizeStatsTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

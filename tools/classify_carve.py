@@ -41,7 +41,7 @@ def classify(r):
 
 
 def index_rows(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         try:
             document = json.load(f)
         except (ValueError, RecursionError):
