@@ -204,6 +204,18 @@ class PostdominatorsTest(unittest.TestCase):
 
 
 class TreeAndRegionGuardTest(unittest.TestCase):
+    def test_loop_inside_a_guard_is_found(self):
+        # the recursion must descend into guard bodies: no loop at the top level here.
+        self.assertTrue(w._tree_has_loop([("guard", 3, [("loop", 4, [("block", 0)])])]))
+        self.assertFalse(w._tree_has_loop([("guard", 3, [("block", 0)])]))
+
+    def test_guard_over_an_ambiguous_pc_containing_the_target_stays_wrapped(self):
+        # the seen set holds both 3 and another pc: 3 in it is not a proof of 3 alone, so the
+        # guard stays (an in-set membership check instead of equality would wrongly inline it).
+        tree = [("block", 0), ("guard", 3, [("block", 1), ("block", 3)])]
+        out_pcs = {0: {1, 3}, 1: {3}, 3: {3}}
+        self.assertEqual(w._unwrap_known_pc_guards(tree, out_pcs), tree)
+
     def test_tree_has_loop_finds_loop_nodes_through_guards(self):
         self.assertFalse(w._tree_has_loop([]))
         self.assertFalse(w._tree_has_loop([("block", 0)]))
