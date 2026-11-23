@@ -15,6 +15,10 @@ import struct
 import sys
 import zlib
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 # Constants from meshlet_page.py
 BLOCK_MAGIC = 0x3063       # 63 30 00 00
 OTHER_BLOCK_MAGIC = 0x4042 # 42 40 00 00
@@ -254,16 +258,6 @@ def positive_int(text):
     return value
 
 
-def same_output_path(first, second):
-    """True when the two names are one file: the same path, or a link, junction or other spelling of it."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze 42 40 00 00 vertex blocks in RPF9 archives")
     parser.add_argument("inputs", nargs="+", help="RPF9 archive paths")
@@ -277,7 +271,7 @@ def main() -> int:
             print(f"ERROR: --json {args.json} is a folder, not a file", file=sys.stderr)
             return 2
         for path in args.inputs:
-            if same_output_path(args.json, path):
+            if same_report_path(args.json, path):
                 print(f"ERROR: --json {args.json} would overwrite the input archive {path}", file=sys.stderr)
                 return 2
 
