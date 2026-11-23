@@ -15561,11 +15561,12 @@ def translate(path):
             g.cu(i)
     if stage == "cs":
         # Compute system registers come from the FSSM header. Word 0x138 is COMPUTE_PGM_RSRC2 (checked against
-        # what 2,689 CS read before writing: 2,281 fit exactly, the rest are loop artifacts of the straight-line
-        # check): USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7], TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11]. Words
-        # 0x13C/0x140/0x144 are the thread-group size. Layout (Mesa radv_shader_args.c): s0..user-1 = user data,
-        # then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z (separate VGPRs on GFX10). An FSPX program
-        # (the FidelityFX DLL's shaders) carries the same two fields in its kind-0 entry (docs/fspx.md).
+        # the SGPRs all 2,689 CS read before writing: 2,540 stay inside it, the other 149 overshoot only through
+        # loop-carried registers of the straight-line check; docs/design.md): USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7],
+        # TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11]. Words 0x13C/0x140/0x144 are the thread-group size. Layout (Mesa
+        # radv_shader_args.c): s0..user-1 = user data, then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z
+        # (separate VGPRs on GFX10). An FSPX program (the FidelityFX DLL's shaders) carries the same two fields in its
+        # kind-0 entry (docs/fspx.md).
         rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
         if (rsrc2 >> 10) & 1:
             raise Unsupported("CS thread-group-size SGPR")
