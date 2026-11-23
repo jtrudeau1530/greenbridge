@@ -1,6 +1,11 @@
 // Xbox-ABI proxy around a PC ID3D12Device.
 //
 // Measured Xbox device deviations used here (vtable indices, x64):
+//   slot 26   GetCustomHeapProperties, the PC slot, but the retail executable calls it with the buffer for the
+//             returned struct in RCX and the device in RDX (node mask in R8, heap type in R9). A PC C++ method has
+//             the device in RCX and the buffer in RDX. The thunk takes the console form when RDX holds a device
+//             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too; no call of them by
+//             the executable has been seen yet, so they are forwarded in the PC form.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
@@ -78,8 +83,8 @@ unsigned device_proxy_slot_count(const void* device);
 ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 62, 67
-// and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device
+// proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
+// 32 and 36 (fence proxies), 62, 67 and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device
 // slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 

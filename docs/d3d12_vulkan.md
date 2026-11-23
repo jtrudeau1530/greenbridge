@@ -2184,6 +2184,12 @@ The trace will enumerate them.
   `WRITE_COMBINE`/`L0`, `READBACK` `WRITE_BACK`/`L0`, `GPU_UPLOAD` `WRITE_COMBINE`/`L1`, all with type `CUSTOM` and
   node masks 1. `CUSTOM`, unknown types and node masks above 1 get an all-zero answer, logged. The test compares
   `DEFAULT`, `UPLOAD` and `READBACK` byte for byte with the host runtime's answer (RTX 4090: identical).
+  The retail executable calls it (device slot 26) with the buffer for the returned struct in RCX and the device in
+  RDX, node mask in R8 and heap type in R9: three calls right after device creation, node mask 1 and types 1, 2
+  and 3 (measured under `gta6rt --run` with a register probe in the slot's thunk). A PC C++ method has the device
+  in RCX and the buffer in RDX, so the Xbox-ABI proxy takes the console form when RDX holds the proxy
+  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slots 25 and 43 return structs too; the
+  executable has not been seen calling them yet, so the proxy still forwards them in the PC form.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.
