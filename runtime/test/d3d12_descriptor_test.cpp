@@ -1690,10 +1690,30 @@ int main() {
 
             // The static samplers' S#s: the three wrapping ones give the texture, texel for texel, as the registered
             // literal does. Unregistered (CreateRootSignature dropping them) they would clamp like the second above.
+            // The two UINT border ones read the R8G8B8A8_UINT view one tile to the right, so every texel is their
+            // border: 1 in each channel for OPAQUE_WHITE_UINT, 0 for the 1.2 flag on TRANSPARENT_BLACK (alpha
+            // included). Unregistered, they too would clamp and read the texture's right edge.
             for (const StaticCase& test : static_cases) {
-                if (!test.created || test.uint_white_border || test.uint_transparent_border) continue;
+                if (!test.created) continue;
                 SampleKeys key = keys[0];
                 std::memcpy(key.ssharp, test.words.data(), sizeof(key.ssharp));
+                if (test.uint_white_border || test.uint_transparent_border) {
+                    std::memcpy(key.tsharp, view_bytes(uint_slot), sizeof(key.tsharp));
+                    key.mode = 1;
+                    std::array<std::uint8_t, bytes> pixels{};
+                    EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
+                    const std::uint8_t want = test.uint_white_border ? 1 : 0;
+                    UINT border = 0;
+                    for (UINT i = 0; i < texels; ++i) {
+                        const std::uint8_t* p = pixels.data() + 4 * i;
+                        border += p[0] == want && p[1] == want && p[2] == want && p[3] == want;
+                    }
+                    std::printf("static sampler, root signature %s: %u/%u texels read the UINT border %u, "
+                                "first RGBA %u,%u,%u,%u\n",
+                                test.name, border, texels, unsigned(want), pixels[0], pixels[1], pixels[2], pixels[3]);
+                    EXPECT(border == texels);
+                    continue;
+                }
                 std::array<std::uint8_t, bytes> pixels{};
                 EXPECT(sample_through_set(d, set0, set0_layout, {&key, 1}, pixels.data()));
                 UINT static_wrapped = 0, static_clamped = 0;
