@@ -8,6 +8,8 @@ no hardware oracle exists. Standard library only; no game files.
 
     python -I tests/test_interp_hw_probe.py
 """
+import contextlib
+import io
 import math
 import os
 import struct
@@ -160,6 +162,77 @@ class TieCheckTest(unittest.TestCase):
         self.assertNotIn(("tie", "p2_f16 rounds once (not f32, then f16)"), tally)
         self.assertEqual(bad, [])
 
+    def test_a_word_that_matches_the_twice_rounded_result_is_reported_bad(self):
+        # Same q as the case above, but the stored word is the via-f32 one (1.0, 0x3C00) instead of
+        # the direct f16 (0x3C01). The model expects the direct rounding, so this has to land in the
+        # differ column and in bad, not in the ok column the previous test asserts.
+        h20 = F(2) ** -14
+        j = F(8) + F(1, 8192)
+        groups = [((1.0, 1.0, 2.0 ** -14), [(1.0, float(j))])]
+        lanes = [(0, 1.0, float(j))]
+        q = F(1) + h20 * j
+        once, twice = ihp.f16w(ihp.r16(q)), ihp.f16w(ihp.r16(F(ihp.r32(q))))
+        self.assertEqual((once, twice), (0x3C01, 0x3C00))     # the two really do disagree here
+        res = [ihp.f32w(1.0), twice, 0, 0]
+        tally, bad = {}, []
+        ihp.check_ties(res, (groups, lanes, 4), tally, bad)
+        key = ("tie", "p2_f16 rounds once (not f32, then f16)")
+        self.assertEqual(tally[key], [0, 1])
+        self.assertEqual(len(bad), 1)
+        self.assertIn("tie: lane 0", bad[0])
+        self.assertIn(f"once {once:#06x} twice {twice:#06x}", bad[0])
+
+
+class RandomCheckTest(unittest.TestCase):
+    """check_random against hand-computed words: one (attr, component) pair, I = J = 1.0.
+
+    p0 = p10 = p20 = the f32 1.0 (0x3F800000), and I = J = the f32 1.0 too, so every fma is exact.
+    The halves of that word are f16 0.0000 (low) and f16 0x3F80 = 1.875 (high): the f32 exponent
+    bits land in the f16 mantissa, which is exactly the kind of junk the split halves see.
+      o[0] p1_f32      = 1*1 + 1 = 2.0                   -> 0x40000000
+      o[1] p2_f32      = 1*1 + 2 = 3.0                   -> 0x40400000
+      o[2] p1ll low    = 0*1 + 0 = 0.0                   -> 0x00000000
+      o[3] p2_f16 low  = 0*1 + 0 = 0.0, canary on top    -> 0xDEAD0000
+      o[4] p1ll high   = 1.875*1 + 1.875 = 3.75          -> 0x40700000
+      o[5] p2_f16 high = 1.875*1 + 3.75 = 5.625 (f16 0x45A0) -> 0xDEAD45A0
+      o[6] mov p0                                       -> 0x3F800000
+    """
+
+    WORDS = [0x40000000, 0x40400000, 0x00000000, 0xDEAD0000, 0x40700000, 0xDEAD45A0, 0x3F800000]
+
+    def run_check(self, words):
+        params = {(0, 0): (0x3F800000, 0x3F800000, 0x3F800000)}
+        kinds = {(0, 0): "f32"}
+        ij = [(ihp.f32w(1.0), ihp.f32w(1.0))]
+        info = (params, kinds, ij, 4 * ihp.NOUT_PER)
+        tally, bad = {}, []
+        ihp.check_random(list(words), info, False, tally, bad)
+        return tally, bad
+
+    def test_hand_computed_words_all_match(self):
+        tally, bad = self.run_check(self.WORDS)
+        self.assertEqual(bad, [])
+        self.assertEqual(len(tally), 9)          # mov, both fma pairs, both half pairs, both canaries
+        for name, counts in tally.items():
+            self.assertEqual(counts, [1, 0], name)
+
+    def test_a_wrong_p1_f32_word_is_a_mismatch(self):
+        words = list(self.WORDS)
+        words[0] = 0x3FFFFFFF                       # one f32 ulp below 2.0
+        tally, bad = self.run_check(words)
+        self.assertEqual(tally[("f32", "p1_f32 = fma(P10, I, P0)")], [0, 1])
+        self.assertEqual(len(bad), 1)
+        self.assertIn("p1_f32 = fma(P10, I, P0)", bad[0])
+        self.assertIn("lane 0 attr0.x", bad[0])
+
+    def test_a_p2_f16_that_keeps_its_dead_high_half_is_a_mismatch(self):
+        words = list(self.WORDS)
+        words[5] = 0x000045A0                       # right low half, canary gone
+        tally, bad = self.run_check(words)
+        self.assertEqual(tally[("f32", "p2_f16 high keeps vdst[31:16]")], [0, 1])
+        self.assertEqual(tally[("f32", "p2_f16 high = fma(h20, J, p1ll) in f16")], [1, 0])
+        self.assertTrue(any("keeps vdst[31:16]" in b for b in bad))
+
 
 class CliTest(unittest.TestCase):
     def run_tool(self, *argv):
@@ -180,7 +253,15 @@ class CliTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
 
     def test_no_oracle_is_77(self):
-        self.assertEqual(self.run_tool("--arch", "gfx1036"), 77)
+        # Patch the oracle open instead of hoping this machine has no AMD GPU: on a box with a
+        # working gfx1036 target the unpatched call would run the real probe and return 0.
+        err = io.StringIO()
+        with mock.patch.object(ihp.runner, "open_oracle",
+                               side_effect=ihp.runner.Unavailable("no AMD GPU on this box")):
+            with contextlib.redirect_stderr(err):
+                rc = ihp.main(["--arch", "gfx1036"])
+        self.assertEqual(rc, 77)
+        self.assertIn("no AMD GPU on this box", err.getvalue())
 
 
 if __name__ == "__main__":
