@@ -12,7 +12,8 @@ several). A shim note then says whether the executable calls a runtime class tha
 the ones a boot can reach, so they come first; "not called" ones can wait. The classes of a file are its
 `constexpr GUID k...Class` ids, as gdk_runtime_calls reads them.
 
-Output: Markdown, to stdout or --out (LF). Exit status 0; 1 when a --gdk-calls file can't be read. Reads files only.
+Output: Markdown, to stdout or --out (LF). Exit status 0 on success, 1 when a --gdk-calls file can't be read,
+or 2 when --out refers to an input report.
 Standard library only.
 """
 from __future__ import annotations
@@ -25,6 +26,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gdk_runtime_calls import served_classes  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ROOT = os.path.normpath(os.path.join(HERE, ".."))
@@ -161,6 +163,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="write the checklist here instead of stdout")
     ap.add_argument("--root", default=DEFAULT_ROOT, help="the repository (default: %(default)s)")
     a = ap.parse_args(argv)
+    if a.out:
+        for report in a.gdk_calls:
+            if same_report_path(a.out, report):
+                ap.error(f"--out {a.out} would overwrite the --gdk-calls report {report}")
     called = None
     if a.gdk_calls:
         try:
