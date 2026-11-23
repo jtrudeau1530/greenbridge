@@ -441,6 +441,15 @@ class Scrub(unittest.TestCase):
 
 
 class Outputs(unittest.TestCase):
+    def test_login_without_github_is_an_argument_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            cmd = [sys.executable, "-I", TOOL, "--out", out, "--login", "fixture-reviewer"]
+            result = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"--login requires --github", result.stderr)
+            self.assertFalse(os.path.exists(out))
+
     def test_nonpositive_test_options_are_argument_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")
