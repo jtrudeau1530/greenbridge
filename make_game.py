@@ -1815,7 +1815,13 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     pools = []
     for root, _, files in os.walk(game):
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
-    settings = ttpf_assets.load_profile(work) if pools else None
+    if pools:
+        try:
+            settings = ttpf_assets.load_profile(work)
+        except ValueError as exc:   # a hand-edited calibration profile is one build error, not a traceback
+            fail(str(exc))
+    else:
+        settings = None
     # rpf9dump names each pool's output folder after the source basename. Pools with the same basename
     # in one destination namespace would share that folder and its manifest, so the second pool would
     # look already exported and lose all its DDS. Give every member of a colliding group its own
