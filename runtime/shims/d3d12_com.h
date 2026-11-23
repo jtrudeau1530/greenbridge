@@ -218,6 +218,13 @@ VkBuffer vulkan_buffer(ID3D12Resource* resource);
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
+
+// Xbox device slot 133 (the console's CreatePlacedResourceX): a buffer on the caller's own pages at `address`, which
+// becomes its console VA. The pages are imported with VK_EXT_external_memory_host, so what the CPU writes there is
+// what the GPU reads. A buffer description only; E_NOTIMPL on a device that is not the Vulkan layer, without the
+// extension, or for a texture.
+HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+                                      REFIID riid, void** out);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 

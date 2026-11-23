@@ -77,6 +77,14 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
+// Device slot 133 (the console's CreatePlacedResourceX) makes a buffer on the title's pages at `va`. The proxy does
+// not create it itself: the device behind it does, through this handler, which the Vulkan layer registers
+// (rt::d3d12::create_buffer_at_host_address). With none registered, or a PC device behind the proxy, the slot
+// answers E_NOTIMPL.
+using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, REFIID riid,
+                                      void** out);
+void set_placed_at_va_handler(PlacedAtVaHandler handler);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 62, 67
 // and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device

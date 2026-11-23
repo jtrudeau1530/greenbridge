@@ -11,6 +11,7 @@
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -160,6 +161,86 @@ int check_import(ID3D12Device* device, bool supported) {
     return 0;
 }
 
+// Xbox device slot 133's backend (rt::d3d12::create_buffer_at_host_address): a buffer on the caller's own pages.
+// Its GPU VA is the address itself, and what the CPU writes there is what a GPU copy reads, with no upload: the
+// pattern is written after the buffer exists and read back through a READBACK buffer. Checked on a VirtualAlloc range
+// and on a view of a pagefile-backed section, the form xmem's physical pages are mapped in. A texture is E_NOTIMPL
+// and an address off the import alignment E_INVALIDARG.
+int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size) {
+    const char* who = "vulkan slot-133 buffer";
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Ref<ID3D12Resource> buffer;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, IID_PPV_ARGS(&buffer.p)), S_OK);
+    EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+    auto* bytes = static_cast<std::uint8_t*>(pages);
+    for (UINT64 i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(i * 131u + 7u);
+
+    D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> readback;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&readback.p))));
+    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    list->CopyBufferRegion(readback.p, 0, buffer.p, 0, size);
+    EXPECT(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, done)));
+    EXPECT(WaitForSingleObject(done, 10000) == WAIT_OBJECT_0);
+    CloseHandle(done);
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    const bool same = std::memcmp(mapped, pages, static_cast<size_t>(size)) == 0;
+    readback->Unmap(0, nullptr);
+    EXPECT(same);
+
+    D3D12_RESOURCE_DESC texture = desc;
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = texture.Height = 64;
+    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    Ref<ID3D12Resource> refused;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, IID_PPV_ARGS(&refused.p)), E_NOTIMPL);
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, IID_PPV_ARGS(&refused.p)),
+              E_INVALIDARG);
+    EXPECT(refused.p == nullptr);
+    std::printf("%s: %s, %llu bytes: GPU VA is the address, a GPU copy reads the CPU's writes\n", who, kind,
+                static_cast<unsigned long long>(size));
+    return 0;
+}
+
+int check_title_placed_all(ID3D12Device* device) {
+    constexpr SIZE_T size = 4 * 0x10000;
+    int failures = 0;
+    void* pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!pages) return 1;
+    failures += check_title_placed(device, "VirtualAlloc range", pages, size);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
+    void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
+    if (!view) return failures + 1;
+    failures += check_title_placed(device, "section view", view, size);
+    UnmapViewOfFile(view);
+    CloseHandle(section);
+    return failures;
+}
+
 void print_cases(const std::vector<Case>& cases, const char* who) {
     for (const Case& c : cases)
         std::printf("%s: %-44s hr=0x%08lX size=%llu align=%llu type=%d cpu=%d pool=%d flags=0x%x\n", who, c.name,
@@ -191,6 +272,7 @@ int main() {
         const std::vector<Case> vulkan_cases = open_cases(ours.p);
         print_cases(vulkan_cases, "vulkan");
         failures += check_import(ours.p, vk.host_pointer_alignment != 0);
+        if (vk.host_pointer_alignment) failures += check_title_placed_all(ours.p);
         Ref<IDXGIFactory4> factory;
         if (!hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
             for (const bool warp : {false, true}) {
