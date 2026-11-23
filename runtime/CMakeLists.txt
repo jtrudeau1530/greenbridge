@@ -308,6 +308,11 @@ if(BUILD_TESTING)
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+  # vk_pipeline_check's memory budget for large modules: pure stdlib, no Vulkan device.
+  add_executable(large_module_gate_test test/large_module_gate_test.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(large_module_gate_test PRIVATE Threads::Threads)
+  add_test(NAME large_module_gate COMMAND large_module_gate_test)
   # XDXR build descriptions (docs/xdxr.md); compared with d3d12.h where the Windows SDK provides it.
   add_executable(xdxr_descs_test test/xdxr_descs_test.cpp)
   add_test(NAME xdxr_descs COMMAND xdxr_descs_test)
