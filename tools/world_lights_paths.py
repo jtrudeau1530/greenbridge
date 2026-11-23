@@ -634,7 +634,13 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
     size = os.path.getsize(path)
     with open(path, "rb") as f:
         head = f.read(8)
-    data_start = struct.unpack_from("<I", head, 4)[0] if head[:4] == b"9FPR" else 0
+    if head[:4] == b"9FPR":
+        if len(head) < 8:
+            # unpack_from on the data-start word would raise struct.error; a truncated header is a usage error.
+            raise ValueError(f"the RPF9 header is {len(head)} bytes, the format needs 8")
+        data_start = struct.unpack_from("<I", head, 4)[0]
+    else:
+        data_start = 0
     lo = max(data_start, start or 0)
     hi = size if limit is None else min(size, lo + limit)
     # Each window walks its own byte range; a resource that starts inside it is read to its end even past the
@@ -788,7 +794,11 @@ def main(argv=None):
         for iname, ipath in inputs:
             if same_report_path(rpath, ipath):
                 ap.error("%s must use a different path than %s" % (rname, iname))
-    total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
+    try:
+        total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
+    except ValueError as e:  # a truncated RPF9 header: one error line, not a struct.error traceback
+        print(f"ERROR: {a.archive}: {e}", file=sys.stderr)
+        return 2
     try:
         summary = summarize(total, a.entities, a.lights_out)
     except ValueError as e:            # a bad --entities row, or an archetype that is not a number

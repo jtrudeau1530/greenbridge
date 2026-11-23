@@ -374,6 +374,20 @@ class ScanTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_a_truncated_rpf9_header_is_one_error_line(self) -> None:
+        # Before: scan() unpacked the data-start word from an unchecked 8-byte head, so a 5-byte "9FPR" file
+        # died in a struct.error traceback. A truncated header is a usage error: one ERROR line, exit 2.
+        short = os.path.join(self.tmp.name, "short.rpf")
+        with open(short, "wb") as f:
+            f.write(b"9FPR\x01")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = T.main([short])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"ERROR: {short}: the RPF9 header is 5 bytes, the format needs 8", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("struct.error", err.getvalue())
+
     def test_summary_write_failure_is_one_error_line(self) -> None:
         # --out naming a directory: IsADirectoryError/PermissionError on most systems. The input half
         # of main already answers with one ERROR line; the write half must too.

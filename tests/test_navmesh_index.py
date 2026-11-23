@@ -149,6 +149,24 @@ class NavmeshIndexTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["streams"], 1)
         self.assertEqual(doc["summary"]["matched"], 1)
 
+    def test_a_non_archive_input_is_a_usage_error(self):
+        # Before: a non-RPF7/8/9 file (or a truncated header) raised SystemExit -> exit 1 with a bare message;
+        # the convention is one error line and exit 2 (the tool's own ap.error cases above).
+        bad = os.path.join(self.root, "notrpf.bin")
+        with open(bad, "wb") as f:
+            f.write(b"\x00" * 64)
+        r = subprocess.run([sys.executable, "-I", TOOL, bad], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("error:", r.stderr)
+        self.assertIn("not an RPF7/8/9 archive", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        short = os.path.join(self.root, "short.rpf")
+        with open(short, "wb") as f:
+            f.write(b"7")
+        r = subprocess.run([sys.executable, "-I", TOOL, short], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("not an RPF7/8/9 archive", r.stderr)
+
     def test_hard_link_to_a_scanned_file_in_a_glob_named_input_is_refused(self):
         folder = os.path.join(self.root, "carve [v1]")
         os.makedirs(folder)
@@ -397,7 +415,8 @@ class NavmeshIndexTest(unittest.TestCase):
 
         try:
             with mock.patch.object(mod.mmap, "mmap", side_effect=tracking_mmap):
-                with self.assertRaises(SystemExit):
+                # main() turns this into one usage error line (ap.error, exit 2); the mmap must still close.
+                with self.assertRaises(ValueError):
                     mod.scan_archive(rpf, start=size)
             self.assertEqual(len(created), 1)
             self.assertTrue(created[0].closed)
