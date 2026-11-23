@@ -66,23 +66,39 @@ static bool append_tile_regions(const D3D12_TILED_RESOURCE_COORDINATE* start, co
     return true;
 }
 
+namespace {
+
+struct SrwGuard {
+    SRWLOCK& lock;
+    explicit SrwGuard(SRWLOCK& l) noexcept : lock(l) { AcquireSRWLockExclusive(&lock); }
+    ~SrwGuard() noexcept { ReleaseSRWLockExclusive(&lock); }
+    SrwGuard(const SrwGuard&) = delete;
+    SrwGuard& operator=(const SrwGuard&) = delete;
+};
+
+// Constant-initialized and intentionally immortal so threads where a mapped executable owns static TLS slot 0 never
+// hit an _Init_thread_header guard or touch a destroyed mutex during process teardown.
+SRWLOCK g_log_lock = SRWLOCK_INIT;
+std::set<std::string>* g_stub_seen = nullptr;
+std::set<std::string>* g_note_seen = nullptr;
+
+}  // namespace
+
 void stub(const char* method) {
     // Generated API stubs pass a bare method name; explanatory diagnostics are not separate calls.
     if (!std::strchr(method, '(')) d3d12_trace::record(method, "unsupported");
-    static std::mutex mutex;
-    static std::set<std::string> seen;
-    std::lock_guard lock(mutex);
-    if (seen.insert(method).second) std::fprintf(stderr, "[rt] d3d12: unimplemented %s\n", method);
+    SrwGuard lock(g_log_lock);
+    if (!g_stub_seen) g_stub_seen = new std::set<std::string>;
+    if (g_stub_seen->insert(method).second) std::fprintf(stderr, "[rt] d3d12: unimplemented %s\n", method);
 }
 
 namespace {
 
 // Reports a deliberate simplification once (unlike stub, which reports a method not implemented).
 void note_once(const char* what) {
-    static std::mutex mutex;
-    static std::set<std::string> seen;
-    std::lock_guard lock(mutex);
-    if (seen.insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
+    SrwGuard lock(g_log_lock);
+    if (!g_note_seen) g_note_seen = new std::set<std::string>;
+    if (g_note_seen->insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
 }
 
 const char* name(leonida::ReplayResult result) {

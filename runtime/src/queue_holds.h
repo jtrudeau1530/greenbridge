@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -66,9 +67,8 @@ public:
         if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
+            const PumpScope scope(pump_thread_);  // what is dropped may release other fences: they must not wait here
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
         }
         pump_ready();
     }
@@ -165,16 +165,17 @@ public:
         for (;;) {
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
-            while (dirty_.exchange(false, std::memory_order_acq_rel)) {
-                bool progress = true;
-                while (progress) {
-                    progress = false;
-                    for (Holder* holder : snapshot()) progress |= holder->release_ready();
+            {
+                const PumpScope scope(pump_thread_);
+                while (dirty_.exchange(false, std::memory_order_acq_rel)) {
+                    bool progress = true;
+                    while (progress) {
+                        progress = false;
+                        for (Holder* holder : snapshot()) progress |= holder->release_ready();
+                    }
+                    run_barriers();
                 }
-                run_barriers();
             }
-            in_pump() = false;
             pump.unlock();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
@@ -187,9 +188,20 @@ private:
         std::function<void()> fn;
     };
 
-    static bool& in_pump() {
-        static thread_local bool pumping = false;
-        return pumping;
+    // Tracks the active pumping thread per QueueHolds instance rather than using thread_local, which would index static
+    // TLS slot 0 on mapped-executable threads where the title owns slot 0.
+    struct PumpScope {
+        std::atomic<std::thread::id>& slot;
+        explicit PumpScope(std::atomic<std::thread::id>& target) noexcept : slot(target) {
+            slot.store(std::this_thread::get_id(), std::memory_order_release);
+        }
+        ~PumpScope() noexcept { slot.store(std::thread::id{}, std::memory_order_release); }
+        PumpScope(const PumpScope&) = delete;
+        PumpScope& operator=(const PumpScope&) = delete;
+    };
+
+    bool in_pump() const noexcept {
+        return pump_thread_.load(std::memory_order_acquire) == std::this_thread::get_id();
     }
 
     std::vector<Holder*> snapshot() const {
@@ -230,6 +242,7 @@ private:
     std::atomic<std::int64_t> barrier_count_{0};
     std::atomic<std::uint64_t> seq_{0};
     std::atomic<bool> dirty_{false};
+    std::atomic<std::thread::id> pump_thread_{};
 };
 
 }  // namespace leonida

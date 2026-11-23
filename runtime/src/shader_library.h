@@ -80,7 +80,7 @@ struct Huffman {
 };
 
 // Canonical Huffman table from code lengths. Returns false for an over-subscribed set.
-inline bool build_huffman(Huffman& h, const std::int16_t* lengths, int n) {
+inline constexpr bool build_huffman(Huffman& h, const std::int16_t* lengths, int n) {
     h.count.fill(0);
     for (int i = 0; i < n; ++i) ++h.count[lengths[i]];
     if (h.count[0] == n) return true;  // no codes: valid only if never used
@@ -144,6 +144,26 @@ inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const H
     }
 }
 
+struct FixedHuffmanTables {
+    Huffman litlen{};
+    Huffman dist{};
+};
+
+// Constexpr at file scope so deflate fixed-Huffman decompression never uses a function-local static init guard
+// (which depends on host CRT TLS slot 0).
+inline constexpr FixedHuffmanTables kFixedHuffmanTables = []() constexpr {
+    FixedHuffmanTables t{};
+    std::int16_t lengths[288]{};
+    for (int i = 0; i < 144; ++i) lengths[i] = 8;
+    for (int i = 144; i < 256; ++i) lengths[i] = 9;
+    for (int i = 256; i < 280; ++i) lengths[i] = 7;
+    for (int i = 280; i < 288; ++i) lengths[i] = 8;
+    build_huffman(t.litlen, lengths, 288);
+    for (int i = 0; i < 30; ++i) lengths[i] = 5;
+    build_huffman(t.dist, lengths, 30);
+    return t;
+}();
+
 } // namespace detail
 
 // Inflates a zlib stream (RFC 1950: header, deflate data, Adler-32). Returns false for a malformed stream, a
@@ -172,19 +192,9 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 out.push_back(x);
             }
         } else if (type == 1) {  // fixed Huffman
-            static const auto tables = [] {
-                std::pair<detail::Huffman, detail::Huffman> t;
-                std::int16_t lengths[288];
-                for (int i = 0; i < 144; ++i) lengths[i] = 8;
-                for (int i = 144; i < 256; ++i) lengths[i] = 9;
-                for (int i = 256; i < 280; ++i) lengths[i] = 7;
-                for (int i = 280; i < 288; ++i) lengths[i] = 8;
-                detail::build_huffman(t.first, lengths, 288);
-                for (int i = 0; i < 30; ++i) lengths[i] = 5;
-                detail::build_huffman(t.second, lengths, 30);
-                return t;
-            }();
-            if (!detail::inflate_codes(reader, out, tables.first, tables.second, limit)) return false;
+            if (!detail::inflate_codes(reader, out, detail::kFixedHuffmanTables.litlen,
+                                       detail::kFixedHuffmanTables.dist, limit))
+                return false;
         } else if (type == 2) {  // dynamic Huffman
             const int literal_count = int(reader.bits(5)) + 257, distance_count = int(reader.bits(5)) + 1;
             const int code_count = int(reader.bits(4)) + 4;

@@ -78,11 +78,45 @@ constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIG
 
 std::atomic<int> g_global_realtime_privilege_override{-1};
 
+// Constant-initialized and intentionally immortal so threads where a mapped executable owns static TLS slot 0 never
+// hit an _Init_thread_header guard or touch a destroyed mutex during process teardown.
+struct SrwGuard {
+    SRWLOCK& lock;
+    explicit SrwGuard(SRWLOCK& l) noexcept : lock(l) { AcquireSRWLockExclusive(&lock); }
+    ~SrwGuard() noexcept { ReleaseSRWLockExclusive(&lock); }
+    SrwGuard(const SrwGuard&) = delete;
+    SrwGuard& operator=(const SrwGuard&) = delete;
+};
+
+SRWLOCK g_log_once_lock = SRWLOCK_INIT;
+std::set<std::pair<std::string, int>>* g_log_once_seen = nullptr;
+
+SRWLOCK g_subgroup_report_lock = SRWLOCK_INIT;
+std::map<std::string, std::pair<std::set<std::string>, unsigned>>* g_subgroup_report_seen = nullptr;
+
+std::atomic<HMODULE> g_vulkan_library{nullptr};
+std::atomic<bool> g_vulkan_library_missing{false};
+
+HMODULE load_vulkan_library() {
+    if (HMODULE cached = g_vulkan_library.load(std::memory_order_acquire)) return cached;
+    if (g_vulkan_library_missing.load(std::memory_order_acquire)) return nullptr;
+    HMODULE loaded = LoadLibraryA("vulkan-1.dll");
+    if (!loaded) {
+        g_vulkan_library_missing.store(true, std::memory_order_release);
+        return nullptr;
+    }
+    HMODULE expected = nullptr;
+    if (!g_vulkan_library.compare_exchange_strong(expected, loaded, std::memory_order_acq_rel)) {
+        FreeLibrary(loaded);
+        return expected;
+    }
+    return loaded;
+}
+
 void log_once(const char* what, int value) {
-    static std::mutex mutex;
-    static std::set<std::pair<std::string, int>> seen;
-    std::lock_guard lock(mutex);
-    if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+    SrwGuard lock(g_log_once_lock);
+    if (!g_log_once_seen) g_log_once_seen = new std::set<std::pair<std::string, int>>;
+    if (g_log_once_seen->insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
 
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
@@ -205,10 +239,10 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
 // shader's name, then again at 10, 100, 1000... of that stage so a whole corpus stays readable.
 void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonida::SubgroupRequest& request,
                                  const leonida::SubgroupSizeCaps& caps) {
-    static std::mutex mutex;
-    static std::map<std::string, std::pair<std::set<std::string>, unsigned>> seen;  // stage -> names, next report
-    std::lock_guard lock(mutex);
-    auto& [names, next_report] = seen[entry.stage];
+    SrwGuard lock(g_subgroup_report_lock);
+    if (!g_subgroup_report_seen)
+        g_subgroup_report_seen = new std::map<std::string, std::pair<std::set<std::string>, unsigned>>;
+    auto& [names, next_report] = (*g_subgroup_report_seen)[entry.stage];
     if (!names.insert(entry.name).second) return;
     if (names.size() == 1) next_report = 10;
     else if (names.size() != next_report) return;
@@ -4473,8 +4507,17 @@ struct ShaderCacheRegistry {
     }
 };
 
+SRWLOCK g_shader_cache_registry_lock = SRWLOCK_INIT;
+std::atomic<ShaderCacheRegistry*> g_shader_cache_registry{nullptr};
+
 ShaderCacheRegistry& process_shader_cache_registry() {
-    static auto* registry = new ShaderCacheRegistry();
+    if (ShaderCacheRegistry* registry = g_shader_cache_registry.load(std::memory_order_acquire)) return *registry;
+    SrwGuard lock(g_shader_cache_registry_lock);
+    ShaderCacheRegistry* registry = g_shader_cache_registry.load(std::memory_order_relaxed);
+    if (!registry) {
+        registry = new ShaderCacheRegistry();
+        g_shader_cache_registry.store(registry, std::memory_order_release);
+    }
     return *registry;
 }
 
@@ -9102,7 +9145,7 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    static const HMODULE library = LoadLibraryA("vulkan-1.dll");
+    const HMODULE library = load_vulkan_library();
     const auto get = library ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(
                                    reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")))
                              : nullptr;
