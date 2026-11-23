@@ -96,7 +96,7 @@ def build(args):
         best = max(cells, key=cells.get)
         args.center = [(best[0] + 0.5) * 50, (best[1] + 0.5) * 50]
     # Missing models or empty geometry must not exhaust a positive placement budget.
-    candidate_limit = len(rows) if args.max_props > 0 else args.max_props * 4
+    candidate_limit = len(rows) if args.max_props > 0 else 0
     picked = select_rows(rows, args.center, args.radius, candidate_limit)
 
     textures, tex_ids = [], {}
@@ -172,6 +172,10 @@ def main(argv=None):
     ap.add_argument("--tex-size", type=int, default=256)
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
+    if not math.isfinite(args.radius) or args.radius < 0:
+        ap.error("--radius must be finite and non-negative")
+    if args.max_props < 0:
+        ap.error("--max-props must be non-negative")
     if os.path.isdir(args.out):
         print(f"ERROR: --out is a folder, not a scene file: {args.out}", file=sys.stderr)
         return 2
