@@ -123,9 +123,17 @@ class Flbit64Tests(unittest.TestCase):
         self.assertEqual(run_lines(["s_flbit_i32_b64 s0, 1"])[0], 63)
         self.assertEqual(run_lines(["s_flbit_i32_i64 s0, -1"])[0], M32)
 
-    def test_lane_mask_source_is_rejected(self):
+    def test_lane_mask_pair_source_is_rejected(self):
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["s_flbit_i32_b64 s0, exec"])
+            run_lines(["s_mov_b64 s[2:3], exec", "s_flbit_i32_b64 s0, s[2:3]"])
+
+    def test_exec_source_gathers_the_wave(self):
+        # EXEC is the wave's lanes (tests/semantic/test_lanemask_bitreplicate_flbit.py runs it per lane); the
+        # single-invocation interpreter here cannot run the subgroup ops, so only the translation is checked.
+        for op in OPS:
+            with self.subTest(op=op), self.assertRaises(si.UnsupportedConstruct) as cm:
+                run_lines([f"{op} s0, exec"])
+            self.assertIn("OpGroupNonUniform", str(cm.exception))
 
 
 if __name__ == "__main__":

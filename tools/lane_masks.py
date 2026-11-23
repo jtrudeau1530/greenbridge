@@ -105,6 +105,11 @@ def put(state, a, k, wave64=True):
             r if isinstance(r, int) else ("vcc_hi" if (r == "vcc_hi" and not wave64) else "vcc")
             for r in a["r"]
         ]
+    elif a["k"] == "special" and a.get("t") == "vcc" and not wave64:
+        # The 64-bit VCC of a wave32 shader is vcc_lo and vcc_hi (separate registers there): a plain write to it
+        # ends vcc_hi's life as a mask too (s_mov_b64 vcc, s[20:21] ahead of s_load ..., vcc, off).
+        put(state, {"k": "special", "t": "vcc_hi"}, None if k in MASK_KINDS else k, wave64)
+        regs = ["vcc"]
     elif a["k"] == "special" and (a.get("t") == "vcc" or (not wave64 and a.get("t") == "vcc_lo")):
         regs = ["vcc"]
     elif a["k"] == "special" and not wave64 and a.get("t") == "vcc_hi":

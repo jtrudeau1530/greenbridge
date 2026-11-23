@@ -6925,7 +6925,10 @@ class Gen:
             if self.is_mask_op(x):
                 raise Unsupported(op + " on a lane mask")
             if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
-                if op != "s_bitreplicate_b64_b32" or d["t"] != "vcc" or self.stage != "cs" or not self.wave64:
+                # exec in either wave size (lane L of D is bit L: S0[L // 2], and exec_hi is not a lane in wave32), vcc
+                # as the 64-bit pair only in wave64
+                if op != "s_bitreplicate_b64_b32" or self.stage != "cs" or \
+                        not (d["t"] == "exec" or (d["t"] == "vcc" and self.wave64)):
                     raise Unsupported(op + " on a lane mask")
                 shift, shifted, bit, mask = (self.tmp() for _ in range(4))
                 lane = self.wave_lane()
@@ -7690,11 +7693,15 @@ class Gen:
             # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
             # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
             # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
-            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            # s_lshl_b64); a lane-mask SGPR pair stays Unsupported (#210). EXEC (and wave64 VCC) as the source is the
+            # wave's own lanes, lane L at bit L, which wave_mask gathers; exec_hi reads 0 in a wave32 shader.
             x = a[1]
-            if self.holds_lane_mask(x):
+            if x["k"] == "special" and (x.get("t") == "exec" or (x.get("t") == "vcc" and self.wave64)) \
+                    and self.holds_lane_mask(x):
+                lo, hi = self.wave_mask(x)
+            elif self.holds_lane_mask(x):
                 raise Unsupported(op + " of a lane mask")
-            if x["k"] == "sgpr" and x.get("n") == 2:
+            elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
