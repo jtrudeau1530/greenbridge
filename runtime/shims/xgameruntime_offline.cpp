@@ -1,4 +1,5 @@
-// xgameruntime: XGameEventImpl, XGameUiImpl and XGameStreamingImpl, offline: three small classes a title calls early.
+// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl and XUserDeviceImpl, offline: small
+// classes a title calls early.
 //
 // Each XGameEvent*, XGameUi* and XGameStreaming* function in xgameruntime.lib asks QueryApiImpl for its class and
 // calls one slot with its own arguments after `this`. The class and interface ids and the method order are
@@ -13,6 +14,9 @@
 //                       (profile cards, pickers, text entry, web authentication, invites) fails before starting.
 //   XGameStreamingImpl  the game is never streamed: initialising succeeds, IsStreaming is false, there are no
 //                       clients, the connection-state registration hands out a token that never fires.
+//   XDisplayImpl        XDisplayTryEnableHdrMode: Disabled (the host output is SDR), Enabled with LEONIDA_HDR=1.
+//   XUserDeviceImpl     every device belongs to the offline user; associations and audio endpoints never change; the
+//                       user has no audio endpoint of its own; finding a controller shows no UI (as on desktop).
 //
 // Slots whose signature the public pages don't give answer with a value that is safe whichever way the caller reads
 // it: see `client_not_connected` (XGameStreaming) and `offline_failure`.
@@ -29,6 +33,10 @@
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
+
+namespace rt::shims {
+void* xgameruntime_user_new_handle();   // xgameruntime_user.cpp
+}
 
 namespace {
 
@@ -362,6 +370,155 @@ HRESULT STDMETHODCALLTYPE streaming_query_interface(void*, REFIID iid, void** ou
     return answer(&g_streaming_object, std::begin(kStreamingInterfaces), std::end(kStreamingInterfaces), iid, out);
 }
 
+
+// ======================= XDisplayImpl =======================
+
+constexpr char kDisplayName[] = "XDisplayImpl";
+constexpr GUID kDisplayClass = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
+const GUID kDisplayInterfaces[] = {
+    kDisplayClass,
+    {0x35f07670, 0x706e, 0x4bfb, {0x94, 0x76, 0x09, 0x07, 0x98, 0xc5, 0xeb, 0xf3}},   // IXDisplayImpl
+};
+
+enum class XDisplayHdrModePreference : uint32_t { PreferHdr = 0, PreferRefreshRate = 1 };
+enum class XDisplayHdrModeResult : uint32_t { Unknown = 0, Enabled = 1, Disabled = 2 };
+struct XDisplayHdrModeInfo {
+    float minToneMapLuminance;            // nits
+    float maxToneMapLuminance;
+    float maxFullFrameToneMapLuminance;
+};
+
+bool hdr_requested() {
+    static const bool on = [] {
+        char value[4] = {};
+        size_t length = 0;
+        return getenv_s(&length, value, "LEONIDA_HDR") == 0 && length == 2 && value[0] == '1';
+    }();
+    return on;
+}
+
+// 4: XDisplayHdrModeResult XDisplayTryEnableHdrMode(XDisplayHdrModePreference preference, XDisplayHdrModeInfo* info)
+// The host swapchain is SDR, so HDR stays off unless LEONIDA_HDR=1; then it is "enabled" with the documented
+// defaults (0.01 / 1000 / 1000 nits).
+uint32_t STDMETHODCALLTYPE display_try_enable_hdr(void*, XDisplayHdrModePreference, XDisplayHdrModeInfo* info) {
+    const bool on = hdr_requested();
+    if (info) *info = on ? XDisplayHdrModeInfo{0.01f, 1000.0f, 1000.0f} : XDisplayHdrModeInfo{};
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XDisplayTryEnableHdrMode: HDR %s\n",
+                     on ? "enabled (LEONIDA_HDR=1)" : "disabled (SDR output; LEONIDA_HDR=1 asks for HDR)");
+    return static_cast<uint32_t>(on ? XDisplayHdrModeResult::Enabled : XDisplayHdrModeResult::Disabled);
+}
+
+template <int Slot> HRESULT STDMETHODCALLTYPE display_unknown(void* self) { return unknown_slot<kDisplayName, Slot>(self); }
+
+HRESULT STDMETHODCALLTYPE display_query_interface(void*, REFIID iid, void** out);
+const void* const kDisplayVtable[] = {
+    FN(display_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(display_unknown<3>),                 // 3 (unknown in the docs)
+    FN(display_try_enable_hdr),             // 4 XDisplayTryEnableHdrMode
+};
+ClassObject g_display_object{kDisplayVtable};
+HRESULT STDMETHODCALLTYPE display_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_display_object, std::begin(kDisplayInterfaces), std::end(kDisplayInterfaces), iid, out);
+}
+
+// ======================= XUserDeviceImpl =======================
+
+constexpr GUID kUserDeviceClass = {0x7d824997, 0x10dc, 0x45ab, {0x86, 0xb7, 0x27, 0x37, 0x76, 0x7c, 0x0b, 0xf1}};
+const GUID kUserDeviceInterfaces[] = {
+    kUserDeviceClass,                                                                  // IXUserDeviceImpl
+    {0x0cc6a956, 0xe7e1, 0x4fdf, {0x93, 0x41, 0x9d, 0x5d, 0xa6, 0x49, 0xeb, 0xc8}},    // IXUserDeviceImpl2 (no methods)
+};
+
+// ASSUMPTION: APP_LOCAL_DEVICE_ID is 32 bytes (APP_LOCAL_DEVICE_ID_SIZE), not on the pages read for this file.
+struct APP_LOCAL_DEVICE_ID {
+    uint8_t value[32];
+};
+
+const char kFindControllerIdentity = 0;
+
+// 3: HRESULT XUserFindForDevice(const APP_LOCAL_DEVICE_ID* deviceId, XUserHandle* handle): every device belongs to
+// the one offline user.
+HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* device, XUserHandle* out) {
+    if (!device || !out) return E_INVALIDARG;
+    *out = rt::shims::xgameruntime_user_new_handle();
+    return S_OK;
+}
+
+// 4: HRESULT XUserRegisterForDeviceAssociationChanged(XTaskQueueHandle queue, void* context,
+//        XUserDeviceAssociationChangedCallback* callback, XTaskQueueRegistrationToken* token)
+// 7: HRESULT XUserRegisterForDefaultAudioEndpointUtf16Changed(XTaskQueueHandle, void*, callback, token*)
+// Associations and endpoints never change offline: a token, no callback.
+HRESULT STDMETHODCALLTYPE device_register(void*, XTaskQueueHandle, void*, void* callback,
+                                          XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) return E_INVALIDARG;
+    std::lock_guard<std::mutex> lock(g_streaming_mutex);
+    token->token = g_next_token++;
+    return S_OK;
+}
+
+// 5, 8: bool ...Unregister...(XTaskQueueRegistrationToken token, bool wait): never pending.
+bool STDMETHODCALLTYPE device_unregister(void*, XTaskQueueRegistrationToken, bool) { return true; }
+
+// 6: HRESULT XUserGetDefaultAudioEndpointUtf16(XUserLocalId user, XUserDefaultAudioEndpointKind kind,
+//        size_t endpointIdUtf16Count, wchar_t* endpointIdUtf16, size_t* endpointIdUtf16Used)
+// The user has no audio endpoint of its own (no headset): ERROR_NOT_FOUND, with an empty string written.
+HRESULT STDMETHODCALLTYPE device_audio_endpoint(void*, uint64_t, uint32_t, size_t count, wchar_t* id, size_t* used) {
+    if (id && count) id[0] = L'\0';
+    if (used) *used = 0;
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+HRESULT CALLBACK find_controller_provider(XAsyncOp op, const XAsyncProviderData* data) {
+    switch (op) {
+    case XAsyncOp::Begin:
+        return XAsyncSchedule(data->async, 0);
+    case XAsyncOp::DoWork:
+        XAsyncComplete(data->async, S_OK, sizeof(APP_LOCAL_DEVICE_ID));
+        return S_OK;
+    case XAsyncOp::GetResult:
+        if (!data->buffer || data->bufferSize < sizeof(APP_LOCAL_DEVICE_ID)) return E_INVALIDARG;
+        *static_cast<APP_LOCAL_DEVICE_ID*>(data->buffer) = APP_LOCAL_DEVICE_ID{};
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+// 9: HRESULT XUserFindControllerForUserWithUiAsync(XUserHandle user, XAsyncBlock* async): no UI, as on desktop.
+HRESULT STDMETHODCALLTYPE device_find_controller_async(void*, XUserHandle user, XAsyncBlock* async) {
+    if (!user) return E_INVALIDARG;
+    if (!async) return E_POINTER;
+    return XAsyncBegin(async, nullptr, &kFindControllerIdentity, "XUserFindControllerForUserWithUiAsync",
+                       find_controller_provider);
+}
+
+// 10: HRESULT XUserFindControllerForUserWithUiResult(XAsyncBlock* async, APP_LOCAL_DEVICE_ID* deviceId): all zero,
+// as the GDK documents for desktop.
+HRESULT STDMETHODCALLTYPE device_find_controller_result(void*, XAsyncBlock* async, APP_LOCAL_DEVICE_ID* device) {
+    if (!device) return E_POINTER;
+    return XAsyncGetResult(async, &kFindControllerIdentity, sizeof(*device), device, nullptr);
+}
+
+HRESULT STDMETHODCALLTYPE device_query_interface(void*, REFIID iid, void** out);
+const void* const kUserDeviceVtable[] = {
+    FN(device_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(device_find_user),                   // 3  XUserFindForDevice
+    FN(device_register),                    // 4  XUserRegisterForDeviceAssociationChanged
+    FN(device_unregister),                  // 5  XUserUnregisterForDeviceAssociationChanged
+    FN(device_audio_endpoint),              // 6  XUserGetDefaultAudioEndpointUtf16
+    FN(device_register),                    // 7  XUserRegisterForDefaultAudioEndpointUtf16Changed
+    FN(device_unregister),                  // 8  XUserUnregisterForDefaultAudioEndpointUtf16Changed
+    FN(device_find_controller_async),       // 9  XUserFindControllerForUserWithUiAsync
+    FN(device_find_controller_result),      // 10 XUserFindControllerForUserWithUiResult
+};
+static_assert(std::size(kUserDeviceVtable) == 11, "IUnknown + IXUserDeviceImpl's 8 methods");
+ClassObject g_user_device_object{kUserDeviceVtable};
+HRESULT STDMETHODCALLTYPE device_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_user_device_object, std::begin(kUserDeviceInterfaces), std::end(kUserDeviceInterfaces), iid, out);
+}
+
 #undef FN
 
 }  // namespace
@@ -380,6 +537,14 @@ bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void*
     }
     if (class_id == kStreamingClass) {
         *hr = streaming_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kDisplayClass) {
+        *hr = display_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kUserDeviceClass) {
+        *hr = device_query_interface(nullptr, interface_id, out);
         return true;
     }
     return false;

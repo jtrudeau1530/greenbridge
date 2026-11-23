@@ -166,7 +166,8 @@ with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the h
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
 version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
-`XGameEventImpl`, `XGameUiImpl` and `XGameStreamingImpl` from xgameruntime-docs' layout (below); for any other class it logs
+`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs'
+layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -278,8 +279,8 @@ The executable's first boot confirms them, or names the slots that differ.
 
 `xgameruntime_store_test` drives the license check, add-ons, updates, package licenses and product queries.
 
-`XGameEventImpl`, `XGameUiImpl` and `XGameStreamingImpl` (`runtime/shims/xgameruntime_offline.cpp`), from the same
-layout, also **not measured**:
+`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl`
+(`runtime/shims/xgameruntime_offline.cpp`), from the same layout, also **not measured**:
 - **`XGameEventWrite`** succeeds; the events are dropped. The first one's name is logged, and
   `LEONIDA_LOG_GAME_EVENTS=1` logs each with its dimensions and measurements.
 - **Dialogs:** a message dialog's title, text and buttons go to the log (`[rt] game dialog:`), and it completes at
@@ -294,7 +295,15 @@ layout, also **not measured**:
 - **ASSUMPTION:** the parameter lists of `XGameUiShowMessageDialogAsync` and
   `XGameStreamingRegisterConnectionStateChanged`, from the GDK reference, not re-checked against the executable.
 
-`xgameruntime_offline_test` drives the three classes.
+- **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
+  answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
+- **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
+  closes). Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
+  endpoint of its own (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
+  documented for desktop. **ASSUMPTION:** `APP_LOCAL_DEVICE_ID` is 32 bytes.
+
+`xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with
+`LEONIDA_HDR=1`.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
