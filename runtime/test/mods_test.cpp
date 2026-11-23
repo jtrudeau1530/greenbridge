@@ -56,6 +56,34 @@ int main() {
     check(!parse_mod("[1,2]", "m", mod, error), "a manifest that is not an object is refused");
     check(parse_mod("{}", "folder_name", mod, error) && mod.name == "folder_name", "the name defaults to the folder");
 
+    // "camera": first-person view (docs/modding.md, "First-person view")
+    check(parse_mod(R"({"camera":{"view_mode":"first_person","first_person_value":4,"contexts":[0]}})", "fp", mod,
+                    error) && mod.camera.set && mod.camera.first_person && mod.camera.first_person_value == 4 &&
+              mod.camera.contexts.size() == 1 && mod.camera.contexts[0] == 0,
+          "a first-person camera section parses");
+    check(parse_mod(R"({"camera":{"view_mode":"default"}})", "d", mod, error) && mod.camera.set &&
+              !mod.camera.first_person,
+          "\"default\" leaves the game's view mode");
+    check(!parse_mod(R"({"camera":{"view_mode":"top_down"}})", "x", mod, error), "an unknown view mode is refused");
+    check(!parse_mod(R"({"camera":{"view_mode":"first_person","first_person_value":4.5}})", "x", mod, error),
+          "a fractional enum value is refused");
+    check(!parse_mod(R"({"camera":{"view_mode":"first_person","contexts":"all"}})", "x", mod, error),
+          "contexts must be a list");
+
+    Mod fp_on_foot, fp_everywhere, off;
+    check(parse_mod(R"({"camera":{"view_mode":"first_person","contexts":[0]}})", "a", fp_on_foot, error) &&
+              parse_mod(R"({"camera":{"view_mode":"first_person","first_person_value":7}})", "b", fp_everywhere,
+                        error) &&
+              parse_mod(R"({"enabled":false,"camera":{"view_mode":"default"}})", "c", off, error),
+          "three camera mods parse");
+    set_active_camera(camera_of({fp_on_foot}));
+    check(override_view_mode(2, 0) == 4, "on foot (context 0) the view becomes first person");
+    check(override_view_mode(2, 1) == 2, "a context the mod does not list keeps the game's view");
+    set_active_camera(camera_of({fp_on_foot, fp_everywhere, off}));
+    check(override_view_mode(1, 5) == 7, "the last enabled camera mod decides (a disabled one is skipped)");
+    set_active_camera(camera_of({}));
+    check(override_view_mode(3, 0) == 3, "with no camera mod the game's view mode passes through");
+
     const auto dir = std::filesystem::temp_directory_path() / "leonida_mods_test";
     std::filesystem::remove_all(dir);
     write(dir / "a_mandy" / "mod.json",

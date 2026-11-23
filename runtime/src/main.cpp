@@ -49,9 +49,9 @@ const char* binding_name(rt::Binding b) {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--trace FILE]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
 }
 
@@ -61,6 +61,7 @@ int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;
+    uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     std::wstring trace_file;
@@ -78,6 +79,12 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
         else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
+        else if (a == L"--view-mode-getter" && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const unsigned long rva = std::wcstoul(argv[++i], &end, 16);
+            if (!end || *end || rva == 0) return usage();
+            view_mode_getter_rva = static_cast<uint32_t>(rva);
+        }
         else if (a == L"--archetype-lookup" && i + 1 < argc) {
             const std::wstring v = argv[++i];
             const auto comma = v.find(L',');
@@ -127,6 +134,12 @@ int wmain(int argc, wchar_t** argv) {
                              sw.from, sw.to_name.c_str(), sw.to);
         }
         leonida::mods::set_active(leonida::mods::ArchetypeSwaps(mods.mods));
+        const leonida::mods::CameraView camera = leonida::mods::camera_of(mods.mods);
+        leonida::mods::set_active_camera(camera);
+        if (camera.first_person)
+            std::fprintf(stderr, "[rt] mods: first-person view (value %u) for %s%s\n", camera.first_person_value,
+                         camera.contexts.empty() ? "every context" : "the listed contexts",
+                         view_mode_getter_rva ? "" : "; not applied: no --view-mode-getter RVA for this executable");
         if (leonida::mods::active().size())
             std::fprintf(stderr, archetype_lookup_rva ? "[rt] mods: %zu archetype swap(s) loaded\n"
                                  : "[rt] mods: %zu archetype swap(s) loaded; not applied: no --archetype-lookup RVA for "
@@ -144,6 +157,16 @@ int wmain(int argc, wchar_t** argv) {
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
+        if (view_mode_getter_rva) {
+            const auto r = leonida::hooks::hook_image_results(main_module.base, view_mode_getter_rva,
+                                                              &leonida::mods::override_view_mode);
+            if (r.ok)
+                std::fprintf(stderr, "[rt] mods: view-mode getter at RVA 0x%X hooked: %zu direct call(s) redirected\n",
+                             view_mode_getter_rva, r.redirected);
+            else
+                std::fprintf(stderr, "[rt] mods: view-mode getter at RVA 0x%X not hooked: %s\n", view_mode_getter_rva,
+                             r.error);
+        }
         if (archetype_lookup_rva) {
             const auto r = leonida::hooks::hook_image_calls(
                 main_module.base, archetype_lookup_rva,

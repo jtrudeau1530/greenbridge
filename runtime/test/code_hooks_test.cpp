@@ -100,6 +100,29 @@ int main() {
     check(!hook_image_calls(self, 0, &remap_lucia, 0).ok, "an RVA in the headers (not code) is refused");
     check(!make_remap_thunk(target0, 2, &remap_lucia, target0), "only argument 0 or 1 can be remapped");
 
+    // The result-override thunk (a view-mode getter): the original returns 2 ("third person, far") for every
+    // context; the override answers 4 ("first person") for context 0 only and leaves the others as they were.
+    uint8_t* getter = mem + 512;
+    put(getter, {0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3});   // mov eax, 2 ; ret
+    uint8_t* call_getter = mem + 544;
+    caller(call_getter, getter);
+    static int original_calls = 0;
+    auto first_person_on_foot = [](uint32_t result, uint32_t context) -> uint32_t {
+        ++original_calls;
+        return context == 0 ? 4u : result;
+    };
+    uint8_t* rthunk = make_result_thunk(getter, first_person_on_foot, getter);
+    check(rthunk != nullptr, "a result thunk is allocated");
+    if (rthunk) {
+        check(redirect_direct_branches(call_getter, 16, getter, rthunk) == 1, "the getter's caller is redirected");
+        FlushInstructionCache(GetCurrentProcess(), mem, 4096);
+        using Ctx = uint32_t (*)(uint32_t);
+        check(reinterpret_cast<Ctx>(call_getter)(0) == 4, "context 0 gets the overridden result");
+        check(reinterpret_cast<Ctx>(call_getter)(3) == 2, "another context keeps the original's result");
+        check(original_calls == 2, "the override sees every call, after the original ran");
+    }
+    check(!hook_image_results(mem, 0, first_person_on_foot).ok, "hook_image_results refuses memory without a PE");
+
     std::printf("code_hooks_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

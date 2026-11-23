@@ -74,6 +74,34 @@ inline uint8_t* make_remap_thunk(const void* close_to, int arg, RemapFn fn, cons
     return t;
 }
 
+using ResultFn = uint32_t (*)(uint32_t result, uint32_t arg0);
+
+// A thunk that runs the original and then passes (its 32-bit result, its first argument) through `fn`, returning
+// what `fn` returns: for a getter such as "the view mode of context N". Only for functions with at most four
+// register arguments (a stack argument would be one slot off) and an integer result.
+// Stack: rsp = 8 mod 16 at entry; one push and 0x20 bytes of shadow space make it 16-aligned for both calls.
+inline uint8_t* make_result_thunk(const void* close_to, ResultFn fn, const void* original) {
+    uint8_t* t = alloc_near(close_to, 4096);
+    if (!t) return nullptr;
+    uint8_t* p = t;
+    auto put = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t b : bytes) *p++ = b; };
+    auto put64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+    put({0x51});                                       // push rcx (the first argument, for fn)
+    put({0x48, 0x83, 0xEC, 0x20});                     // sub rsp, 0x20
+    put({0x48, 0xB8}); put64(reinterpret_cast<uint64_t>(original));   // mov rax, original
+    put({0xFF, 0xD0});                                 // call rax (rcx, rdx, r8, r9 still the caller's)
+    put({0x48, 0x8B, 0x54, 0x24, 0x20});               // mov rdx, [rsp+0x20] (the saved first argument)
+    put({0x89, 0xC1});                                 // mov ecx, eax (the original's result)
+    put({0x48, 0xB8}); put64(reinterpret_cast<uint64_t>(fn));         // mov rax, fn
+    put({0xFF, 0xD0});                                 // call rax
+    put({0x48, 0x83, 0xC4, 0x20});                     // add rsp, 0x20
+    put({0x59, 0xC3});                                 // pop rcx ; ret
+    DWORD old = 0;
+    VirtualProtect(t, 4096, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), t, p - t);
+    return t;
+}
+
 // Points every E8/E9 rel32 in [begin, begin + size) whose target is `target` at `thunk`. The range must be writable.
 // Returns how many were rewritten.
 inline std::size_t redirect_direct_branches(uint8_t* begin, std::size_t size, const uint8_t* target,
@@ -103,7 +131,10 @@ struct HookResult {
 
 // Hooks the function at `target_rva` of the mapped image at `base`: one thunk, then every direct call or jump to it
 // in the image's executable sections. Runs before any image code (main.cpp), so no thread is executing the bytes.
-inline HookResult hook_image_calls(uint8_t* base, uint32_t target_rva, RemapFn fn, int arg) {
+// Validates `target_rva` as code of the mapped image at `base`, builds the thunk with `make(target)` and points the
+// image's direct calls and jumps to the target at it.
+template <class MakeThunk>
+inline HookResult redirect_image_calls(uint8_t* base, uint32_t target_rva, MakeThunk make) {
     HookResult r;
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return r.error = "not a mapped PE image", r;
@@ -118,7 +149,7 @@ inline HookResult hook_image_calls(uint8_t* base, uint32_t target_rva, RemapFn f
             in_code = true;
     if (!in_code) return r.error = "the RVA is not in an executable section", r;
     uint8_t* target = base + target_rva;
-    uint8_t* thunk = make_remap_thunk(target, arg, fn, target);
+    uint8_t* thunk = make(target);
     if (!thunk) return r.error = "no memory within 2 GiB of the image for the thunk", r;
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
@@ -133,6 +164,19 @@ inline HookResult hook_image_calls(uint8_t* base, uint32_t target_rva, RemapFn f
     }
     r.ok = true;
     return r;
+}
+
+// The argument-remapping hook (archetype lookup): argument `arg` of every direct call goes through `fn`.
+inline HookResult hook_image_calls(uint8_t* base, uint32_t target_rva, RemapFn fn, int arg) {
+    if (arg != 0 && arg != 1) return HookResult{false, 0, "only argument 0 or 1 can be remapped"};
+    return redirect_image_calls(base, target_rva,
+                                [&](uint8_t* target) { return make_remap_thunk(target, arg, fn, target); });
+}
+
+// The result-override hook (view-mode getter): every direct call's result goes through `fn` with the first argument.
+inline HookResult hook_image_results(uint8_t* base, uint32_t target_rva, ResultFn fn) {
+    return redirect_image_calls(base, target_rva,
+                                [&](uint8_t* target) { return make_result_thunk(target, fn, target); });
 }
 
 }  // namespace leonida::hooks
