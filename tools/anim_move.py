@@ -32,6 +32,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_index  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 MAGIC = b"MoVE"
 VERSION = 19
@@ -422,12 +423,18 @@ def _collect_move_streams_rpf(path, start=None, limit=None):
     return items, walk["files"]
 
 
-def _collect_move_streams_dir(path):
-    entries = []
+def _iter_dir_stream_paths(path):
+    """Yield (name, full_path) for every candidate stream file in a carved-streams directory."""
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if name.lower().endswith((".json", ".csv")) or os.path.islink(full) or not os.path.isfile(full):
             continue
+        yield name, full
+
+
+def _collect_move_streams_dir(path):
+    entries = []
+    for name, full in _iter_dir_stream_paths(path):
         size = os.path.getsize(full)
         if size == 0 or size > MAX_STANDALONE_FILE_BYTES:
             continue
@@ -589,7 +596,8 @@ def main(argv=None):
         ap.error("--start and --limit cannot be used when the input is a directory")
     if os.path.isdir(a.out):
         sys.exit(f"{a.out}: cannot write: Is a directory")
-    if os.path.exists(a.out) and os.path.samefile(a.archive, a.out):
+    inputs = [full for _name, full in _iter_dir_stream_paths(a.archive)] if os.path.isdir(a.archive) else [a.archive]
+    if any(same_report_path(path, a.out) for path in inputs):
         sys.exit(f"{a.out}: refuses to overwrite the input archive")
     try:
         resources, summary = scan(a.archive, a.start, a.limit)
