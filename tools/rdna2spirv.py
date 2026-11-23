@@ -7389,7 +7389,11 @@ class Gen:
                 self.emit(f"{result} = OpConvertSToF %double {self.as_int(src)}")
             else:
                 self.emit(f"{result} = OpConvertUToF %double {src}")
-            self.dst_f64(a[0], result, mods, op)
+            # SHADER-721 follow-up, measured on gfx1036 through tools/hw_oracle (wave32 and wave64 identical on
+            # every case, tools/f64_omod_probe.py): a binary64 destination ignores mul:2/mul:4/div:2 while
+            # denorm_mode_16_64 = 3, which is the game's MODE, and applies them only with IEEE=0 and 16/64-bit
+            # denormals flushed. clamp applies in every MODE, so only it is passed on.
+            self.dst_f64(a[0], result, [m for m in mods if m == "clamp"], op)
         elif op in ("v_trunc_f64", "v_ceil_f64", "v_rndne_f64", "v_floor_f64"):
             if len(a) != 2 or a[0]["k"] != "vgpr" or a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
@@ -8891,7 +8895,10 @@ class Gen:
             # (0/0 or inf/inf) -> -qNaN; (x/inf or 0/y) -> +-0; (x/0 or inf/y or NaN(S0)) -> +-inf;
             # otherwise copysign(S0, sign_out). Computed bit-exact on integer words; Float64 is only needed
             # when VOP3 output modifiers (omod/clamp) are present on v_div_fixup_f64.
-            has_omod = any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods)
+            # The destination of both forms is a 16-bit or 64-bit float, and hardware ignores mul:/div: on those
+            # results while denorm_mode_16_64 = 3 (the game's MODE): measured with tools/hw_oracle on gfx1036,
+            # wave32 and wave64 identical, in tools/f64_omod_probe.py. clamp applies in every MODE.
+            has_clamp = "clamp" in mods
             if op == "v_div_fixup_f16":
                 sel, dhi = self.opsel_bits(mods, 3)
                 def h16(sv, hi_half):
@@ -8940,7 +8947,7 @@ class Gen:
                 self.emit(f"{r3} = OpSelect %uint {b_ind} {self.cu(0xFE00)} {r2}")
                 self.emit(f"{r4} = OpSelect %uint {nan1} {s1} {r3}")
                 self.emit(f"{r5} = OpSelect %uint {nan2} {s2} {r4}")
-                if has_omod:
+                if has_clamp:
                     v2f, fv = self.tmp(), self.tmp()
                     self.emit(f"{v2f} = OpExtInst %v2float %glsl UnpackHalf2x16 {r5}")
                     self.emit(f"{fv} = OpCompositeExtract %float {v2f} 0")
@@ -9031,12 +9038,12 @@ class Gen:
                 self.emit(f"{l4} = OpSelect %uint {nan1} {lo1} {l3}")
                 self.emit(f"{r_hi} = OpSelect %uint {nan2} {hi2} {h4}")
                 self.emit(f"{r_lo} = OpSelect %uint {nan2} {lo2} {l4}")
-                if has_omod:
+                if has_clamp:
                     self.uses_f64 = True
                     v2, dv, mv2 = self.tmp(), self.tmp(), self.tmp()
                     self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {r_lo} {r_hi}")
                     self.emit(f"{dv} = OpBitcast %double {v2}")
-                    dv = self.clamp_mods_f64(dv, mods)
+                    dv = self.clamp_mods_f64(dv, [m for m in mods if m == "clamp"])
                     self.emit(f"{mv2} = OpBitcast %v2uint_d {dv}")
                     r_lo, r_hi = self.tmp(), self.tmp()
                     self.emit(f"{r_lo} = OpCompositeExtract %uint {mv2} 0")
@@ -10590,12 +10597,15 @@ class Gen:
                 self.emit(f"{other_lo} = OpSelect %uint {is_sub} {sub_lo} {lo}")
                 self.emit(f"{r_hi} = OpSelect %uint {isnorm} {m_hi} {other_hi}")
                 self.emit(f"{r_lo} = OpSelect %uint {isnorm} {lo} {other_lo}")
-                if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):
+                # SHADER-721 follow-up, measured with tools/hw_oracle on gfx1036 (wave32 and wave64 identical,
+                # tools/f64_omod_probe.py): a binary64 result ignores mul:2/mul:4/div:2 while denorm_mode_16_64 = 3,
+                # which is the game's MODE. clamp applies in every MODE, so only it needs Float64 here.
+                if "clamp" in mods:
                     self.uses_f64 = True
                     v2, dv, mv2 = self.tmp(), self.tmp(), self.tmp()
                     self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {r_lo} {r_hi}")
                     self.emit(f"{dv} = OpBitcast %double {v2}")
-                    dv = self.clamp_mods_f64(dv, mods)
+                    dv = self.clamp_mods_f64(dv, [m for m in mods if m == "clamp"])
                     self.emit(f"{mv2} = OpBitcast %v2uint_d {dv}")
                     r_lo, r_hi = self.tmp(), self.tmp()
                     self.emit(f"{r_lo} = OpCompositeExtract %uint {mv2} 0")
