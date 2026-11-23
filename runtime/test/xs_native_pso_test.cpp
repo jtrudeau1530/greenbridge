@@ -382,13 +382,22 @@ void test_unresolved() {
     EXPECT(mock->graphics_calls == 1 && mock->last.vs.size() == 16 && std::memcmp(mock->last.vs.data(), "FSSM", 4) == 0);
     EXPECT(mock->last.ps.empty() && mock->last.elements.empty() && mock->last.rt_count == 2);
     EXPECT(xs::native_pso_stats().stubbed == 1);
+    // A device without #7417 refuses the stub: counted as refused, not stubbed.
+    mock->result = E_INVALIDARG;
+    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_INVALIDARG && !out && mock->graphics_calls == 2);
+    EXPECT(xs::native_pso_stats().stubbed == 1 && xs::native_pso_stats().refused == 3);
+    mock->result = S_OK;
     SetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", L"0");
-    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->graphics_calls == 1);
+    EXPECT(call57(device, &unknown.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->graphics_calls == 2);
 
-    SetEnvironmentVariableW(L"LEONIDA_NATIVE_PSO", L"0");
     Desc good;
     good.stage(0, kVs).stage(1, kPs);
-    EXPECT(call57(device, &good.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && mock->graphics_calls == 1);
+    for (const wchar_t* off : {L"0", L"off", L"FALSE", L"no"}) {
+        SetEnvironmentVariableW(L"LEONIDA_NATIVE_PSO", off);
+        EXPECT(call57(device, &good.desc, &kPipelineIid, &out) == E_NOTIMPL && !out && mock->graphics_calls == 2);
+    }
+    SetEnvironmentVariableW(L"LEONIDA_NATIVE_PSO", L"1");
+    EXPECT(call57(device, &good.desc, &kPipelineIid, &out) == S_OK && mock->graphics_calls == 3);
 }
 
 void test_arguments_and_results() {
@@ -416,8 +425,11 @@ void test_arguments_and_results() {
     EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_FAIL && !out && g_odd_releases == 1);
 }
 
+std::filesystem::path g_provided;
+std::filesystem::path provided_dir() { return g_provided; }
+
 void test_directory() {
-    // No provider: LEONIDA_SHADERS names the folder.
+    // No provider (a host D3D12 device): refused, even with LEONIDA_SHADERS naming a good folder.
     fresh(false);
     MockDevice* mock = new_device();
     void* device = proxy_over(mock);
@@ -425,14 +437,15 @@ void test_directory() {
     d.stage(0, kVs).stage(1, kPs);
     void* out = nullptr;
     SetEnvironmentVariableW(L"LEONIDA_SHADERS", g_spirv.c_str());
-    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->last.vs == kVsBytes);
+    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->graphics_calls == 0);
 
-    // A folder without native_hashes.txt, and none at all: nothing resolves.
-    fresh(false);
-    SetEnvironmentVariableW(L"LEONIDA_SHADERS", g_root.c_str());
-    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL);
-    fresh(false);
-    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->graphics_calls == 1);
+    // A folder without native_hashes.txt, and an empty path: nothing resolves.
+    for (const std::filesystem::path& dir : {g_root, std::filesystem::path()}) {
+        fresh(false);
+        g_provided = dir;
+        xs::set_native_shader_directory_provider(&provided_dir);
+        EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL && mock->graphics_calls == 0);
+    }
 }
 
 }  // namespace

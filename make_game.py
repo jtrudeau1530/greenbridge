@@ -1394,12 +1394,15 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
 
 def native_pso_hashes(dxbc: str, spirv: str) -> None:
     """Write <spirv>/native_hashes.txt, which device slot 57 finds the game's containers by (their HASH digest;
-    tools/native_pso_hashes.py). A few seconds over the corpus; redone when index.json is newer than the map."""
+    tools/native_pso_hashes.py). A few seconds over the corpus; redone when index.json, the carve index or the tool
+    is newer than the map."""
     import native_pso_hashes as tool
     index, out = os.path.join(spirv, "index.json"), os.path.join(spirv, tool.OUT_NAME)
     if not os.path.isfile(index) or not os.path.isdir(dxbc):
         return
-    if os.path.isfile(out) and os.path.getmtime(out) >= os.path.getmtime(index):
+    inputs = [index, os.path.join(dxbc, "index.json"), os.path.abspath(tool.__file__)]
+    newest = max(os.path.getmtime(p) for p in inputs if os.path.isfile(p))
+    if os.path.isfile(out) and os.path.getmtime(out) >= newest:
         return
     if os.path.exists(out):
         os.remove(out)

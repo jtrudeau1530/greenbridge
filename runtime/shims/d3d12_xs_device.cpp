@@ -3681,6 +3681,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 57) {
         note_slot(57);
+        log_xbox_route_once(57, "native graphics pipeline (desc, riid, out)", a1, a2, a3, a4, a5);
         return hr_to_u64(create_native_graphics_pipeline(self->real, reinterpret_cast<const void*>(a1),
                                                          reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 67) {

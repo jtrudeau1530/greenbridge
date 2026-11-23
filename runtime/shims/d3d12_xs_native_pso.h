@@ -1,4 +1,4 @@
-// Xbox device slot 57: native graphics pipelines (design and sources in runtime/src/native_pso.h and HANDOFF.md).
+// Xbox device slot 57: native graphics pipelines (layout and sources in runtime/src/native_pso.h).
 //
 // The handler reads the 0x108-byte description, finds each stage's source container through the HASH digest in its
 // records (<shaders>/native_hashes.txt, written by tools/native_pso_hashes.py), and creates the pipeline on the
@@ -34,7 +34,7 @@
 namespace rt::d3d12_xs {
 
 // Where the translator's output is (<work>/shaders/spirv); asked once, on the first slot-57 call. The Vulkan device
-// sets it; without a provider, LEONIDA_SHADERS is read.
+// sets it. Without one (a host D3D12 device, which cannot take console containers) every call is refused.
 using ShaderDirectoryProvider = std::filesystem::path (*)();
 
 struct NativePsoStats {
@@ -51,24 +51,17 @@ inline SRWLOCK g_lock = SRWLOCK_INIT;
 inline bool g_loaded = false;  // under g_lock
 inline std::filesystem::path* g_dir = nullptr;
 inline np::HashMap* g_map = nullptr;  // null when there is no usable map
-inline std::atomic<std::uint64_t> g_calls{0}, g_created{0}, g_stubbed{0}, g_refused{0};
+inline std::atomic<std::uint64_t> g_calls{0}, g_created{0}, g_stubbed{0}, g_refused{0}, g_stub_asks{0};
 inline std::atomic<bool> g_first_logged{false}, g_odd_logged{false};
 
+// "0", "off", "false" and "no" (any case) are off; anything else set is on.
 inline bool env_flag(const wchar_t* name, bool fallback) {
     wchar_t value[8] = {};
     const DWORD n = GetEnvironmentVariableW(name, value, 8);
     if (n == 0 || n >= 8) return fallback;
-    return value[0] != L'0';
-}
-
-inline std::filesystem::path env_shader_directory() {
-    const DWORD size = GetEnvironmentVariableW(L"LEONIDA_SHADERS", nullptr, 0);
-    if (!size) return {};
-    std::wstring value(size, L'\0');
-    const DWORD length = GetEnvironmentVariableW(L"LEONIDA_SHADERS", value.data(), size);
-    if (!length || length >= size) return {};
-    value.resize(length);
-    return std::filesystem::path(value);
+    for (const wchar_t* off : {L"0", L"off", L"false", L"no"})
+        if (_wcsicmp(value, off) == 0) return false;
+    return true;
 }
 
 // The map and its folder, loaded on the first call. Read-only afterwards, so callers use them without the lock.
@@ -78,14 +71,15 @@ inline const np::HashMap* hash_map(const std::filesystem::path** dir) {
         g_loaded = true;
         try {
             const ShaderDirectoryProvider provider = g_provider.load();
-            auto path = provider ? provider() : env_shader_directory();
+            auto path = provider ? provider() : std::filesystem::path();
             const auto file = path / L"native_hashes.txt";
             std::ifstream in(file, std::ios::binary);
             const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
             auto map = std::make_unique<np::HashMap>();
             std::string error;
             if (path.empty()) {
-                std::fprintf(stderr, "[rt] d3d12_xs: slot 57: no translated shader folder (LEONIDA_SHADERS)\n");
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 57: no translated shader folder (needs the Vulkan device "
+                             "and LEONIDA_SHADERS or shader_path.txt)\n");
             } else if (!in && text.empty()) {
                 std::fprintf(stderr, "[rt] d3d12_xs: slot 57: no native_hashes.txt in %s; rerun make_game.py's "
                              "shaders stage\n", reinterpret_cast<const char*>(path.u8string().c_str()));
@@ -197,10 +191,33 @@ inline const char* status_name(np::PlanStatus s) {
 // A bare FSSM blob that no index names: the device's own "no translated shader" path answers it.
 inline constexpr std::uint8_t kStubProgram[16] = {'F', 'S', 'S', 'M'};
 
+// The device's answer: failures are logged and counted, an odd pointer is refused, successes are counted in `done`.
+inline HRESULT finish(HRESULT hr, void** out, std::uint64_t call, const char* what, std::atomic<std::uint64_t>& done) {
+    if (FAILED(hr)) {
+        const std::uint64_t n = g_refused.fetch_add(1) + 1;
+        if (log_this(n))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 call %llu: the device refused 0x%08lx (%s) (%llu so far)\n",
+                         static_cast<unsigned long long>(call), static_cast<unsigned long>(hr), what,
+                         static_cast<unsigned long long>(n));
+        return hr;
+    }
+    // The title keeps the pipeline shifted right by one (issue #7496): an odd pointer would lose its low bit.
+    if (*out && (reinterpret_cast<std::uintptr_t>(*out) & 1)) {
+        if (!g_odd_logged.exchange(true)) std::fprintf(stderr, "[rt] d3d12_xs: slot 57: odd pipeline pointer\n");
+        static_cast<IUnknown*>(*out)->Release();
+        *out = nullptr;
+        g_refused.fetch_add(1);
+        return E_FAIL;
+    }
+    done.fetch_add(1);
+    return hr;
+}
+
 inline HRESULT unresolved(ID3D12Device* real, const np::GraphicsDesc& desc, const np::FixedState* state,
-                          const IID& riid, void** out, const char* why, std::size_t block) {
+                          const IID& riid, void** out, std::uint64_t call, const char* why, std::size_t block) {
     const bool stub = env_flag(L"LEONIDA_STUB_PIPELINES", false);
-    const std::uint64_t n = (stub ? g_stubbed : g_refused).fetch_add(1) + 1;
+    static_assert(sizeof(kStubProgram) == 16);
+    const std::uint64_t n = stub ? g_stub_asks.fetch_add(1) + 1 : g_refused.fetch_add(1) + 1;
     if (log_this(n))
         std::fprintf(stderr, "[rt] d3d12_xs: slot 57: %s (block %zu); %s (%llu so far)\n", why, block,
                      stub ? "asking the device for a stub" : "refused with E_NOTIMPL",
@@ -210,7 +227,7 @@ inline HRESULT unresolved(ID3D12Device* real, const np::GraphicsDesc& desc, cons
     pc.pRootSignature = static_cast<ID3D12RootSignature*>(const_cast<void*>(desc.root_signature));
     fill_fixed_state(state ? *state : np::FixedState{}, pc);
     pc.VS = {kStubProgram, sizeof(kStubProgram)};
-    return real->CreateGraphicsPipelineState(&pc, riid, out);
+    return finish(real->CreateGraphicsPipelineState(&pc, riid, out), out, call, "stub", g_stubbed);
 }
 
 }  // namespace native_pso_detail
@@ -235,7 +252,7 @@ inline void reset_native_pso_state() {
     g_dir = nullptr;
     g_loaded = false;
     ReleaseSRWLockExclusive(&g_lock);
-    g_calls = g_created = g_stubbed = g_refused = 0;
+    g_calls = g_created = g_stubbed = g_refused = g_stub_asks = 0;
 }
 
 // slot 57 (desc, riid, out) on the device behind the proxy.
@@ -243,15 +260,17 @@ inline HRESULT create_native_graphics_pipeline(ID3D12Device* real, const void* d
                                                void** out) {
     using namespace native_pso_detail;
     const std::uint64_t call = g_calls.fetch_add(1) + 1;
+    if (desc_words && !g_first_logged.exchange(true)) {
+        const auto& d = *static_cast<const np::GraphicsDesc*>(desc_words);
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 first call: blob A %llu B, blob B %llu B, riid %p, out %p\n",
+                     static_cast<unsigned long long>(d.state_a.size), static_cast<unsigned long long>(d.state_b.size),
+                     static_cast<const void*>(riid), static_cast<void*>(out));
+    }
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
     if (!desc_words) return E_INVALIDARG;
     const auto& desc = *static_cast<const np::GraphicsDesc*>(desc_words);
-    if (!g_first_logged.exchange(true))
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 first call: desc %p, blob A %llu B, blob B %llu B, riid %p\n",
-                     desc_words, static_cast<unsigned long long>(desc.state_a.size),
-                     static_cast<unsigned long long>(desc.state_b.size), static_cast<const void*>(riid));
     if (!env_flag(L"LEONIDA_NATIVE_PSO", true)) {
         g_refused.fetch_add(1);
         return E_NOTIMPL;
@@ -270,15 +289,15 @@ inline HRESULT create_native_graphics_pipeline(ID3D12Device* real, const void* d
         return E_INVALIDARG;
     }
     if (plan.status != np::PlanStatus::ok || !dir)
-        return unresolved(real, desc, &plan.state, *riid, out, map ? status_name(plan.status) : "no native_hashes.txt",
-                          plan.failed_block);
+        return unresolved(real, desc, &plan.state, *riid, out, call,
+                          map ? status_name(plan.status) : "no native_hashes.txt", plan.failed_block);
 
     std::vector<std::uint8_t> code[np::kStageBlocks];
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pc{};
     D3D12_SHADER_BYTECODE ms{};
     for (const np::PlannedStage& s : plan.stages) {
         if (!read_container(*dir, s.shader->path, code[s.block]))
-            return unresolved(real, desc, &plan.state, *riid, out, "container not readable", s.block);
+            return unresolved(real, desc, &plan.state, *riid, out, call, "container not readable", s.block);
         const D3D12_SHADER_BYTECODE bc{code[s.block].data(), code[s.block].size()};
         const std::string& stage = s.shader->stage;
         (stage == "vs" ? pc.VS : stage == "ps" ? pc.PS : stage == "gs" ? pc.GS : ms) = bc;
@@ -294,24 +313,7 @@ inline HRESULT create_native_graphics_pipeline(ID3D12Device* real, const void* d
 
     const HRESULT hr = plan.mesh ? create_mesh(real, pc, ms, *riid, out)
                                  : real->CreateGraphicsPipelineState(&pc, *riid, out);
-    if (FAILED(hr)) {
-        const std::uint64_t n = g_refused.fetch_add(1) + 1;
-        if (log_this(n))
-            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 call %llu: the device refused 0x%08lx (%s) (%llu so far)\n",
-                         static_cast<unsigned long long>(call), static_cast<unsigned long>(hr),
-                         plan.stages.front().shader->path.c_str(), static_cast<unsigned long long>(n));
-        return hr;
-    }
-    // The title keeps the pipeline shifted right by one (issue #7496): an odd pointer would lose its low bit.
-    if (*out && (reinterpret_cast<std::uintptr_t>(*out) & 1)) {
-        if (!g_odd_logged.exchange(true)) std::fprintf(stderr, "[rt] d3d12_xs: slot 57: odd pipeline pointer\n");
-        static_cast<IUnknown*>(*out)->Release();
-        *out = nullptr;
-        g_refused.fetch_add(1);
-        return E_FAIL;
-    }
-    g_created.fetch_add(1);
-    return hr;
+    return finish(hr, out, call, plan.stages.front().shader->path.c_str(), g_created);
 }
 
 }  // namespace rt::d3d12_xs
