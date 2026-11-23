@@ -670,6 +670,9 @@ def write_json(path, docs, summary):
     except BaseException:
         if temp is not None:
             with suppress(OSError):
+                # The staging file may have inherited a read-only destination's mode; make it deletable
+                # first, or Windows strands it beside the report when the replace fails.
+                os.chmod(temp, 0o600)
                 os.unlink(temp)
         raise
 
