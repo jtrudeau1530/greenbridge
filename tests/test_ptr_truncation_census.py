@@ -191,6 +191,20 @@ class SummaryTests(unittest.TestCase):
         finally:
             sys.stderr = stderr
 
+    def test_limit_must_be_positive(self):
+        for value in ("0", "-1"):
+            with self.subTest(limit=value):
+                stderr = sys.stderr
+                sys.stderr = io.StringIO()
+                try:
+                    with self.assertRaises(SystemExit) as cm:
+                        P.main([os.path.join(ROOT, "tools"), "--limit", value])
+                finally:
+                    message = sys.stderr.getvalue()
+                    sys.stderr = stderr
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--limit must be at least 1", message)
+
 
 if __name__ == "__main__":
     unittest.main()
