@@ -140,7 +140,7 @@ the payload end happened to fit the byte count, but it is not the format.
 | magic | 0x00 | 4 bytes | `PAMH` (little-endian `HMAP`) |
 | version | 0x04 | 2 x `u8` | 1.2 in `common.rpf`; overwritten in the `levels.rpf` tiles |
 | pad | 0x06 | `u16` | 0 in `common.rpf`; text in the tiles |
-| flag word | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`; padding in the tiles |
+| word at the GTA V `compressed` offset | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`. Level tiles contain label bytes with bit 0 set. |
 | width, height | 0x0C | 2 x `u16` | 144, 164 in `common.rpf`; 64, 64 in every tile |
 | six bounds | 0x10 | 6 x `f32` | `(-13312, -9728, -302)` to `(5120, 11264, 404)` |
 | data size | 0x28 | `u32` | 48,544 in `common.rpf`; 8,704 in a tile |
@@ -167,13 +167,16 @@ same rules: a 44-byte header, 64 x 64 cells, 64 full-width row records with
 - Max values span 0..255 and min values 0..254. `min <= max` in all but 62
   cells, all in the tile at `(-5120, 2048)`, where the encoder wrote a min
   above its max.
-- Bytes 0x05..0x0B are leftover text, not a version minor and a flag. 0x04
-  stays 1, 0x05.. hold the tile name `n_m` (column + 1, row + 1), and the
-  remaining bytes keep the tail of the string `height`, right-aligned at 0x0B.
-  The 28 distinct 0x08..0x0B words are all text; none is zero and none changes
-  the arrays.
-- The census groups by grid size, not by the 0x04 version bytes, because
-  0x05 is the first digit of the name. Nothing depends on the 0x08 word.
+- Use the tile's minimum XY corner to recover its column and row. Subtract the
+  grid minimum and divide each axis by 512. The 1,476 distinct coordinate pairs
+  produce only 954 distinct seven-byte labels at 0x05..0x0B.
+- To reproduce the label, right-align `height` in those seven bytes, then write
+  the one-based `column_row` and its NUL at 0x05. This predicts 819 headers
+  exactly. Setting bit 0 at **0x08** in that prediction matches all seven bytes
+  on **1,476/1,476** tiles. In 81 tiles the bit occupies the expected NUL.
+  Every stored 0x08 word is odd. The bit's runtime meaning is unknown.
+- The census groups by grid size. Byte 0x04 stays 1, 0x05 holds the first
+  digit of the column, and the 0x08 word takes 28 distinct values.
 
 ```powershell
 python -I tools/gamedata_maps.py <work>\carve\levels --json levels.json
@@ -204,10 +207,9 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
 
 ### Checksum and unknown fields
 
-- `PAMH` 0x08 is GTA V's `compressed` word only in the `common.rpf` payload,
-  where it holds `0x1BBC8CED`. In the 1,476 `levels.rpf` tiles bytes 0x04..0x0B
-  are leftover text (tile name plus `height`), so 0x08 is padding there. The
-  `0x1BBC8CED` value is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib
+- The `common.rpf` `PAMH` payload holds `0x1BBC8CED` at GTA V's `compressed`
+  offset, 0x08. The level tiles overlap this word with the coordinate label
+  described above. The common value is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib
   digest of the max/min arrays; it is reported as a flag word, not a proven
   checksum.
 - `MHIU` 0x28 is a `u8` default height, not a 32-bit word (ASSET-48). Its
