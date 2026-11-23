@@ -132,18 +132,21 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["debug_strings"] += 1
             elif kind == "exception":
                 trace["exception_count"] += 1
+                if limit <= 0:
+                    continue
+                stack = event.get("stack")
+                detail = {
+                    "code": event.get("code"),
+                    "at": event.get("at"),
+                    "cpp": event.get("cpp"),
+                    "access": event.get("access"),
+                    "address": event.get("address"),
+                    "stack": stack[:8] if isinstance(stack, list) else [],
+                }
                 if len(trace["exceptions"]) < limit:
-                    stack = event.get("stack")
-                    trace["exceptions"].append(
-                        {
-                            "code": event.get("code"),
-                            "at": event.get("at"),
-                            "cpp": event.get("cpp"),
-                            "access": event.get("access"),
-                            "address": event.get("address"),
-                            "stack": stack[:8] if isinstance(stack, list) else [],
-                        }
-                    )
+                    trace["exceptions"].append(detail)
+                else:
+                    trace["exceptions"][-1] = detail
             elif kind == "exit":
                 trace["exit"] = event.get("code")
             elif kind == "error":

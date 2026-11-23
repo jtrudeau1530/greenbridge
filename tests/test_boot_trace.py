@@ -137,6 +137,35 @@ class BootTraceTests(unittest.TestCase):
         self.assertIs(trace["exceptions"][1]["cpp"], True)
         self.assertEqual(trace["exit"], 0)
 
+    def test_exception_limit_keeps_final_observation(self):
+        early = [
+            {"kind": "exception", "code": "0xe06d7363", "at": f"synthetic.exe+0x{0x1100 + i:x}", "cpp": True}
+            for i in range(10)
+        ]
+        final = {
+            "kind": "exception",
+            "code": "0xc0000005",
+            "at": "synthetic.exe+0x2010",
+            "access": "read",
+            "address": "0x0",
+            "stack": ["synthetic.exe+0x2010", "synthetic.exe+0x1000"],
+        }
+        for limit, preceding in ((1, early), (10, early), (10, early[:-1])):
+            with self.subTest(limit=limit, count=len(preceding) + 1):
+                self.write(self.startup, [STARTUP[0], *preceding, final])
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(bt.main([self.startup, "--limit", str(limit), "--json"]), 0)
+                summary = json.loads(output.getvalue())
+                startup = summary["startup"]
+                self.assertEqual(startup["exception_count"], len(preceding) + 1)
+                self.assertEqual(
+                    [exc["at"] for exc in startup["exceptions"]],
+                    [exc["at"] for exc in preceding[:limit - 1]] + [final["at"]],
+                )
+                self.assertEqual(startup["exceptions"][-1]["stack"], final["stack"])
+                self.assertIn("synthetic.exe+0x2010 (read 0x0)", bt.format_text(summary, limit))
+
     def test_debug_text_is_not_printed(self):
         self.write(self.startup, STARTUP)
         text = bt.format_text(bt.summarize(bt.parse_startup(self.startup), None), 10)
