@@ -568,6 +568,36 @@ void test_physical_pages(const PhysicalApi& api) {
     // The windows were split into one placeholder per page; the process exit releases them.
 }
 
+DWORD protection_of(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof info) ? info.Protect : 0;
+}
+
+void test_mapping_protection(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 2;
+    auto* const rw = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    auto* const ro = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READONLY));
+    auto* const none = static_cast<uint8_t*>(api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages,
+                                                               0x3, PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS));
+    check(rw && ro && none, "reserve PAGE_READWRITE, PAGE_READONLY and 0x801 windows");
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == kPages, "allocate the pages they share");
+    if (!rw || !ro || !none || count != kPages) return;
+    check(api.map(rw, kPages, pages) == rw && api.map(ro, kPages, pages) == ro && api.map(none, kPages, pages) == none,
+          "the same pages map into all three windows");
+    std::memset(rw, 0x3c, kPages * kPage64k);
+    check(std::memcmp(rw, ro, kPages * kPage64k) == 0, "the read-only mapping reads what the read-write one wrote");
+    check(protection_of(ro) == PAGE_READONLY, "a page mapped in a PAGE_READONLY window is read-only");
+    check(protection_of(none) == PAGE_NOACCESS, "a page mapped in a 0x801 window is PAGE_NOACCESS");
+    check(api.map(rw, kPages, nullptr) == rw && api.map(ro, kPages, nullptr) == ro &&
+              api.map(none, kPages, nullptr) == none,
+          "unmap all three");
+    check(api.free_pages(kPages, pages) == TRUE, "free the shared pages");
+}
+
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
@@ -941,6 +971,7 @@ int main() {
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
+        test_mapping_protection(physical);
         test_placeholders(physical);
     }
 
