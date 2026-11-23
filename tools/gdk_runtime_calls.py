@@ -337,7 +337,7 @@ class RuntimeTable:
 
     @classmethod
     def load(cls, path: str) -> "RuntimeTable":
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             return cls(json.load(f))
 
     def ids(self) -> set[str]:

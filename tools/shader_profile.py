@@ -275,7 +275,7 @@ def stage_map(disasm_dir) -> dict:
     so the name is only a fallback for shaders the index doesn't list. Empty when there is no readable index."""
     path = carve_index_path(disasm_dir)
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             entries = json.load(f)
         return {os.path.splitext(e["file"])[0]: e["stage"] for e in entries
                 if isinstance(e, dict) and isinstance(e.get("file"), str) and isinstance(e.get("stage"), str)}

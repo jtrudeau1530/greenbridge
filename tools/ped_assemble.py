@@ -1582,7 +1582,7 @@ def load_parts_from_path(
         return parts, None
 
     if ext == ".json":
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
         if isinstance(data, dict) and "parts" in data:
             skel = _skeleton_from_dict(data.get("skeleton"), default_space=data.get("coord_space", source_space))

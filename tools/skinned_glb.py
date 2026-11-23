@@ -209,7 +209,7 @@ def _finite_matrix(m) -> bool:
 def _load_json(path: str) -> dict:
     # An interrupted export leaves an empty or cut-off model.json: report it like any other bad input (BUILD-1031).
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             value = json.load(handle)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SkinError(f"{path}: invalid JSON: {exc}") from exc
