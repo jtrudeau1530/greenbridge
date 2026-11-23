@@ -242,7 +242,8 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
 
 def run_test_process(argv: list[str], *, cwd: str, env: dict[str, str],
                      timeout: float) -> subprocess.CompletedProcess:
-    options = dict(cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    options = dict(cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if os.name != "posix":
         return subprocess.run(argv, **options, timeout=timeout)
 
