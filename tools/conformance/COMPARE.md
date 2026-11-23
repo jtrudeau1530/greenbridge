@@ -337,6 +337,8 @@ selftest passed
   manifest rather than hard-coding 256 in the tool.
 - **PNG support is exactly the contract**: 8-bit RGB (type 2) or RGBA (type 6),
   non-interlaced, filter types 0-4. Everything else is rejected with a message.
+  RGB must be opaque: `tRNS` transparency is rejected rather than silently treated
+  as opaque. Re-export such images as RGBA with an explicit alpha channel.
 - **No colour management.** Ancillary chunks such as gAMA, sRGB and iCCP are
   ignored; pixels are compared exactly as stored. This matches the scene
   contract's "no sRGB conversion".

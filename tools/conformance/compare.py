@@ -6,6 +6,7 @@ never reads C++ or scene definitions: the images and the manifest are the whole
 contract. PNG support is deliberately small and complete for that contract:
 8-bit RGB or RGBA, non-interlaced, with all five filter types (0-4), because any
 encoder that writes those formats may use any of them.
+RGB must be opaque; tRNS transparency is rejected. Use RGBA for explicit alpha.
 
 Exit codes, identical in every mode:
     0  everything the mode checked passed
@@ -278,6 +279,13 @@ def read_png(path):
     file_bytes = read_file_bytes(path, "PNG image")
     chunks = split_png_chunks(file_bytes, path)
     width, height, colour_type = parse_image_header(chunks, path)
+    if any(chunk_type == b"tRNS" for chunk_type, _ in chunks):
+        if colour_type == PNG_COLOUR_TYPE_RGBA:
+            raise ToolError(f"'{path}': tRNS is forbidden in an RGBA PNG; re-export a valid RGBA image")
+        raise ToolError(
+            f"'{path}': PNG tRNS transparency is not supported; re-export as RGBA "
+            f"with an explicit alpha channel. Ignoring tRNS would compare transparent pixels as opaque"
+        )
 
     compressed_data = b"".join(
         chunk_data for chunk_type, chunk_data in chunks if chunk_type == b"IDAT"
