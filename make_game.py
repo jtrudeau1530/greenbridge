@@ -2200,6 +2200,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                         return first
                     second = check_range(start + half, count - half)
                     return second or first
+                # The give-up path is exactly when a durable record matters: a module was named earlier,
+                # but the driver now aborts before it can name another one. fail() raises, so write first.
+                if crashed:
+                    record_crashes(out, spirv, crashed)
                 fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
                      "the checker could not finish even this range in a fresh process; check available memory "
                      "and report it if it keeps happening")
@@ -2208,6 +2212,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             crashed.extend(suspects)
             with open(skip, "w", encoding="utf-8", newline="\n") as f:
                 f.write("".join(n + "\n" for n in crashed))
+        if crashed:
+            record_crashes(out, spirv, crashed)
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
 
