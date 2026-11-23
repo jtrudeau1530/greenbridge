@@ -8,6 +8,7 @@
 // so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
+#include "window_station.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -124,15 +125,6 @@ void pump() {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-}
-
-bool has_interactive_window_station() {
-    HWINSTA station = GetProcessWindowStation();
-    if (!station) return true;  // Unknown environment: let window creation report the real failure.
-    USEROBJECTFLAGS flags{};
-    DWORD bytes = 0;
-    if (!GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &bytes)) return true;
-    return (flags.dwFlags & WSF_VISIBLE) != 0;
 }
 
 // True when the window manager reports this window as the top-level window at a screen point. Being the foreground

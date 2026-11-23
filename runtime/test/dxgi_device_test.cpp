@@ -15,6 +15,7 @@
 //     and the adapter provider still reaches it, so the Vulkan device hands out the layer's adapter there too.
 // Exits 77 when neither a host D3D12 device nor a Vulkan device can be made. No shaders, game data or Xbox DLLs.
 #include "vk_test_device.h"
+#include "window_station.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -131,9 +132,12 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     }
     // The next step of the sequence. Which answer comes back is the adapter's business (a software adapter has no
     // output; the layer's adapter has none before D3D-313): it is one of the two, and an output only with S_OK.
+    // Without an interactive window station (SSH, a service) the host has no outputs to give and answers
+    // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE.
     Ref<IDXGIOutput> output;
     const HRESULT output_hr = adapter->EnumOutputs(0, &output.p);
-    EXPECT((output_hr == S_OK && output.p) || (output_hr == DXGI_ERROR_NOT_FOUND && !output.p));
+    EXPECT((output_hr == S_OK && output.p) || (output_hr == DXGI_ERROR_NOT_FOUND && !output.p) ||
+           (output_hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE && !output.p && !has_interactive_window_station()));
 
     // IDXGIDevice1's own state: kept and read back.
     UINT latency = 0;
