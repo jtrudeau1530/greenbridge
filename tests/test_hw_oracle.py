@@ -271,6 +271,20 @@ class ToolchainFallbacks(unittest.TestCase):
         self.assertIn("-mcode-object-version=5", args)
         self.assertIn("-mwavefrontsize64", args)
 
+    def test_the_hip_linker_uses_amdgpu_elf_emulation(self):
+        o = self.oracle()
+        o.clang, o.lld = "clang", "ld.lld"
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner.subprocess, "run", return_value=ok) as run:
+            o.workdir = tmp
+            code, error = o._assemble("")
+        self.assertEqual(error, "")
+        run.assert_called_with(
+            [o.lld, "-m", "elf64_amdgpu", "-shared", os.path.join(tmp, "k.o"), "-o", code],
+            capture_output=True, text=True,
+        )
+
     def test_true16_is_used_only_where_the_assembler_needs_it(self):
         bare_only = lambda text, wave=32: (None, "error") if ".l" in text else ("k.co", "")
         half_only = lambda text, wave=32: ("k.co", "") if ".l" in text else (None, "error")
