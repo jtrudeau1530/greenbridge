@@ -1548,6 +1548,26 @@ def runtime_gpu_per_vertex():
         return None
 
 
+def runtime_gpu_barycentric_fallback():
+    """Whether the selected Vulkan GPU's driver has a known BaryCoordKHR bug (Mesa ANV, AMD Windows on gfx90c), or None
+    when it can't be told."""
+    try:
+        v = runtime_gpu_info().get("barycentric_fallback")
+        return v if isinstance(v, bool) else None
+    except (AttributeError, TypeError):
+        return None
+
+
+def barycentric_fallback_override():
+    """LEONIDA_BARY_FALLBACK=1/0 forces the same barycentric path as the GPU test runner; None leaves it automatic."""
+    v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 def runtime_gpu_max_push_constants():
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
     v = runtime_gpu_info().get("max_push_constants_size")
@@ -2636,6 +2656,26 @@ def main() -> int:
             a.f16_interp_fallback = True
         elif per_vertex is None:
             a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
+    if "shaders" in stages:
+        if a.bary_fallback:
+            # Command-line precedence: --bary-fallback wins over LEONIDA_BARY_FALLBACK=0.
+            pass
+        else:
+            override = barycentric_fallback_override()
+            if override is True:
+                log("shaders: LEONIDA_BARY_FALLBACK=1 forces --bary-fallback")
+                a.bary_fallback = True
+            elif override is False:
+                log("shaders: LEONIDA_BARY_FALLBACK=0 forces native barycentrics")
+                a.bary_fallback = False
+            else:
+                bary_fallback = runtime_gpu_barycentric_fallback()
+                if bary_fallback is True:
+                    log("shaders: this GPU's driver has a known BaryCoordKHR bug (Mesa ANV, or AMD's Windows driver "
+                        "on gfx90c): translating with --bary-fallback")
+                    a.bary_fallback = True
+                elif bary_fallback is None:
+                    a.bary_fallback = keep_recorded_fallback("--bary-fallback", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
         max_pc = runtime_gpu_max_push_constants()

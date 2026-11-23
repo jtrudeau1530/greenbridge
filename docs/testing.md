@@ -447,6 +447,20 @@ too and which `--bary-fallback` can't express. With `LEONIDA_F16_INTERP_FALLBACK
 exports decoded instead (see Macs, below) and run with or without the bary fallback; `run_gpu_tests.py` turns that
 on by itself where the device lacks the extension. Under the bary fallback without it they skip.
 
+Intel Arc with Mesa ANV currently advertises the native barycentric feature but has a driver bug where translated
+pixel shaders can read `BaryCoordKHR.i` as zero (SHADER-925). `make_game.py` detects ANV and automatically translates
+with `--bary-fallback`; both entry points accept `LEONIDA_BARY_FALLBACK=1` to force it and
+`LEONIDA_BARY_FALLBACK=0` to force native barycentrics. The CLI `--bary-fallback` flag also remains available for
+game builds and other manually built fixtures.
+
+AMD's Windows driver on gfx90c iGPUs (Renoir, Lucienne, Cezanne, Barcelo: Ryzen 4000/5000 mobile and 5000G, GCN 5)
+also advertises the feature but returns a wrong third `BaryCoordKHR` component, about 0.99 where a small value is
+expected (#5933: Vega 8, PCI 1002:15E7, driver 31.0.21921.13001). `ps_bary`, `ps_persp_bary` and `ps_ij_computed`
+fail natively; through the fallback `ps_bary` and `ps_persp_bary` pass. `tools/vk_subgroup_info.py` reports
+`barycentric_fallback` for these PCI IDs under `VK_DRIVER_ID_AMD_PROPRIETARY`, so `make_game.py` and
+`run_gpu_tests.py` turn the fallback on by themselves there, with the same `LEONIDA_BARY_FALLBACK` override. RADV and
+other GCN 5 GPUs are not covered: none has been measured.
+
 ## Macs: 16-bit interpolation without PerVertexKHR
 
 `ps_interp_f16_high` (and `ms_f16_pack`) normally read 16-bit interpolants through `PerVertexKHR` inputs, which
@@ -559,6 +573,7 @@ game's device ignores it`, so leaving them set cannot slow a game down (`run_tin
 | `build.py`: 0 translated, reason `.text` | An old `build.py` with LLVM 19 | Update to current `main` |
 | `vk_harness` doesn't compile: `VK_KHR_maintenance8` names unknown | Vulkan headers older than the SDK the code was written against | Update to current `main` (the code now builds without it), or use current Khronos Vulkan-Headers; conda-forge's package is too old |
 | `ps_bary` and `ps_uniform_branch` fail by about 0.9 | The GPU runs pixel shaders wave64 without fragment barycentrics (GCN3 and RDNA1 on RADV), or an old AMD Windows driver (22.40) | Current `main` skips them on such devices; on Windows, update the driver |
+| `ps_bary`, `ps_persp_bary` and `ps_ij_computed` read the third barycentric as about 0.99 on a gfx90c iGPU (Vega 8, AMD Windows driver 31.0.21921.13001; #5933) | The driver's native `BaryCoordKHR` is wrong there: the same tests pass through `--bary-fallback`, and natively on RADV (Radeon 8060S) | `tools/vk_subgroup_info.py` turns the fallback on by itself for gfx90c under AMD's driver, and `make_game.py`, `run_gpu_tests.py`, `build.py` and `check.py` follow it when `LEONIDA_BARY_FALLBACK` is unset; `=1` forces the fallback and `=0` forces native barycentrics, where they still fail |
 | `cs_w32_salu64` gives eight wrong words on RDNA1 under RADV Mesa 25.2.8 (`0x1E6A2C48 0x1234 0 0x100 47 48 0xFFFF8000 0xFFFFFFFE`, where word 2 should be `0xFFFFFFFF`) | Only the high word of the `s_bfe_i64` result is wrong. The same words appear on four pinned V540s (Navi 12, PCI `1002:7360`) and on a clean upstream/main worktree, and three different valid SPIR-V sign-extension formulations give the same result while the CPU interpreter matches, so this is the driver version rather than the translator (SHADER-276) | Expected with Mesa 25.2.8; the fixture passes on NVIDIA and on AMD's Windows driver. Try a newer Mesa before treating it as a translator bug; do not weaken the fixture's expectation |
 | `d3d12_typeless_rtv` fails its WARP comparison on an AMD desktop iGPU (TEST-591) | [Reported on the Ryzen 5 7600X iGPU with Windows 10 build 19045 and AMD 23.40.02](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7083403389). The exact cause is still open. | Retest on a newer Windows and AMD driver combination. Passing results were reported on the [Ryzen 9 7900 iGPU with AMD 25.10.30.02](https://github.com/ItsNotRexed/Leonida/issues/3232#issuecomment-7085263408), a [gfx1036 iGPU with AMD 26.5.2](https://github.com/ItsNotRexed/Leonida/issues/2891#issuecomment-7084023801), and the [Ryzen 7 9800X3D iGPU with driver 32.0.21045.29003](https://github.com/ItsNotRexed/Leonida/pull/3440). |
 | `ps_interp_f16_high` fails on a Mac: `PerVertexKHR decoration is not supported in MSL`, then `vkCreateGraphicsPipelines` -3 | MoltenVK can't convert `PerVertexKHR` inputs to Metal | Current `main` translates it with `--f16-interp-fallback` on MoltenVK (see "Macs: 16-bit interpolation") |
