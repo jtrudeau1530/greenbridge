@@ -316,7 +316,7 @@ def summarize(rows, source, span, zero, unread, elapsed):
             "elapsed_s": round(elapsed, 2)}
 
 
-def scan_dir(path, max_inflate=1 << 28):
+def scan_dir(path, max_inflate=1 << 28, skipped=None):
     # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
     # class by glob and match nothing. The "**"/"*.rpf"/"*.bin" suffixes stay as glob patterns.
     root = glob.escape(os.fspath(path))
@@ -328,6 +328,8 @@ def scan_dir(path, max_inflate=1 << 28):
                 r, s = scan_rpf(p, max_inflate=max_inflate)
             except (OSError, ValueError) as e:   # one unreadable archive should not lose the others
                 print(f"{p}: skipped ({e})", file=sys.stderr)
+                if skipped is not None:
+                    skipped.append(p)     # the caller still reports the run as incomplete
                 continue
             rows += r
             summaries.extend(s)
@@ -506,8 +508,10 @@ def main(argv=None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()
     if os.path.isdir(a.target):
-        rows, summaries = scan_dir(a.target, a.max_inflate)
+        skipped = []
+        rows, summaries = scan_dir(a.target, a.max_inflate, skipped)
     else:
+        skipped = []
         try:
             rows, summaries = scan_rpf(a.target, a.start, a.limit, a.max_inflate)
         except (OSError, ValueError) as e:
@@ -518,6 +522,9 @@ def main(argv=None):
     write_outputs(rows, summaries, a.out, a.csv)
     if not rows:
         print("no zlib streams found", file=sys.stderr)
+    if skipped:
+        print(f"{len(skipped)} archive(s) could not be scanned; the report is incomplete", file=sys.stderr)
+        return 1
     return 0
 
 

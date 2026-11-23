@@ -199,6 +199,24 @@ class ScanTest(unittest.TestCase):
                 self.assertEqual(rows[0]["node_bytes"], 64)
                 self.assertNotIn("fill", rows[0])
 
+    def test_directory_with_an_unreadable_archive_keeps_the_others_but_exits_nonzero(self):
+        good = os.path.join(self.dir, "good.rpf")
+        with open(good, "wb") as f:
+            f.write(make_rpf([bvh_payload(3)]))
+        bad = bytearray(make_rpf([bvh_payload(2)]))
+        struct.pack_into("<I", bad, 4, len(bad) + 1000)       # the data area starts past the end of the file
+        with open(os.path.join(self.dir, "bad.rpf"), "wb") as f:
+            f.write(bad)
+        out = os.path.join(self.dir, "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(code, 1)
+        self.assertIn("bad.rpf: skipped", err.getvalue())
+        self.assertIn("incomplete", err.getvalue())
+        with open(out) as f:
+            self.assertEqual(json.load(f)["summary"]["streams"], 1)    # the readable archive is still reported
+
     def test_index_outputs(self):
         path = os.path.join(self.dir, "pack.rpf")
         with open(path, "wb") as f:
