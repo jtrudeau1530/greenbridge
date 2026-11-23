@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_ir import HDR, parse_file  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
@@ -17367,7 +17368,7 @@ def write_index(path, index):
         _json.dump(index, f, indent=0, sort_keys=True)
         f.flush()
         os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
-    os.replace(tmp, path)   # ponytail: no retry; add one if a scanner on Windows ever holds the new file open
+    replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
 
 
 class ShardSetError(Exception):

@@ -71,6 +71,7 @@ sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -1497,7 +1498,7 @@ def runtime_gpu_max_push_constants():
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
-                       "spirv_opt.py", "report_paths.py", "gfx10_formats.json")
+                       "spirv_opt.py", "report_paths.py", "replace_retry.py", "gfx10_formats.json")
 
 
 def sources_digest(folder: str, names, lead: str = "") -> str:
@@ -1949,7 +1950,7 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
                            stdin=subprocess.DEVNULL)
         progress.tick()
         if r.returncode == 0 and os.path.isfile(tmp):
-            os.replace(tmp, dst)
+            replace_retry(tmp, dst)
             return True
         if os.path.isfile(tmp):
             os.remove(tmp)
