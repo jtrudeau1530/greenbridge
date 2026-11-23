@@ -200,25 +200,12 @@ int main(int argc, char** argv) {
     const LUID real_luid = real ? real->GetAdapterLuid() : LUID{};
     check(proxy_luid.LowPart == real_luid.LowPart && proxy_luid.HighPart == real_luid.HighPart,
           "slot 43 forwards GetAdapterLuid (struct return)");
-    // Slots 25 and 26 return a struct wider than 8 bytes. The console title calls them with the C ABI: the hidden
+    // Slot 25 returns a struct wider than 8 bytes. The console title calls it with the C ABI: the hidden
     // return pointer first (RCX), then the device (RDX), then the arguments, and the buffer comes back in RAX
-    // (measured for slot 26 on the retail executable). Call them that way through raw function pointers and compare
-    // with the PC device's own answers.
+    // (measured for slot 26 on the retail executable). Call slot 25 that way through a raw function pointer and compare
+    // with the PC device's own answer.
     check(rt::d3d12_xs::device_slot_overridden(25), "device slot 25 is the C-ABI GetResourceAllocationInfo override");
-    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 is the C-ABI GetCustomHeapProperties override");
     if (real) {
-        using HeapPropsFn = D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
-        auto get_heap_props = reinterpret_cast<HeapPropsFn>(proxy_vtbl[26]);
-        for (D3D12_HEAP_TYPE type : {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK}) {
-            D3D12_HEAP_PROPERTIES got;
-            std::memset(&got, 0xcd, sizeof(got));
-            D3D12_HEAP_PROPERTIES* returned = get_heap_props(&got, device.Get(), 1, type);
-            const D3D12_HEAP_PROPERTIES want = real->GetCustomHeapProperties(1, type);
-            check(returned == &got, "slot 26 returns the caller's buffer in RAX");
-            check(std::memcmp(&got, &want, sizeof(got)) == 0,
-                  "slot 26 (C ABI) writes the PC device's GetCustomHeapProperties into the caller's buffer");
-        }
-
         using AllocInfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
                                                                      const D3D12_RESOURCE_DESC*);
         auto get_alloc_info = reinterpret_cast<AllocInfoFn>(proxy_vtbl[25]);
@@ -230,11 +217,8 @@ int main(int argc, char** argv) {
         check(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment,
               "slot 25 (C ABI) writes the PC device's GetResourceAllocationInfo into the caller's buffer");
 
-        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Both
-        // slots still answer that form.
-        const D3D12_HEAP_PROPERTIES pc_props = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
-        const D3D12_HEAP_PROPERTIES pc_want = real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
-        check(std::memcmp(&pc_props, &pc_want, sizeof(pc_props)) == 0, "slot 26 still answers the PC (C++) form");
+        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Slot 25
+        // still answers that form.
         const D3D12_RESOURCE_ALLOCATION_INFO pc_info = device->GetResourceAllocationInfo(0, 1, &desc);
         check(pc_info.SizeInBytes == want.SizeInBytes && pc_info.Alignment == want.Alignment,
               "slot 25 still answers the PC (C++) form");
@@ -246,6 +230,41 @@ int main(int argc, char** argv) {
     hr = device->CreateReservedResource(&reserved_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                         IID_PPV_ARGS(reserved.GetAddressOf()));
     check(SUCCEEDED(hr) && reserved != nullptr, "slot 30 forwards CreateReservedResource (stack arguments)");
+
+    // Slot 26 the way the retail executable calls GetCustomHeapProperties: the buffer for the struct in RCX, the
+    // device in RDX, for the three heap types it asks about. The answer is the PC device's own, and nothing but
+    // the struct is written (the buffer sits in a pattern). On main this call read the PC vtable through the buffer.
+    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 takes the console's struct-return form");
+    using XboxGetCustomHeapPropertiesFn =
+        D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
+    auto get_custom_heap = reinterpret_cast<XboxGetCustomHeapPropertiesFn>(proxy_vtbl[26]);
+    const D3D12_HEAP_TYPE heap_types[] = {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK};
+    bool console_returns_buffer = true, console_matches_pc = real != nullptr, console_writes_only_struct = true;
+    for (const D3D12_HEAP_TYPE type : heap_types) {
+        struct Padded {
+            D3D12_HEAP_PROPERTIES value;
+            std::uint8_t after[64];
+        } padded;
+        std::memset(&padded, 0xA5, sizeof(padded));
+        console_returns_buffer = get_custom_heap(&padded.value, device.Get(), 1, type) == &padded.value &&
+                                 console_returns_buffer;
+        const D3D12_HEAP_PROPERTIES want = real ? real->GetCustomHeapProperties(1, type) : D3D12_HEAP_PROPERTIES{};
+        console_matches_pc = console_matches_pc && std::memcmp(&padded.value, &want, sizeof(want)) == 0;
+        for (const std::uint8_t byte : padded.after)
+            console_writes_only_struct = console_writes_only_struct && byte == 0xA5;
+    }
+    check(console_returns_buffer, "slot 26 console form returns the buffer's address");
+    check(console_matches_pc, "slot 26 console form writes the PC device's DEFAULT, UPLOAD and READBACK properties");
+    check(console_writes_only_struct, "slot 26 console form writes nothing past the struct");
+    check(rt::d3d12_xs::device_slot_hits(26) == 3, "slot 26 hit counter is 3");
+    check(rt::d3d12_xs::is_device_proxy(device.Get()) && rt::d3d12_xs::device_proxy_real_device(device.Get()) == real,
+          "the proxy is intact after the console-form calls");
+    // A PC C++ call through the proxy (the proxy in RCX, the buffer in RDX) is still forwarded.
+    const D3D12_HEAP_PROPERTIES pc_form = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
+    const D3D12_HEAP_PROPERTIES pc_want = real ? real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD)
+                                               : D3D12_HEAP_PROPERTIES{};
+    check(real && std::memcmp(&pc_form, &pc_want, sizeof(pc_want)) == 0 && rt::d3d12_xs::device_slot_hits(26) == 4,
+          "slot 26 PC form still forwards GetCustomHeapProperties");
 
     // Slot 14: descriptor heap through the proxy. The proxy wraps the real PC heap for the handle ABI.
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
@@ -364,6 +383,61 @@ int main(int argc, char** argv) {
     }
     check(rt::d3d12_xs::device_slot_hits(76) == 2, "slot 76 hit counter is 2");
     check(rt::d3d12_xs::device_slot_first_call_seen(76), "slot 76 first-call flag is set");
+
+    // Xbox device slots from the public HLE. On the Vulkan device the PC entries at 78/79 are
+    // CreateReservedResource2/CreateSampler2 and 80 is past the 80-slot table, so success here can only come from
+    // the routes: frame events return S_OK and a fresh token, CreateCommandQueueX returns a queue proxy and
+    // CreateCommandListX (desc, allocator, initialState, riid, out; no node mask) reaches PC CreateCommandList.
+    {
+        using SetFrameIntervalFn = HRESULT(WINAPI*)(void*, void*, UINT, UINT, UINT);
+        using ScheduleFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT);
+        using WaitFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT, UINT64*);
+        using CreateQueueXFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
+        using CreateListXFn = HRESULT(WINAPI*)(void*, const void*, ID3D12CommandAllocator*, ID3D12PipelineState*,
+                                               const IID*, void**);
+
+        hr = reinterpret_cast<SetFrameIntervalFn>(proxy_vtbl[78])(device.Get(), nullptr, 16667, 1, 0);
+        check(hr == S_OK, "slot 78 SetFrameIntervalX returns S_OK");
+        hr = reinterpret_cast<ScheduleFrameEventFn>(proxy_vtbl[79])(device.Get(), 0, 0, nullptr, 0);
+        check(hr == S_OK, "slot 79 ScheduleFrameEventX returns S_OK");
+
+        std::uint64_t token = 0, token2 = 0;
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, INFINITE, nullptr, 0, &token);
+        check(hr == S_OK && token != 0, "slot 80 WaitFrameEventX returns a non-zero token");
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, &token2);
+        check(hr == S_OK && token2 != 0 && token2 != token, "slot 80 returns a fresh token on the next wait");
+        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, nullptr);
+        check(hr == E_POINTER, "slot 80 refuses a null token with E_POINTER");
+        check(rt::d3d12_xs::device_slot_hits(78) == 1 && rt::d3d12_xs::device_slot_hits(79) == 1 &&
+                  rt::d3d12_xs::device_slot_hits(80) == 3,
+              "slots 78/79/80 hit counters are 1/1/3");
+
+        D3D12_COMMAND_QUEUE_DESC xbox_queue{};
+        xbox_queue.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        const IID iid_queue = __uuidof(ID3D12CommandQueue);
+        ComPtr<ID3D12CommandQueue> xbox_queue_proxy;
+        hr = reinterpret_cast<CreateQueueXFn>(proxy_vtbl[48])(device.Get(), &xbox_queue, &iid_queue,
+                                                               reinterpret_cast<void**>(xbox_queue_proxy.GetAddressOf()));
+        check(hr == S_OK && rt::d3d12_xs::is_queue_proxy(xbox_queue_proxy.Get()),
+              "slot 48 CreateCommandQueueX returns a queue proxy");
+        check(rt::d3d12_xs::device_slot_hits(48) == 1, "slot 48 hit counter is 1");
+
+        ComPtr<ID3D12CommandAllocator> xbox_allocator;
+        hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                            IID_PPV_ARGS(xbox_allocator.GetAddressOf()));
+        struct XboxCommandListDesc {
+            UINT Type;
+            UINT NodeMask;
+        } list_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 7};  // the node mask is ignored by the console call
+        const IID iid_list = __uuidof(ID3D12GraphicsCommandList);
+        ComPtr<ID3D12GraphicsCommandList> xbox_list;
+        hr = SUCCEEDED(hr) ? reinterpret_cast<CreateListXFn>(proxy_vtbl[73])(
+                                 device.Get(), &list_desc, xbox_allocator.Get(), nullptr, &iid_list,
+                                 reinterpret_cast<void**>(xbox_list.GetAddressOf()))
+                           : hr;
+        check(hr == S_OK && xbox_list != nullptr, "slot 73 CreateCommandListX returns a command list");
+        check(rt::d3d12_xs::device_slot_hits(73) == 1, "slot 73 hit counter is 1");
+    }
 
     // Slot 62: an empty root signature and a trivial compute shader through the Xbox signature. The PC entry at
     // slot 62 is CreateStateObject, so success here proves the override reached CreateComputePipelineState.

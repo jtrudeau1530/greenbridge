@@ -1,6 +1,12 @@
 // Xbox-ABI proxy around a PC ID3D12Device.
 //
 // Measured Xbox device deviations used here (vtable indices, x64):
+//   slot 26   GetCustomHeapProperties, the PC slot, but the retail executable calls it with the buffer for the
+//             returned struct in RCX and the device in RDX (node mask in R8, heap type in R9). A PC C++ method has
+//             the device in RCX and the buffer in RDX. The thunk takes the console form when RDX holds a device
+//             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too and are still
+//             forwarded in the PC form: 25 is reported called the same way later in the boot (#6982), with console
+//             resource descriptions the PC method cannot take as they are, and no call of 43 has been seen.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
@@ -10,6 +16,17 @@
 //   slot 26   GetCustomHeapProperties, called by the retail title with the C ABI: return buffer in RCX, the device
 //             in RDX (the PC form is `this` in RCX, return buffer in RDX). Slot 25 (GetResourceAllocationInfo, also a
 //             struct wider than 8 bytes) takes the same form by the same rule. Both accept either form.
+//   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
+//             D3D12_COMMAND_QUEUE_DESC's (public HLE).
+//   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
+//             initialState, riid, out). The type is the first word of the Xbox desc; there is no node-mask argument
+//             in the console call (public HLE; the PC six-argument form differs).
+//   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
+//             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
+//             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
+// The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
+// be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
+// LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
@@ -21,8 +38,9 @@
 // wrapper and compares it with a hidden-pointer call against the real heap.
 //
 // Every other PC device slot is forwarded by a generated thunk that swaps `this` to the PC device. The proxy's
-// vtable therefore follows the PC device order, with slots 62 and 76 deliberately shadowed. The full Xbox vtable
-// order is not known from the spec; slots beyond the PC device's own vtable return E_NOTIMPL and log once.
+// vtable therefore follows the PC device order, with slots 62 and 76 and the public HLE's 48/73/78/79/80 deliberately
+// shadowed. The full Xbox vtable order is not known from the spec; slots beyond the PC device's own vtable return
+// E_NOTIMPL and log once.
 //
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
@@ -81,9 +99,10 @@ unsigned device_proxy_slot_count(const void* device);
 ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 62, 67
-// and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device
-// slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
+// proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
+// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76.
+// Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
+// CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
