@@ -1812,7 +1812,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
     for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_tfe", ["load"]),
-                       ("cs_imgload_d16", ["load-d16"]), ("cs_sample_lz_int_d16", ["load-d16"])):
+                       ("cs_imgload_d16", ["load-d16"]), ("cs_imgload_d16_tfe", ["load-d16"]),
+                       ("cs_sample_lz_int_d16", ["load-d16"])):
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)
