@@ -217,6 +217,19 @@ F1 = {"v_rcp_f32": "rcp", "v_rsq_f32": "InverseSqrt", "v_sqrt_f32": "Sqrt", "v_e
 S2 = {"s_and_b32": "OpBitwiseAnd", "s_or_b32": "OpBitwiseOr",
       "s_lshl_b32": "OpShiftLeftLogical", "s_lshr_b32": "OpShiftRightLogical", "s_mul_i32": "OpIMul"}
 
+# RDNA2 ISA SOPC scalar compare (14 ops) and bit-test (4 ops) exact mnemonic sets (tools/rdna2_isa_tables.py SOPC).
+SOPC_CMP32_OPS = frozenset({
+    "s_cmp_eq_i32", "s_cmp_lg_i32", "s_cmp_gt_i32", "s_cmp_ge_i32", "s_cmp_lt_i32", "s_cmp_le_i32",
+    "s_cmp_eq_u32", "s_cmp_lg_u32", "s_cmp_gt_u32", "s_cmp_ge_u32", "s_cmp_lt_u32", "s_cmp_le_u32",
+})
+SOPC_CMP64_OPS = frozenset({"s_cmp_eq_u64", "s_cmp_lg_u64"})
+SOPC_BITCMP_OPS = frozenset({"s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64"})
+SOPC_SRC32_SPECIALS = frozenset({
+    "null", "m0", "vcc_lo", "vcc_hi", "exec_lo", "exec_hi",
+    "scc", "src_scc", "src_pops_exiting_wave_id",
+})
+SOPC_SRC64_SPECIALS = frozenset({"vcc", "exec", "null"})
+
 # Runs of lane-local VALU instructions share one `if (active)` instead of an OpSelect per VGPR write (Gen.insns).
 # VALU ops that are not lane-local: they read other lanes, write a lane mask, SCC or EXEC, or write a carry or
 # other scalar result in every lane (v_add_co_u32's mask goes to inactive lanes too).
@@ -1972,6 +1985,36 @@ class Gen:
         ord_res = emit_b(f"OpLogicalAnd %bool {ordered} {cmp_res}")
         return emit_b(f"OpLogicalNot %bool {ord_res}") if invert else ord_res
 
+    def _validate_sopc_operand(self, op, src, *, is_64):
+        if src.get("neg") or src.get("abs") or src.get("sext"):
+            raise Unsupported(f"{op}: operand modifiers not supported on SOPC")
+        k = src.get("k")
+        if is_64:
+            if k == "sgpr" and src.get("n", 1) == 2:
+                return
+            if k == "imm":
+                return
+            if k == "special" and src.get("t") in SOPC_SRC64_SPECIALS:
+                return
+            raise Unsupported(f"{op}: expected 64-bit scalar operand")
+        if k == "sgpr" and src.get("n", 1) == 1:
+            return
+        if k in ("imm", "fimm"):
+            return
+        if k == "special" and src.get("t") in SOPC_SRC32_SPECIALS:
+            return
+        raise Unsupported(f"{op}: expected 32-bit scalar operand")
+
+    def _validate_sopc(self, ins, op, a, mods, *, src0_64=False, src1_64=False):
+        if ins["op"] != op:
+            raise Unsupported(f"{ins['op']}: encoding suffix not supported on SOPC")
+        if mods:
+            raise Unsupported(f"{op}: modifiers not supported on SOPC")
+        if len(a) != 2:
+            raise Unsupported(f"{op}: expected 2 operands, got {len(a)}")
+        self._validate_sopc_operand(op, a[0], is_64=src0_64)
+        self._validate_sopc_operand(op, a[1], is_64=src1_64)
+
     def bitcmp(self, op, a):
         """s_bitcmp0/1_b32/b64: test if bit (a[1]) of scalar a[0] is 0 or 1, result in SCC."""
         is_64 = op.endswith("b64")
@@ -1987,6 +2030,12 @@ class Gen:
         elif is_64 and a[0]["k"] == "imm":
             v = a[0]["v"] & 0xFFFFFFFFFFFFFFFF
             lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+        elif is_64 and a[0]["k"] == "special" and a[0].get("t") == "null":
+            lo, hi = self.cu(0), self.cu(0)
+        elif is_64 and a[0]["k"] == "special" and a[0].get("t") == "vcc":
+            lo, hi = self.tmp(), self.tmp()
+            self.emit(f"{lo} = OpLoad %uint %vcc")
+            self.emit(f"{hi} = OpLoad %uint %vcc_hi")
         elif is_64:
             lo, hi = self.mask_src(a[0]), self.cu(0)
         else:
@@ -6390,6 +6439,9 @@ class Gen:
             self.x_memory_order(base_op(ins["op"]))
         self.cur_either = self.lane_either.get(id(ins), ())
         if ins["op"].endswith("_dpp"):
+            bop = base_op(ins["op"])
+            if bop in SOPC_CMP32_OPS or bop in SOPC_CMP64_OPS or bop in SOPC_BITCMP_OPS:
+                raise Unsupported(f"{ins['op']}: encoding suffix not supported on SOPC")
             return self.dpp_insn(ins)
         if not ins["op"].endswith("_sdwa"):
             return self._insn(ins)
@@ -9051,7 +9103,8 @@ class Gen:
                 self.emit(f"{r} = OpNot %uint {x}")
                 self._store_b32_mask_dst(a[0], r, to_mask_dst, dst_half)
                 self.scc_logic(a, r)
-        elif op in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
+        elif op in SOPC_CMP64_OPS:
+            self._validate_sopc(ins, op, a, mods, src0_64=True, src1_64=True)
             # 64-bit compare of masks/pointers: equal iff both halves are equal.
             # Only canonical full-wave masks (exec, mask vcc, or a wave64 (MASK_LO, MASK_HI) pair) can take the
             # per-lane vote path; pairs with EITHER (0/-1), plain data, swapped/duplicated halves, or wave32 masks
@@ -10514,7 +10567,8 @@ class Gen:
                 self.write_lo16(a[0], self.f16_res(self.clamp_f16(f, mods)))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
-        elif op.startswith("s_cmp_"):
+        elif op in SOPC_CMP32_OPS:
+            self._validate_sopc(ins, op, a, mods)
             self.compare(op, a, scalar=True)
         elif op.startswith("s_cmpk_"):
             # s_cmpk_<cond>_<ty> sX, imm16: zero-extended for u32, sign-extended for i32.
@@ -10523,7 +10577,8 @@ class Gen:
             if ty == "i32" and v & 0x8000:
                 v -= 0x10000
             self.compare("s_cmp_" + op[len("s_cmpk_"):], [a[0], {"k": "imm", "v": v}], scalar=True)
-        elif op.startswith("s_bitcmp"):
+        elif op in SOPC_BITCMP_OPS:
+            self._validate_sopc(ins, op, a, mods, src0_64=op.endswith("_b64"))
             self.bitcmp(op, a)
         elif op == "s_mul_hi_u32":
             x, y = self.src_u(a[1]), self.src_u(a[2])
