@@ -15,15 +15,18 @@ needed or bundled.
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
 import json
 import os
 import struct
 import sys
+import tempfile
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
@@ -685,12 +688,24 @@ def main(argv: list[str] | None = None) -> int:
         except (TypeError, ValueError) as exc:
             print(f"error: cannot write {args.json_path}: {exc}", file=sys.stderr)
             return 2
+        staged = None
         try:
-            with open(args.json_path, "w", encoding="utf-8", newline="\n") as handle:
+            directory = os.path.dirname(os.path.abspath(args.json_path))
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=directory,
+                                             prefix=".glb_inspect-", delete=False) as handle:
+                staged = handle.name
                 handle.write(text)
+            os.chmod(staged, published_mode(args.json_path))
+            os.replace(staged, args.json_path)
+            staged = None
         except OSError as exc:
             print(f"error: cannot write {args.json_path}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
             return 2
+        finally:
+            if staged is not None:
+                with suppress(OSError):
+                    os.chmod(staged, 0o600)
+                    os.unlink(staged)
     print(format_report(report))
     if args.json_path:
         print(f"wrote: {args.json_path}")
