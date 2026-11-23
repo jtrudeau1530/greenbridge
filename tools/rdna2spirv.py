@@ -657,15 +657,57 @@ class Gen:
         that an SDWA BYTE_1 select produced, from an inline constant or a VGPR alike (ps_sdwa_f16_const), while the
         same denormal in a register or a literal widens right. A half with a zero exponent field is therefore
         widened exactly with integer ops: sign * mantissa * 2^-24."""
-        u = self.src_h(s)
-        v2, f = self.tmp(), self.tmp()
-        self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
-        self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")
-        h, ex, small, mant, mf, den, neg, isneg, sden, out = (self.tmp() for _ in range(10))
+        return self.f16_in_bits(s, hi, apply_mods=False)[0]
+
+    @staticmethod
+    def _f16_const_nan(s, hi=0):
+        """Return True/False when ``s`` (with half ``hi``) is statically NaN/non-NaN, or None at run time."""
+        if not s or "sdwa_sel" in s:
+            return None
+        if s["k"] == "fimm":
+            return s["v"] != s["v"]
+        if s["k"] == "imm":
+            hv = ((s["v"] & 0xFFFFFFFF) >> (16 if hi else 0)) & 0xFFFF
+            return (hv & 0x7FFF) > 0x7C00
+        return None
+
+    def _f16_half_nan(self, h):
+        ab, cond = self.tmp(), self.tmp()
+        self.emit(f"{ab} = OpBitwiseAnd %uint {h} {self.cu(0x7FFF)}")
+        self.emit(f"{cond} = OpUGreaterThan %bool {ab} {self.cu(0x7C00)}")
+        return cond
+
+    def all_f16_nan_cond(self, half_pairs):
+        """Given ``[(h_uint, const_status), ...]``, return True (all const NaN), None (impossible), or %bool ID."""
+        if any(st is False for _, st in half_pairs):
+            return None
+        checks = [self._f16_half_nan(h) for h, st in half_pairs if st is None]
+        if not checks:
+            return True
+        cond = checks[0]
+        for c in checks[1:]:
+            nxt = self.tmp()
+            self.emit(f"{nxt} = OpLogicalAnd %bool {cond} {c}")
+            cond = nxt
+        return cond
+
+    def _f16_half_word(self, u, hi=0):
+        """Extract the selected 16-bit half of ``u`` into ``%uint[15:0]`` (high half shifts cleanly without redundant & 0xFFFF)."""
+        h = self.tmp()
         if hi:
             self.emit(f"{h} = OpShiftRightLogical %uint {u} {self.cu(16)}")
         else:
             self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+        return h
+
+    def f16_in_bits(self, s, hi=0, apply_mods=True):
+        """Like ``f16_in``, also returning ``(h_bits, const_nan_status)``; ``h_bits`` keeps abs/neg if ``apply_mods``."""
+        u = self.src_h(s)
+        v2, f = self.tmp(), self.tmp()
+        self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
+        self.emit(f"{f} = OpCompositeExtract %float {v2} {1 if hi else 0}")
+        ex, small, mant, mf, den, neg, isneg, sden, out = (self.tmp() for _ in range(9))
+        h = self._f16_half_word(u, hi)
         self.emit(f"{ex} = OpBitwiseAnd %uint {h} {self.cu(0x7C00)}")
         self.emit(f"{small} = OpIEqual %bool {ex} {self.cu(0)}")
         self.emit(f"{mant} = OpBitwiseAnd %uint {h} {self.cu(0x3FF)}")
@@ -675,7 +717,17 @@ class Gen:
         self.emit(f"{isneg} = OpUGreaterThanEqual %bool {h} {self.cu(0x8000)}")
         self.emit(f"{sden} = OpSelect %float {isneg} {neg} {den}")
         self.emit(f"{out} = OpSelect %float {small} {sden} {f}")
-        return self.modify_f(out, s)
+        h_mod = h
+        if apply_mods:
+            if s.get("abs"):
+                ha = self.tmp()
+                self.emit(f"{ha} = OpBitwiseAnd %uint {h_mod} {self.cu(0x7FFF)}")
+                h_mod = ha
+            if s.get("neg"):
+                hn = self.tmp()
+                self.emit(f"{hn} = OpBitwiseXor %uint {h_mod} {self.cu(0x8000)}")
+                h_mod = hn
+        return self.modify_f(out, s), h_mod, self._f16_const_nan(s, hi)
 
     def fma_mix_srcs(self, a, mods):
         """Read the 3 operands of v_fma_mix*: f16 at op_sel[i] when op_sel_hi[i] is set (via src_h so fimm is binary16), else f32."""
@@ -1331,17 +1383,8 @@ class Gen:
         self.emit(f"{r} = OpBitwiseOr %uint {a} {sh}")
         return r
 
-    def f16_out(self, d, r, hi=0, fract=False, mode=True, exact_tiny=False):
-        """Narrow f32 ``r`` to f16 (f16_res: nearest even, or toward zero under MODE) and write it to the low half of ``d``, or to the high half when
-        ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16).
-        ``fract`` (v_fract_f16): a result that rounded up to 1.0 (0x3c00) becomes 0x3bff, the largest f16 below 1,
-        as on hardware (docs/design.md, float min/max/med3 with NaN and v_fract)."""
-        lo = self.f16_res(r, exact_tiny) if mode else self.f16_bits(r)     # mode=False: the op ignores MODE rounding (rcp/rsq/sqrt)
-        if fract:
-            one, below = self.tmp(), self.tmp()
-            self.emit(f"{one} = OpIEqual %bool {lo} {self.cu(0x3C00)}")
-            self.emit(f"{below} = OpSelect %uint {one} {self.cu(0x3BFF)} {lo}")
-            lo = below
+    def put_f16_bits(self, d, lo, hi=0):
+        """Write 16-bit %uint ``lo`` into the low half of ``d``, or to the high half when ``hi``, keeping the other half."""
         if not hi:
             self.write_lo16(d, lo)
             return
@@ -1353,6 +1396,19 @@ class Gen:
         self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
         self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
         self.dst(d, v)
+
+    def f16_out(self, d, r, hi=0, fract=False, mode=True, exact_tiny=False):
+        """Narrow f32 ``r`` to f16 (f16_res: nearest even, or toward zero under MODE) and write it to the low half of ``d``, or to the high half when
+        ``hi`` (op_sel destination bit). Either way the other half is kept (see write_lo16).
+        ``fract`` (v_fract_f16): a result that rounded up to 1.0 (0x3c00) becomes 0x3bff, the largest f16 below 1,
+        as on hardware (docs/design.md, float min/max/med3 with NaN and v_fract)."""
+        lo = self.f16_res(r, exact_tiny) if mode else self.f16_bits(r)     # mode=False: the op ignores MODE rounding (rcp/rsq/sqrt)
+        if fract:
+            one, below = self.tmp(), self.tmp()
+            self.emit(f"{one} = OpIEqual %bool {lo} {self.cu(0x3C00)}")
+            self.emit(f"{below} = OpSelect %uint {one} {self.cu(0x3BFF)} {lo}")
+            lo = below
+        self.put_f16_bits(d, lo, hi)
 
     def f16_roundtrip(self, f):
         """f32 -> f16 -> f32 (round to nearest; f16 denormals flushed to signed zero), modelling a 32-bit
@@ -6050,6 +6106,65 @@ class Gen:
         self.emit(f"{below} = OpSelect %float {one} {self.tof(self.cu(0x3F7FFFFF))} {r}")
         return below
 
+    @staticmethod
+    def _f32_const_nan(s):
+        """Return True/False when ``s`` is statically NaN/non-NaN f32, or None at run time."""
+        if not s or "sdwa_sel" in s:
+            return None
+        if s["k"] == "fimm":
+            return s["v"] != s["v"]
+        if s["k"] == "imm":
+            u = s["v"] & 0xFFFFFFFF
+            return (u & 0x7F800000) == 0x7F800000 and bool(u & 0x7FFFFF)
+        return None
+
+    def _select_nan_first(self, res, first, nan_second, second=None, second_src=None):
+        """Return ``first`` when ``second`` is NaN, else ``res`` (RDNA2 S0 priority when both operands are NaN)."""
+        if nan_second is False:
+            return res
+        if nan_second is True:
+            return first
+        if nan_second is None:
+            st = self._f32_const_nan(second_src)
+            if st is False:
+                return res
+            if st is True:
+                return first
+            nan_second = self.tmp()
+            self.emit(f"{nan_second} = OpIsNan %bool {second}")
+        sel = self.tmp()
+        self.emit(f"{sel} = OpSelect %float {nan_second} {first} {res}")
+        return sel
+
+    def nminmax_f32(self, glsl_op, x, y, y_src=None, nan_y=None):
+        """GLSL.std.450 ``NMin``/``NMax`` returning ``x`` with its bits intact whenever ``y`` is NaN."""
+        r = self.tmp()
+        self.emit(f"{r} = OpExtInst %float %glsl {glsl_op} {x} {y}")
+        return self._select_nan_first(r, x, nan_y, y, y_src)
+
+    def _read_f16_minmax_srcs(self, srcs, sels, mods):
+        """Read f16 min/max/med3 sources and track raw modified ``src0`` half when ``clamp`` is absent."""
+        if "clamp" in mods:
+            return [self.f16_in(s, sel) for s, sel in zip(srcs, sels)], None, None
+        in_bits = [self.f16_in_bits(s, sel, apply_mods=(i == 0)) for i, (s, sel) in enumerate(zip(srcs, sels))]
+        vals = [v for v, _, _ in in_bits]
+        all_nan = self.all_f16_nan_cond([(raw, st) for _, raw, st in in_bits])
+        return vals, all_nan, in_bits[0][1]
+
+    def _finish_f16_minmax_out(self, dst_op, r, mods, dhi, all_nan, h0_mod):
+        r = self.clamp_f16(r, mods)
+        if all_nan is None:
+            self.f16_out(dst_op, r, dhi)
+            return
+        if all_nan is True:
+            lo = h0_mod
+        else:
+            lo = self.f16_res(r)
+            sel_u = self.tmp()
+            self.emit(f"{sel_u} = OpSelect %uint {all_nan} {h0_mod} {lo}")
+            lo = sel_u
+        self.put_f16_bits(dst_op, lo, dhi)
+
     def med3_f(self, vals, srcs, sel=None):
         """v_med3_f32 / v_med3_f16 on the f32 values ``vals`` of operands ``srcs`` (``sel``: the f16 half each one
         reads). Without NaN: the median, NMin(NMax(z, NMin(x, y)), NMax(x, y)) — using NMax/NMin rather than FClamp
@@ -6064,6 +6179,7 @@ class Gen:
         self.emit(f"{m1} = OpExtInst %float %glsl NMax {z} {lo}")
         self.emit(f"{m} = OpExtInst %float %glsl NMin {m1} {hi}")
         checks = []
+        preds = []
         for i, (v, s) in enumerate(zip(vals, srcs)):
             bits = None
             if s["k"] == "imm":
@@ -6077,10 +6193,12 @@ class Gen:
                     h = (bits >> 16 if sel[i] else bits) & 0xFFFF
                     is_nan = (h & 0x7C00) == 0x7C00 and h & 0x3FF
                 if not is_nan:
+                    preds.append(False)
                     continue
             c = self.tmp()
             self.emit(f"{c} = OpIsNan %bool {v}")
             checks.append(c)
+            preds.append(c)
         if not checks:
             return m
         nan = checks[0]
@@ -6088,8 +6206,13 @@ class Gen:
             o = self.tmp()
             self.emit(f"{o} = OpLogicalOr %bool {nan} {c}")
             nan = o
-        mn, r = self.tmp(), self.tmp()
-        self.emit(f"{mn} = OpExtInst %float %glsl NMin {lo} {z}")
+        if sel is None:
+            mn1 = self._select_nan_first(lo, x, preds[1])
+            mn = self.nminmax_f32("NMin", mn1, z, nan_y=preds[2])
+        else:
+            mn = self.tmp()
+            self.emit(f"{mn} = OpExtInst %float %glsl NMin {lo} {z}")
+        r = self.tmp()
         self.emit(f"{r} = OpSelect %float {nan} {mn} {m}")
         return r
 
@@ -6512,10 +6635,9 @@ class Gen:
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
             x, y, z = (self.src_f(t) for t in a[1:4])
-            f = "NMax" if "max" in op else "NMin"      # a NaN operand gives the other one (docs/design.md)
-            m, r = self.tmp(), self.tmp()
-            self.emit(f"{m} = OpExtInst %float %glsl {f} {x} {y}")
-            self.emit(f"{r} = OpExtInst %float %glsl {f} {m} {z}")
+            f = "NMax" if "max" in op else "NMin"      # RDNA2: f(f(s0, s1), s2) keeping S0 on all-NaN
+            m = self.nminmax_f32(f, x, y, y_src=a[2])
+            r = self.nminmax_f32(f, m, z, y_src=a[3])
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_and_or_b32":
             x, y, z = (self.src_u(t) for t in a[1:4])
@@ -8263,13 +8385,16 @@ class Gen:
             ns = 3 if op == "v_pk_fma_f16" else 2
             sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
             nlo, nhi = bits("neg_lo", [0] * ns), bits("neg_hi", [0] * ns)
+            track_pk_nan = op in ("v_pk_min_f16", "v_pk_max_f16") and "clamp" not in mods
+            pk_raw, pk_st, pk_h0 = ([], []), ([], []), []
             srcs = []
             for i in range(ns):
                 u = self.src_h(a[1 + i])
                 v2 = self.tmp()
                 self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
                 comps = []
-                for half_sel, neg in ((sel[i], nlo[i]), (selhi[i], nhi[i])):
+                extracted = {}
+                for lane, (half_sel, neg) in enumerate(((sel[i], nlo[i]), (selhi[i], nhi[i]))):
                     c = self.tmp()
                     self.emit(f"{c} = OpCompositeExtract %float {v2} {half_sel}")
                     if neg:
@@ -8277,6 +8402,19 @@ class Gen:
                         self.emit(f"{n2} = OpFNegate %float {c}")
                         c = n2
                     comps.append(c)
+                    if track_pk_nan:
+                        if half_sel not in extracted:
+                            extracted[half_sel] = self._f16_half_word(u, half_sel)
+                        h_bits = extracted[half_sel]
+                        pk_raw[i].append(h_bits)
+                        pk_st[i].append(self._f16_const_nan(a[1 + i], half_sel))
+                        if i == 0:
+                            if neg:
+                                hn = self.tmp()
+                                self.emit(f"{hn} = OpBitwiseXor %uint {h_bits} {self.cu(0x8000)}")
+                                pk_h0.append(hn)
+                            else:
+                                pk_h0.append(h_bits)
                 vv = self.tmp()
                 self.emit(f"{vv} = OpCompositeConstruct %v2float {comps[0]} {comps[1]}")
                 srcs.append(vv)
@@ -8308,7 +8446,24 @@ class Gen:
             c0, c1 = self.tmp(), self.tmp()
             self.emit(f"{c0} = OpCompositeExtract %float {r} 0")
             self.emit(f"{c1} = OpCompositeExtract %float {r} 1")
-            self.emit(f"{p} = OpCopyObject %uint {self.f16_pack2(c0, c1, exact_tiny=op == 'v_pk_add_f16')}")
+            if track_pk_nan:
+                lanes = []
+                for k, c_val in enumerate((c0, c1)):
+                    both_nan = self.all_f16_nan_cond([(pk_raw[0][k], pk_st[0][k]), (pk_raw[1][k], pk_st[1][k])])
+                    if both_nan is True:
+                        lanes.append(pk_h0[k])
+                    else:
+                        hk = self.f16_res(c_val)
+                        if both_nan is not None:
+                            sel_k = self.tmp()
+                            self.emit(f"{sel_k} = OpSelect %uint {both_nan} {pk_h0[k]} {hk}")
+                            hk = sel_k
+                        lanes.append(hk)
+                sh = self.tmp()
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {lanes[1]} {self.cu(16)}")
+                self.emit(f"{p} = OpBitwiseOr %uint {lanes[0]} {sh}")
+            else:
+                self.emit(f"{p} = OpCopyObject %uint {self.f16_pack2(c0, c1, exact_tiny=op == 'v_pk_add_f16')}")
             self.dst(a[0], p)
         elif op in ("s_movrels_b32", "s_movrels_b64"):
             # Relative SGPR read through M0 (RDNA2 ISA SOP1): D = SGPR[S0 + M0] (the b64 form reads the pair at
@@ -8410,7 +8565,7 @@ class Gen:
                 self.dst(d, v)
         elif op in ("v_med3_f16", "v_min3_f16", "v_max3_f16"):
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
-            vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
+            vals, all_nan, h0_mod = self._read_f16_minmax_srcs(a[1:4], sel, mods)
             if op == "v_med3_f16":
                 r = self.med3_f(vals, a[1:4], sel)
             else:
@@ -8418,8 +8573,7 @@ class Gen:
                 m, r = self.tmp(), self.tmp()
                 self.emit(f"{m} = OpExtInst %float %glsl {f} {vals[0]} {vals[1]}")
                 self.emit(f"{r} = OpExtInst %float %glsl {f} {m} {vals[2]}")
-            r = self.clamp_f16(r, mods)
-            self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
+            self._finish_f16_minmax_out(a[0], r, mods, dhi, all_nan, h0_mod)  # opsel-capable VOP3: keeps the other half
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
             # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
             # 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1) & 0xFFFF. The m form is masked: a byte where
@@ -8650,7 +8804,11 @@ class Gen:
             # f16 math on the low halves (op_sel:[src0,src1,dst] in the VOP3 form); the other half of the destination
             # is kept. v_subrev_f16 is S1 - S0: op_sel still names src0 and src1, only the subtraction is swapped.
             sel, dhi = self.opsel_bits(mods, 2)
-            vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:3])]
+            if op in ("v_max_f16", "v_min_f16"):
+                vals, all_nan, h0_mod = self._read_f16_minmax_srcs(a[1:3], sel, mods)
+            else:
+                vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:3])]
+                all_nan = h0_mod = None
             if op == "v_subrev_f16":
                 vals.reverse()
             r = self.tmp()
@@ -8665,10 +8823,12 @@ class Gen:
                     r = self.sum_toward_zero(vals[0], ny, r)
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if 'max' in op else 'NMin'} {vals[0]} {vals[1]}")
-            r = self.clamp_f16(r, mods)
-            # an f16 sum is exact below 2^-14; clamp keeps that, omod is ignored on f16
-            exact = k in ("OpFAdd", "OpFSub")
-            self.f16_out(a[0], r, dhi, exact_tiny=exact)  # GFX10: f16 ops keep the other half
+                self._finish_f16_minmax_out(a[0], r, mods, dhi, all_nan, h0_mod)
+            if k:
+                r = self.clamp_f16(r, mods)
+                # an f16 sum is exact below 2^-14; clamp keeps that, omod is ignored on f16
+                exact = k in ("OpFAdd", "OpFSub")
+                self.f16_out(a[0], r, dhi, exact_tiny=exact)  # GFX10: f16 ops keep the other half
         elif op.startswith(("v_cmp_", "v_cmpx_")) and op.endswith(("_u64", "_i64")) and op.split("_")[2] in ("eq", "ne", "lg"):
             # 64-bit equality compare: both halves of the register pairs. GFX10 v_cmpx has no destination operand:
             # it writes EXEC only (inactive lanes stay inactive).
@@ -10409,13 +10569,7 @@ class Gen:
             x, y = self.src_f(a[1]), self.src_f(a[2])
             r = self.tmp()
             if F2[op] in ("max", "min"):
-                self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if F2[op] == 'max' else 'NMin'} {x} {y}")
-                # RDNA2 returns S0 when S1 is NaN, including S0's payload when both are NaNs.
-                # NMin/NMax alone allow any NaN in that case.
-                nan_y, selected = self.tmp(), self.tmp()
-                self.emit(f"{nan_y} = OpIsNan %bool {y}")
-                self.emit(f"{selected} = OpSelect %float {nan_y} {x} {r}")
-                r = selected
+                r = self.nminmax_f32("NMax" if F2[op] == "max" else "NMin", x, y, y_src=a[2])
             else:
                 self.emit(f"{r} = {F2[op]} %float {x} {y}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
