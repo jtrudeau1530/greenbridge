@@ -244,6 +244,20 @@ GameInputMotionState motion_state(IGameInput* input, IGameInputDevice* dev, bool
     return ms;
 }
 
+struct MotionReadings {
+    IGameInputDevice* gyro;
+    IGameInputDevice* plain;
+    int gyro_calls, plain_calls;
+};
+void CALLBACK on_motion_reading(GameInputCallbackToken, void* context, IGameInputReading* reading, bool) {
+    auto* seen = static_cast<MotionReadings*>(context);
+    IGameInputDevice* dev = nullptr;
+    if (reading) reading->GetDevice(&dev);
+    if (dev == seen->gyro) ++seen->gyro_calls;
+    if (dev == seen->plain) ++seen->plain_calls;
+    if (dev) dev->Release();
+}
+
 // ---- raw HID (RT-175) -------------------------------------------------------------------------------------------
 
 using rt::gameinput::RawReportSize;
@@ -631,6 +645,19 @@ void test_motion(IGameInput* input) {
         next->Release();
     }
     if (first) first->Release();
+
+    MotionReadings seen{mdev, pdev, 0, 0};
+    GameInputCallbackToken motion_token = 0;
+    check(input->RegisterReadingCallback(nullptr, GameInputKindMotion, 0.0f, &seen, on_motion_reading, &motion_token) == S_OK,
+          "motion: RegisterReadingCallback(GameInputKindMotion)");
+    for (int i = 0; i < 4; ++i) {
+        SDL_SetJoystickVirtualButton(gyro_pad.js, SDL_GAMEPAD_BUTTON_SOUTH, i % 2 == 0);
+        SDL_SetJoystickVirtualButton(plain.js, SDL_GAMEPAD_BUTTON_SOUTH, i % 2 == 0);
+        rt::gameinput::poll();
+    }
+    input->UnregisterCallback(motion_token, 0);
+    check(seen.gyro_calls > 0 && seen.plain_calls == 0,
+          "motion: a Motion reading callback fires for the gyro pad's readings, not for the plain pad's");
 
     detach(gyro_pad);
     detach(plain);

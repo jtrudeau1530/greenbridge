@@ -227,7 +227,9 @@ intensity 0; waveform indices other than 0 are `E_INVALIDARG`.
 Pads whose SDL gamepad reports both a gyroscope and an accelerometer (a DualSense, a Switch Pro, Steam Input pads) get
 `GameInputKindMotion` in `supportedInput` and a `motionInfo` (`GameInputMotionInfo`, Microsoft's v0 layout); `IGameInputReading::GetMotionState`
 returns a `GameInputMotionState` on their readings, and `GetCurrentReading`/`GetNextReading` answer a
-`GameInputKindMotion` query for such a pad and return `GAMEINPUT_E_READING_NOT_FOUND` for a pad without sensors. The
+`GameInputKindMotion` query for such a pad and return `GAMEINPUT_E_READING_NOT_FOUND` for a pad without sensors. A
+reading callback registered for `GameInputKindMotion` hears only such pads: like a device callback, it is limited to
+devices that support at least one of the kinds it names (Microsoft's `RegisterReadingCallback` reference). The
 sensors are enabled when the pad is opened, at SDL's requested rate, and every poll reads the latest sample.
 
 - The state carries **signed fractions of the maxima `motionInfo` reports** (1.0 = full magnitude), which is the
@@ -451,8 +453,8 @@ rests on a transcription rather than on a side-by-side compile.
   first twin's id equal to the single-pad id). Motion runs on a virtual pad with sensors (`nsensors` in the
   virtual-joystick description, fed with `SDL_SendJoystickVirtualSensorData`): the kind and `motionInfo` on a sensor
   pad and not on a plain one, no motion before the first sample, normalisation against the `motionInfo` maxima, the
-  accuracy values, the ±1 clamp, the ~8 ms cadence, and that a motion query on a pad without sensors is
-  `GAMEINPUT_E_READING_NOT_FOUND`. The keyboard pad is
+  accuracy values, the ±1 clamp, the ~8 ms cadence, that a motion query on a pad without sensors is
+  `GAMEINPUT_E_READING_NOT_FOUND`, and that a Motion reading callback hears only the sensor pad. The keyboard pad is
   driven through `rt::gameinput::set_keyboard_source` and `set_cursor_source` with fake keys, focus and cursor: every
   binding, two keys at once, each WASD direction, opposite keys cancelling, diagonals, the mouse moving the right
   stick, clamping and decaying to 0, the mouse-button triggers, no input out of focus, release of buttons, sticks and

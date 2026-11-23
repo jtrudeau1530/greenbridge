@@ -843,7 +843,7 @@ bool matches(const Callback& c, const Event& e) {
             if (!(c.kind & e.device->info.supportedInput) && c.kind != GameInputKindUnknown) return false;
             return e.only || ((e.current ^ e.previous) & c.status_filter);
         case CbType::Reading:
-            return (c.kind & kSupportedKinds) || c.kind == GameInputKindUnknown;
+            return c.kind == GameInputKindUnknown || (c.kind & e.device->info.supportedInput);
         default:
             return true;
     }
