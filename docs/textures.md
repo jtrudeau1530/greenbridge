@@ -982,8 +982,25 @@ with per-instance data, the shape of a per-tile or per-cell map. One of the othe
 
 **The 121 other streams** start with no known magic (`RDS5`, `0DRP`, `TTPF`, `RSC8`, `PSIN`, `RBF0`, DDS) in
 their first 4 KiB, and the large ones are high-entropy (7.3 to 7.7 bits per byte over the first 64 KiB, except
-one at 4.1). They are left as opaque raw data here; matching them to the `data/ttdb` texture pools is the
-obvious next check.
+one at 4.1). They are left as opaque raw data here.
+
+**They are not copies of the texture pools.** Each of the 121 streams was compared with every chunk of all 57
+`.ttpf` pools in the package (1,026,833 chunks: 918,223 zlib, 102,725 BCPack BC1, 5,167 BC7, 718 other BCPack
+codecs, 5 raw), as stored and, for zlib chunks, inflated: the SHA-1 of the whole stream against the SHA-1 of each
+chunk, and the stream's first 64 bytes against each chunk's first 64 bytes (85 of the 121 streams start with more
+than four distinct byte values; the other 36 start with near-constant bytes and only take the whole-content test).
+
+| Result | Streams |
+|---|---:|
+| Identical to a pool chunk (stored zlib bytes and inflated content) | 1 (4 KiB, a shared `data/ttdb` pool) |
+| Same first 212,464 to 582,338 bytes as a 4 MiB `data/ttdb` chunk, then different | 3 (6, 12 and 32 MiB) |
+| Same first 1,010 to 2,800 bytes as hundreds of chunks (a common leading pattern, not a copy) | 3 |
+| No match | 114 |
+
+Sizes of the 121: 62 below 64 KiB, 16 of exactly 64 KiB, 32 from 64 KiB to 16 MiB, 11 of 16 MiB or more. So,
+apart from one 4 KiB stream, the opaque data of `textures.rpf` is not pool texture data, and three of the large
+streams share a long identical start with a pool chunk and then diverge (not traced here). Method: the carve's
+inflated streams and `tools/ttpf_mips.py`'s `Pool` chunk table; counts only.
 
 Not measured here (hypothesis): what the 1,313 texture pairs are keyed by, and whether the format codes are
 DXGI values (the exact-size match supports it).
