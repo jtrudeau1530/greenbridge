@@ -722,9 +722,10 @@ Covered: 2D `image_load`, `R8G8B8A8_UNORM`, `R16G16B16A16_SFLOAT`, `R32G32B32A32
 and `R8G8B8A8_UINT`/`SINT`, all as sampled images, as the runtime binds a read-only texture (integer formats are
 read through the translator's uint/sint aliases of the sampled array). The shader converts the loaded 8-bit integer values to float for
 readback; every such value is exactly representable, including signed negatives. Wider integers are not covered.
-Texture sizes divide the 64x64 draw (8/16/32/64), so every texel is read at least once. The nonzero masks cycle from
-`0xf` through `0x1`–`0xe`; 90 programs cover all 15 masks for each of the six default formats. Selected channels
-are packed into consecutive destination registers, while unwritten registers keep initialized sentinel values.
+Texture sizes divide the 64x64 draw (8/16/32/64), so every texel is read at least once. The mask cycle starts with
+`0xf` and `0x5`, so the default eight programs already exercise packing across a gap. With 90 programs, each of the
+six default formats exercises all 15 nonzero masks. Selected channels are packed into consecutive destination
+registers, while unwritten registers keep initialized sentinel values.
 The packing model follows the image VGPR usage description in AMD's
 [RDNA 1.0 ISA guide](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna-shader-instruction-set-architecture.pdf);
 the Vulkan test compares translated shaders on the host GPU, not native RDNA2 execution.
@@ -1297,9 +1298,10 @@ Differences are `denormal` (the reference declines the program for a denormal: f
 which fails the run. Seeds 11 to 13, 600 programs each, up to 8 ops: Radeon gfx1036 wave32 597 match, 3 omod_neg_zero;
 wave64 593 match, 3 denormal, 4 omod_neg_zero; RTX 5080 wave32 595 match, 3 omod_neg_zero, 2 denormal; no mismatch.
 
-### Translated programs on a Vulkan GPU: `--oracle hw,vk` of `pk16_diff`, `vint_diff`, `wint_diff`, `sdwa_diff` (and `fmisc_diff`, `f32_fuzz`)
+### Translated programs on a Vulkan GPU: `--oracle hw,vk` of `pk16_diff`, `vint_diff`, `wint_diff`, `sdwa_diff` and `fmisc_diff`
 
-These fuzzers judge the translator in `spirv_mini_interp`, which cannot see what a driver does with the SPIR-V. With
+These fuzzers judge the translator in `spirv_mini_interp`, which cannot see what a driver does with the SPIR-V. `f32_fuzz`
+has no Vulkan path (its GPU oracle is `--oracle hw`, above). With
 `--oracle hw,vk` each program also runs through llvm-mc (gfx1013), `rdna2spirv.py` and `runtime/build/vk_compute_test`
 (`tools/vk_fuzz_run.py`; `--build DIR`, `--work DIR`, `LEONIDA_VK_DEVICE`) as one wave, and its words are judged against
 the hardware's words from a kernel run in the same wave size (`--wave 32` or `--wave 64`; wave64 needs native 64-wide

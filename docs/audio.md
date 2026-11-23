@@ -304,9 +304,11 @@ The dictionary comes from two kinds of input:
   they give 138,104 wave names.
 
 Measured on the 1.0.2.1 package (2026-11-22) with 2,455,498 distinct lowercase words: identifiers harvested from the
-carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves:
+carved archives (by a scan like `hashdict.py`, not `hashdict.py` itself) plus the conversation waves. The columns are
+the ones the tool prints per source, so the second one is its distinct bank/ID pairs: an id that appears in two banks
+counts once in each (`Index.streams` in `tools/awc_names.py`):
 
-| Archive | Banks | Distinct ids | Named | Dialogue | Family | Control (expected false) |
+| Archive | Banks | Distinct bank/ID pairs | Named | Dialogue | Family | Control (expected false) |
 |---|---:|---:|---:|---:|---:|---:|
 | `audio.rpf` | 7,162 | 1,606,237 | 92,043 | 0 | 92,043 | 352 |
 | `story000.rpf` | 63,861 | 234,458 | 173,800 | 120,511 | 53,289 | 62 |
@@ -328,6 +330,11 @@ python -I tools/awc_names.py <work>/assets/audio/awc --words <temp>/hashes.json 
 Each positional source is reported and thresholded on its own. A source is a directory of `.awc` banks, a single
 bank, or an `audio_manifest.json` from `rpf9dump audio` (read without opening the banks). Pure Python; the run above
 took about 3 minutes on one core.
+
+The dictionary is also readable the other way, which needs no carve folder:
+`python -I tools/hashdict.py --lookup <temp>/hashes.json <hash>...` takes a dictionary path followed by one or more
+32-bit hashes in hexadecimal and prints each with the name the dictionary holds for it, or `?` when it holds none
+(`tools/hashdict.py:70,82-93`). That answers "which wave is this id" when another tool prints a hash and no name.
 
 You can also pass the JSON inventory written by `awc_manifest.py --out inventory.json`. The naming tool reads
 the plain stream IDs and streamed-music channel IDs directly from its rows. Bank labels keep the nested path

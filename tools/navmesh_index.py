@@ -170,7 +170,12 @@ def scan_directory(root, pattern=None):
     t0 = time.time()
     # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
     # class by glob and match nothing. The pattern (and "**") stays as the caller's glob.
-    for path in sorted(glob.glob(os.path.join(glob.escape(os.fspath(root)), "**", pattern), recursive=True)):
+    query = pattern.replace(os.altsep, os.sep) if os.altsep else pattern
+    if query.split(os.sep, 1)[0] != "**":
+        query = os.path.join("**", query)
+    matches = glob.iglob(os.path.join(glob.escape(os.fspath(root)), query), recursive=True)
+    # Separated ** segments (e.g. **/tiles/**/*.bin) can still match a pathname more than once.
+    for path in sorted(set(matches) if query.split(os.sep).count("**") > 1 else matches):
         if not os.path.isfile(path):
             continue
         size = os.path.getsize(path)

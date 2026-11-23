@@ -4967,6 +4967,21 @@ class Gen:
         self.emit(f"{word} = OpSelect %uint {upper} {hi} {lo}")
         return word
 
+    def wave32_first_running_lane(self):
+        """The lowest running lane of this wave32 fragment's 32-lane half (0-31): the lane a uniform value is read
+        from. A fixed lane (0 of the half) need not be running: a quad with no covered sample, or helpers a driver
+        leaves out of subgroup operations, read as undefined (SHADER-1016)."""
+        ballot, any_, lsb, first = (self.tmp() for _ in range(4))
+        self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        word = self.wave32_ballot_word(ballot)
+        # An empty word (a helper a driver leaves out of its own ballot) reads lane 0, as v_readfirstlane does,
+        # never FindILsb's 0xFFFFFFFF.
+        self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
+        self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
+        self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+        self.uses_subgroup = self.uses_ballot = True
+        return first
+
     def ballot_lsb_by_words(self, bal):
         """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
         OpGroupNonUniformBallotFindLSB gives (a ballot has no bit at or above the subgroup size), without asking for
@@ -6963,7 +6978,14 @@ class Gen:
                 if kind in ("add", "sub"):
                     self.emit(f"{r} = {'OpIAdd' if kind == 'add' else 'OpISub'} %uint {v[0]} {v[1]}")
                 elif kind == "mul_lo":
-                    self.emit(f"{r} = OpIMul %uint {v[0]} {v[1]}")
+                    # The low 16 bits of the product as ((x << 16) * y) >> 16, not (x * y) & 0xffff: the AMD Windows driver
+                    # (26.10.1) dropped that mask when the other half of the result folded to zero (a constant half of 0:
+                    # 0x1234 * 0xaaaa came out 0x0c229e88 for 0x00009e88).
+                    xs = self.tmp()
+                    self.emit(f"{xs} = OpShiftLeftLogical %uint {v[0]} {self.cu(16)}")
+                    p16 = self.tmp()
+                    self.emit(f"{p16} = OpIMul %uint {xs} {v[1]}")
+                    self.emit(f"{r} = OpShiftRightLogical %uint {p16} {self.cu(16)}")
                 elif kind == "mad":
                     m = self.tmp()
                     self.emit(f"{m} = OpIMul %uint {v[0]} {v[1]}")
@@ -11763,8 +11785,10 @@ class Gen:
         if self.emulate:
             return r
         if self.wave32_fragment:
+            # Each 32-lane half of a wider subgroup is its own wave with its own SGPRs: broadcast from the half's
+            # first running lane, as OpGroupNonUniformBroadcastFirst does for the whole subgroup below.
             b = self.tmp()
-            self.g_shuffle(b, r, self.cu(0))
+            self.g_shuffle(b, r, self.wave32_first_running_lane())
             return b
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
         # broadcast is an identity on every driver and makes that uniformity explicit to the compiler. Mesa ANV
@@ -14584,7 +14608,10 @@ def assemble(gen):
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
-    if gen.uses_ballot:
+    # dedupe_types keeps the first uvec4 it meets: when the typed-image types follow, declare the ballot type after
+    # them, so a shader that gains a ballot keeps the name %v4uint_st (SHADER-1016).
+    st_types = gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image
+    if gen.uses_ballot and not st_types:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
@@ -14616,7 +14643,7 @@ def assemble(gen):
         types += ["%double = OpTypeFloat 64"]
     if gen.uses_f64 or gen.uses_clock:
         types += ["%v2uint_d = OpTypeVector %uint 2"]
-    if gen.uses_ballot:
+    if gen.uses_ballot and not st_types:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
     if gen.uses_fmt_size:
         sizes = [Gen.FORMATS[c][0] if c in Gen.FORMATS else 0 for c in range(128)]
@@ -14629,6 +14656,7 @@ def assemble(gen):
     if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
+                  *(["%v4uint_bal = OpTypeVector %uint 4"] if gen.uses_ballot else []),
                   f"%fmt_mask_arr = OpTypeArray %uint {gen.cu(16)}",
                   "%_ptr_Private_fmt = OpTypePointer Private %fmt_mask_arr",
                   "%_ptr_Private_uint = OpTypePointer Private %uint"]

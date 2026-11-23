@@ -30,7 +30,7 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
 from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
@@ -924,7 +924,7 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
-                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_buf_load_sub", "cs_buf_fmt8"):
+                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_pk_mul_lo_const", "cs_buf_load_sub", "cs_buf_fmt8"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
             # cs_cmpx_class_f32 and cs_cvt_pk_u8 are per-lane and need no particular subgroup width either.
@@ -948,6 +948,7 @@ def run_suite(a, work: str) -> int:
                                    0xBEEF0001],
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
                 "cs_cvt_pk_u8": CVT_PK_U8_WORDS,
+                "cs_pk_mul_lo_const": PK_MUL_LO_WORDS,
                 # TEST-510: sub-dword MUBUF loads (RAW end check by element size) and GFX10_FORMAT_8_UINT
                 "cs_buf_load_sub": [0x80, 0xFFFFFF80, 0x1FF, 0xFFFF807F, 0xAB01, 0xCD, 0, 0],
                 "cs_buf_fmt8": [0x7F, 0x80, 0xFF, 0x01, 0, 0, 0xFF, 1],
