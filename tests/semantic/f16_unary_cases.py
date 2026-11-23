@@ -164,9 +164,11 @@ class UnaryF16:
             base = self.ref(a)
             # `clamp` of a NaN result is not modelled (the translator emits FClamp; docs/design.md, float min/max/med3 with
             # NaN), so a NaN result is only checked with the output multipliers.
-            for suffix, want in ((" mul:2", scale(base, 2.0)), (" mul:4", scale(base, 4.0)),
-                                 (" div:2", scale(base, 0.5)), (" clamp", clamp01(base)),
-                                 (" mul:2 clamp", clamp01(scale(base, 2.0)))):
+            # #4542, measured on gfx1036: an f16 destination ignores omod (mul:2/mul:4/div:2) under the game's MODE
+            # (IEEE=0, f16 denormals kept) and keeps clamp (docs/design.md, f16 output modifiers).
+            for suffix, want in ((" mul:2", base), (" mul:4", base),
+                                 (" div:2", base), (" clamp", clamp01(base)),
+                                 (" mul:2 clamp", clamp01(base))):
                 if is_nan(base) and "clamp" in suffix:
                     continue
                 with self.subTest(a=hex(a), mod=suffix):

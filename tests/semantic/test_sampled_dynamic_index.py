@@ -23,6 +23,9 @@ class SampledDynamicIndex(unittest.TestCase):
         bindings = {var: int(binding) for var, binding in re.findall(r"OpDecorate (%\w+) Binding (\d+)", asm)}
         lookups = set(re.findall(r"(%\w+) = OpFunctionCall %uint %desc_lookup_fn ", asm))
         broadcasts = re.findall(r"(%\w+) = OpGroupNonUniformBroadcastFirst %uint %\w+ (%\w+)", asm)
+        # a wave32 pixel shader in a 64-lane subgroup takes its own half's first lane with a shuffle (design.md,
+        # "Execution model": shuffle sources keep the current half)
+        broadcasts += re.findall(r"(%\w+) = OpGroupNonUniformShuffle %uint %\w+ (%\w+) %\w+", asm)
         lookup_indices = lookups | {result for result, source in broadcasts if source in lookups}
         sampled, storage = set(), set()
         for var, index in re.findall(r"OpAccessChain %_ptr_UC_\w+ (%\w+) (%\w+)$", asm, re.M):

@@ -799,12 +799,14 @@ class NegativeControls(unittest.TestCase):
         # 4. Dropping the destination EXEC OpSelect overwrites inactive destination lanes.
         # The select is the one dst() emits right before the OpStore of the destination VGPR (not the activity selects
         # of the FI=0 path, which also follow a shuffle).
-        # The program writes four VGPRs (v1, v2, the permlane's v2, v21), so four such selects; the third is the permlane's.
-        dst_selects = list(re.finditer(r"(%\w+ = OpSelect %uint %\w+ (%\w+)) %\w+(\n\s*OpStore %\w+ %\w+\n)", spv))
-        n4 = 1 if len(dst_selects) == 4 else len(dst_selects)
-        m = dst_selects[2]
+        # It is the first such select after the data shuffle: v1 and v2 before it are written inside one active run
+        # (#3549), which has no per-write select, and v21 comes after it.
+        shuffle = re.search(r"OpGroupNonUniformShuffle %uint %c3 ", spv).start()
+        dst_selects = [m for m in re.finditer(r"(%\w+ = OpSelect %uint %\w+ (%\w+)) %\w+(\n\s*OpStore %\w+ %\w+\n)", spv)
+                       if m.start() > shuffle]
+        self.assertGreaterEqual(len(dst_selects), 1)
+        m = dst_selects[0]
         bad_exec = spv[:m.start()] + m.group(1) + " " + m.group(2) + m.group(3) + spv[m.end():]
-        self.assertEqual(n4, 1)
         got_bad_exec = self._run(bad_exec, 32, 32)
         self.assertNotEqual(got_bad_exec, want)
         self.assertNotEqual(got_bad_exec[1], OLD_SENTINEL | 1)
