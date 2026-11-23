@@ -100,7 +100,7 @@ fn match_masks(tiles: &[u64], cells: &[u64], words: usize, margin: f64, out: &mu
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "popcnt")]
-fn match_masks_popcnt(tiles: &[u64], cells: &[u64], words: usize, margin: f64, out: &mut [Match]) {
+unsafe fn match_masks_popcnt(tiles: &[u64], cells: &[u64], words: usize, margin: f64, out: &mut [Match]) {
     if words == 16 {
         match_masks(tiles, cells, 16, margin, out);
     } else {
