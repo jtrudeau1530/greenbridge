@@ -1030,12 +1030,12 @@ All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing de
 
 1. **Port BC6H/BC7 BCPack decoders to `TtpfReader` (`rpf9-explorer` / `tools/rpf9dump`).**
    Compact 2D mip tails, multi-slice layouts, DXGI 11, and strict BCPack BC1/BC3/BC4/BC5
-   decoding are now live in `rpf9-explorer` (`breadbbbb/rpf9-explorer#7`; `ASSET-44`), and
-   since the `ad41e794` submodule pin (`breadbbbb/rpf9-explorer#15`; `ASSET-125`)
-   `Core/TtpfReader.cs` detiles 64 KiB 4 BPP surfaces with the RDNA2/RbPlus `(3, -3)` order
-   at bits 6..7 (`GFX10_SW_64K_D_RBPLUS_PATINFO`), as `tools/ttpf_mips.py` does. Remaining C#
-   follow-ups are BC6H/BC7 block rebuilders (plus optional external history tables) and
-   preserving lower-mip zlib/raw fallback when a higher mip is refused in strict mode.
+   decoding are now live in `rpf9-explorer` (carried by the `e293917` submodule pin,
+   `breadbbbb/rpf9-explorer#7`; `ASSET-44`). Remaining C# follow-ups are BC6H/BC7 block
+   rebuilders (plus optional external history tables), preserving lower-mip zlib/raw
+   fallback when a higher mip is refused in strict mode, and fixing `Core/TtpfReader.cs:70`
+   (`Patterns[2]`), which currently uses Navi 1x's `(-3, 3)` at bits 6..7 instead of
+   RDNA2/RbPlus `(3, -3)` (`GFX10_SW_64K_D_RBPLUS_PATINFO`).
 2. **Wire optional external `--history` tables into C# `TtpfReader`.** `tools/bcpack_history_calib.py`
    now derives local `bc1.json`..`bc7.json` history files into `<work>` for the pure-Python
    decoder (`tools/bcpack.py` / `tools/ttpf_mips.py --history <path>`), either by exact
