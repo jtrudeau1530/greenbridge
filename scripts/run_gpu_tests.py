@@ -355,6 +355,10 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     wave64: it was run with --require-wave64, so exit 77 is a skip and the 64-wide confirmation must be printed.
     partial: a group smaller than a wave, run at subgroup size 64 without full subgroups; skipped when the device
     reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size."""
+    if rc == 77:   # the program refused the module and said why ("unsupported: <why>"): a skip with that reason, in every mode
+        why = next((ln for ln in msg.splitlines() if ln.startswith("unsupported:")), None)
+        if why:
+            return None, "SKIP (" + why[len("unsupported:"):].strip() + ")"
     no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
     if (wave64 and rc == 77) or (no64 and rc == 0):
         return None, "SKIP (no 64-wide compute subgroup on this device)"

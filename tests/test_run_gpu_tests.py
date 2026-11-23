@@ -233,6 +233,15 @@ class WholeWaveDump(unittest.TestCase):
         self.assertIs(ok, None)
         self.assertTrue(detail.startswith("SKIP"))
 
+    def test_a_77_with_an_unsupported_reason_keeps_that_reason(self):
+        """A 64-wide device, a module that needs OpFmaKHR the device lacks: the skip names OpFmaKHR, not the subgroup."""
+        msg = ("unsupported: cs_x.spv needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device lacks it; "
+               "translate with --fma glsl\n")
+        ok, detail = self.judge(77, DEVICE_64 + msg)
+        self.assertIs(ok, None)
+        self.assertTrue(detail.startswith("SKIP (cs_x.spv needs OpFmaKHR"), detail)
+        self.assertNotIn("64-wide", detail)
+
     def test_right_words_without_the_confirmation_fail(self):    # a vk_compute_test that ignores the flag
         ok, detail = self.judge(0, DEVICE_64 + dump(WANT))
         self.assertIs(ok, False)
@@ -261,6 +270,17 @@ class NotWholeWave(unittest.TestCase):
     def test_plain_dump_needs_no_confirmation_and_a_77_is_a_failure(self):
         self.assertEqual(judge(0, dump(WANT)), (True, "55 48"))
         self.assertIs(judge(77, "unavailable\n")[0], False)
+
+    def test_a_77_with_an_unsupported_reason_is_a_skip(self):
+        """A module that needs OpFmaKHR on a device without VK_KHR_shader_fma: vk_compute_test exits 77 with a reason."""
+        msg = ("unsupported: cs_x.spv needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device lacks it; "
+               "translate with --fma glsl\n")
+        for kw in ({}, {"emulated": True}, {"partial": True}):
+            with self.subTest(**kw):
+                ok, detail = judge(77, DEVICE_32 + msg, **kw)
+                self.assertIs(ok, None)
+                self.assertTrue(detail.startswith("SKIP (cs_x.spv needs OpFmaKHR"), detail)
+        self.assertIs(judge(77, DEVICE_32 + "no reason given\n")[0], False)       # a bare 77 stays a failure
 
     def test_hex_words(self):
         ok, detail = rgt.judge_cs_dump(0, dump([0x400080FF, 7]), [0x400080FF, 7], wave64=False, partial=False,

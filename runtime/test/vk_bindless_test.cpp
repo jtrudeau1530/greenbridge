@@ -280,6 +280,8 @@ int main(int argc, char** argv) {
     qci.pQueuePriorities = &priority;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
+    // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
+    if (!fma.accepts_file(argv[1]) || !fma.accepts_file(argv[2])) return 77;
     fma.link_after(&enable);
     const char* fma_extension = fma.extension();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable};

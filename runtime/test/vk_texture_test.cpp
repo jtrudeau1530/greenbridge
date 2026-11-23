@@ -209,6 +209,8 @@ int main(int argc, char** argv) {
     std::vector<const char*> enable;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
+    // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
+    if (!fma.accepts_file(vs_path.c_str()) || !fma.accepts_file(fs_path.c_str())) return 77;
     if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
