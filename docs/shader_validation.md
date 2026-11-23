@@ -1238,7 +1238,17 @@ the minimized case is printed. `--oracle gpu` translates the same
 fragment shader and runs it through `runtime/build/vk_harness`, comparing the raw RGBA32F output words. It assembles
 the fragment module with `spirv-as` and the full-screen vertex shader with the Vulkan SDK's `glslc`; use `--exe PATH`
 to select another `vk_harness`. It exits 77 if the executable, SDK tools, Vulkan device or required `shaderFloat64`
-feature is unavailable. `--oracle hw` requires the AMD `tools/hw_oracle` setup and likewise exits 77 when unavailable.
+feature is unavailable. `--oracle hw` runs the same programs natively on an AMD GPU through `tools/hw_oracle` (one lane
+of a wave32 compute kernel, as `tools/fmisc_diff.py` does) and compares the four words with the reference only, not with
+the translator; `--hw-arch` picks the architecture to assemble for (default: detected). The campaign is one launch, and a
+failing program is re-run alone while it is shrunk. The hardware runs every form, so the known-divergence exclusions
+(translator limits) do not apply: output modifiers, clamp, negated/absolute operands and directed rounding are compared
+too, and the kernels start in the game's inferred float MODE (IEEE off, DX10_CLAMP on). `v_rcp_f64`, `v_rsq_f64` and
+`v_sqrt_f64` are counted skips there, because the native results are approximations (PROC-216) and the reference is exact;
+an architecture that cannot set that MODE (gfx1170 and later) or a program the assembler rejects is a counted skip with the
+runner's reason. It exits 77 only when the `tools/hw_oracle` tools or device are missing. The path is covered by
+`tests/test_f64_diff.py` with a fake oracle (routing, `--hw-arch`, exit 77, skips, shrinking); **no AMD hardware run has
+been done for it yet**.
 Exit codes are 0 for no unexpected
 mismatch, 1 for a mismatch (with instruction-removal shrinking), 2 for CLI/harness errors and 77 for unavailable
 oracles. Skips always include a reason.
@@ -1247,6 +1257,7 @@ oracles. Skips always include a reason.
 python -I tools/f64_diff.py --programs 300 --seed 1
 python -I tools/f64_diff.py --known --programs 300 --seed 1
 python -I tools/f64_diff.py --oracle gpu --programs 300 --seed 1
+python -I tools/f64_diff.py --oracle hw --programs 300 --seed 1
 python -I tools/f64_diff.py --self-test
 python -I tests/test_f64_diff.py
 ```

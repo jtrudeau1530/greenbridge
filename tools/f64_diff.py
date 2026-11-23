@@ -7,9 +7,10 @@ and executes their SPIR-V with the semantic one-lane interpreter. Only synthetic
 are created; no game files are read.
 
 The GPU path is deliberately optional. It translates the same fragment shader, runs it
-through vk_harness, and reads back RGBA32F words. The hardware oracle is AMD-only and
-returns 77 when the host has no configured AMD hw_oracle. ``--known`` runs known
-divergence probes; a reproduced mismatch intentionally returns 1.
+through vk_harness, and reads back RGBA32F words. ``--oracle hw`` runs the programs natively
+on an AMD GPU through tools/hw_oracle (``--hw-arch`` selects the architecture) and compares
+them with the reference; it returns 77 only when that oracle is unavailable. ``--known`` runs
+known divergence probes; a reproduced mismatch intentionally returns 1.
 """
 import argparse
 import gc
@@ -70,6 +71,10 @@ class SkipCase(Exception):
 
 class GPUUnavailable(Exception):
     pass
+
+
+class HWUnavailable(Exception):
+    """No configured AMD hw_oracle on this host (tools/hw_oracle/); the CLI turns it into exit 77."""
 
 
 def words_to_bits(lo, hi):
@@ -166,8 +171,13 @@ def add_bits(a, b, mode=0):
     if is_inf(a) or is_inf(b):
         af, bf = to_float(a), to_float(b)
         return from_float(af + bf)
-    negzero = (is_zero(a) and is_zero(b) and bool((a & b) >> 63)) or mode == 2
     exact = to_fraction(a) + to_fraction(b)
+    # IEEE 754-2019 6.3: an exact zero sum of two zeros of the same sign keeps that sign in every mode; any other
+    # exact zero (opposite-signed zeros, or x + (-x)) is -0 only when rounding toward negative, +0 otherwise.
+    if is_zero(a) and is_zero(b) and (a ^ b) >> 63 == 0:
+        negzero = bool(a >> 63)
+    else:
+        negzero = mode == 2
     return round_fraction(exact, mode, negzero)
 
 
@@ -452,6 +462,31 @@ def run_gpu(lines, name, tmpdir, gpu):
     with open(raw, "rb") as f: return list(struct.unpack("<4I", f.read()))
 
 
+# The float MODE the hardware kernels start with: the one docs/design.md infers for the game's shaders (the same as
+# tools/fmisc_diff.py): IEEE off so output modifiers apply, DX10_CLAMP on. Directives an architecture cannot set make
+# the program a counted skip (runner.Oracle.run returns the reason).
+HW_MODE = {"ieee": 0, "dx10_clamp": 1, "denorm32": 0}
+
+
+def hw_kernel(lines):
+    """A raw tools/hw_oracle kernel: the program on one lane, then v8..v11 stored at the output pointer."""
+    from hw_oracle import asm
+    return asm.Kernel(list(lines) + ["v_mov_b32 v0, 0", "global_store_b128 v0, v[8:11], s[2:3]", "s_endpgm"],
+                      wave=32, threads=1, words=4, raw=True, mode=HW_MODE)
+
+
+def open_hw_oracle(arch=None):
+    """The AMD hardware oracle, or HWUnavailable when its tools or device are missing."""
+    try:
+        from hw_oracle import runner
+    except ImportError as exc:
+        raise HWUnavailable(f"tools/hw_oracle cannot be imported: {exc}") from exc
+    try:
+        return runner.open_oracle(arch=arch)
+    except runner.Unavailable as exc:
+        raise HWUnavailable(str(exc)) from exc
+
+
 def rand_bits(rng):
     # Mostly finite normals, with signed zeros, infinities and NaNs for predicate/class coverage.
     if rng.random() < .2:
@@ -578,7 +613,13 @@ def equivalent(a, b, kind="int"):
     return a == b
 
 
-def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False):
+def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False, hw_words=None):
+    """Compare one program with the reference. ``gpu`` is the prepared Vulkan context for --oracle gpu, or the open
+    hw_oracle for --oracle hw (whose result may be passed in as ``hw_words``: four words or a skip reason)."""
+    if oracle == "hw":
+        # The hardware runs every form natively, so the translator-only exclusions do not apply: compare it with the
+        # whole reference, the known cases included.
+        include_known = True
     if not include_known:
         for line in lines:
             if " mul:" in line or " div:" in line:
@@ -593,6 +634,14 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
         return "skip", f"reference limitation: {type(exc).__name__}: {exc}", None, None
     if oracle == "gpu" and any(line.lstrip().startswith(("v_rsq_f64 ", "v_sqrt_f64 ")) for line in lines):
         return "skip", "GLSL.std.450 InverseSqrt/Sqrt double-precision result precision is implementation-defined", expected, None
+    if oracle == "hw":
+        if any(line.lstrip().startswith(("v_rcp_f64 ", "v_rsq_f64 ", "v_sqrt_f64 ")) for line in lines):
+            return "skip", ("native v_rcp_f64/v_rsq_f64/v_sqrt_f64 are approximations (about 26 bits, PROC-216) and "
+                            "the reference is exact, so their result is not judged"), expected, None
+        actual = hw_words if hw_words is not None else gpu.run([hw_kernel(lines)])[0]
+        if isinstance(actual, str): return "skip", f"hardware: {actual}", expected, None
+        actual = [int(x) & M32 for x in actual]
+        return ("match", "", expected, actual) if equivalent(expected, actual, output_kind(lines)) else ("mismatch", "word comparison", expected, actual)
     try: actual = run_gpu(lines, name, tmp, gpu) if oracle == "gpu" else translate(lines, name, tmp)
     except (rdna2spirv.Unsupported, UnsupportedConstruct, SkipCase) as exc: return "skip", f"{type(exc).__name__}: {exc}", expected, None
     except (IndexError, KeyError, ValueError, OverflowError) as exc: return "skip", f"translator/interpreter limitation: {type(exc).__name__}: {exc}", expected, None
@@ -626,7 +675,7 @@ def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=
 
 
 def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, known=False, all_failures=False,
-              oracle="translator", gpu=None):
+              oracle="translator", gpu=None, hw=None):
     counts = Counter(); skips = Counter(); failures = []
     rng = random.Random(seed)
     sequence = [(op, True, None) for op in ops] if sweep else []
@@ -634,18 +683,24 @@ def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, kn
     if known:
         sequence += [("v_div_fixup_f64" if label == "div-fixup-nan-s0" else "v_add_f64", True, label)
                      for label in KNOWN_DIVERGENCES]
+    cases = []
+    for idx, (op, is_sweep, known_case) in enumerate(sequence):
+        setup_lines, body_lines, _, _ = make_case(rng, op, allow_literal, known_case)
+        lines = setup_lines + body_lines
+        if not is_sweep and not known_case:
+            n_ops = rng.randint(1, max_ops)
+            for _ in range(n_ops - 1):
+                _, extra_body, _, _ = make_case(rng, rng.choice(ops), allow_literal)
+                lines.extend(extra_body)
+        cases.append((idx, lines, known_case))
+    # One launch for the whole campaign; a failing program is re-run alone while it is shrunk.
+    hw_results = hw.run([hw_kernel(lines) for _, lines, _ in cases]) if oracle == "hw" else None
     with tempfile.TemporaryDirectory(prefix="f64-diff-") as tmp:
-        gpu_ctx = prepare_gpu(gpu, tmp) if oracle == "gpu" else None
-        for idx, (op, is_sweep, known_case) in enumerate(sequence):
-            setup_lines, body_lines, _, _ = make_case(rng, op, allow_literal, known_case)
-            lines = setup_lines + body_lines
-            if not is_sweep and not known_case:
-                n_ops = rng.randint(1, max_ops)
-                for _ in range(n_ops - 1):
-                    _, extra_body, _, _ = make_case(rng, rng.choice(ops), allow_literal)
-                    lines.extend(extra_body)
+        gpu_ctx = prepare_gpu(gpu, tmp) if oracle == "gpu" else hw if oracle == "hw" else None
+        for idx, lines, known_case in cases:
             status, reason, want, got = run_one(lines, f"ps_f64_{idx:05d}", tmp, oracle, gpu_ctx,
-                                                include_known=bool(known_case))
+                                                include_known=bool(known_case),
+                                                hw_words=hw_results[idx] if hw_results is not None else None)
             if status == "skip": skips[reason] += 1
             else: counts[status] += 1
             if status == "mismatch":
@@ -704,7 +759,7 @@ def main(argv=None):
     ap.add_argument("--oracle", choices=("translator", "gpu", "hw"), default="translator",
                     help="translator (default), Vulkan GPU via vk_harness, or AMD hardware oracle")
     ap.add_argument("--exe", help="vk_harness executable for --oracle gpu")
-    ap.add_argument("--hw-arch", help="AMD hw_oracle architecture (if configured)")
+    ap.add_argument("--hw-arch", help="GPU architecture hw_oracle assembles for (default: detected)")
     args = ap.parse_args(argv)
     if args.programs < 0 or args.max_ops < 1: print("programs must be nonnegative and max-ops positive", file=sys.stderr); return 2
     ops = [x.strip() for x in args.ops.split(",")] if args.ops else list(BASE)
@@ -715,20 +770,25 @@ def main(argv=None):
         print("Excluded (not translated by main): v_mul_f64, v_min_f64, v_max_f64, v_fract_f64, v_cvt_f64_f32, v_ldexp_f64, v_mad_f64, v_cvt_i32_f64, v_cvt_u32_f64, v_div_scale_f64")
         return 0
     if args.self_test: return 0 if self_test() else 1
-    gpu = None
+    gpu = hw = None
     if args.oracle == "hw":
-        print("hardware oracle unavailable: this host has no configured AMD hw_oracle", file=sys.stderr); return 77
+        try: hw = open_hw_oracle(args.hw_arch)
+        except HWUnavailable as exc:
+            print(f"hardware oracle unavailable: {exc}", file=sys.stderr); return 77
+        print(f"hardware oracle: {getattr(hw, 'device', 'AMD GPU')}")
     if args.oracle == "gpu":
         ext = ".exe" if os.name == "nt" else ""
         gpu = args.exe or os.path.join(ROOT, "runtime", "build", "vk_harness" + ext)
     try:
         counts, skips, failures = run_batch(ops, args.programs, args.seed, args.max_ops, args.sweep,
                                             not args.no_literals, args.known, args.all_failures,
-                                            args.oracle, gpu)
+                                            args.oracle, gpu, hw)
     except GPUUnavailable as exc:
         print(f"GPU oracle unavailable: {exc}", file=sys.stderr); return 77
-    except HarnessError as exc:
+    except (HarnessError, RuntimeError) as exc:
         print(f"harness error: {exc}", file=sys.stderr); return 2
+    finally:
+        if hw is not None: hw.close()
     total = sum(counts.values()) + sum(skips.values())
     print(f"{args.oracle}: {counts['match']} match, {counts['mismatch']} mismatch; {total} total, {dict(skips)} skips")
     if failures:
