@@ -14545,8 +14545,11 @@ def assemble(gen):
             # TG_SIZE_EN (RSRC2 bit 10): the SGPR after the workgroup ids holds the number of waves in the group in
             # [5:0] and this wave's index in it in [11:6] (Mesa ac_nir_lower_intrinsics_to_args.c, GFX6-10:
             # load_num_subgroups is tg_size[5:0], load_subgroup_id tg_size[11:6], and a wave64 compute shader's
-            # local invocation index is mbcnt(~0, tg_size & 0xfc0)). Thread i is in wave i / W, as for
-            # s_get_waveid_in_workgroup. The other bits are 0 here. Not measured on hardware.
+            # local invocation index is mbcnt(~0, tg_size & 0xfc0)), the wave index again in [24:20] (Mesa's GFX10.3
+            # field) and bit 31 set in the group's first wave. Measured on gfx1036 through tools/hw_oracle (#6446:
+            # 100, 128 and 133 threads, wave32 and wave64; e.g. wave32 x 128 gives 80000004 00100044 00200084
+            # 003000c4); the other bits were 0 there. One pipeline-library program reads [24:20]. Not measured on
+            # gfx1013. Thread i is in wave i / W, as for s_get_waveid_in_workgroup.
             sx, sy, sz = gen.cs["size"]
             w = 64 if gen.wave64 else 32
             r = gen.cs["user"] + len(gen.cs["tgid"])
@@ -14556,7 +14559,11 @@ def assemble(gen):
                    "%tgi0 = OpIAdd %uint %tgx %tgyx", "%tgi = OpIAdd %uint %tgi0 %tgzx",
                    f"%tgw = OpShiftRightLogical %uint %tgi {gen.cu(w.bit_length() - 1)}",
                    f"%tgws = OpShiftLeftLogical %uint %tgw {gen.cu(6)}",
-                   f"%tgv = OpBitwiseOr %uint %tgws {gen.cu(-(-(sx * sy * sz) // w))}",
+                   f"%tgwh = OpShiftLeftLogical %uint %tgw {gen.cu(20)}",
+                   f"%tgf0 = OpIEqual %bool %tgw {gen.cu(0)}",
+                   f"%tgf = OpSelect %uint %tgf0 {gen.cu(0x80000000)} {gen.cu(0)}",
+                   f"%tgv0 = OpBitwiseOr %uint %tgws {gen.cu(-(-(sx * sy * sz) // w))}",
+                   "%tgv1 = OpBitwiseOr %uint %tgv0 %tgwh", "%tgv = OpBitwiseOr %uint %tgv1 %tgf",
                    f"%tgp = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", "OpStore %tgp %tgv"]
     if gen.frag_inputs:
         fn += ["%fc = OpLoad %v4float %frag_coord"]

@@ -6,8 +6,9 @@ With TG_SIZE_EN set, the SGPR after the user data and the enabled workgroup ids 
 workgroup in bits [5:0] and the wave's index in it in bits [11:6] (Mesa, src/amd/common/nir/
 ac_nir_lower_intrinsics_to_args.c, GFX6-10: load_num_subgroups = tg_size[5:0], load_subgroup_id = tg_size[11:6];
 a wave64 compute shader's local invocation index is mbcnt(~0, tg_size & 0xfc0)). The translator writes that value
-in the prologue: thread i is in wave i / W (W = 32 or 64), the rule s_get_waveid_in_workgroup uses. Bits above 11
-are 0. Not measured on hardware. 91 compute programs of the pipeline library set the bit (docs/shader_library.md);
+in the prologue: thread i is in wave i / W (W = 32 or 64), the rule s_get_waveid_in_workgroup uses. It also has
+the wave index in [24:20] and bit 31 set in the first wave, as measured on gfx1036 (#6446, tools/hw_oracle);
+not measured on gfx1013. 91 compute programs of the pipeline library set the bit (docs/shader_library.md);
 the reads of it all start with `s_and_b32 sN, sTG, 0xfc0`, and most feed that to v_mbcnt_lo_u32_b32, as below.
 
 Each case translates a compute listing (4 user SGPRs, workgroup id x in s4, so the thread-group SGPR is s5), runs
@@ -99,7 +100,14 @@ class TgSizeTests(unittest.TestCase):
 
     def test_whole_value(self):
         got = run(["v_mov_b32 v5, s5"], True, (192, 1, 1))
-        self.assertEqual(got, [(i // 64) << 6 | 3 for i in range(192)])
+        self.assertEqual(got, [(i // 64) << 20 | (i // 64) << 6 | 3 | (0x80000000 if i < 64 else 0)
+                               for i in range(192)])
+
+    def test_matches_the_gfx1036_measurement(self):
+        # tools/hw_oracle on gfx1036 (#6446), wave32 x 128 threads: one word per wave.
+        got = run(["v_mov_b32 v5, s5"], False, (128, 1, 1))
+        self.assertEqual([got[32 * k] for k in range(4)], [0x80000004, 0x00100044, 0x00200084, 0x003000C4])
+        self.assertEqual(got, [got[32 * (i // 32)] for i in range(128)])
 
     def test_follows_the_workgroup_ids(self):
         # TGID_X/Y/Z all enabled: the ids are s4, s5, s6, the thread-group SGPR is s7.
