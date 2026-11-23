@@ -112,6 +112,23 @@ class F64DiffTests(unittest.TestCase):
                                      "v_mov_b32 v13, 0x3ff00000", op])
             self.assertEqual(result[0], 0x12345678)
 
+    def test_hw_oracle_reference_starts_with_one_lane_in_exec(self):
+        # The hardware kernel is one lane, so a v_cmpx that hits leaves EXEC = 1 and `s_mov_b32 s22, exec_lo` reads 1;
+        # the all-lanes reference said 0xffffffff, so every v_cmpx case was a false mismatch on --oracle hw. The
+        # words are what gfx1036 returned for this program (RDNA2 iGPU, Windows driver 32.0.21045.16010).
+        lines = ["s_mov_b32 s6, 0x66466f79", "s_mov_b32 s7, 0x2df96874",
+                 "v_mov_b32 v8, 0x1081490d", "v_mov_b32 v9, 0xfdeb0203",
+                 "v_mov_b32 v10, 0xa1ef942f", "v_mov_b32 v11, 0xfedbc06e",
+                 "s_mov_b32 s10, exec_lo", "v_cmpx_lt_f64_e64 0xc83d5d11, |s[6:7]|",
+                 "s_mov_b32 s22, exec_lo", "s_mov_b32 exec_lo, s10", "v_mov_b32 v9, s22",
+                 "v_cmp_lt_f64_e64 s20, 0xc83d5d11, |s[6:7]|", "v_cndmask_b32_e64 v8, 0, 1, s20"]
+        hardware = [0x00000001, 0x00000001, 0xA1EF942F, 0xFEDBC06E]
+        with tempfile.TemporaryDirectory() as tmp:
+            status, _, _, _ = fd.run_one(lines, "ps_f64_hw_exec", tmp, "hw", hw_words=hardware)
+        self.assertEqual(status, "match")
+        self.assertEqual(fd.ref_program(lines)[1], 0xFFFFFFFF)    # the translator's all-lanes view is unchanged
+        self.assertEqual(fd.ref_program(lines, exec_lo=1)[1], 1)
+
     def test_shrink_reuses_prepared_gpu_context(self):
         context = {"exe": "fake"}
         observed = []
@@ -296,7 +313,7 @@ class F64DiffTests(unittest.TestCase):
                     out.append(self.reason)
                     continue
                 try:
-                    words = fd.ref_program(kernel.lines[:-3], True)   # drop the store epilogue
+                    words = fd.ref_program(kernel.lines[:-3], True, exec_lo=1)   # drop the store epilogue; one lane, EXEC = 1
                 except (fd.SkipCase, ArithmeticError, IndexError, KeyError, ValueError):
                     out.append("assembler rejected: fake")
                     continue

@@ -281,8 +281,8 @@ def parse_source_args(line):
     return bits[0], bits[1].rstrip(","), [x.strip() for x in args]
 
 
-def ref_program(lines, include_known=False):
-    vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, M32
+def ref_program(lines, include_known=False, exec_lo=M32):
+    vgpr, sgpr, mode, vcc, active = {}, {}, 0, 0, exec_lo
     for line in lines:
         s = line.strip()
         if not s or s.startswith((";", "exp ", "s_endpgm")): continue
@@ -629,7 +629,8 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
                 return "skip", f"KNOWN_DIVERGENCE fclamp-nan-zero: {KNOWN_DIVERGENCES['fclamp-nan-zero']}", None, None
             if line.split() and line.split()[0] in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_div_fmas_f64") and ("|" in line or "-v[" in line or "-s[" in line):
                 return "skip", f"KNOWN_DIVERGENCE double-neg-abs: {KNOWN_DIVERGENCES['double-neg-abs']}", None, None
-    try: expected = ref_program(lines, include_known)
+    # The hardware kernel is one lane, so EXEC is 1 there and a program that reads exec_lo back sees 1.
+    try: expected = ref_program(lines, include_known, 1 if oracle == "hw" else M32)
     except SkipCase as exc: return "skip", str(exc), None, None
     except (ArithmeticError, IndexError, KeyError, ValueError) as exc:
         return "skip", f"reference limitation: {type(exc).__name__}: {exc}", None, None
