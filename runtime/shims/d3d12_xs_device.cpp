@@ -2613,12 +2613,25 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
-    if (!self->console_lists)
-        return self->real->CreateCommandList(0, type, allocator, initial_state,
-                                             command_list_iid_for_pc(*riid), out);
+    // A refusal for the first word's type is retried with the second word's (the retail {0, 2} compute list).
+    const auto second = static_cast<D3D12_COMMAND_LIST_TYPE>(words[1]);
+    const bool retry = second != type && (second == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                                          second == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
+                                          second == D3D12_COMMAND_LIST_TYPE_COPY);
+    auto create = [&](const IID& iid, void** where) {
+        HRESULT r = self->real->CreateCommandList(0, type, allocator, initial_state, iid, where);
+        if (FAILED(r) && retry) {
+            r = self->real->CreateCommandList(0, second, allocator, initial_state, iid, where);
+            static std::atomic<bool> logged_second{false};
+            if (first_call(logged_second))
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 73 CreateCommandListX: type %d from word 1 -> 0x%08lx\n",
+                             static_cast<int>(second), static_cast<unsigned long>(r));
+        }
+        return r;
+    };
+    if (!self->console_lists) return create(command_list_iid_for_pc(*riid), out);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                   __uuidof(ID3D12GraphicsCommandList), &created);
+    const HRESULT hr = create(__uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
 }

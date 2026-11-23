@@ -184,6 +184,16 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
+            // A call through a null (or wild) pointer leaves nothing to unwind from at RIP; the caller's return
+            // address is still the top of the stack, so it is recorded as "return_to".
+            if (info.ContextRecord && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters >= 2 &&
+                r.ExceptionInformation[0] == 8 && info.ContextRecord->Rsp) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                const auto* top = reinterpret_cast<const uint64_t*>(info.ContextRecord->Rsp);
+                if (VirtualQuery(top, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                    !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                    f += ",\"return_to\":" + quote(where(*top));
+            }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
         }
