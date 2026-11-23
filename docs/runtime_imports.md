@@ -198,7 +198,8 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   are dropped, and a `COPYFILE2` progress routine is not called. A call it can't run as asked (`SKIP_ALTERNATE_STREAMS`,
   `DIRECTORY`, `OPEN_AND_COPY_REPARSE_POINT`, `IGNORE_SOURCE_ENCRYPTION`, an unknown flag, or a longer V2 block) is
   `ERROR_NOT_SUPPORTED` and writes nothing. `rt::fs::force_copy_file2_fallback` makes the test take this path on
-  Windows too.
+  Windows too. A cancel flag that is already set is answered before the host's `CopyFile2` is called as well, since
+  Wine 10 and 11 export `CopyFile2` but ignore the flag; clearing it lets the same call be retried.
 - `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
   folder) first, so the package keeps its own.
 - A folder has to exist in the title's view before it is used. An open that writes fails with `ERROR_PATH_NOT_FOUND`
