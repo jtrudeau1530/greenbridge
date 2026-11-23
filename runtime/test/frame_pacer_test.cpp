@@ -501,7 +501,10 @@ int main() {
         auto wait = wait_async(pacer, infinite_timeout_ms);
         EXPECT(blocked(wait));
         clock.advance_us(period);
-        EXPECT(wait.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+        if (wait.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+            pacer.suspend();  // lets the waiter go, so that the failure below ends the test and does not hang it
+            EXPECT(!"the first wait returns one period after the event is armed");
+        }
         Result r = wait.get();
         EXPECT(r.hr == pacer_hr::ok && r.token == 1);
         // Once the event is armed, a present is a frame in flight again.

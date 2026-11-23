@@ -321,7 +321,8 @@ public:
         retire_locked(now);
         cv_.notify_all();
     }
-    // A blank present (no planes) carries no token: it is only counted as a frame to show. Not paced: shows at once.
+    // A blank present (no planes) carries no token: it is only counted as a frame to show. With no interval set or
+    // the origin event not armed it is not paced: it shows at once and is not counted.
     void note_untokened_present() {
         std::lock_guard guard(mutex_);
         if (!interval_set_ || !armed_) return;
