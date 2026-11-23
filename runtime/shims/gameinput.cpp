@@ -81,8 +81,13 @@ constexpr float kMaxAngularVelocity = 34.9066f;  // 2000 deg/s in rad/s
 constexpr float kMotionSensorRate = 250.0f;      // requested sample rate; the device clamps to what it has
 constexpr uint64_t kMotionReadingUs = 8'000;     // a motion pad streams readings at ~125 Hz so the history stays sane
 
+// Keep first-use initialization independent of the compiler's function-local static guards.
+std::once_flag g_qpc_once;
+LARGE_INTEGER g_qpc_frequency{};
+
 uint64_t now_us() {
-    static const LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    std::call_once(g_qpc_once, [] { QueryPerformanceFrequency(&g_qpc_frequency); });
+    const auto freq = g_qpc_frequency;
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
     return static_cast<uint64_t>(c.QuadPart / freq.QuadPart * 1'000'000 + c.QuadPart % freq.QuadPart * 1'000'000 / freq.QuadPart);
@@ -622,13 +627,16 @@ void RawReport::GetDevice(IGameInputDevice** device) {
     *device = device_;
 }
 
+std::once_flag g_hid_once;
+bool g_hid_ok = false;
+
 // The default backend: SDL's hidapi. A pad is opened by the path SDL reports for it; with no such HID path, by its
 // vendor and product id when exactly one game-pad collection (usage page 1, usage 5) matches, so twins never mix.
 // A pad without a path (SDL virtual joysticks, the keyboard pad) gets no HID device.
 void* sdl_hid_open(const char* path, uint16_t vendor, uint16_t product) {
     if (!path || !*path) return nullptr;
-    static const bool ok = SDL_hid_init() == 0;
-    if (!ok) return nullptr;
+    std::call_once(g_hid_once, [] { g_hid_ok = SDL_hid_init() == 0; });
+    if (!g_hid_ok) return nullptr;
     if (SDL_hid_device* h = SDL_hid_open_path(path)) return h;
     SDL_hid_device_info* list = SDL_hid_enumerate(vendor, product);
     const char* only = nullptr;
@@ -822,10 +830,13 @@ struct State {
     std::atomic<DWORD> delivering_thread{0};  // written by the delivering thread, read unlocked by UnregisterCallback
 };
 
+std::once_flag g_state_once;
+State* g_state = nullptr;
+
 // Never destroyed: the poll thread may still run while the process exits.
 State& g() {
-    static State* s = new State;
-    return *s;
+    std::call_once(g_state_once, [] { g_state = new State; });
+    return *g_state;
 }
 
 void queue_event(const Event& e) {
@@ -2533,9 +2544,12 @@ private:
     std::atomic<ULONG> refs_{1};
 };
 
+std::once_flag g_instance_once;
+GameInput* g_instance = nullptr;
+
 GameInput& instance() {
-    static GameInput* gi = new GameInput;
-    return *gi;
+    std::call_once(g_instance_once, [] { g_instance = new GameInput; });
+    return *g_instance;
 }
 
 // HRESULT GameInputCreate(IGameInput** gameInput). One instance per process; each call adds a reference.

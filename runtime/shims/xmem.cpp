@@ -29,6 +29,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -41,6 +42,9 @@ namespace {
 constexpr size_t kAlign = 64;
 constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
 
+constinit std::set<std::pair<std::string, uint64_t>>* g_seen_attributes = nullptr;
+constinit std::set<std::pair<uint32_t, uint64_t>>* g_seen_transfers = nullptr;
+
 std::string caller_field(const void* caller) {
     return ",\"caller\":" + rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
 }
@@ -52,10 +56,10 @@ std::string caller_field(const void* caller) {
 void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
-    static std::set<std::pair<std::string, uint64_t>> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert({api, attributes}).second) return;
+        if (!g_seen_attributes) g_seen_attributes = new std::remove_pointer_t<decltype(g_seen_attributes)>;
+        if (!g_seen_attributes->insert({api, attributes}).second) return;
     }
     std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
@@ -660,11 +664,11 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
     }
     if (rt::startup_trace::enabled()) {
         static std::mutex mutex;
-        static std::set<std::pair<uint32_t, uint64_t>> seen;
         bool first = false;
         {
             const std::lock_guard lock(mutex);
-            first = seen.insert({type, static_cast<uint64_t>(size)}).second;
+            if (!g_seen_transfers) g_seen_transfers = new std::remove_pointer_t<decltype(g_seen_transfers)>;
+            first = g_seen_transfers->insert({type, static_cast<uint64_t>(size)}).second;
         }
         if (first) {
             rt::startup_trace::event(
