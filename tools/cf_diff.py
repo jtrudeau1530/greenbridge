@@ -630,10 +630,12 @@ def main(argv=None):
     structured = not a.dispatch_loop
     if a.program is not None:
         rc = 0
+        matched = 0
         for wave in waves:
             body = program_for(a.seed, a.program, wave, a.depth)
             status, detail = run_case(f"ps_cf_{a.program:04d}_w{wave}", body, wave, structured)
             print(f"program {a.program} wave{wave}: {status} {detail}")
+            matched += status == "match"
             if status == "mismatch":
                 rc = 1
                 if a.minimize:
@@ -641,6 +643,9 @@ def main(argv=None):
                     print("reduced:", run_case("ps_cf_min", body, wave, structured)[1])
             if a.show or a.minimize:
                 print(listing_text(build(body, wave), f"ps_cf_{a.program:04d}_w{wave}"))
+        if not rc and not matched:   # same order as the suite: a mismatch (1) outranks "nothing was compared" (2)
+            print("no program ran: every one was skipped")
+            return 2
         return rc
     counts, failures = run_suite(a.programs, a.seed, waves, structured, a.depth)
     skips = sum(counts["skip"].values())
