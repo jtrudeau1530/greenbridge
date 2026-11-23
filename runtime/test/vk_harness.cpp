@@ -795,6 +795,11 @@ int main(int argc, char** argv) {
             f.write(reinterpret_cast<const char*>(&n64), 8);
             f.write(data.data(), std::streamsize(n));
         }
+        f.close();
+        if (!f) {
+            std::fprintf(stderr, "failed to write pipeline binaries to %s\n", bin_out);
+            return 1;
+        }
         std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
     }
     VkPipeline cpipe = VK_NULL_HANDLE;
