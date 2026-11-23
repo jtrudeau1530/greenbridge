@@ -14,6 +14,7 @@
 #include "xbox_present_readback_size.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../shims/d3d12_trace.h"
 #include "../shims/xbox_present.h"
 
 #include <algorithm>
@@ -24,6 +25,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <array>
+#include <filesystem>
+#include <fstream>
+#include <io.h>
+#include <iterator>
+#include <string>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -33,6 +39,38 @@
 namespace {
 
 using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: 8-byte handle in RAX
+
+// Sends stderr (where the D3D12 trace goes) to a file while it lives, with the trace on.
+struct TraceCapture {
+    std::filesystem::path path;
+    int saved = -1;
+    explicit TraceCapture(const std::filesystem::path& file) : path(file) {
+        std::fflush(stderr);
+        std::FILE* out = std::fopen(path.string().c_str(), "wb");
+        saved = _dup(2);
+        if (out && saved >= 0) _dup2(_fileno(out), 2);
+        if (out) std::fclose(out);
+        rt::d3d12_trace::set_enabled(true);
+    }
+    std::string finish() {
+        rt::d3d12_trace::set_enabled(false);
+        std::fflush(stderr);
+        if (saved >= 0) {
+            _dup2(saved, 2);
+            _close(saved);
+            saved = -1;
+        }
+        std::ifstream in(path, std::ios::binary);
+        return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    }
+    ~TraceCapture() { finish(); }
+};
+
+int count_of(const std::string& text, const char* needle) {
+    int count = 0;
+    for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++count;
+    return count;
+}
 
 template<class T>
 struct Ref {
@@ -440,8 +478,27 @@ int main() {
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         std::printf("1 plane, RGBA8 solid: ok (swapchain format %d)\n", int(frame.format));
 
-        // 0 planes: a black frame, and no token is needed.
-        EXPECT(xbox.PresentX(0, nullptr, nullptr) == S_OK);
+        // 0 planes: a black frame, and no token is needed. With the D3D12 trace on, each PresentX writes one line
+        // with its outcome, a refused call included, and nothing when the trace is off.
+        {
+            std::error_code ignored;
+            const std::filesystem::path trace_file =
+                std::filesystem::temp_directory_path(ignored) / "leonida_xbox_present_trace.txt";
+            std::string trace;
+            HRESULT blank = E_FAIL, refused = S_OK;
+            {
+                TraceCapture capture(trace_file);
+                blank = xbox.PresentX(0, nullptr, nullptr);
+                refused = xbox.PresentX(3, &plane, nullptr);  // more than two planes: refused before anything is shown
+                trace = capture.finish();
+            }
+            std::filesystem::remove(trace_file, ignored);
+            EXPECT(blank == S_OK);
+            EXPECT(refused == E_INVALIDARG);
+            EXPECT(count_of(trace, " XboxPresentation::PresentX ok\n") == 1);
+            EXPECT(count_of(trace, " XboxPresentation::PresentX failed\n") == 1);
+            EXPECT(count_of(trace, "[d3d12-trace] #") == 2);
+        }
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {0, 0, 0}, 0));
         // (The blank frame is a frame in flight like any other: with latency 1 the next wait needs it shown first.)
