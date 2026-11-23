@@ -6621,7 +6621,9 @@ public:
             }();
             if (!placeholder) return hr;
             static std::atomic<int> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+            const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (nth % 1000 == 0) std::fprintf(stderr, "[rt] d3d12: compute pipeline placeholders so far: %d\n", nth);
+            if (nth <= 8)
                 std::fprintf(stderr, "[rt] d3d12: compute pipeline (%zu bytes) failed with 0x%08lx; placeholder handed out\n",
                              static_cast<std::size_t>(desc->CS.BytecodeLength), static_cast<unsigned long>(hr));
             auto* empty = new PipelineState(state_);
@@ -6734,15 +6736,34 @@ public:
         if (!out) return d3d12_trace::result(method, E_POINTER);
         *out = nullptr;
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        // LEONIDA_PLACEHOLDER_PSO=1 (a boot diagnostic, as in CreateComputePipelineState): a stream the layer refuses
+        // (the retail title's shaderless template streams: null root signature, no shader stages) gets a pipeline
+        // object with no Vulkan pipeline, so the caller's init goes on.
+        const auto placeholder = [&](HRESULT failed) {
+            static const bool enabled = [] {
+                const char* v = std::getenv("LEONIDA_PLACEHOLDER_PSO");
+                return v && *v == '1';
+            }();
+            if (!enabled) return d3d12_trace::result(method, failed);
+            static std::atomic<int> logged{0};
+            const int nth = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (nth % 1000 == 0) std::fprintf(stderr, "[rt] d3d12: pipeline stream placeholders so far: %d\n", nth);
+            if (nth <= 8)
+                std::fprintf(stderr, "[rt] d3d12: pipeline stream (%zu bytes) failed with 0x%08lx; placeholder handed out\n",
+                             static_cast<std::size_t>(desc->SizeInBytes), static_cast<unsigned long>(failed));
+            auto* empty = new PipelineState(state_);
+            empty->attach_device(identity());
+            return d3d12_trace::result(method, hand_out(empty, riid, out));
+        };
         PipelineStream stream;
-        if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return placeholder(hr);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
         if (FAILED(hr)) {
             pipeline->Release();
-            return d3d12_trace::result(method, hr);
+            return placeholder(hr);
         }
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
