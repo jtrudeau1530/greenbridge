@@ -112,10 +112,17 @@ def xml_complete(root: str, data: bytes) -> bool:
     return bool(closes or self_closed)
 
 
+def _self_closing_root(root: str, data: bytes) -> bool:
+    text = data[3:] if data.startswith(BOM) else data
+    text = XML_NON_TAG.sub(b"", text).strip()
+    name = re.escape(root.encode("ascii", "replace"))
+    return bool(re.fullmatch(rb"<" + name + rb"(?=[\s/])(?:\"[^\"]*\"|'[^']*'|[^'\">])*/>", text))
+
+
 def standalone_xml(data: bytes) -> bool:
     """A complete document in one stream, with or without a declaration."""
     root = xml_root(data)
-    return bool(root) and tail_root(data) == root and xml_complete(root, data)
+    return bool(root) and xml_complete(root, data) and (tail_root(data) == root or _self_closing_root(root, data))
 
 
 def stream_kind(data: bytes, row: dict) -> str:
@@ -258,20 +265,25 @@ def build_rows(rows: list, source) -> list:
         if kind in ("rbf0", "psin", "text", "binary"):
             group = [i]
             chunks = [data] if kind == "text" and b"<" in data else None
+            start_root = xml_root(data) if chunks is not None else ""
             j = i + 1
-            while j < n and rows[j - 1]["size"] == 65536:
-                nxt = source.read(rows[j])
-                if standalone_xml(nxt):
-                    break
-                nk = stream_kind(nxt, rows[j])
-                if nk in ("decl", "bink2", "rbf0", "psin", "other"):
-                    break
-                if chunks is not None:
-                    chunks.append(nxt)
-                group.append(j)
-                j += 1
+            if not (chunks is not None and standalone_xml(data)):
+                while j < n and rows[j - 1]["size"] == 65536:
+                    nxt = source.read(rows[j])
+                    if standalone_xml(nxt):
+                        break
+                    nk = stream_kind(nxt, rows[j])
+                    if nk in ("decl", "bink2", "rbf0", "psin", "other") or (chunks is not None and nk == "binary"):
+                        break
+                    if chunks is not None:
+                        chunks.append(nxt)
+                    group.append(j)
+                    j += 1
+                    if chunks is not None and start_root and tail_root(nxt) == start_root and xml_complete(start_root, b"".join(chunks)):
+                        break
             if chunks is not None:
-                root = tail_root(b"".join(chunks))
+                blob = b"".join(chunks)
+                root = tail_root(blob) or (xml_root(blob) if standalone_xml(blob) else "")
                 out.append(row_for("xml", rows, group, root=root, header=False, complete=bool(root)))
             else:
                 out.append(row_for(kind, rows, group))
