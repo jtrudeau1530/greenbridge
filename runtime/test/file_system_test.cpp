@@ -580,7 +580,12 @@ void run_checks(const std::filesystem::path& root) {
                 check(std::filesystem::exists(overlay_file) == (has_overlay && readonly),
                       "a refused delete keeps its overlay and never copies the package up");
                 if (readonly) {
-                    check(attributes_w(logical.c_str()) == visible_attributes,
+                    // The host's answer for a real file given the same attributes, which survived its refused
+                    // delete: Windows reads back exactly what was set, while Wine 9 adds ARCHIVE and keeps neither
+                    // HIDDEN nor SYSTEM without its xattr support (0x21 for every read-only case here).
+                    const DWORD native_attributes = ::GetFileAttributesW(native_file.c_str());
+                    check(native_attributes != INVALID_FILE_ATTRIBUTES &&
+                              attributes_w(logical.c_str()) == native_attributes,
                           "a refused delete retains the visible attributes");
                     const HANDLE retained = create_w(logical.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                                      OPEN_EXISTING, 0, nullptr);
