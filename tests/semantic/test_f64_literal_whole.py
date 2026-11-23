@@ -98,6 +98,13 @@ class WholeLiteralTests(unittest.TestCase):
                 self.assertEqual(source_words(op, f"0x{ONE_HALF_UP:016x}"), ONE_HALF_WORDS)
         self.assertEqual(frexp_words(f"0x{ONE_HALF_UP:016x}"), ONE_HALF_WORDS)
 
+    def test_a_literal_wider_than_32_bits_translates(self):
+        # 0x100000000 used to be refused as `Unsupported: v_ceil_f64 literal`; it is the double
+        # 2^32, its two words 0x00000000 and 0x00000001 (tests/semantic/test_f64_round.py kept the refusal).
+        for op in ("v_ceil_f64", "v_floor_f64", "v_trunc_f64", "v_rndne_f64"):
+            with self.subTest(op=op):
+                self.assertEqual(source_words(op, "0x100000000"), (0, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
