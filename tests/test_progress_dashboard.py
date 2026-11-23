@@ -3,7 +3,7 @@
     python -I tests/test_progress_dashboard.py
 
 Every input is written here by hand (Markdown tables, JUnit XML, a CTest log, a fake work folder whose shader names
-are sentinels). No game files, no GPU, no network: the GitHub path is exercised through its parsers only.
+are sentinels). No game files, no GPU, no network: the GitHub path is fed synthetic gh output.
 """
 import json
 import os
@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -163,6 +164,26 @@ class Github(unittest.TestCase):
         self.assertEqual(pd.item_ids("Docs/Tests: SHADER-4 and SHADER-4 again, TEST-9"), ["SHADER-4", "TEST-9"])
         self.assertEqual(pd.item_ids("hash with SHA-256, write UTF-8, read OPTIONS2-1 and D3D12-3"), [])
         self.assertEqual(pd.item_ids(None), [])
+
+    def test_d3d_metric_counts_merged_pull_requests_not_only_table_rows(self):
+        body = ("| ID | Title | Owner | PR | Status |\n|---|---|---|---|---|\n"
+                "| D3D-1 | a | @a | #50 | PR open |\n| D3D-2 | b | @b | #51 | PR open |\n")
+        merged = [{"number": n, "title": f"D3D-{n}: x", "mergedAt": "2026-11-22T10:00:00Z", "author": {"login": "x"}}
+                  for n in (10, 11, 12)]
+        open_prs = [{"number": 50, "title": "D3D-1: a", "isDraft": False, "author": {"login": "x"}},
+                    {"number": 51, "title": "D3D-2: b", "isDraft": False, "author": {"login": "x"}}]
+
+        def fake_gh(args, timeout=60):
+            if args[:2] == ["pr", "list"]:
+                return merged if "merged" in args else open_prs
+            if args[:2] == ["issue", "view"]:
+                return {"body": body, "updatedAt": "2026-11-22T00:00:00Z"}
+            return []
+        col = pd.Collector()
+        with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
+            pd.collect_github(col, "o/r", "me")
+        m = next(m for m in col.metrics if m["id"] == "d3d12.merged")
+        self.assertEqual((m["numerator"], m["denominator"]), (3, 5))
 
     def test_merged_pull_requests_are_implemented(self):
         merged = [{"number": 10, "title": "D3D-1: a", "mergedAt": "2026-11-22T10:00:00Z", "author": {"login": "x"}},
