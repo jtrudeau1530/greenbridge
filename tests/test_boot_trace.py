@@ -267,6 +267,21 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["sequence_break_count"], 0)
         self.assertEqual(trace["sequence_breaks"], [])
 
+    def test_repeated_method_failures_are_counted_beyond_the_sample_limit(self):
+        self.write_lines(self.d3d12, [
+            "[d3d12-trace] #1 CreatePipelineState ok",
+            "[d3d12-trace] #2 CreatePipelineState failed",
+            "[d3d12-trace] #3 CreatePipelineState failed",
+            "[d3d12-trace] #4 ExecuteCommandLists partial",
+        ])
+        trace = bt.parse_d3d12(self.d3d12, limit=1)
+        self.assertEqual(trace["method_outcomes"], {
+            "CreatePipelineState": {"ok": 1, "failed": 2},
+            "ExecuteCommandLists": {"partial": 1},
+        })
+        self.assertEqual(len(trace["failed"]), 1)
+        self.assertIn("CreatePipelineState: failed 2", bt.format_text({"startup": None, "d3d12": trace}, 1))
+
     def test_sequence_breaks_count_boundaries_and_limit_examples(self):
         self.write_lines(self.d3d12, [
             "[d3d12-trace] #4 Foo called",
