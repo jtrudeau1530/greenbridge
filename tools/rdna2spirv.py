@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 from report_paths import path_key, same_report_path  # noqa: E402
-from shader_ir import HDR, parse_file  # noqa: E402
+from shader_ir import HDR, parse_file, parse_line  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
@@ -6587,7 +6587,11 @@ class Gen:
         args = [dict(a) for a in ins["args"]]
         if len(args) < 2:
             raise Unsupported("DPP operands")
-        if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
+        # A compare writes a lane mask, and which bit a masked-out or invalid-source lane gets is not measured, so only
+        # one that no lane can be masked out of (every row and bank enabled; bound_ctrl or DPP8 for the source).
+        cmp_mask = (base_op(ins["op"]).startswith("v_cmp_") and args[0].get("k") == "special" and
+                    args[0].get("t") in ("vcc", "vcc_lo") and row_mask == bank_mask == 0xF and (dpp8 is not None or bound))
+        if not cmp_mask and (args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1):
             raise Unsupported("DPP destination")
         if args[1].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
@@ -6765,7 +6769,7 @@ class Gen:
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
         args[1] = {"k": "ssa", "v": src0}
         previous = self.dpp_guard
-        self.dpp_guard = write
+        self.dpp_guard = None if cmp_mask else write
         try:
             return self._insn({**ins, "args": args})
         finally:
@@ -15875,6 +15879,61 @@ def fold_far_branches(insns):
     return out
 
 
+VOPC_F32 = "f lt eq le gt lg ge o u nge nlg ngt nle neq nlt tru".split()
+
+
+def vopc_dpp_gaps(insns, blob, start, end):
+    """The VOPC DPP16 compares (v_cmp_<cc>_f32_dpp vcc_lo, v<a>, v<b> + one control dword) that llvm-mc rejects
+    ('dpp variant of this instruction is not supported', also on gfx1030), read from the words between the anchored
+    instructions. Only f32 compares with no source modifier, DPP16 controls (quad_perm, row_shl/shr/ror, row_mirror,
+    row_half_mirror) and DPP8 (0xE9, fi 0xEA) are decoded; any other word stays data, so a path into it still falls through."""
+    covered = set()
+    for i in insns:
+        covered.update(range(i["pc"], i["pc"] + len(i["enc"]) // 2, 4))
+    out = []
+    for pc in range(start, min(end, len(blob)) - 4, 4):
+        if pc in covered:
+            continue
+        w0, w1 = struct.unpack_from("<2I", blob, pc)
+        if w0 & 0x1FF in (0xE9, 0xEA) and w0 >> 25 == 0x3E and (w0 >> 17) & 0xFF <= 15:
+            sel = ",".join(str((w1 >> (8 + 3 * k)) & 7) for k in range(8))
+            line = "\tv_cmp_%s_f32_dpp vcc_lo, v%d, v%d dpp8:[%s]%s ; encoding: [%s]" % (
+                VOPC_F32[(w0 >> 17) & 0xFF], w1 & 0xFF, (w0 >> 9) & 0xFF, sel, " fi:1" if w0 & 1 == 0 else "",
+                ",".join("0x%02x" % b for b in blob[pc:pc + 8]))
+            ins = parse_line(line)
+            ins["pc"] = pc
+            out.append(ins)
+            continue
+        if w0 & 0x1FF != 0xFA or w0 >> 25 != 0x3E or (w0 >> 17) & 0xFF > 15 or w1 & 0xF60000:
+            continue
+        ctrl = (w1 >> 8) & 0x1FF
+        if ctrl < 0x100:
+            ctl = "quad_perm:[%d,%d,%d,%d]" % tuple((ctrl >> (2 * k)) & 3 for k in range(4))
+        elif 0x101 <= ctrl <= 0x10F or 0x111 <= ctrl <= 0x11F or 0x121 <= ctrl <= 0x12F:
+            ctl = "row_%s:%d" % (("shl", "shr", "ror")[(ctrl >> 4) & 3], ctrl & 15)
+        elif ctrl in (0x140, 0x141):
+            ctl = "row_mirror" if ctrl == 0x140 else "row_half_mirror"
+        else:
+            continue
+        line = "\tv_cmp_%s_f32_dpp vcc_lo, v%d, v%d %s row_mask:0x%x bank_mask:0x%x%s ; encoding: [%s]" % (
+            VOPC_F32[(w0 >> 17) & 0xFF], w1 & 0xFF, (w0 >> 9) & 0xFF, ctl, w1 >> 28, (w1 >> 24) & 15,
+            " bound_ctrl:1" if w1 & 0x080000 else "", ",".join("0x%02x" % b for b in blob[pc:pc + 8]))
+        ins = parse_line(line)
+        ins["pc"] = pc
+        out.append(ins)
+    return out
+
+
+def fspx_prologue_len(blob, start):
+    """Bytes of the leading run of 12-byte groups (VOP3 opcode 0x180, bits 31..16 = 0xD580, plus a literal) that an
+    FSPX program starts with: 36 bytes for the three-group prologue fspx_unpack drops, 24 for the two-group one it
+    leaves in the listing. They are hardware no-ops (docs/fspx.md), not code."""
+    n = 0
+    while start + n + 12 <= len(blob) and int.from_bytes(blob[start + n:start + n + 4], "little") >> 16 == 0xD580:
+        n += 12
+    return n
+
+
 def reachable_code(insns, code_end=None):
     """Instructions reachable from the first one, following fall-through and branch targets. Fall-through stops
     after s_endpgm, s_branch and s_setpc_b64. Raises Unsupported if a branch target isn't an instruction start, or if
@@ -16648,12 +16707,24 @@ def translate(path):
                 ins["normalized"] = True
             ins["pc"] = at
             pos = at + len(enc)
+        found = vopc_dpp_gaps(insns, blob, info["code_start"], info.get("code_end") or len(blob))
+        second = {i["pc"] + 4 for i in found}    # llvm-mc decoded the control dword on its own: the compare owns it
+        insns = sorted([i for i in insns if i["pc"] not in second] + found, key=lambda i: i["pc"])
+        prologue_end = info["code_start"] + fspx_prologue_len(blob, info["code_start"])
+        if prologue_end > info["code_start"]:
+            insns = [i for i in insns if i["pc"] >= prologue_end]
+            # a prologue literal and the s_inst_prefetch after it can decode as one 8-byte instruction (a hash is data)
+            first = prologue_end + (4 if blob[prologue_end:prologue_end + 4] == b"\x03\x00\xa0\xbf" else 0)
+            if not insns or insns[0]["pc"] not in (prologue_end, first):
+                raise Unsupported("FSPX prologue: no instruction at its end")
         insns = fold_far_branches(insns)
         insns = reachable_code(insns, info.get("code_end"))
         if any(i.get("normalized") for i in insns):
             raise Unsupported("reachable instruction with normalized encoding")
     else:
         check_printed_encodings(path, info)
+    insns = [dict(i, op="s_endpgm", args=[]) if base_op(i["op"]) == "s_sethalt" and
+             next((x["v"] for x in i["args"] if x["k"] == "imm"), 0) & 1 else i for i in insns]   # a halted wave never runs on
     g = Gen(stage, hoist_reg_ptrs=True, cache_active=True)
     g.exec_static_true = not any(writes_exec(i) for i in insns)
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
