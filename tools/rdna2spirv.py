@@ -6149,6 +6149,48 @@ class Gen:
         self.emit(f"{r} = OpSelect %float {small} {z} {f}")
         return r
 
+    def _validate_div_valu(self, ins, op, mods, *, dst_width, src_width=None,
+                           allow_opsel=False, strict_omod=True, allow_null_dst=False):
+        """Validate encoding, arity, destination/source widths and modifiers for VOP3 IEEE-754 division ops."""
+        raw_op = ins["op"]
+        raw_args = self.cur_ins["args"]
+        if raw_op.endswith(("_e32", "_sdwa", "_dpp")):
+            raise Unsupported(op + " encoding")
+        if len(raw_args) != 4:
+            raise Unsupported(op + " operands")
+        dst = raw_args[0]
+        is_null_dst = allow_null_dst and dst.get("k") == "special" and dst.get("t") == "null"
+        if not is_null_dst and (dst.get("k") != "vgpr" or dst.get("n", 1) != dst_width):
+            raise Unsupported(op + " destination")
+        if dst.get("neg") or dst.get("abs") or dst.get("sext"):
+            raise Unsupported(op + " destination modifier")
+        for src in raw_args[1:]:
+            if src.get("sext"):
+                raise Unsupported(op + " operand modifier")
+            if src_width is not None and src.get("n", 1) != src_width:
+                raise Unsupported(op + " operand width")
+        seen_clamp = False
+        seen_omod = False
+        seen_opsel = False
+        for m in mods:
+            if m == "clamp":
+                if seen_clamp:
+                    raise Unsupported(op + " modifier")
+                seen_clamp = True
+            elif m in ("mul:2", "mul:4", "div:2"):
+                if strict_omod and seen_omod:
+                    raise Unsupported(op + " modifier")
+                seen_omod = True
+            elif allow_opsel and m.startswith("op_sel:"):
+                if seen_opsel or not (m.startswith("op_sel:[") and m.endswith("]")):
+                    raise Unsupported(op + " modifier")
+                bits = [p.strip() for p in m[8:-1].split(",")]
+                if not (1 <= len(bits) <= 4) or any(b not in ("0", "1") for b in bits):
+                    raise Unsupported(op + " modifier")
+                seen_opsel = True
+            else:
+                raise Unsupported(f"{op} modifier {m}")
+
     def dst_f64(self, d, value, mods, op):
         if d["k"] != "vgpr" or d.get("n") != 2:
             raise Unsupported(op + " destination")
@@ -9224,6 +9266,13 @@ class Gen:
             self.emit(f"{r} = OpExtInst %uint %glsl {s}Clamp {z} {lo} {hi}")
             self.dst(a[0], r)
         elif op in ("v_div_fixup_f16", "v_div_fixup_f64"):
+            self._validate_div_valu(
+                ins, op, mods,
+                dst_width=1 if op == "v_div_fixup_f16" else 2,
+                src_width=1 if op == "v_div_fixup_f16" else None,
+                allow_opsel=op == "v_div_fixup_f16",
+                strict_omod=False,
+            )
             # Final IEEE-754 special-case fixup for division (RDNA2 ISA VOP3, S0=quot, S1=denom, S2=num):
             # sign_out = sign(S1) ^ sign(S2); NaN(S2) -> quiet(S2); NaN(S1) -> quiet(S1);
             # (0/0 or inf/inf) -> -qNaN; (x/inf or 0/y) -> +-0; (x/0 or inf/y or NaN(S0)) -> +-inf;
@@ -9620,6 +9669,14 @@ class Gen:
             self.emit_fma(r, vals[0], vals[1], vals[2])
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in ("v_div_fmas_f32", "v_div_fmas_f64"):
+            self._validate_div_valu(
+                ins, op, mods,
+                dst_width=1 if op == "v_div_fmas_f32" else 2,
+                src_width=1 if op == "v_div_fmas_f32" else None,
+                allow_opsel=False,
+                strict_omod=True,
+                allow_null_dst=op == "v_div_fmas_f32",
+            )
             # Scaled FMA for IEEE-754 division (RDNA2 ISA VOP3, measured natively on gfx1036 wave32/wave64):
             #   VCC == 0: fma(S0, S1, S2)
             #   VCC == 1: (exp(S2) > bias ? 2^S : 2^-S) * fma_exact(S0, S1, S2)
@@ -10960,11 +11017,9 @@ class Gen:
             #       7. NaN(S0) -> sign_out | 0x7F800000 (+-inf)
             #       8. otherwise -> copysign(S0, sign_out)
             #   - Output modifiers: mul:2/mul:4/div:2 then clamp (DX10_CLAMP=1 maps NaN to +0.0 before [0, 1]).
-            if len(a) != 4:
-                raise Unsupported(op + " operands")
-            bad = [m for m in mods if m not in ("clamp", "mul:2", "mul:4", "div:2")]
-            if bad:
-                raise Unsupported(f"{op} modifier {bad[0]}")
+            self._validate_div_valu(
+                ins, op, mods, dst_width=1, src_width=1, allow_opsel=False, strict_omod=True, allow_null_dst=True,
+            )
 
             def _raw_f32_bits(arg):
                 u_val = self.src_u({k: v for k, v in arg.items() if k not in ("abs", "neg")})
