@@ -22,9 +22,22 @@ SYNC_MARKER = re.compile(r"`([0-9a-f]{7,40})`")
 
 
 def sync_marker_matches(index_commit, quickstart_text):
-    """Whether a quickstart's opening note has exactly the commit recorded in the index."""
-    opening_note = "\n".join(quickstart_text.splitlines()[:10])
-    markers = SYNC_MARKER.findall(opening_note)
+    """Whether the opening note has exactly the commit recorded in the index."""
+    lines = quickstart_text.splitlines()
+    heading = next((i for i, line in enumerate(lines) if line.startswith("# ")), None)
+    start = heading + 1 if heading is not None else 0
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    if start == len(lines):
+        return False
+
+    opening_note = []
+    for line in lines[start:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            break
+        opening_note.append(line[1:].lstrip() if line.startswith(">") else line)
+
+    markers = SYNC_MARKER.findall("\n".join(opening_note))
     return len(markers) == 1 and markers[0] == index_commit
 
 
@@ -131,6 +144,15 @@ class IndexTest(unittest.TestCase):
     def test_synced_commit_mismatch_is_detected(self):
         page = "> This guide is synced with commit `01234567`.\n"
         self.assertFalse(sync_marker_matches("89abcdef", page))
+
+    def test_hash_outside_opening_note_does_not_count_as_sync_marker(self):
+        page = ("> [!NOTE]\n"
+                "> This guide has no sync marker.\n"
+                "\n"
+                "Example output: `01234567`.\n"
+                "\n"
+                "## First section\n")
+        self.assertFalse(sync_marker_matches("01234567", page))
 
 
 if __name__ == "__main__":
