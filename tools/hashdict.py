@@ -56,6 +56,10 @@ def harvest(data: bytes, out: set, minlen: int):
                 out.add("")
 
 
+def _raise_scan_error(error):
+    raise error
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve", nargs="?")
@@ -173,9 +177,13 @@ def main():
               f"(first: {missing[0]}). Re-run the carve to get their strings.", file=sys.stderr)
     for x in a.extra:
         if os.path.isdir(x):
-            for root, _, files in os.walk(x):
-                for fn in files:
-                    strings.add(os.path.splitext(fn)[0])
+            try:
+                for _, _, files in os.walk(x, onerror=_raise_scan_error):
+                    for fn in files:
+                        strings.add(os.path.splitext(fn)[0])
+            except OSError as e:
+                print(f"ERROR: cannot scan --extra directory {e.filename or x}: {e.strerror or e}", file=sys.stderr)
+                return 2
         elif os.path.isfile(x):
             with open(x, "rb") as f:
                 harvest(f.read(), strings, a.min)
