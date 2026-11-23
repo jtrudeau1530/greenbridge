@@ -6371,6 +6371,36 @@ public:
 
     // Heaps and placed resources (section 3.3). A heap reserves its size in the arena, so a buffer placed at a
     // 64 KiB-aligned offset is simply that offset into the arena, and its console VA is the heap's place plus it.
+    // Existing-memory heaps and lifetime trackers. CheckFeatureSupport reports EXISTING_HEAPS unsupported, so a call
+    // the host accepts stays E_NOTIMPL; the host refuses a null address, a file mapping that is not a handle and a
+    // null lifetime owner with E_INVALIDARG on WARP, NVIDIA and Intel (d3d12_existing_heap_test). Docs:
+    // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromaddress
+    HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress(const void* address, REFIID, void** out) override {
+        constexpr auto method = "ID3D12Device3::OpenExistingHeapFromAddress";
+        if (out) *out = nullptr;
+        if (!address || !out) return d3d12_trace::result(method, E_INVALIDARG);
+        log_once("OpenExistingHeapFromAddress (existing heaps are not supported)", 0);
+        return d3d12_trace::result(method, E_NOTIMPL);
+    }
+
+    HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(HANDLE file_mapping, REFIID, void** out) override {
+        constexpr auto method = "ID3D12Device3::OpenExistingHeapFromFileMapping";
+        if (out) *out = nullptr;
+        DWORD flags = 0;
+        if (!file_mapping || !out || !GetHandleInformation(file_mapping, &flags))
+            return d3d12_trace::result(method, E_INVALIDARG);
+        log_once("OpenExistingHeapFromFileMapping (existing heaps are not supported)", 0);
+        return d3d12_trace::result(method, E_NOTIMPL);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateLifetimeTracker(ID3D12LifetimeOwner* owner, REFIID, void** out) override {
+        constexpr auto method = "ID3D12Device5::CreateLifetimeTracker";
+        if (out) *out = nullptr;
+        if (!owner || !out) return d3d12_trace::result(method, E_INVALIDARG);
+        log_once("CreateLifetimeTracker (not supported)", 0);
+        return d3d12_trace::result(method, E_NOTIMPL);
+    }
+
     HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
