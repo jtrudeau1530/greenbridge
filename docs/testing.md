@@ -278,6 +278,29 @@ against Microsoft's answers recorded in the test (`d3d12_subresource_copy` and `
 A few still compare with the host (`root_sig`, `device_proxy`, and some of `d3d12_vulkan_device`'s cases), so some
 of those fail for that reason.
 
+### Run a Windows CI artifact under Wine
+
+The `Runtime` workflow uploads `runtime-windows` for seven days. It contains the Windows executables, DLLs,
+synthetic test shaders, CTest inventory and the path of the Windows checkout. From a clean checkout of the commit
+used by the Windows job, set `run_id` to the Actions run ID and download the artifact to `runtime/build`:
+
+```sh
+gh run download "$run_id" --repo ItsNotRexed/Leonida --name runtime-windows --dir runtime/build
+
+WINE=wine WINEPREFIX="$(mktemp -d)" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all \
+  bash scripts/run_wine_session.sh python3 -I scripts/run_wine_tests.py \
+  --tests runtime/build/ctest.json \
+  --windows-root "$(cat runtime/build/windows-root.txt)" \
+  --require loader --require pe_loader --require loader_tls --require unimplemented_policy \
+  --require run_tiny_game --require run_tiny_game_exit_code
+```
+
+The session script initializes a dedicated prefix and stops its Wine processes at exit. On a headless host,
+put `xvfb-run -a` before `bash` so prefix initialization and the tests share one virtual display. The test runner
+maps the recorded Windows drive to the Linux checkout for shaders referenced by absolute Windows paths. It prints
+every verdict and returns a failure status if any required test fails, skips or is missing. Check the printed
+verdicts for failures outside the required set.
+
 ## GPUs with 32-wide subgroups (NVIDIA, Intel, Apple)
 
 The game's shaders are mostly wave64. A GPU that can't run 64-wide compute subgroups skips the wave64 tests
