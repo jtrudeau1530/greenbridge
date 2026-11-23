@@ -632,6 +632,101 @@ void test_placeholders(const PhysicalApi& api) {
     check(reserved_only(base), "the rest of the placeholder is still reserved");
 }
 
+// Carving or committing a sub-range of an existing window keeps the untouched prefix and suffix mappable, and
+// reusing an address released outside the shim (UnmapViewOfFile) drops stale mapped-page entries.
+void test_window_carve_and_reuse(const PhysicalApi& api) {
+    // 1. Carving a sub-window out of an existing window preserves its untouched prefix and suffix.
+    auto* const carved = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(carved != nullptr, "reserve a 4-page window to carve a sub-window from");
+    if (carved) {
+        void* const mid = api.virtual_alloc(carved + kPage64k, kPage64k,
+                                            MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x21, PAGE_READONLY);
+        check(mid == carved + kPage64k, "carve a middle sub-window with MEM_REPLACE_PLACEHOLDER");
+        uint64_t pages[3]{};
+        uint64_t count = 3;
+        check(api.allocate(0x280, &count, pages) == TRUE && count == 3, "allocate three pages for carved-window test");
+        check(api.map(carved, 1, &pages[0]) == carved, "prefix before a carved sub-window stays mappable");
+        check(api.map(carved + kPage64k, 1, &pages[1]) == carved + kPage64k, "carved sub-window is mappable");
+        check(api.map(carved + 2 * kPage64k, 1, &pages[2]) == carved + 2 * kPage64k,
+              "suffix after a carved sub-window stays mappable");
+        if (count == 3) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            check(VirtualQuery(carved, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE,
+                  "prefix keeps the original window protection");
+            check(VirtualQuery(carved + kPage64k, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY,
+                  "carved sub-window uses its replacement protection");
+            check(VirtualQuery(carved + 2 * kPage64k, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE,
+                  "suffix keeps the original window protection");
+        }
+        api.map(carved, 1, nullptr);
+        api.map(carved + kPage64k, 1, nullptr);
+        api.map(carved + 2 * kPage64k, 1, nullptr);
+        api.free_pages(3, pages);
+    }
+
+    // 2. Committing a sub-range of a window removes that sub-range from g_windows while keeping its neighbours.
+    auto* const split = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(split != nullptr, "reserve a 4-page window to commit a sub-range from");
+    if (split) {
+        auto* const mid = static_cast<uint8_t*>(api.virtual_alloc(
+            split + kPage64k, kPage64k, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x21,
+            PAGE_READWRITE));
+        check(mid == split + kPage64k, "commit a middle sub-range of a physical-page window");
+        if (mid) mid[0] = 0x5b;
+        uint64_t pages[2]{};
+        uint64_t count = 2;
+        check(api.allocate(0x280, &count, pages) == TRUE && count == 2, "allocate two pages for split-window test");
+        // Spanning into the committed sub-range must fail upfront without mapping page 0.
+        SetLastError(ERROR_SUCCESS);
+        check(api.map(split, 2, pages) == nullptr && GetLastError() == ERROR_INVALID_ADDRESS && reserved_only(split),
+              "mapping across a committed sub-range fails upfront and leaves prefix unmapped");
+        check(api.map(split, 1, &pages[0]) == split, "prefix before a committed sub-range stays mappable");
+        check(api.map(split + 2 * kPage64k, 1, &pages[1]) == split + 2 * kPage64k,
+              "suffix after a committed sub-range stays mappable");
+        check(mid && mid[0] == 0x5b, "committed sub-range keeps its contents");
+        api.map(split, 1, nullptr);
+        api.map(split + 2 * kPage64k, 1, nullptr);
+        api.free_pages(2, pages);
+    }
+
+    // 3. Reusing a window address released externally via UnmapViewOfFile clears stale mapped-page tracking.
+    auto* const reused = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(reused != nullptr, "reserve a window to test external unmap and address reuse");
+    if (reused) {
+        uint64_t pages[2]{};
+        uint64_t count = 2;
+        check(api.allocate(0x280, &count, pages) == TRUE && count == 2, "allocate two pages for reuse test");
+        check(api.map(reused, 1, &pages[0]) == reused, "map first page before external UnmapViewOfFile");
+        fill_page(reused, 0xdead0000u);
+        check(UnmapViewOfFile(reused) != FALSE, "host UnmapViewOfFile releases the view outside the shim");
+        void* const again =
+            api.virtual_alloc(reused, kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE);
+        check(again == reused, "re-reserve a physical-page window at the externally freed address");
+        if (again) {
+            const bool remapped = api.map(again, 1, &pages[1]) == again;
+            check(remapped, "XMemMapPhysicalPages succeeds at a reused address without failing on stale g_mapped");
+            if (remapped) {
+                check(read_u32(again, 0) == 0, "fresh page mapped at reused address reads as zero");
+                // Also verify a plain MEM_RESERVE_PLACEHOLDER at an externally freed address clears ghost windows.
+                check(UnmapViewOfFile(again) != FALSE, "host UnmapViewOfFile releases the second view outside the shim");
+                void* const plain =
+                    api.virtual_alloc(again, kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS);
+                check(plain == again, "re-reserve a plain placeholder at the externally freed address");
+                if (plain) {
+                    SetLastError(ERROR_SUCCESS);
+                    check(api.map(plain, 1, &pages[0]) == nullptr && GetLastError() == ERROR_INVALID_ADDRESS,
+                          "plain placeholder at a reused window address does not inherit the old window entry");
+                    VirtualFree(plain, 0, MEM_RELEASE);
+                }
+            }
+        }
+        api.free_pages(2, pages);
+    }
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -973,6 +1068,7 @@ int main() {
         test_physical_pages(physical);
         test_mapping_protection(physical);
         test_placeholders(physical);
+        test_window_carve_and_reuse(physical);
     }
 
     print_result();
