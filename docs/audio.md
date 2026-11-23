@@ -403,3 +403,14 @@ the audio itself is not. See the ground rules in [design.md](design.md#ground-ru
 
 The tools export the streams and channels as stored. They do not reconstruct runtime mixing, looping, ducking or
 music-segment selection; that belongs to the game's audio system.
+
+## Streamed-music cue sheets
+
+Run `python -I tools/awc_opus.py <bank-or-directory> <output> --cue-sheet` to write
+`cue_regions.json` next to the Ogg files for each bank with verified regions. Each row names
+a sibling audio file and the hexadecimal cue-name hash. The integer interval
+`[start_sample, end_sample)` counts 48 kHz frames per channel from the start of playback.
+Overlapping regions keep their original endpoints. The exporter pairs consecutive same-name
+start/end records within one ordered marker tag. It requires a unique stream entry and
+descriptor channel with the same ID, exported packets, and endpoints within the declared
+and exported audio. A rerun with the option refreshes an existing sheet even if it becomes empty.
