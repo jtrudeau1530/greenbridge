@@ -5463,8 +5463,8 @@ public:
     HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
                                                  D3D12_COMMAND_LIST_FLAGS, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device4::CreateCommandList1";
-        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE, then a null
-        // output is E_UNEXPECTED.
+        // The host runtime's order ("command list1:" cases): one node and a type up to VIDEO_ENCODE (non-zero
+        // D3D12_COMMAND_LIST_FLAGS are ignored by the host runtime), then a null output is E_UNEXPECTED.
         if (out) *out = nullptr;
         if ((node_mask & ~1u) || UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE))
             return d3d12_trace::result(method, E_INVALIDARG);
