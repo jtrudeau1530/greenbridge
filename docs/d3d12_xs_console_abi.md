@@ -171,6 +171,13 @@ Layout shift on the list tail (sibling layer): from `CopyTextureRegionX` on, met
 later in the newer layout — newer→older pairs 85→83, 86→84, 87→85, 90→88, 91→89, 92→90, 95→93,
 96→94.
 
+The shim hands out console-shaped command lists by default: `GetCommandList`-shaped queries build
+the proxy with the console vtable above. `LEONIDA_D3D12_LISTS=pc` makes it hand out PC-shaped lists
+instead, for guests compiled against the PC headers (the `tiny_frame` test fixture calls through PC
+vtable indices; without the variable its `ClearRenderTargetView` at PC slot 48 lands on the
+console's `IASetVertexBuffers` and `Close` never runs). The device, queue, heap and fence stay
+console-shaped either way.
+
 ### 5.4 DMA command list
 
 | Slot | Method | Evidence |
