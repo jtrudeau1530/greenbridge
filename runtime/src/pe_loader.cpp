@@ -962,14 +962,21 @@ void remove_from_existing_threads(Module& m) {
     }
 }
 
-// DLL_THREAD_ATTACH: a record under this thread's id is from a thread that ended without a detach event.
+// DLL_THREAD_ATTACH: a record under this thread's id is from a thread that ended without a detach event, unless its
+// block is the one in this thread's slot. That record is this thread's own and stays: Windows builds a new thread's
+// TLS array before it calls the DLLs, so a load() in between gave the thread its copy as it does for any running
+// thread (install_on_existing_threads), and install_thread_block then leaves it alone. Freed here, the copy would
+// stay in the slot, be taken for the helper's block by the install that follows and be put back at
+// DLL_THREAD_DETACH for Windows to free. A record of an ended thread cannot pass for it: its block is still
+// allocated, so nothing Windows or the loader put into the new thread's array has its address.
 void forget_ended_thread_id() {
     const DWORD self = GetCurrentThreadId();
+    void** const slots = module_tls_slots();
     ExistingThreadsLock lock;
     ExistingThreads& state = existing_threads();
     state.ended.erase(std::remove(state.ended.begin(), state.ended.end(), self), state.ended.end());
     for (auto it = state.blocks.begin(); it != state.blocks.end();) {
-        if (it->thread != self) {
+        if (it->thread != self || (slots && it->index < kMaxModuleTlsSlots && slots[it->index] == it->block)) {
             ++it;
             continue;
         }

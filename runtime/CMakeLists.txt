@@ -822,6 +822,20 @@ if(BUILD_TESTING)
       ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
     )
 
+    # Loaded by loader_tls_test itself, ahead of gta6rt_tls_host.dll: its DllMain reads one thread's TLS slot on either
+    # side of the loader's thread events and can hold that thread in its DLL_THREAD_ATTACH. Built without the CRT.
+    add_library(tls_attach_hold SHARED test/fixtures/tls_attach_hold.cpp)
+    target_compile_definitions(tls_attach_hold PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tls_attach_hold PRIVATE /W4 /permissive- /utf-8 /GS-)
+    target_link_options(tls_attach_hold PRIVATE /NODEFAULTLIB /ENTRY:tls_attach_hold_main)
+    target_link_libraries(tls_attach_hold PRIVATE kernel32)
+    set_target_properties(tls_attach_hold PROPERTIES
+      OUTPUT_NAME tls_attach_hold
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The fixtures import only host
     # DLLs, so no shim tables are linked.
     add_executable(loader_tls_test
@@ -834,7 +848,7 @@ if(BUILD_TESTING)
     )
     target_compile_definitions(loader_tls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(loader_tls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only gta6rt_tls_host)
+    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only tls_attach_hold gta6rt_tls_host)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )

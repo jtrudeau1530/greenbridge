@@ -503,6 +503,176 @@ void test_terminated_thread(const fs::path& dll) {
     CloseHandle(parked.never);
 }
 
+// A new thread is not reached by its DLL_THREAD_ATTACH events at once: Windows builds its TLS array first and then
+// calls every DLL in load order, the loader's helper DLL among the last. A load() in between finds a running thread
+// with a helper block and gives it a copy, as it does for any thread that was already there. The thread's own event
+// then has to leave that copy alone: it is the block in its slot, and what it replaced is the block Windows frees
+// when the thread ends.
+//
+// tls_attach_hold.dll (test/fixtures) makes the moment reachable. main() loads it before anything loads the helper,
+// so its DllMain runs before the helper's when a thread starts and after it when a thread ends; it holds the thread in
+// the first and reports the slot from both. The image is a copy of the fixture without its import directory: load()
+// then asks nothing of the Windows loader, whose lock the held thread owns, and returns while the thread is held.
+// Only the copy's tiny_tls_get runs, which calls nothing.
+void test_thread_mid_attach(const fs::path& dll, const fs::path& temp, HMODULE hold) {
+    std::printf("\n-- a thread load() reaches while it is still attaching --\n");
+    // Measured on Windows only. The case rests on Windows' DllMain order and on load() asking nothing of the loader
+    // lock the held thread owns; nobody has run it under Wine yet, so it is skipped there and says so.
+    if (GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version")) {
+        std::printf("SKIP under Wine: the held-thread case has not been measured there\n");
+        return;
+    }
+    constexpr DWORD kWaitMs = 10000;
+    using SlotFn = void*(__cdecl*)();
+    const auto proc = [&](const char* name) {
+        return hold ? reinterpret_cast<void*>(GetProcAddress(hold, name)) : nullptr;
+    };
+    const auto watch =
+        reinterpret_cast<void(__cdecl*)(DWORD, DWORD, HANDLE, HANDLE, DWORD)>(proc("tls_attach_hold_watch"));
+    const auto at_attach = reinterpret_cast<SlotFn>(proc("tls_attach_hold_at_attach"));
+    const auto after_hold = reinterpret_cast<SlotFn>(proc("tls_attach_hold_after_hold"));
+    const auto at_detach = reinterpret_cast<SlotFn>(proc("tls_attach_hold_at_detach"));
+    check(watch && at_attach && after_hold && at_detach, "tls_attach_hold.dll is loaded next to the fixture");
+    if (!watch || !at_attach || !after_hold || !at_detach) return;
+
+    const fs::path image = copy_without_directory(dll, temp / "tiny_tls_no_imports.dll", IMAGE_DIRECTORY_ENTRY_IMPORT);
+    uint32_t index = rt::kNoTlsIndex;
+    {
+        // The slot the next Loader gets, and everything load() resolves on first use resolved before a thread is held.
+        rt::Loader warm(temp);
+        index = warm.load(image).tls_index;
+    }
+
+    struct Seen {
+        uint32_t index = rt::kNoTlsIndex;
+        int(__cdecl* get)() = nullptr;
+        void* block = nullptr;
+        int value = -1;
+        static DWORD WINAPI run(void* p) {
+            auto* seen = static_cast<Seen*>(p);
+            seen->block = module_tls_slots()[seen->index];
+            seen->value = seen->get();
+            return 0;
+        }
+    };
+    // mid_attach false is the control: the same thread and the same checks, started after load() has returned.
+    for (const bool mid_attach : {false, true}) {
+        Seen seen;
+        seen.index = index;
+        HANDLE reached = mid_attach ? CreateEventW(nullptr, TRUE, FALSE, nullptr) : nullptr;
+        HANDLE release = mid_attach ? CreateEventW(nullptr, TRUE, FALSE, nullptr) : nullptr;
+        HANDLE thread = nullptr;
+        const auto start = [&] {
+            thread = CreateThread(nullptr, 0, &Seen::run, &seen, CREATE_SUSPENDED, nullptr);
+            if (!thread) throw std::runtime_error("CreateThread failed");
+            watch(GetThreadId(thread), index, reached, release, kWaitMs);
+            ResumeThread(thread);
+        };
+        if (mid_attach) {
+            start();
+            check(WaitForSingleObject(reached, kWaitMs) == WAIT_OBJECT_0,
+                  "a new thread is held in its DLL_THREAD_ATTACH, before the loader's thread event");
+        }
+        {
+            rt::Loader loader(temp);
+            rt::Module& m = loader.load(image);
+            check(m.tls_index == index, "the image gets the TLS index the thread is watched at");
+            seen.get = find_export<int(__cdecl*)()>(m, "tiny_tls_get");
+            if (mid_attach) SetEvent(release);
+            else start();
+            if (WaitForSingleObject(thread, kWaitMs) != WAIT_OBJECT_0) {
+                // It still uses this frame and the Loader, so nothing here can be unwound.
+                check(false, "the watched thread ends");
+                std::printf("\nloader_tls_test: FAILED (stopped: a thread did not end in %lu ms)\n", kWaitMs);
+                TerminateProcess(GetCurrentProcess(), 1);
+            }
+        }
+        CloseHandle(thread);
+        if (reached) CloseHandle(reached);
+        if (release) CloseHandle(release);
+
+        void* const helper = at_attach();
+        if (mid_attach) {
+            check(after_hold() != nullptr && after_hold() != helper,
+                  "load() gives the held thread its copy of the template");
+        } else {
+            check(helper != nullptr && seen.block != nullptr && seen.block != helper,
+                  "a thread started after load() gets its copy in its DLL_THREAD_ATTACH");
+        }
+        check(seen.value == 7, mid_attach ? "the held thread reads the template value 7"
+                                          : "the thread started after load() reads the template value 7");
+        check(helper != nullptr && at_detach() == helper,
+              mid_attach ? "the held thread ends with the helper DLL's block back in its slot"
+                         : "the thread started after load() ends with the helper DLL's block back in its slot");
+        MEMORY_BASIC_INFORMATION info{};
+        check(VirtualQuery(seen.block, &info, sizeof(info)) == 0 || info.State == MEM_FREE,
+              mid_attach ? "the held thread's copy is freed when it ends"
+                         : "the copy of the thread started after load() is freed when it ends");
+    }
+}
+
+// The other kind of record a new thread can find under its id, which it still has to drop: load() gave a running
+// thread a block, the thread was terminated (no DLL_THREAD_DETACH, so record and block stay), and Windows gave its id
+// to a new thread. When an id comes back is Windows' business (after some 580 other threads on Windows 11 26200), so
+// the block is looked at only if it does within kThreads threads.
+void test_reused_thread_id(const fs::path& dll) {
+    std::printf("\n-- a terminated thread's id is used again --\n");
+    constexpr DWORD kWaitMs = 10000;
+    constexpr int kThreads = 4096;
+    struct Victim {
+        HANDLE up = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        uint32_t index = rt::kNoTlsIndex;
+        void* block = nullptr;
+    } v;
+    const HANDLE victim = CreateThread(
+        nullptr, 0,
+        [](void* p) -> DWORD {
+            auto* victim = static_cast<Victim*>(p);
+            SetEvent(victim->up);
+            WaitForSingleObject(victim->go, INFINITE);  // load() has run
+            victim->block = module_tls_slots()[victim->index];
+            SetEvent(victim->done);
+            Sleep(INFINITE);  // until it is terminated
+            return 0;
+        },
+        &v, 0, nullptr);
+    check(victim != nullptr && WaitForSingleObject(v.up, kWaitMs) == WAIT_OBJECT_0,
+          "a thread is running before load()");
+    if (!victim) return;
+
+    rt::Loader loader(dll.parent_path());
+    v.index = loader.load(dll).tls_index;
+    SetEvent(v.go);
+    const bool seen = WaitForSingleObject(v.done, kWaitMs) == WAIT_OBJECT_0;
+    const DWORD id = GetThreadId(victim);
+    TerminateThread(victim, 0);
+    WaitForSingleObject(victim, kWaitMs);
+    CloseHandle(victim);  // the last handle: the id is free from here on
+    MEMORY_BASIC_INFORMATION info{};
+    check(seen && v.block != nullptr && VirtualQuery(v.block, &info, sizeof(info)) != 0 && info.State == MEM_COMMIT,
+          "the block load() gave it is still there after it was terminated");
+
+    bool reused = false;
+    for (int i = 0; i < kThreads && !reused; ++i) {
+        const HANDLE next = CreateThread(nullptr, 0, [](void*) -> DWORD { return 0; }, nullptr, 0, nullptr);
+        if (!next) break;
+        reused = GetThreadId(next) == id;
+        const bool ended = WaitForSingleObject(next, kWaitMs) == WAIT_OBJECT_0;
+        CloseHandle(next);
+        if (!ended) return check(false, "a thread that does nothing ends");
+    }
+    if (reused)
+        check(VirtualQuery(v.block, &info, sizeof(info)) == 0 || info.State == MEM_FREE,
+              "a new thread with the terminated thread's id frees that thread's block");
+    else
+        std::printf("     the id was not used again within %d threads: nothing to check\n", kThreads);
+    CloseHandle(v.up);
+    CloseHandle(v.go);
+    CloseHandle(v.done);
+}
+
 void test_existing_threads(const fs::path& dll) {
     // A pool worker exists from here on: the callback has run on one, and the pool keeps its workers for a while.
     PoolProbe warm;
@@ -783,10 +953,15 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Before anything loads the loader's helper DLL: Windows calls DllMain in load order (test_thread_mid_attach).
+        const HMODULE attach_hold = LoadLibraryW((tls_dll.parent_path() / L"tls_attach_hold.dll").c_str());
+
         TempDir temp;
         test_purge_ownership_scoping(tls_dll, temp.path);  // first: the sweep fires once per process
         test_existing_threads(tls_dll);
         test_terminated_thread(tls_dll);
+        test_thread_mid_attach(tls_dll, temp.path, attach_hold);
+        test_reused_thread_id(tls_dll);
         test_tls(tls_dll);
         test_thread_events(tls_dll);
         test_thread_outlives_loader(tls_dll);
