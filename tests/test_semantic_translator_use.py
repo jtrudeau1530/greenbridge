@@ -68,7 +68,6 @@ DEBT = {
     "test_valu_alignbyte_b32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_cmp_class.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_cvt_f32_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_cvt_int_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_dot2_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_dot4_int.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_dot8_int.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
