@@ -45,6 +45,12 @@ def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
     assert captured.out == ""
 
 
+def test_a_run_where_every_program_was_skipped_is_not_a_success(capsys, monkeypatch):
+    monkeypatch.setattr(cf_diff, "run_case", lambda *args, **kwargs: ("skip", "unsupported form"))
+    assert cf_diff.main(["--programs", "2", "--seed", "1"]) == 2
+    assert "no program ran: every one was skipped" in capsys.readouterr().out
+
+
 def test_generation_is_deterministic():
     assert cf_diff.program_for(5, 3, 32, 3) == cf_diff.program_for(5, 3, 32, 3)
     assert cf_diff.program_for(5, 3, 32, 3) != cf_diff.program_for(5, 4, 32, 3)

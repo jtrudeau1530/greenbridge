@@ -49,6 +49,19 @@ class Harness(unittest.TestCase):
                 self.assertEqual(counts["pass"], 60)
 
 
+class EverythingSkipped(unittest.TestCase):
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        import contextlib
+        import io
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.object(md, "run_one", lambda *args: ("skip", "unsupported form")), \
+                contextlib.redirect_stdout(out):
+            rc = md.main(["--programs", "2", "--seed", "1"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
+
+
 class Reference(unittest.TestCase):
     """The reference model on hand-made cases (the expected words are worked out by hand)."""
 

@@ -32,9 +32,24 @@ class HarnessErrorExit(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(sd, "run_fragment", side_effect=UnsupportedConstruct("test construct")):
             with contextlib.redirect_stdout(out):
-                self.assertEqual(sd.main(["--programs", "1"]), 0)
+                sd.main(["--programs", "1"])
         self.assertIn("1 skipped, 0 harness errors", out.getvalue())
         self.assertIn("test construct", out.getvalue())
+
+    def test_a_run_where_every_program_was_skipped_is_not_a_success(self):
+        out = io.StringIO()
+        with mock.patch.object(sd, "run_fragment", side_effect=UnsupportedConstruct("test construct")):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(sd.main(["--programs", "2"]), 2)
+        self.assertIn("no program ran: every one was skipped", out.getvalue())
+
+    def test_some_skips_next_to_passes_still_exit_0(self):
+        out = io.StringIO()
+        calls = iter([("match", ""), ("skip", "unsupported form")])
+        with mock.patch.object(sd, "run_one", lambda *_a: next(calls)):
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(sd.main(["--programs", "2"]), 0)
+        self.assertIn("1 pass, 0 mismatch, 1 skipped", out.getvalue())
 
     def test_mismatch_still_exits_1(self):
         with mock.patch.object(sd, "run_one", lambda *_a: ("mismatch", "lane word 0")), mock.patch("sys.stdout"):
