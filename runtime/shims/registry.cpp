@@ -18,9 +18,19 @@
 namespace rt::shims {
 namespace {
 
+// Immortal and free of function-local static init guards (safe on guest threads when TLS slot 0 is owned by the
+// mapped executable or under Wine / static-CRT cross-builds, as in RT-488).
+INIT_ONCE g_table_once = INIT_ONCE_STATIC_INIT;
+std::map<std::string, void*>* g_table = nullptr;
+
+BOOL CALLBACK init_table(PINIT_ONCE, PVOID, PVOID*) {
+    g_table = new std::map<std::string, void*>;
+    return TRUE;
+}
+
 std::map<std::string, void*>& table() {
-    static std::map<std::string, void*> t;  // "dll!name"
-    return t;
+    InitOnceExecuteOnce(&g_table_once, init_table, nullptr, nullptr);
+    return *g_table;
 }
 
 std::string lower_ascii(std::string s) {
@@ -237,7 +247,8 @@ constexpr size_t kThunkSize = 32;
 uint8_t* g_pool = nullptr;
 size_t g_pool_used = 0, g_pool_size = 0;
 std::mutex g_pool_mutex;
-void* g_stub = nullptr;  // under g_pool_mutex
+void* g_stub = nullptr;                              // under g_pool_mutex
+std::map<std::string, void*>* g_thunks = nullptr;    // under g_pool_mutex; immortal
 
 void* make_common_stub() {
     constexpr size_t kUnwindOffset = 0x80, kFunctionOffset = 0x90, kRegionSize = 0x1000;
@@ -385,33 +396,37 @@ struct BundledLoaderEntry {
     const BundledModuleOps* ops;
 };
 
-// Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
-std::mutex& bundled_loader_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+// Immortal and constant-initialized: late mapped-DLL detach, atexit handlers, or guest threads (with TLS slot 0
+// owned by the mapped executable) may call GetProcAddress/FreeLibrary without tripping a function-local static guard.
+SRWLOCK g_bundled_lock = SRWLOCK_INIT;
+std::vector<BundledLoaderEntry>* g_bundled_loaders = nullptr;
 
-std::vector<BundledLoaderEntry>& bundled_loaders() {
-    static auto* v = new std::vector<BundledLoaderEntry>;
-    return *v;
-}
+struct SrwLockGuard {
+    SRWLOCK* lock;
+    explicit SrwLockGuard(SRWLOCK& l) : lock(&l) { AcquireSRWLockExclusive(lock); }
+    ~SrwLockGuard() { ReleaseSRWLockExclusive(lock); }
+    SrwLockGuard(const SrwLockGuard&) = delete;
+    SrwLockGuard& operator=(const SrwLockGuard&) = delete;
+};
 
 std::vector<BundledLoaderEntry> snapshot_bundled_loaders() {
-    std::lock_guard lock(bundled_loader_mutex());
-    return bundled_loaders();
+    SrwLockGuard lock(g_bundled_lock);
+    return g_bundled_loaders ? *g_bundled_loaders : std::vector<BundledLoaderEntry>{};
 }
 
 }  // namespace
 
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops) {
     if (!ctx || !ops) return;
-    std::lock_guard lock(bundled_loader_mutex());
-    bundled_loaders().push_back({ctx, ops});
+    SrwLockGuard lock(g_bundled_lock);
+    if (!g_bundled_loaders) g_bundled_loaders = new std::vector<BundledLoaderEntry>;
+    g_bundled_loaders->push_back({ctx, ops});
 }
 
 void remove_bundled_loader(void* ctx) {
-    std::lock_guard lock(bundled_loader_mutex());
-    auto& list = bundled_loaders();
+    SrwLockGuard lock(g_bundled_lock);
+    if (!g_bundled_loaders) return;
+    auto& list = *g_bundled_loaders;
     for (auto it = list.begin(); it != list.end(); ++it)
         if (it->ctx == ctx) {
             list.erase(it);
@@ -479,10 +494,11 @@ bool owns_dll(const std::string& dll_lower) {
 
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name) {
     std::lock_guard lock(g_pool_mutex);
-    static std::map<std::string, void*> s_thunks;
+    if (!g_thunks) g_thunks = new std::map<std::string, void*>;
+    auto& thunks = *g_thunks;
     const std::string key = lower_ascii(dll) + "!" + name;
-    auto it = s_thunks.find(key);
-    if (it != s_thunks.end()) return it->second;
+    auto it = thunks.find(key);
+    if (it != thunks.end()) return it->second;
 
     if (!g_stub) g_stub = make_common_stub();
     if (!g_stub) return nullptr;
@@ -506,7 +522,7 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
     std::memset(code + 22, 0xCC, kThunkSize - 22);
     std::memcpy(t, code, kThunkSize);
     FlushInstructionCache(GetCurrentProcess(), t, kThunkSize);
-    s_thunks.emplace(key, t);
+    thunks.emplace(key, t);
     return t;
 }
 
