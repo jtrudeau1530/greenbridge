@@ -430,6 +430,18 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(summary["lane_graph"]["junctions"], 1)
         self.assertEqual(summary["graph_resources"], {"junctions": 1, "links": 1, "nodes": 1})
 
+    def test_duplicate_light_definitions_compare_values_not_just_counts(self):
+        total = T.scan(self.rpf)
+        total["archetype_lights"] = {
+            1: [[{"posn": [0, 1, 0]}], [{"posn": [0, 1, 0]}]],
+            2: [[{"posn": [0, 1, 0]}], [{"posn": [1, 0, 0]}]],
+            3: [[], [{"intensity": 2}]],
+            4: [[{"intensity": 2}]],
+        }
+        summary = T.summarize(total)
+        self.assertEqual(summary["archetypes_defined_more_than_once"], 3)
+        self.assertEqual(summary["archetype_light_definitions_differ"], 2)
+
     def test_jobs_give_the_same_summary(self):
         one = T.summarize(T.scan(self.rpf, jobs=1))
         two = T.summarize(T.scan(self.rpf, jobs=2))

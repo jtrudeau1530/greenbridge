@@ -685,8 +685,8 @@ def summarize(total, entities=None, lights_out=None):
         "light_value_ranges": {k: [round(v[0], 4), round(v[1], 4)] for k, v in total["ranges"].items()},
         "archetypes_with_lights": len(arch),
         "archetypes_defined_more_than_once": sum(1 for sets in arch.values() if len(sets) > 1),
-        "archetype_light_definitions_differ": sum(1 for sets in arch.values()
-                                                  if len(sets) > 1 and any(len(s) != len(sets[0]) for s in sets)),
+        "archetype_light_definitions_differ": sum(1 for sets in arch.values() if len(sets) > 1
+                                                  and any(sets[i] != sets[0] for i in range(1, len(sets)))),
     }
     placed = collections.Counter()
     out = None
