@@ -1929,10 +1929,92 @@ class WorldBuildStagingTest(unittest.TestCase):
     def test_world_json_write_failure_restores_previous_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets, output, before = self._previous_world(tmp)
-            with unittest.mock.patch.object(world_build, "_write_json_atomic",
-                                            side_effect=OSError("synthetic world.json write error")):
-                with self.assertRaises(OSError):
+            world_path = os.path.join(output, "world.json")
+            replace = glb_writer._replace
+
+            def fail_manifest_replace(source, destination):
+                if destination == world_path:
+                    raise OSError("synthetic world.json rename error")
+                replace(source, destination)
+
+            with unittest.mock.patch.object(glb_writer, "_replace", fail_manifest_replace):
+                with self.assertRaisesRegex(OSError, "world.json rename"):
                     world_build.build_world(assets, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def _kill_during_publication(self, assets, output, point):
+        child = """
+import os
+import sys
+tools, assets, output, point = sys.argv[1:]
+sys.path.insert(0, tools)
+import glb_writer
+import world_build
+
+replace = glb_writer._replace
+chunks = os.path.join(output, 'chunks')
+def kill_after_rename(src, dst):
+    adds_chunk = os.path.dirname(dst) == chunks and not os.path.lexists(dst)
+    replace(src, dst)
+    if ((point == 'backup' and os.path.basename(os.path.dirname(dst)) == 'previous')
+            or (point == 'new' and adds_chunk)
+            or (point == 'manifest' and dst == os.path.join(output, 'world.json'))):
+        os._exit(77)
+
+glb_writer._replace = kill_after_rename
+world_build.build_world(assets, output)
+"""
+        run = subprocess.run([sys.executable, "-I", "-c", child, TOOLS, assets, output, point],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 77, run.stderr)
+
+    def _rerun_with_missing_assets(self, tmp, output):
+        # Recovery has to happen even if the new export cannot start.
+        run = subprocess.run([sys.executable, "-I", WorldBuildTest.TOOL,
+                              os.path.join(tmp, "missing"), "--out", output],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("assets path does not exist:", run.stderr)
+
+    def test_killed_after_backing_up_live_chunk_restores_previous_world(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            self._kill_during_publication(assets, output, "backup")
+            self.assertEqual(len(os.listdir(os.path.join(output, "chunks"))), 1)
+            self._rerun_with_missing_assets(tmp, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def test_killed_after_installing_new_chunk_removes_it_on_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, _ = self._previous_world(tmp)
+            world_build.build_world(assets, output, limit=0)
+            before = self._snapshot(output)
+            self._kill_during_publication(assets, output, "new")
+            self.assertEqual(len(os.listdir(os.path.join(output, "chunks"))), 1)
+            self._rerun_with_missing_assets(tmp, output)
+            self.assertEqual(self._snapshot(output), before)
+
+    def test_killed_after_manifest_commit_keeps_the_new_world(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            reference = os.path.join(tmp, "reference")
+            world_build.build_world(assets, reference)
+            expected = self._snapshot(reference)
+            self.assertNotEqual(expected, before)
+            self._kill_during_publication(assets, output, "manifest")
+            self._rerun_with_missing_assets(tmp, output)
+            self.assertEqual(self._snapshot(output), expected)
+
+    def test_recovery_that_cannot_restore_a_chunk_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, output, before = self._previous_world(tmp)
+            self._kill_during_publication(assets, output, "backup")
+            interrupted = self._snapshot(output)
+            with unittest.mock.patch.object(glb_writer, "_replace", side_effect=PermissionError("file in use")):
+                with self.assertRaisesRegex(OSError, "could not recover the previous world"):
+                    world_build.build_world(assets, output)
+            self.assertEqual(self._snapshot(output), interrupted)
+            self._rerun_with_missing_assets(tmp, output)
             self.assertEqual(self._snapshot(output), before)
 
     def test_staging_left_by_a_killed_build_is_removed_on_the_next_build(self):
