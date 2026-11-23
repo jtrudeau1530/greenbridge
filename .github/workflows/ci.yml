@@ -132,7 +132,11 @@ jobs:
       - name: Install llvm-mc (LLVM 21) and spirv-tools
         shell: bash
         run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+          # The signing key is checked against apt.llvm.org's published fingerprint before apt trusts it.
+          key=$(mktemp)
+          curl -fsSL -o "$key" https://apt.llvm.org/llvm-snapshot.gpg.key
+          python3 -I scripts/check_apt_key.py "$key" 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+          sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg "$key"
           echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends llvm-21 spirv-tools
