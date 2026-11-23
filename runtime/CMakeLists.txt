@@ -1222,6 +1222,10 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # OpFmaKHR width gate of vk_shader_fma.h (shaderFmaFloat32 / shaderFmaFloat64): no Vulkan instance, no GPU.
+  add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
+  target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
+  add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
   if(MSVC)
     # Keep the checker and its worker threads on the toolchain's C++ runtime under Wine.
     set_property(TARGET vk_pipeline_check PROPERTY
