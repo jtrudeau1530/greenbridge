@@ -166,7 +166,7 @@ def main():
         sys.exit(f"{e.filename or a.archive}: {e.strerror or e}")
     if a.rigs:
         try:
-            with open(a.rigs, encoding="utf-8") as f:
+            with open(a.rigs, encoding="utf-8-sig") as f:
                 summary["rbf0_join"] = join_rbf0(dicts, json.load(f))
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             print(f"ERROR: {a.rigs}: invalid rig report ({getattr(e, 'strerror', None) or e})", file=sys.stderr)
