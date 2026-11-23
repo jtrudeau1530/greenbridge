@@ -161,11 +161,15 @@ def write_file(path: str, data: bytes) -> None:
         os.chmod(tmp_path, published_mode(out_path) if os.path.exists(out_path) else folder_file_mode(parent))
         os.replace(tmp_path, out_path)
     except BaseException:
-        try:
-            if tmp_path is not None:
+        if tmp_path is not None:
+            try:
+                os.chmod(tmp_path, 0o600)  # it may already carry a read-only mode, which Windows won't unlink
+            except OSError:
+                pass
+            try:
                 os.remove(tmp_path)
-        except OSError:
-            pass
+            except OSError:
+                pass
         raise
 
 

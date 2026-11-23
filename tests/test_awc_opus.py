@@ -990,5 +990,31 @@ class MalformedBankTest(unittest.TestCase):
             self.assertIn("skip bad.awc", out.getvalue())
 
 
+class WriteFileReadOnlyTest(unittest.TestCase):
+    def test_failed_replace_over_a_read_only_file_leaves_no_staging_file(self):
+        real_remove = os.remove
+
+        def windows_remove(p):
+            if not os.access(p, os.W_OK):
+                raise PermissionError(13, "read-only file", p)
+            real_remove(p)
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "a.ogg")
+            with open(dest, "wb") as f:
+                f.write(b"old")
+            os.chmod(dest, 0o444)
+            try:
+                with mock.patch.object(awc.os, "replace", side_effect=OSError("replace failed")), \
+                        mock.patch.object(awc.os, "remove", side_effect=windows_remove):
+                    with self.assertRaises(OSError):
+                        awc.write_file(dest, b"new")
+                self.assertEqual(sorted(os.listdir(d)), ["a.ogg"])
+                with open(dest, "rb") as f:
+                    self.assertEqual(f.read(), b"old")
+            finally:
+                os.chmod(dest, 0o644)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
