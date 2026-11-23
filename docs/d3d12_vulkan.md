@@ -2480,8 +2480,11 @@ The trace will enumerate them.
   `VkClearColorValue::uint32` for both image and rectangle clears; copying float bits gives incorrect stored
   integers without a Vulkan validation error. **Measured:** Windows D3D12 on WARP and AMD RX 5700 XT clamps
   negatives/NaN to zero, positive overflow/infinity to the component maximum, and truncates fractions.
-  `d3d12_uint_clear_test` compares full and rectangular D3D12 readbacks with WARP over seven input sets on all
-  three formats; `clear_color_test` checks both replay paths without a GPU, including unchanged float values.
+  `d3d12_clear_test` (renamed from `d3d12_uint_clear_test` in #525, D3D-45) compares full and rectangular D3D12
+  readbacks with WARP over eleven integer input sets on every UINT and SINT render-target format it lists, beside
+  the UNORM/SNORM/FLOAT and depth/stencil cases. ctest runs only its `--rgb9e5` mode (`d3d12_rgb9e5_rtv`), so the
+  WARP comparison is run by hand until #521's 0.5 tie rounding lands (`runtime/CMakeLists.txt`).
+  `clear_color_test` checks both replay paths without a GPU, including unchanged float values.
   This does not add typed-view reinterpretation of typeless resources or new integer formats.
 - **RGBA8 typeless RTV clears:** explicit UNORM, SRGB, UINT, SINT and SNORM RTVs on a
   `R8G8B8A8_TYPELESS` 2D resource with sample count 1, selecting a mip and a contiguous array-layer range.
