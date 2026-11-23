@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -213,6 +214,29 @@ bool env_has(Fn getmainargs, const C* entry) {
     return false;
 }
 
+template <typename C, typename Fn>
+void check_getmainargs_null_outputs(Fn fn, const char* name) {
+    int count = 123;
+    C* sentinel = nullptr;
+    C** args = &sentinel;
+    C** env = &sentinel;
+    if (fn(nullptr, &args, &env, 0, nullptr) != EINVAL || args != &sentinel || env != &sentinel) {
+        std::fprintf(stderr, "FAIL %s null argc\n", name);
+        ++failures;
+    }
+    if (fn(&count, nullptr, &env, 0, nullptr) != EINVAL || count != 123 || env != &sentinel) {
+        std::fprintf(stderr, "FAIL %s null argv\n", name);
+        ++failures;
+    }
+    count = 0;
+    args = nullptr;
+    env = nullptr;
+    if (fn(&count, &args, &env, 0, nullptr) != 0 || count < 1 || !args || !args[0] || !env) {
+        std::fprintf(stderr, "FAIL %s normal outputs\n", name);
+        ++failures;
+    }
+}
+
 void check_getmainargs_environment() {
     using Narrow = int(__cdecl*)(int*, char***, char***, int, void*);
     using Wide = int(__cdecl*)(int*, wchar_t***, wchar_t***, int, void*);
@@ -237,6 +261,8 @@ void check_getmainargs_environment() {
         std::fprintf(stderr, "FAIL __getmainargs: no environment (or one without LEONIDA_RT136_A)\n");
         ++failures;
     }
+    check_getmainargs_null_outputs<char>(narrow_fn, "__getmainargs");
+    check_getmainargs_null_outputs<wchar_t>(wide_fn, "__wgetmainargs");
     // A variable set after set_command_line reallocates the CRT's table; a pointer kept from before would dangle.
     if (_putenv_s("LEONIDA_RT136_B", "after") != 0 || _wputenv_s(L"LEONIDA_RT136_C", L"after") != 0) {
         std::fprintf(stderr, "FAIL _putenv_s/_wputenv_s did not set the test variables\n");
