@@ -317,14 +317,18 @@ def main(argv=None):
                   "; pass the transform in export.json to bvh_rehydrate.py with --transform" if transform else ""))
     if a.json:
         match = consistent[0][3] if consistent else None
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"signature": signature, "consistent": bool(consistent), "scored": len(results),
-                       "matched": None if match is None else {
-                           "offset": match["item"]["Offset"], "model": match["model"],
-                           "geometry": [match["kept"][k][2] for k in match["used"]],
-                           "triangles": [match["kept"][k][3] for k in match["used"]],
-                           "name": match["item"]["Name"] if a.names else None}},
-                      f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"signature": signature, "consistent": bool(consistent), "scored": len(results),
+                           "matched": None if match is None else {
+                               "offset": match["item"]["Offset"], "model": match["model"],
+                               "geometry": [match["kept"][k][2] for k in match["used"]],
+                               "triangles": [match["kept"][k][3] for k in match["used"]],
+                               "name": match["item"]["Name"] if a.names else None}},
+                          f, indent=1)
+        except OSError as e:
+            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     return 0 if consistent else 1
 
 
