@@ -703,6 +703,30 @@ class TexturedOracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_image(self.image(probe=(0.1, 0.2, 0.8, 1.0)), self.manifest)
 
+    def test_rejects_expected_rgba_with_wrong_channel_count(self):
+        for field, colour, next_red in (
+            ("centre_rgba", self.manifest["centre_rgba"], CLEAR),
+            ("rgba_probes", self.manifest["rgba_probes"][0]["rgba"], 0.2),
+        ):
+            for values in ([], colour[:3], [*colour, next_red]):
+                with self.subTest(field=field, values=values):
+                    manifest = self.manifest.copy()
+                    if field == "centre_rgba":
+                        manifest[field] = values
+                    else:
+                        manifest[field] = [{**self.manifest[field][0], "rgba": values}]
+                    with self.assertRaisesRegex(AssertionError, f"{field}.*exactly four"):
+                        check_image(self.image(), manifest)
+
+    def test_compares_alpha_for_four_channel_expectations(self):
+        for probe, readback in (
+            ("centre", self.image(centre=(0.2, 0.4, 0.6, 0.75))),
+            ("offset", self.image(probe=(0.8, 0.2, 0.1, 0.75))),
+        ):
+            with self.subTest(probe=probe):
+                with self.assertRaises(AssertionError):
+                    check_image(readback, self.manifest)
+
     def test_sample_rgba_bilinear(self):
         rgba = bytes(
             [
