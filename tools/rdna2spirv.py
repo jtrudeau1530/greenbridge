@@ -6766,6 +6766,12 @@ class Gen:
             return
         if op == "s_denorm_mode":
             raise Unsupported(op + ": denormal mode writes are not modelled")
+        if op == "s_mov_b32" and self.wave64:
+            to_mask_dst, dst_half = self._mask_b32_dst_half(a[0], a[1:2])
+            if to_mask_dst and self.holds_lane_mask(a[1]) and self.mask_half(a[1]) not in (None, dst_half):
+                val = self._mask_b32_src(a[1], dst_half)
+                self._store_b32_mask_dst(a[0], val, True, dst_half)
+                return
         if op == "s_mov_b32" and a[0]["k"] == "special" and a[0]["t"] in ("exec_lo", "exec_hi") and \
                 (a[0]["t"] == "exec_hi" or a[1]["k"] in ("imm", "fimm") or
                  (a[1]["k"] == "sgpr" and not self.holds_lane_mask(a[1]))):
