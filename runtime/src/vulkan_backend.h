@@ -2131,7 +2131,10 @@ private:
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
             std::uint64_t room = 64;  // one D3D12_RAYTRACING_INSTANCE_DESC
-            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64 || va > UINT64_MAX - vk.heap_base) {
+            // No overflow check on heap_base + va: a buffer outside the arena whose device address lies below the
+            // arena's (an UPLOAD heap in system memory without Resizable BAR) has a VA that wraps (address - base),
+            // and the unsigned sum wraps back to its device address, as the replay's other VA translations do.
+            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64) {
                 funcs.vkUnmapMemory(context_.device(), stage.memory);
                 discard();
                 return ReplayResult::invalid_copy;
