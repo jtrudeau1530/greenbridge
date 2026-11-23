@@ -17,4 +17,9 @@ HRESULT create_factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAdd
                        VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
                        std::uint32_t queue_family, REFIID riid, void** out);
 
+// Makes `adapter`, when it is this layer's, hand out its outputs in the console's IDXGIOutput slot order (the one a GDKX
+// title calls: slot 21 is GetDisplayModeList1). For the adapter IDXGIDevice1::GetAdapter gives the title. False, and
+// nothing changes, for any other adapter.
+bool hand_out_console_outputs(IDXGIAdapter* adapter);
+
 }  // namespace rt::dxgi

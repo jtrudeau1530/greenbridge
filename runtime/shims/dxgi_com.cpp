@@ -1055,6 +1055,117 @@ private:
     DisplayInfo info_{};
 };
 
+// The output a GDKX title gets from IDXGIDevice1::GetAdapter -> EnumOutputs(0), in the console's slot order. Read from
+// the retail executable twice (#7154: YaBulochka, FJKiXfaR): slot 21 is GetDisplayModeList1, which the PC order has
+// at 19, so the console interface has two slots of its own after GetFrameStatistics (18). The title calls slot 21
+// twice, the count and then the fill (DXGI_FORMAT_UNKNOWN, flags 0, DXGI_MODE_DESC1), scans the refresh rates and
+// releases the output; it calls no other slot past 18. Slots 0-18 are the public IDXGIOutput order and forward to the
+// layer's Output. Slots 19, 20 and 22-39 are not measured: each says so once and returns E_NOTIMPL. A Windows x64
+// method that takes no arguments of its own can be called with any, so they need no signature.
+//
+// DXGI_FORMAT_UNKNOWN is listed as the desktop's B8G8R8A8_UNORM. ASSUMPTION: the console lists its modes for any
+// format then; the PC answers 0 modes for it, which the title would also accept (it then keeps 60 Hz).
+class ConsoleOutput final {
+public:
+    explicit ConsoleOutput(IDXGIOutput1* inner) : inner_(inner) {}
+    ConsoleOutput(const ConsoleOutput&) = delete;
+    ConsoleOutput& operator=(const ConsoleOutput&) = delete;
+
+    // 0-2 IUnknown
+    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (riid != __uuidof(IUnknown) && riid != __uuidof(IDXGIObject) && riid != __uuidof(IDXGIOutput)) {
+            return E_NOINTERFACE;
+        }
+        *out = this;
+        AddRef();
+        return S_OK;
+    }
+    virtual ULONG STDMETHODCALLTYPE AddRef() { return ++refs_; }
+    virtual ULONG STDMETHODCALLTYPE Release() {
+        const ULONG left = --refs_;
+        if (!left) delete this;
+        return left;
+    }
+    // 3-6 IDXGIObject
+    virtual HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID name, UINT size, const void* data) {
+        return inner_->SetPrivateData(name, size, data);
+    }
+    virtual HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID name, const IUnknown* object) {
+        return inner_->SetPrivateDataInterface(name, object);
+    }
+    virtual HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID name, UINT* size, void* data) {
+        return inner_->GetPrivateData(name, size, data);
+    }
+    virtual HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** out) { return inner_->GetParent(riid, out); }
+    // 7-18 IDXGIOutput
+    virtual HRESULT STDMETHODCALLTYPE GetDesc(DXGI_OUTPUT_DESC* desc) { return inner_->GetDesc(desc); }
+    virtual HRESULT STDMETHODCALLTYPE GetDisplayModeList(DXGI_FORMAT fmt, UINT flags, UINT* count, DXGI_MODE_DESC* d) {
+        return inner_->GetDisplayModeList(fmt, flags, count, d);
+    }
+    virtual HRESULT STDMETHODCALLTYPE FindClosestMatchingMode(const DXGI_MODE_DESC* match, DXGI_MODE_DESC* closest,
+                                                              IUnknown* device) {
+        return inner_->FindClosestMatchingMode(match, closest, device);
+    }
+    virtual HRESULT STDMETHODCALLTYPE WaitForVBlank() { return inner_->WaitForVBlank(); }
+    virtual HRESULT STDMETHODCALLTYPE TakeOwnership(IUnknown* device, BOOL exclusive) {
+        return inner_->TakeOwnership(device, exclusive);
+    }
+    virtual void STDMETHODCALLTYPE ReleaseOwnership() { inner_->ReleaseOwnership(); }
+    virtual HRESULT STDMETHODCALLTYPE GetGammaControlCapabilities(DXGI_GAMMA_CONTROL_CAPABILITIES* caps) {
+        return inner_->GetGammaControlCapabilities(caps);
+    }
+    virtual HRESULT STDMETHODCALLTYPE SetGammaControl(const DXGI_GAMMA_CONTROL* gamma) {
+        return inner_->SetGammaControl(gamma);
+    }
+    virtual HRESULT STDMETHODCALLTYPE GetGammaControl(DXGI_GAMMA_CONTROL* gamma) {
+        return inner_->GetGammaControl(gamma);
+    }
+    virtual HRESULT STDMETHODCALLTYPE SetDisplaySurface(IDXGISurface* surface) {
+        return inner_->SetDisplaySurface(surface);
+    }
+    virtual HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(IDXGISurface* surface) {
+        return inner_->GetDisplaySurfaceData(surface);
+    }
+    virtual HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) {
+        return inner_->GetFrameStatistics(stats);
+    }
+    // 19-20, console only
+    virtual HRESULT STDMETHODCALLTYPE ConsoleSlot19() { return unmeasured(19); }
+    virtual HRESULT STDMETHODCALLTYPE ConsoleSlot20() { return unmeasured(20); }
+    // 21
+    virtual HRESULT STDMETHODCALLTYPE GetDisplayModeList1(DXGI_FORMAT fmt, UINT flags, UINT* count,
+                                                          DXGI_MODE_DESC1* modes) {
+        if (fmt == DXGI_FORMAT_UNKNOWN) fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+        return inner_->GetDisplayModeList1(fmt, flags, count, modes);
+    }
+    // 22-39: not measured; a slot past them reads past the table.
+#define LEONIDA_CONSOLE_OUTPUT_SLOT(n) \
+    virtual HRESULT STDMETHODCALLTYPE ConsoleSlot##n() { return unmeasured(n); }
+    LEONIDA_CONSOLE_OUTPUT_SLOT(22) LEONIDA_CONSOLE_OUTPUT_SLOT(23) LEONIDA_CONSOLE_OUTPUT_SLOT(24)
+    LEONIDA_CONSOLE_OUTPUT_SLOT(25) LEONIDA_CONSOLE_OUTPUT_SLOT(26) LEONIDA_CONSOLE_OUTPUT_SLOT(27)
+    LEONIDA_CONSOLE_OUTPUT_SLOT(28) LEONIDA_CONSOLE_OUTPUT_SLOT(29) LEONIDA_CONSOLE_OUTPUT_SLOT(30)
+    LEONIDA_CONSOLE_OUTPUT_SLOT(31) LEONIDA_CONSOLE_OUTPUT_SLOT(32) LEONIDA_CONSOLE_OUTPUT_SLOT(33)
+    LEONIDA_CONSOLE_OUTPUT_SLOT(34) LEONIDA_CONSOLE_OUTPUT_SLOT(35) LEONIDA_CONSOLE_OUTPUT_SLOT(36)
+    LEONIDA_CONSOLE_OUTPUT_SLOT(37) LEONIDA_CONSOLE_OUTPUT_SLOT(38) LEONIDA_CONSOLE_OUTPUT_SLOT(39)
+#undef LEONIDA_CONSOLE_OUTPUT_SLOT
+
+private:
+    ~ConsoleOutput() { inner_->Release(); }
+
+    static HRESULT unmeasured(unsigned slot) {
+        static std::atomic<bool> said[40];
+        if (slot < 40 && !said[slot].exchange(true)) {
+            std::fprintf(stderr, "[rt] dxgi: console IDXGIOutput slot %u is not measured; returning E_NOTIMPL\n", slot);
+        }
+        return E_NOTIMPL;
+    }
+
+    IDXGIOutput1* inner_;
+    std::atomic<ULONG> refs_{1};
+};
+
 
 // Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
@@ -1090,6 +1201,9 @@ LARGE_INTEGER umd_driver_version(LUID luid) {
     return version;
 }
 
+// Answered only by the layer's own Adapter, so hand_out_console_outputs can find it behind an IDXGIAdapter.
+constexpr GUID kLayerAdapterTag = {0x041c5af0, 0xc2ba, 0x44a6, {0xa1, 0x0c, 0x4c, 0x7f, 0xb2, 0x95, 0xdf, 0xb9}};
+
 class Adapter final : public IDXGIAdapter3 {
 public:
     Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical)
@@ -1122,8 +1236,16 @@ public:
             AddRef();
             return S_OK;
         }
+        if (riid == kLayerAdapterTag) {
+            *out = this;
+            AddRef();
+            return S_OK;
+        }
         return E_NOINTERFACE;
     }
+
+    // The adapter a title got from IDXGIDevice1::GetAdapter: its outputs are ConsoleOutputs.
+    void hand_out_console_outputs() { console_outputs_ = true; }
 
     // IDXGIObject
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
@@ -1148,7 +1270,9 @@ public:
         *out = nullptr;
         const std::vector<DisplayInfo> displays = enumerate_displays();
         if (index >= displays.size()) return DXGI_ERROR_NOT_FOUND;
-        *out = new Output(static_cast<IDXGIAdapter*>(this), displays[index]);
+        auto* const output = new Output(static_cast<IDXGIAdapter*>(this), displays[index]);
+        *out = console_outputs_ ? reinterpret_cast<IDXGIOutput*>(new ConsoleOutput(output))
+                                : static_cast<IDXGIOutput*>(output);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetDesc(DXGI_ADAPTER_DESC* desc) override {
@@ -1338,6 +1462,7 @@ private:
     DXGI_ADAPTER_DESC2 desc_{};
     LARGE_INTEGER umd_version_{};  // CheckInterfaceSupport(IDXGIDevice): the adapter's user-mode driver version
     bool has_memory_budget_ = false;
+    bool console_outputs_ = false;
     std::shared_ptr<ReservationState> reservations_;
 };
 
@@ -1701,6 +1826,14 @@ HRESULT create_factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAdd
     const HRESULT hr = factory->QueryInterface(riid, out);
     factory->Release();
     return hr;
+}
+
+bool hand_out_console_outputs(IDXGIAdapter* adapter) {
+    void* layer = nullptr;
+    if (!adapter || FAILED(adapter->QueryInterface(kLayerAdapterTag, &layer)) || !layer) return false;
+    static_cast<Adapter*>(layer)->hand_out_console_outputs();
+    static_cast<Adapter*>(layer)->Release();
+    return true;
 }
 
 }  // namespace rt::dxgi

@@ -8676,6 +8676,7 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
         hr = factory->EnumAdapters(0, &adapter);
         factory->Release();
         if (FAILED(hr)) return hr;
+        rt::dxgi::hand_out_console_outputs(adapter);  // the title calls its outputs in the console's slot order
         hr = adapter->QueryInterface(riid, out);
         adapter->Release();
         return hr;

@@ -139,6 +139,34 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     EXPECT((output_hr == S_OK && output.p) || (output_hr == DXGI_ERROR_NOT_FOUND && !output.p) ||
            (output_hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE && !output.p && !has_interactive_window_station()));
 
+    // The layer's output is the console's: the title calls slot 21 as GetDisplayModeList1 (count, then fill) with
+    // DXGI_FORMAT_UNKNOWN and flags 0, and its QueryInterface stops at IDXGIOutput (the PC chain is another order).
+    if (vulkan && output.p) {
+        using ModeList1 = HRESULT(STDMETHODCALLTYPE*)(void*, DXGI_FORMAT, UINT, UINT*, DXGI_MODE_DESC1*);
+        using Unmeasured = HRESULT(STDMETHODCALLTYPE*)(void*);
+        void** const table = *reinterpret_cast<void***>(output.p);
+        UINT count = 0;
+        EXPECT(reinterpret_cast<ModeList1>(table[21])(output.p, DXGI_FORMAT_UNKNOWN, 0, &count, nullptr) == S_OK);
+        EXPECT(count > 0);
+        DXGI_MODE_DESC1 modes[512]{};
+        UINT filled = count < 512 ? count : 512;
+        const HRESULT fill_hr =
+            reinterpret_cast<ModeList1>(table[21])(output.p, DXGI_FORMAT_UNKNOWN, 0, &filled, modes);
+        EXPECT((fill_hr == S_OK || fill_hr == DXGI_ERROR_MORE_DATA) && filled > 0);
+        EXPECT(modes[0].Width > 0 && modes[0].Height > 0 && modes[0].RefreshRate.Numerator > 0);
+        EXPECT(reinterpret_cast<Unmeasured>(table[19])(output.p) == E_NOTIMPL);
+        EXPECT(reinterpret_cast<Unmeasured>(table[20])(output.p) == E_NOTIMPL);
+        EXPECT(reinterpret_cast<Unmeasured>(table[22])(output.p) == E_NOTIMPL);
+        DXGI_OUTPUT_DESC desc{};
+        EXPECT(output->GetDesc(&desc) == S_OK && desc.AttachedToDesktop);  // slots 0-18 are the PC's
+        Ref<IUnknown> output1;
+        EXPECT(output->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1.p)) == E_NOINTERFACE);
+        Ref<IUnknown> same;
+        EXPECT(output->QueryInterface(__uuidof(IDXGIOutput), reinterpret_cast<void**>(&same.p)) == S_OK &&
+               same.p == static_cast<IUnknown*>(output.p));
+        std::printf("%s: the title's output answers console slot 21 (GetDisplayModeList1): %u modes\n", label, count);
+    }
+
     // IDXGIDevice1's own state: kept and read back.
     UINT latency = 0;
     EXPECT(dxgi->GetMaximumFrameLatency(&latency) == S_OK && latency == 3);
