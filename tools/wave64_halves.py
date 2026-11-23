@@ -33,6 +33,7 @@ candidate cross-half opcodes and decides nothing. This module decides per shader
 the tiers the translator wrote into an index.json. They answer different questions.
 
 Standard library only.
+Usage: `python -I tools/wave64_halves.py --help` lists the options.
 """
 import argparse
 import json
