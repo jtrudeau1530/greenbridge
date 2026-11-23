@@ -80,6 +80,33 @@ class MaskChannelTests(unittest.TestCase):
                         sys.stderr = saved_err
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_json_folder_is_created(self):
+        """--json under a folder that does not exist yet gets the report, not a traceback, and nothing else."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.dds")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            reports = os.path.join(tmp, "reports")
+            out = os.path.join(reports, "m.json")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(mc.main([path, "--json", out]), 0)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["width"], W)
+            self.assertEqual(os.listdir(reports), ["m.json"])                # no staging file left behind
+
+    def test_json_write_error_is_one_line(self):
+        """A --json path the tool cannot write is one ERROR line and exit 2, as the other report tools do."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.dds")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            out = os.path.join(path, "r.json")                              # its folder is the input file
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                self.assertEqual(mc.main([path, "--json", out]), 2)
+            self.assertEqual(err.getvalue().count("\n"), 1)
+            self.assertTrue(err.getvalue().startswith(f"ERROR: {out}: "), err.getvalue())
+
     def test_json_cannot_replace_the_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "m.dds")

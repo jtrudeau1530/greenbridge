@@ -10,6 +10,9 @@ tens of thousands of small blobs a spotty one. ``docs/gamedata.md`` uses these c
 `Channel` numbers to texture channels.
 
 Only counts are written. The input is the user's own export and stays local.
+
+`--json` is published from a staging file next to the destination, creating the folder when it is missing, so
+a run that fails while writing leaves an older report in place; a write error is one `ERROR:` line and exit 2.
 """
 from __future__ import annotations
 
@@ -17,11 +20,13 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import dds_png  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 CHANNELS = "RGBA"
 
@@ -106,14 +111,19 @@ def main(argv=None) -> int:
         print(f"{name} min {row['min']} max {row['max']} mean {row['mean']} distinct {row['distinct']} | "
               + " | ".join(parts))
     if a.json:
+        out_dir = os.path.dirname(os.path.abspath(a.json))
         try:
-            parent = os.path.dirname(os.path.abspath(a.json))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-                json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
-        except OSError as e:
-            print(f"error: cannot write {a.json}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            os.makedirs(out_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".mask-json-", dir=out_dir) as staging:
+                staged = os.path.join(staging, "masks.json")
+                with open(staged, "w", encoding="utf-8", newline="\n") as fh:
+                    json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
+                os.chmod(staged, published_mode(a.json))    # tempfile creates 0600; the report gets the usual bits
+                os.replace(staged, a.json)
+        except OSError as error:
+            # A failed write must not leave a half-written report where the last good one was.
+            reason = error.strerror or str(error)
+            print(f"ERROR: {a.json}: {reason}", file=sys.stderr)
             return 2
     return 0
 
