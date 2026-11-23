@@ -145,7 +145,7 @@ struct Ground {
     float cell = 4, x0 = 0, y0 = 0;
     int nx = 0, ny = 0;
     std::vector<std::vector<float>> tris;   // per cell: 9 floats a triangle
-    explicit Ground(const Scene& s) {
+    void build(const Scene& s) {
         float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
         std::vector<float> all;
         for (const Draw& d : s.draws) {
@@ -664,7 +664,7 @@ int main(int argc, char** argv) {
             cam.pos[2] += (float(key('E')) - float(key('Q'))) * v;
         } else {
             if (!ground) {
-                ground.emplace(scene);
+                ground.emplace().build(scene);
                 last = std::chrono::steady_clock::now();  // Exclude grid construction from the next movement step.
             }
             const float h = std::hypot(f[0], f[1]) > 1e-4f ? std::hypot(f[0], f[1]) : 1;
