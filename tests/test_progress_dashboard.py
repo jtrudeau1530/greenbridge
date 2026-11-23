@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -81,6 +82,21 @@ class Tests(unittest.TestCase):
                 text = fh.read()
             self.assertIn("__main__", text)
             self.assertIsNone(pd.PYTEST_MARKERS.search(text))
+
+    def test_unlistable_subfolder_raises_instead_of_a_partial_scan(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the selection and the digest
+        # used to silently drop the sub-folder and report the rest as complete.
+        def walk(top, onerror=None, **kwargs):
+            if onerror is not None:
+                onerror(PermissionError(13, "Permission denied", os.path.join(top, "locked")))
+            return
+            yield  # pragma: no cover
+
+        with mock.patch.object(pd.os, "walk", side_effect=walk):
+            with self.assertRaises(PermissionError):
+                pd.ci_test_files()
+            with self.assertRaises(PermissionError):
+                pd.code_digest()
 
 
 class Freshness(unittest.TestCase):
