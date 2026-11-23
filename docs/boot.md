@@ -103,16 +103,16 @@ Read the startup trace first; the first event that is not the expected one is th
 4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
    so the process behaviour is the same with or without the trace.
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
-6. **D3D12 trace** — the `failed`, `unsupported` and `refused` lines name the method. Compare its position with
-   the public SDK vtable; an unknown slot is expected until the executable names it (Q2, Q6). The `[rt]` lines in
-   the same log carry what the trace does not: the 24 device words, feature ids, warnings.
+6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
+   submission ran the supported commands from a list. The runtime's `[rt]` diagnostic names the command it left out.
+   Compare the method's position with the public SDK vtable. An unknown slot is expected until the executable names it
+   (Q2, Q6). The `[rt]` lines in the same log carry the 24 device words, feature IDs and warnings.
 7. **First frame** — after the device and queues, the first `CreateRootSignature`, PSO, `Draw*` and `PresentX` (or
    DXGI) calls are the frame's critical path. The layer's M0–M4 tests already exercise the offscreen parts; the
    present slots are the part that cannot be measured from the package alone.
 
-The trace tool prints the first call per method and the `unsupported`/`failed`/`refused` lists; `--json` gives the
-same summary for a script. Share that summary's **counts and error classes**, not the trace file or its debug
-strings.
+The trace tool prints the first call per method and the `unsupported`/`failed`/`refused`/`partial` lists. The `--json`
+option gives the same summary for a script. Share only the summary's **counts and error classes**.
 
 If startup stops before the first D3D12 call, the combined command still prints the startup report. A missing
 or invalid requested trace is reported on stderr and sets exit code 2. In a partial JSON report that section

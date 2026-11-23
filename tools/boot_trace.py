@@ -165,6 +165,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "failed": [],
         "unsupported": [],
         "refused": [],
+        "partial": [],
         "last_seq": 0,
     }
     with _open_text(path) as fh:
@@ -181,7 +182,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
             if method not in trace["first"]:
                 trace["methods"].append(method)
                 trace["first"][method] = {"seq": seq, "outcome": outcome}
-            if outcome in ("failed", "unsupported", "refused"):
+            if outcome in ("failed", "unsupported", "refused", "partial"):
                 bucket = trace[outcome]
                 if len(bucket) < limit:
                     bucket.append({"seq": seq, "method": method})
@@ -274,6 +275,9 @@ def format_text(summary: dict, limit: int) -> str:
         if d3d12["refused"]:
             refused = [f"#{c['seq']} {c['method']}" for c in d3d12["refused"]]
             out.append(f"  refused: {_tail(refused, limit)}")
+        if d3d12.get("partial"):
+            partial = [f"#{c['seq']} {c['method']}" for c in d3d12["partial"]]
+            out.append(f"  partial: {_tail(partial, limit)}")
     return "\n".join(out)
 
 

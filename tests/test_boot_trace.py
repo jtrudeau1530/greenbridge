@@ -238,6 +238,27 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("ID3D12CommandQueue::ExecuteCommandLists", text)
         self.assertIn("[rt] diagnostics are not summarized", text)
 
+    def test_partial_submissions_are_named_in_text_and_json(self):
+        method = "ID3D12CommandQueue::ExecuteCommandLists"
+        self.write_lines(self.d3d12, [
+            f"[d3d12-trace] #1 {method} ok",
+            f"[d3d12-trace] #2 {method} partial",
+            f"[d3d12-trace] #3 {method} partial",
+        ])
+        trace = bt.parse_d3d12(self.d3d12, limit=1)
+        self.assertEqual(trace["first"][method], {"seq": 1, "outcome": "ok"})
+        self.assertEqual(trace["outcomes"]["partial"], 2)
+        text = bt.format_text(bt.summarize(None, trace), 1)
+        self.assertIn(f"  partial: #2 {method}", text)
+        self.assertNotIn(f"#3 {method}", text)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--limit", "1", "--json"]), 0)
+        parsed = json.loads(stdout.getvalue())["d3d12"]
+        self.assertEqual(parsed["partial"], [{"seq": 2, "method": method}])
+        self.assertEqual(parsed["outcomes"]["partial"], 2)
+
     def test_json_cli(self):
         self.write(self.startup, STARTUP)
         self.write_lines(self.d3d12, D3D12)
