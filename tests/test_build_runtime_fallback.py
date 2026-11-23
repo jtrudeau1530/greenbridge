@@ -93,6 +93,16 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         megabytes = re.search(r"run_entry\(void\* entry, std::size_t stack_bytes = (\d+)u << 20\);", shim).group(1)
         self.assertEqual(int(megabytes) << 20, int(reserve))
 
+    def test_the_loader_gets_the_host_base_cmake_gives_it(self):
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        base = re.search(r"set\(GTA6RT_HOST_BASE (/BASE:0x[0-9A-Fa-f]+)\)", cmake).group(1)
+        self.assertRegex(cmake, r"target_link_options\(gta6rt PRIVATE [^)]*\$\{GTA6RT_HOST_BASE\}")
+        lines = [line for line in self.body.splitlines() if "/Fe:gta6rt.exe" in line]
+        self.assertEqual(len(lines), 1)
+        pattern = rf"/Fe:gta6rt\.exe /link (\S+ )*{re.escape(base)}( |$)"
+        self.assertNotRegex(lines[0].replace(base, ""), pattern)
+        self.assertRegex(lines[0], pattern)
+
     def test_build_cmd_sets_utf8_codepage_for_ninja_showincludes(self):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("chcp 65001 >nul", text)
