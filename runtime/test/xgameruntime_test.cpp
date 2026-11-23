@@ -175,6 +175,60 @@ void* ask(QueryFn query, const GUID& cls, const GUID& iid) {
     return query(&cls, iid, &p) == S_OK ? p : nullptr;
 }
 
+// Read both metadata APIs against two synthetic installs with different title IDs and locales.
+void check_package_config_root(void* game, void* package) {
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / (L"leonida_package_" + std::to_wstring(GetCurrentProcessId()));
+    const std::wstring native = root.native();
+    const fs::path extended = native.starts_with(L"\\\\?\\") ? native :
+        native.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + native.substr(2) : L"\\\\?\\" + native;
+    std::error_code ec;
+    const bool own_root = fs::create_directory(extended, ec);
+    check(own_root, "create a separate root for the two test installs");
+    if (!own_root) return;
+
+    fs::path nested;
+    while ((root / nested).native().size() <= MAX_PATH + 20)
+        nested /= L"test-install-\u16a0-0123456789abcdef";
+    fs::create_directories(extended / nested, ec);
+    check(!ec, "create a long Unicode install directory");
+    std::ofstream(root / L"MicrosoftGame.Config")
+        << "<Game><TitleId>AB</TitleId><Resources><Resource Language='aa-AA'/></Resources></Game>";
+    std::ofstream(extended / nested / L"MicrosoftGame.Config")
+        << "<Game><TitleId>CD</TitleId><Resources><Resource Language='bb-BB'/></Resources></Game>";
+    using TitleId = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
+    using Locale = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
+    auto matches = [&](uint32_t expected_id, const char* expected_locale) {
+        uint32_t actual_id = 0;
+        char actual_locale[32]{};
+        const auto id_hr = method<TitleId>(game, 3)(game, &actual_id);
+        const auto locale_hr = method<Locale>(package, 11)(package, sizeof(actual_locale), actual_locale);
+        return id_hr == S_OK && actual_id == expected_id && locale_hr == S_OK &&
+               std::strcmp(actual_locale, expected_locale) == 0;
+    };
+    rt::fs::configure(root, {});
+    SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", (extended / nested).c_str());
+    check(matches(0xCD, "bb-BB"), "long verbatim game directory selects its own title ID and locale");
+    SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", (root / nested).c_str());
+    check(matches(0xCD, "bb-BB"), "long ordinary game directory selects its own title ID and locale");
+    SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", (extended / nested / L"missing").c_str());
+    uint32_t id = 0;
+    check(method<TitleId>(game, 3)(game, &id) == E_FAIL, "a missing config in the override does not use another title ID");
+    const auto cwd = fs::current_path();
+    fs::current_path(root);
+    const auto relative = nested / L".." / nested.filename();
+    SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", relative.c_str());
+    check(matches(0xCD, "bb-BB"), "a relative override with a parent segment selects the long install");
+    fs::current_path(cwd);
+    SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", nullptr);
+    check(matches(0xAB, "aa-AA"), "removing the override restores the configured title ID and locale");
+    rt::fs::configure(root / nested, {});
+    check(matches(0xCD, "bb-BB"), "a long configured directory supplies metadata when the override is unset");
+    rt::fs::configure({}, {});
+    fs::remove_all(extended, ec);
+    check(!ec, "remove the long test install");
+}
+
 const GUID kSystem5Id = {0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
 const GUID kIUnknownId = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 
@@ -933,6 +987,10 @@ void check_run_time_load() {
             DeleteFileA(config.c_str());
             RemoveDirectoryA(game.c_str());
             SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+            if (void* package = get(package_cls)) {
+                check_package_config_root(g, package);
+                release(package);
+            }
             reinterpret_cast<LaunchNew>(slot(g, 4))(g, "other.exe", "", nullptr);
             check(true, "slot 4 (void XLaunchNewGame) returns offline");
             check(reinterpret_cast<Restart>(slot(g, 5))(g, "--restarted", 0) == S_OK,

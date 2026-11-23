@@ -1021,12 +1021,32 @@ bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess
 // there is no folder or no config. Wide on purpose: a game folder named outside the ANSI code page must reach the file
 // intact.
 std::string package_config() {
-    wchar_t env[MAX_PATH] = {};
-    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_GAME_DIR", env, MAX_PATH);
-    const std::filesystem::path dir = (n > 0 && n < MAX_PATH) ? std::filesystem::path(env) : rt::fs::game_dir();
+    std::wstring env(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_GAME_DIR", env.data(), static_cast<DWORD>(env.size()));
+        if (n < env.size()) {
+            env.resize(n);
+            break;
+        }
+        env.resize(n);  // The required capacity includes the terminator.
+    }
+    const std::filesystem::path dir = env.empty() ? rt::fs::game_dir() : std::filesystem::path(env);
     if (dir.empty()) return {};
-    std::ifstream f(dir / L"MicrosoftGame.Config", std::ios::binary);
-    if (!f) return {};
+    const auto config = dir / L"MicrosoftGame.Config";
+    std::ifstream f(config, std::ios::binary);
+    if (!f) {
+        // A process without longPathAware can still open an absolute path through the extended-length namespace.
+        // Resolve relative paths and dot segments before adding the prefix, which disables Win32 normalization.
+        std::error_code ec;
+        const auto full = config.is_absolute() ? config : std::filesystem::absolute(config, ec);
+        if (ec || (config.native().size() < MAX_PATH && full.native().size() < MAX_PATH)) return {};
+        const std::wstring path = full.lexically_normal().native();
+        if (path.starts_with(L"\\\\?\\") || path.starts_with(L"\\\\.\\")) return {};
+        const std::filesystem::path extended = path.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + path.substr(2)
+                                                                         : L"\\\\?\\" + path;
+        f.open(extended, std::ios::binary);
+        if (!f) return {};
+    }
     return std::string{std::istreambuf_iterator<char>(f), {}};
 }
 
