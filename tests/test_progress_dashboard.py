@@ -3,7 +3,7 @@
     python -I tests/test_progress_dashboard.py
 
 Every input is written here by hand (Markdown tables, JUnit XML, a CTest log, a fake work folder whose shader names
-are sentinels). No game files, no GPU, no network: the GitHub path is exercised through its parsers only.
+are sentinels). No game files, no GPU, no network: the GitHub path is fed synthetic gh output.
 """
 import json
 import os
@@ -251,6 +251,62 @@ class Github(unittest.TestCase):
         self.assertEqual(pd.item_ids("Docs/Tests: SHADER-4 and SHADER-4 again, TEST-9"), ["SHADER-4", "TEST-9"])
         self.assertEqual(pd.item_ids("hash with SHA-256, write UTF-8, read OPTIONS2-1 and D3D12-3"), [])
         self.assertEqual(pd.item_ids(None), [])
+
+    def test_d3d_metric_counts_merged_pull_requests_not_only_table_rows(self):
+        body = ("| ID | Title | Owner | PR | Status |\n|---|---|---|---|---|\n"
+                "| D3D-1 | a | @a | #50 | PR open |\n| D3D-2 | b | @b | #51 | PR open |\n")
+        merged = [{"number": n, "title": f"D3D-{n}: x", "mergedAt": "2026-11-22T10:00:00Z", "author": {"login": "x"}}
+                  for n in (10, 11, 12)]
+        open_prs = [{"number": 50, "title": "D3D-1: a", "isDraft": False, "author": {"login": "x"}},
+                    {"number": 51, "title": "D3D-2: b", "isDraft": False, "author": {"login": "x"}}]
+
+        def fake_gh(args, timeout=60):
+            if args[:2] == ["pr", "list"]:
+                return merged if "merged" in args else open_prs
+            if args[:2] == ["issue", "view"]:
+                return {"body": body, "updatedAt": "2026-11-22T00:00:00Z"}
+            return []
+        col = pd.Collector()
+        with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
+            pd.collect_github(col, "o/r", "me")
+        m = next(m for m in col.metrics if m["id"] == "d3d12.merged")
+        self.assertEqual((m["numerator"], m["denominator"]), (3, 5))
+
+    def run_d3d_metric(self, body, merged, open_prs):
+        """The d3d12.merged metric for a #313 body and the repository's merged and open PR lists (None: unreadable)."""
+        def fake_gh(args, timeout=60):
+            if args[:2] == ["pr", "list"]:
+                return merged if "merged" in args else open_prs
+            if args[:2] == ["issue", "view"]:
+                return {"body": body, "updatedAt": "2026-11-22T00:00:00Z"}
+            return []
+        col = pd.Collector()
+        with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
+            pd.collect_github(col, "o/r", "me")
+        return next(m for m in col.metrics if m["id"] == "d3d12.merged")
+
+    @staticmethod
+    def prs(*pairs):
+        return [{"number": n, "title": t, "isDraft": False, "mergedAt": "2026-11-22T10:00:00Z", "author": {"login": "x"}}
+                for n, t in pairs]
+
+    def test_d3d_id_with_an_open_pr_is_not_counted_as_merged(self):
+        body = ("| ID | Title | Owner | PR | Status |\n|---|---|---|---|---|\n"
+                "| D3D-3 | a | @a | #819 | PR open |\n| D3D-4 | b | @b | #60 merged | merged |\n")
+        merged = self.prs((291, "D3D-3: first part"), (60, "D3D-4: b"), (292, "D3D-20: c"), (293, "D3D-21: d"))
+        open_prs = self.prs((819, "D3D-3: rest"), (820, "D3D-20: more"))
+        m = self.run_d3d_metric(body, merged, open_prs)
+        # D3D-4 (table: merged) and D3D-21 (merged PR, no open PR); not D3D-3 (table: open) or D3D-20 (open PR)
+        self.assertEqual((m["numerator"], m["denominator"]), (2, 4))
+        self.assertNotIn("note", m)
+
+    def test_d3d_metric_says_so_when_a_pr_list_could_not_be_read(self):
+        body = ("| ID | Title | Owner | PR | Status |\n|---|---|---|---|---|\n"
+                "| D3D-4 | b | @b | #60 merged | merged |\n| D3D-5 | c | @c | #61 | PR open |\n")
+        m = self.run_d3d_metric(body, self.prs((70, "D3D-9: x")), None)
+        self.assertEqual((m["numerator"], m["denominator"]), (1, 2))   # table rows only
+        self.assertIn("partial", m["title"])
+        self.assertIn("could not be read", m["note"])
 
     def test_merged_pull_requests_are_implemented(self):
         merged = [{"number": 10, "title": "D3D-1: a", "mergedAt": "2026-11-22T10:00:00Z", "author": {"login": "x"}},

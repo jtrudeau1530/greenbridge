@@ -758,6 +758,11 @@ def item_ids(title):
     return out
 
 
+def d3d_item_ids(pulls):
+    """D3D- item IDs named by the titles of these pull requests."""
+    return {i for p in pulls for i in item_ids(p.get("title")) if i.startswith("D3D-")}
+
+
 def collect_pulls(col, repo, merged, open_prs, limit=PR_LIMIT):
     """Every pull request into main: merged is IMPLEMENTED, open is PARTIAL; closed without merging is left out.
     Grouped by the item family its title names (D3D, SHADER, BUILD, ...)."""
@@ -832,7 +837,8 @@ def collect_github(col, repo, login):
         col.source("github_ci", None, "ok", len(latest))
     issue = gh_json(["issue", "view", "313", "-R", repo, "--json", "body,updatedAt"])
     if issue:
-        n = merged = 0
+        n = 0
+        table_ids, table_done = set(), set()
         for heading, header, rows, _ in md_tables(issue["body"]):
             h = [plain(x).lower() for x in header]
             if h[:1] != ["id"] or "pr" not in h:
@@ -842,15 +848,25 @@ def collect_github(col, repo, login):
                     continue
                 owner, pr, st = plain(row[h.index("owner")]), plain(row[h.index("pr")]), plain(row[h.index("status")]) if "status" in h else ""
                 status, why = d3d_state(owner, pr, st, merged_set, open_set)
-                merged += status == "implemented"
+                table_ids.add(plain(row[0]))
+                if status == "implemented":
+                    table_done.add(plain(row[0]))
                 n += 1
                 col.add(f"d3d.{plain(row[0])}", "d3d12", why, f"{plain(row[0])} {plain(row[1])}"[:120], status,
                         detail=(st or why)[:200], owner=owner, prs=pr[:120])
         col.source("github_313", None, "ok", n, note=f"issue updated {issue.get('updatedAt')}")
         if n:
-            col.metric("d3d12.merged", "d3d12", "D3D- items merged on main", merged, n,
-                       "items with a PR merged into main (the PR column's word, or the repository's merged list) and no PR "
-                       "still open / items")
+            # the table lists only items still in progress; a merged item leaves it, so the merges are counted where they are recorded
+            lists_read = merged_set is not None
+            merged_ids = d3d_item_ids(merged) if lists_read else set()
+            open_ids = d3d_item_ids(open_prs) if lists_read else set()
+            pr_done = (merged_ids - table_ids) - open_ids    # rows in #313 keep the table's state; the rest need a merged PR and no open one
+            col.metric("d3d12.merged", "d3d12", "D3D- items merged on main" + ("" if lists_read else " (partial)"),
+                       len(table_done | pr_done), len(table_ids | merged_ids | open_ids),
+                       "#313 rows whose state is implemented (d3d_state), plus D3D- IDs not in #313 that a merged PR title names "
+                       "and no open PR title names / all known D3D- IDs (#313 rows plus IDs named by any merged or open PR title)",
+                       note=None if lists_read else "partial: the merged or open PR list could not be read, "
+                                                     "so only the #313 rows are counted")
     coord = gh_json(["issue", "list", "-R", repo, "--state", "open", "--search", "Coordinating who works on what in:title",
                      "--json", "number,title,updatedAt"])
     if coord:
