@@ -17,6 +17,11 @@ Reads what the shaders stage of make_game.py leaves in <work>/shaders, and print
   (§5.2) if two of its stages use one; this gives the per-stage counts. Which stages are paired in one PSO is in
   the executable, not in shaders.rpf.
 
+InnerCoverage metadata is cross-tabulated by stage: SFI0 set/clear/unknown versus ISG1
+present/absent/unknown. Unknown includes missing or truncated parts; unreadable containers
+remain in the existing unreadable count. DXIL permits InnerCoverage outside the signature,
+so ISG1 absence is not evidence of non-use. These counts do not identify an Xbox input VGPR.
+
 Standard library only. Nothing from the game is printed or written: names, code and data stay in the work folder.
 """
 import argparse
@@ -143,9 +148,32 @@ def stage_name(row: dict) -> str:
     return stage if isinstance(stage, str) and stage else "?"
 
 
+def inner_coverage_metadata(p: dict) -> tuple[str, str]:
+    """Independent SFI0/ISG1 observations, not an Xbox VGPR mapping.
+
+    DXC DxilConstants.h defines ShaderFeatureInfo_InnerCoverage as 0x400;
+    DxilContainer.h defines the signature system value as 70. DXIL.rst marks
+    InnerCoverage NotInSig: an absent signature entry does not disprove use.
+    Missing/truncated metadata must not become evidence of absence.
+    """
+    sfi = p.get("SFI0", b"")
+    feature = "unknown"
+    if len(sfi) >= 8:
+        feature = "set" if struct.unpack_from("<Q", sfi)[0] & 0x400 else "clear"
+    sig = p.get("ISG1", b"")
+    signature = "unknown"
+    if len(sig) >= 8:
+        count, first = struct.unpack_from("<II", sig)
+        if 8 <= first <= len(sig) and count <= (len(sig) - first) // 32:
+            signature = "present" if any(struct.unpack_from("<I", sig, first + i * 32 + 12)[0] == 70
+                                         for i in range(count)) else "absent"
+    return feature, signature
+
+
 def scan_dxbc(dxbc_dir: str, index: list) -> dict:
     stages = Counter()
     flags = defaultdict(Counter)  # flag -> stage -> shaders
+    inner = defaultdict(Counter)  # stage -> independent metadata observations, counts only
     gs_streams = Counter()
     non_zero_stream = Counter()  # stage -> shaders with an output element on a stream other than 0
     records, shaders_with = Counter(), Counter()   # PSV0: (type, kind) -> records; watched class -> shaders
@@ -168,6 +196,8 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
         except (OSError, ValueError):
             missing += 1
             continue
+        feature, signature = inner_coverage_metadata(p)
+        inner[stage][f"sfi0_{feature}__isg1_{signature}"] += 1
         if len(p.get("SFI0", b"")) >= 8:
             mask = struct.unpack_from("<Q", p["SFI0"], 0)[0]
             for bit, name in SFI0_FLAGS.items():
@@ -193,6 +223,7 @@ def scan_dxbc(dxbc_dir: str, index: list) -> dict:
         by_type[t] += n
     return {"stages": {s: stages.get(s, 0) for s in ALL_STAGES} | {k: v for k, v in stages.items() if k not in ALL_STAGES},
             "sfi0": {n: dict(flags[n]) for n in sorted(flags)},
+            "inner_coverage_metadata": {s: dict(sorted(v.items())) for s, v in sorted(inner.items())},
             "gs_output_stream_count": dict(gs_streams), "output_on_stream_other_than_0": dict(non_zero_stream),
             "psv0": {"records": sum(records.values()),
                      "by_type": dict(by_type),
@@ -571,6 +602,8 @@ def main() -> int:
     for name in WATCHED:
         print(f"SFI0 {name}: {sum(d['sfi0'].get(name, {}).values())} {d['sfi0'].get(name, {})}")
     print("SFI0, every flag set anywhere:", {n: sum(v.values()) for n, v in d["sfi0"].items()})
+    print("InnerCoverage metadata (ISG1 absence does not disprove use; no Xbox VGPR mapping):",
+          d["inner_coverage_metadata"])
     print("GS output-signature stream counts:", d["gs_output_stream_count"],
           "| shaders with an output on a stream other than 0:", d["output_on_stream_other_than_0"] or 0)
     pv = d["psv0"]
