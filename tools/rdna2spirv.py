@@ -10057,12 +10057,26 @@ class Gen:
             # op_sel[0..1], with neg/abs source modifiers) is clamped to [-1, 1] (i16) or [0, 1] (u16), scaled by
             # 32767 or 65535 and rounded once to nearest even (NaN -> 0). For |cl| >= 0.25, cl * (scale + 1) is an
             # exact even integer in f32, so cl * (scale + 1) - RoundEven(cl) gives the exact single-rounded result
-            # without binary32 double-rounding at near-tie f16 inputs. Output modifiers and dst op_sel are rejected.
-            if any(m == "clamp" or m.startswith(("mul:", "div:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods):
+            # without binary32 double-rounding at near-tie f16 inputs. Measured exhaustively on gfx1036 across all
+            # 65,536 f16 values (wave32 & wave64): VOP3 clamp is a hardware no-op, and op_sel[2] = 1 shifts the
+            # 32-bit packed result left by 16 bits (D[31:16] = norm16(S0.f16), D[15:0] = 0, overwriting D).
+            # Reserved VOP3 omod bits [60:59] are rejected by llvm-mc (gfx1036) and ignored by silicon, so
+            # mul:*/div:*, VOP3P modifiers, _dpp/_sdwa, and malformed op_sel lists are refused.
+            opsel_mods = [m for m in mods if m.startswith("op_sel:")]
+            if (ins["op"].endswith(("_dpp", "_sdwa")) or len(opsel_mods) > 1 or
+                    any(m != "clamp" and not m.startswith("op_sel:") for m in mods)):
                 raise Unsupported(op + " modifier")
+            if opsel_mods:
+                m_sel = opsel_mods[0]
+                if not (m_sel.startswith("op_sel:[") and m_sel.endswith("]")):
+                    raise Unsupported(op + " op_sel")
+                try:
+                    raw_bits = [int(x) for x in m_sel[len("op_sel:["):-1].split(",")]
+                except ValueError:
+                    raise Unsupported(op + " op_sel") from None
+                if not raw_bits or len(raw_bits) > 3 or any(b not in (0, 1) for b in raw_bits):
+                    raise Unsupported(op + " op_sel")
             sel, dhi = self.opsel_bits(mods, 2)
-            if dhi:
-                raise Unsupported(op + " op_sel destination")
             snorm = op == "v_cvt_pknorm_i16_f16"
             lo_f = self.fconst(-1.0) if snorm else "%f0"
             scale_f = self.fconst(32767.0 if snorm else 65535.0)
@@ -10094,6 +10108,10 @@ class Gen:
             sh, r = self.tmp(), self.tmp()
             self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
+            if dhi:
+                r_hi = self.tmp()
+                self.emit(f"{r_hi} = OpShiftLeftLogical %uint {r} {self.cu(16)}")
+                r = r_hi
             self.dst(a[0], r)
         elif op == "v_cvt_pkrtz_f16_f32":
             # Packs two f32 as f16 into one dword with round-toward-zero (exact, see f16_rtz). The earlier
