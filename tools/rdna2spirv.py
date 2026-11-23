@@ -15192,6 +15192,11 @@ def sdwa_reads_dst(op: str, mods: list[str]) -> bool:
             and any(m.startswith(("dst_sel:BYTE_", "dst_sel:WORD_")) for m in mods))
 
 
+# All VGPR operands of these instructions are sources, including store address and data ranges.
+VGPR_READ_ONLY_PREFIXES = ("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "ds_write",
+                           "global_store", "flat_store", "scratch_store")
+
+
 def read_before_write_vgprs(insns):
     """VGPRs a shader reads before writing them: for a fetch-calling VS these are the fetched attributes."""
     written, first = set(), []
@@ -15199,8 +15204,7 @@ def read_before_write_vgprs(insns):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store")) \
+        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES) \
             or (op.startswith("global_atomic_") and "glc" not in ins["mods"])   # no vdst without glc
         regs = []
         for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
@@ -15260,8 +15264,7 @@ def interp_ij_analysis(insns, g):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store"))
+        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES)
         if not reads_all and a[0]["k"] == "vgpr":
             for r in vgpr_dest_registers(ins):
                 writes[r].append(n)
@@ -15462,8 +15465,7 @@ def reg_reads_writes(insns):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write",
-                                   "global_store"))
+        reads_all = op.startswith(VGPR_READ_ONLY_PREFIXES)
         regs = []
         for x in (a if reads_all or sdwa_reads_dst(op, ins.get("mods", [])) else a[1:]):
             if x["k"] == "vgpr":
