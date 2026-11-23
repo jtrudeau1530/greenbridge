@@ -29,9 +29,7 @@ inline constexpr std::size_t kDerivedRecordPayload = 4;
 // present, so the count reaches 4 (measured from the title's record writes, see the notes in docs/d3d12_vulkan.md).
 inline constexpr unsigned kDerivedMaxRecords = 4;
 
-// An owned deep copy of one pipeline state stream. The root signature references are held until destruction; shader
-// bytecode, stream-output and input-layout arrays and strings, and cached blobs are copied, and their pointers in the
-// copy point at the copies.
+// Owns a pipeline state stream, its root signatures, and shared copies of its blobs.
 class PsoStreamRecord {
 public:
     // Null when the stream is malformed, holds a subobject type this module does not walk, or is too large.
@@ -55,9 +53,13 @@ private:
     bool copy_pointed_data(std::size_t type, std::size_t payload_offset);
 
     std::vector<unsigned char> bytes_;
-    std::vector<std::vector<unsigned char>> blobs_;  // owned copies; their buffers do not move when this grows
-    std::vector<ID3D12RootSignature*> roots_;        // AddRef'd
+    // Interned immutable copies with stable addresses.
+    std::vector<std::shared_ptr<const std::vector<unsigned char>>> blobs_;
+    std::vector<ID3D12RootSignature*> roots_;  // AddRef'd
 };
+
+// Distinct pointed-to blobs currently shared by live records (for tests: 0 once every record is destroyed).
+std::size_t interned_blob_count();
 
 enum class DeriveStatus { ok, unknown_tag, missing_state, malformed };
 
@@ -70,5 +72,19 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
 // then the record is dropped. find returns null when no record was attached to that object.
 bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> record);
 const PsoStreamRecord* find_pso_record(ID3D12Object* object);
+
+// The console draws its rectangle lists (IA topology 17) with pipelines it made as triangles: its native pipeline
+// format (slot 57) carries topology types 0..4 only, and slot 55 derives from those. The layer draws rectangles
+// through a pipeline of the console's rectangle type 19, which adds each rectangle's fourth corner in a generated
+// geometry stage (src/rect_list_geometry.h). rect_list_variant_stream writes `base` with its PRIMITIVE_TOPOLOGY set
+// to that type; `out`'s pointers still refer to the base record's copies.
+enum class RectVariantStatus {
+    ok,
+    rectangles,     // already the rectangle type: the pipeline itself draws the list
+    not_triangles,  // a point, line or patch pipeline, or no topology subobject: not a rectangle list's pipeline
+    extra_stage,    // a GS, HS, DS or mesh stage: the generated stage only follows a vertex stage
+    malformed,
+};
+RectVariantStatus rect_list_variant_stream(const PsoStreamRecord& base, std::vector<unsigned char>& out);
 
 }  // namespace rt::d3d12_xs

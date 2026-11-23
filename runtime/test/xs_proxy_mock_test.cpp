@@ -107,6 +107,7 @@ struct Mock {
     Mock* device10_alias;    // device: when set, QueryInterface(ID3D12Device10) answers this object, not itself
     UINT64 allocation_size;  // device: what GetResourceAllocationInfo (slot 25) answers
     IUnknown* private_data;  // resource: the SetPrivateDataInterface object, released with the last reference
+    HRESULT private_data_result;
     SRWLOCK lock;            // fence: guards completed, armed_value and armed_event (zeroed = SRWLOCK_INIT)
     std::uint64_t completed; // fence: what GetCompletedValue (slot 8) returns
     std::uint64_t armed_value;  // fence: the value SetEventOnCompletion (slot 9) waits for
@@ -409,6 +410,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         }
     }
     if (m->kind == Kind::resource && slot == 5) {                     // SetPrivateDataInterface(guid, object)
+        if (FAILED(m->private_data_result)) return static_cast<std::uint32_t>(m->private_data_result);
         auto* const object = reinterpret_cast<IUnknown*>(a2);
         if (object) object->AddRef();
         if (m->private_data) m->private_data->Release();
@@ -3019,6 +3021,9 @@ struct PlacedHandlerState {
     D3D12_RESOURCE_DESC desc{};
     unsigned char first_byte = 0xcc;  // the memory's first byte when the handler ran: zeroed or the title's
     HRESULT result = S_OK;
+    HRESULT private_data_result = S_OK;
+    Mock* resource = nullptr;
+    bool resource_destroyed_at_free = false;
 } g_placed;
 
 HRESULT mock_placed_handler(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, std::uint32_t,
@@ -3029,8 +3034,9 @@ HRESULT mock_placed_handler(ID3D12Device* real, void* va, const D3D12_RESOURCE_D
     g_placed.desc = desc;
     g_placed.first_byte = *static_cast<const unsigned char*>(va);
     if (FAILED(g_placed.result)) return g_placed.result;
-    Mock* child = new_mock(Kind::resource);
-    return mock_query(child, &riid, out);
+    g_placed.resource = new_mock(Kind::resource);
+    g_placed.resource->private_data_result = g_placed.private_data_result;
+    return mock_query(g_placed.resource, &riid, out);
 }
 
 int check_committed_buffers_on_xmem() {
@@ -3082,6 +3088,21 @@ int check_committed_buffers_on_xmem() {
     EXPECT(reinterpret_cast<Mock*>(resource)->private_data != nullptr && g_heap_hook.free_calls == 0);
     EXPECT(release(resource) == 0);
     EXPECT(g_heap_hook.free_calls == 1 && g_heap_hook.last_free_ptr == arena);
+
+    // Failed private-data attachment destroys the placed resource before freeing its backing.
+    reset();
+    g_placed.private_data_result = E_OUTOFMEMORY;
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, [](void* ptr, std::uint64_t attributes) {
+        g_placed.resource_destroyed_at_free = g_placed.resource && g_placed.resource->refs == 0;
+        mock_heap_free(ptr, attributes);
+    });
+    resource = reinterpret_cast<void*>(1);
+    const HRESULT attach_failure = slot76(buffer, 0, &resource);
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+    EXPECT(attach_failure == E_OUTOFMEMORY && !resource);
+    EXPECT(g_placed.resource && g_placed.resource->calls[5] == 1);
+    EXPECT(g_heap_hook.free_calls == 1 && g_heap_hook.last_free_ptr == arena);
+    EXPECT(g_placed.resource_destroyed_at_free);
 
     // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: the title's bytes stay.
     reset();

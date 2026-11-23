@@ -38,6 +38,7 @@
 #include "d3d12_xs_pso_stream.h"
 #include "d3d12_xs_native_pso.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+#include "../src/rect_list_geometry.h"  // leonida::topology_rect_list
 
 #ifdef LEONIDA_VULKAN_DEVICE
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
@@ -2210,6 +2211,9 @@ struct ListProxy {
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vb_scratch;  // slot-48 views with their VAs translated
     std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> so_scratch;  // slot-49 views, same treatment
+    // Rectangle lists (rect_list_pipeline): the pipeline the title set, the one the real list has, and the topology.
+    std::uint64_t title_pso = 0, bound_pso = 0;
+    std::uint32_t topology = 0;
 
     void pin_cursor_at_limit() {
         const std::uint64_t at_limit = static_cast<std::uint64_t>(
@@ -2333,6 +2337,49 @@ unsigned detect_list_slot_count(IUnknown* real) {
     return 60;
 }
 
+// Rectangle lists (console IA topology 17). The console draws them with pipelines it made as triangles (slot 57's
+// native format has topology types 0..4 only, and slot 55 derives from those). While topology 17 is set, the real
+// list gets the pipeline's rectangle variant instead (rect_list_pipeline, below), so the layer's geometry stage adds
+// each rectangle's fourth corner; otherwise the title's own pipeline. Reset, ClearState and an executed bundle set
+// the state as D3D12 does.
+ID3D12PipelineState* rect_list_pipeline(DeviceProxy* device, ID3D12PipelineState* pso);
+
+std::uint64_t rect_list_wanted(ListProxy* self) {
+    if (self->topology != leonida::topology_rect_list || !self->title_pso) return self->title_pso;
+    return reinterpret_cast<std::uint64_t>(
+        rect_list_pipeline(self->device, reinterpret_cast<ID3D12PipelineState*>(self->title_pso)));
+}
+
+// SetPipelineState (slot 25): the pipeline to forward.
+std::uint64_t rect_list_set_pipeline(ListProxy* self, std::uint64_t pso) {
+    self->title_pso = pso;
+    self->bound_pso = rect_list_wanted(self);
+    return self->bound_pso;
+}
+
+// IASetPrimitiveTopology (slot 20): entering or leaving topology 17 changes the pipeline the real list needs.
+void rect_list_set_topology(ListProxy* self, std::uint64_t topology) {
+    self->topology = static_cast<std::uint32_t>(topology);
+    const std::uint64_t want = rect_list_wanted(self);
+    if (want == self->bound_pso) return;
+    self->bound_pso = want;
+    self->real->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(want));
+}
+
+// Reset and ClearState (initial pipeline, topology undefined), and list creation.
+void rect_list_reset(ListProxy* self, std::uint64_t pso) {
+    self->title_pso = self->bound_pso = pso;
+    self->topology = 0;
+}
+
+// ExecuteBundle: the pipeline and topology a bundle set stay set on the calling list afterwards.
+void rect_list_after_bundle(ListProxy* self, const ListProxy* bundle) {
+    if (bundle->title_pso) self->title_pso = bundle->title_pso, self->bound_pso = bundle->bound_pso;
+    if (bundle->topology) self->topology = bundle->topology;
+}
+
+bool is_list_proxy_impl(const void* list);
+
 template <unsigned Slot>
 std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2392,7 +2439,16 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // exists, the same way).
                 a1 = unwrap_object(a1);
                 a2 = unwrap_object(a2);
+                rect_list_reset(self, a2);
+            } else if constexpr (Slot == 11) {
+                rect_list_reset(self, a1);  // ClearState(pso)
+            } else if constexpr (Slot == 20) {
+                rect_list_set_topology(self, a1);  // IASetPrimitiveTopology
+            } else if constexpr (Slot == 25) {
+                a1 = rect_list_set_pipeline(self, a1);  // SetPipelineState
             } else if constexpr (Slot == kConsoleExecuteBundle) {
+                if (is_list_proxy_impl(reinterpret_cast<const void*>(a1)))
+                    rect_list_after_bundle(self, reinterpret_cast<const ListProxy*>(a1));
                 a1 = unwrap_object(a1);  // the bundle is a list proxy too
             } else if constexpr (Slot >= 41 && Slot <= 46) {
                 // The six root descriptor setters (index, GPU VA): an upload-arena CPU pointer becomes the
@@ -2545,7 +2601,7 @@ IUnknown* list_real_or_null(const void* object) {
 
 // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
 // proxy through `out`.
-HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
+HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out, std::uint64_t initial_pso) {
     if (!created) return E_FAIL;
     ListProxy* proxy = new (std::nothrow) ListProxy();  // (): the console body starts zeroed
     if (!proxy) {
@@ -2557,6 +2613,7 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
     proxy->device = device;
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->pc_slot_count = detect_list_slot_count(created);
+    rect_list_reset(proxy, initial_pso);
     proxy->pin_cursor_at_limit();
     proxy_add_ref(device);  // the list keeps its Xbox-ABI device alive for GetDevice
 
@@ -2599,7 +2656,7 @@ HRESULT proxy_create_command_list(DeviceProxy* self, std::uint64_t node_mask, st
         reinterpret_cast<ID3D12PipelineState*>(pso), __uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
     if (!created) return E_FAIL;
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self, riid, out, pso);
 }
 
 // Calls the real device's slot `Slot` with these five words in the positions the thunk received them (see "A thunk
@@ -2748,7 +2805,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     void* created = nullptr;
     const HRESULT hr = create(__uuidof(ID3D12GraphicsCommandList), &created);
     if (FAILED(hr)) return hr;
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self, riid, out, initial_state_word);
 }
 
 // Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer
@@ -3528,23 +3585,24 @@ std::size_t xmem_size(DeviceProxy* self, const D3D12_RESOURCE_DESC& desc) {
     return static_cast<std::size_t>(info.SizeInBytes);
 }
 
-// Ties hook memory to `resource` as private data, so it goes back through the hook's free when the resource dies. A
-// resource that takes no reference (no ID3D12Object, or no memory for the entry) gives the memory back at once.
-void tie_xmem(void* resource, void* memory, const XmemHooks& hooks) {
-    auto* const owner = new (std::nothrow) XmemBackingOwner(memory, hooks.free, kXmemCommittedResourceAttributes);
-    if (!owner) {
-        if (hooks.free) hooks.free(memory, kXmemCommittedResourceAttributes);
-        return;
-    }
+// The caller retains ownership of the hook memory if attachment fails.
+HRESULT tie_xmem(void* resource, void* memory, const XmemHooks& hooks) {
+    if (!resource) return E_POINTER;
     ID3D12Object* object = nullptr;
-    if (resource &&
-        SUCCEEDED(static_cast<IUnknown*>(resource)->QueryInterface(__uuidof(ID3D12Object),
-                                                                    reinterpret_cast<void**>(&object))) &&
-        object) {
-        object->SetPrivateDataInterface(kXmemBackingPrivateData, owner);  // the resource holds its own reference
-        object->Release();
+    HRESULT hr = static_cast<IUnknown*>(resource)->QueryInterface(
+        __uuidof(ID3D12Object), reinterpret_cast<void**>(&object));
+    if (FAILED(hr)) return hr;
+    if (!object) return E_NOINTERFACE;
+
+    auto* const owner = new (std::nothrow) XmemBackingOwner(memory, nullptr, kXmemCommittedResourceAttributes);
+    hr = E_OUTOFMEMORY;
+    if (owner) {
+        hr = object->SetPrivateDataInterface(kXmemBackingPrivateData, owner);
+        if (SUCCEEDED(hr)) owner->free_fn = hooks.free;
+        owner->Release();
     }
-    owner->Release();  // frees now when the resource took no reference
+    object->Release();
+    return hr;
 }
 
 // LEONIDA_XMEM_RESOURCE_BACKING=0 keeps every committed resource on the PC device's own memory and the hook memory as
@@ -3602,7 +3660,8 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
                          "[rt] d3d12_xs: slot %u resource memory through the title's XMem hook: %zu bytes, %s "
                          "(bookkeeping: the resource stays on the PC device's memory)\n",
                          slot, size, memory ? "allocated" : "refused");
-        if (memory) tie_xmem(*out, memory, hooks);
+        if (memory && FAILED(tie_xmem(*out, memory, hooks)) && hooks.free)
+            hooks.free(memory, kXmemCommittedResourceAttributes);
         return hr;
     }
 
@@ -3618,12 +3677,18 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
     if (!(heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) std::memset(memory, 0, size);
     HRESULT hr = handler(self->real, memory, desc, 0xFFFFFFFFu, riid, out);
     if (SUCCEEDED(hr)) {
+        const HRESULT attach_hr = tie_xmem(*out, memory, hooks);
+        if (FAILED(attach_hr)) {
+            if (*out) static_cast<IUnknown*>(*out)->Release();
+            *out = nullptr;
+            if (hooks.free) hooks.free(memory, kXmemCommittedResourceAttributes);
+            return attach_hr;
+        }
         static std::atomic<bool> logged{false};
         if (first_call(logged))
             std::fprintf(stderr,
                          "[rt] d3d12_xs: slot %u buffer on the title's XMem hook memory: %p, %llu bytes (%zu taken)\n",
                          slot, memory, static_cast<unsigned long long>(desc.Width), size);
-        tie_xmem(*out, memory, hooks);
         return hr;
     }
     static std::atomic<bool> fallback_logged{false};
@@ -3634,11 +3699,9 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
                      slot, memory, static_cast<unsigned long>(hr));
     if (out) *out = nullptr;
     hr = create_pc();
-    if (FAILED(hr) || !*out) {
+    if (FAILED(hr) || !*out || FAILED(tie_xmem(*out, memory, hooks))) {
         if (hooks.free) hooks.free(memory, kXmemCommittedResourceAttributes);
-        return hr;
     }
-    tie_xmem(*out, memory, hooks);
     return hr;
 }
 
@@ -3990,6 +4053,85 @@ HRESULT proxy_create_derived_pso(DeviceProxy* self, ID3D12PipelineState* base, s
     desc.SizeInBytes = patched.size();
     desc.pPipelineStateSubobjectStream = patched.data();
     return create_pso_from_stream(self, &desc, riid, out);
+}
+
+// ---- Rectangle variants (see rect_list_wanted) ----
+// A pipeline's rectangle variant is made the first time a list binds it with topology 17, from the stream kept on it
+// (keep_pso_stream: slots 57, 55 and 86 all keep one), with the topology type set to the console's rectangle type 19
+// (rect_list_variant_stream). The variant lives in the pipeline's private data, so it is released with the pipeline
+// and a later pipeline at the same address does not find it. A pipeline that cannot have one keeps a null there:
+// the attempt is made once per pipeline, and each reason is logged once.
+constexpr GUID kRectVariantGuid{0x6d2a41c8, 0x93be, 0x4f07, {0xa5, 0x1c, 0x2e, 0x84, 0x7b, 0xd0, 0x39, 0x5f}};
+constexpr GUID kRectVariantPointerGuid{0xb83e05d4, 0x1f6a, 0x4c92, {0x8e, 0x37, 0xd1, 0x5a, 0x04, 0xc6, 0x9b, 0x21}};
+std::mutex g_rect_variant_mutex;  // one maker at a time, so two lists never make two variants of one pipeline
+std::atomic<std::uint64_t> g_rect_variants_made{0}, g_rect_variants_refused{0};
+
+// True when the pipeline was looked at before; `variant` is then its variant, or null when it has none.
+bool known_rect_variant(ID3D12PipelineState* pso, ID3D12PipelineState*& variant) {
+    variant = nullptr;
+    UINT size = sizeof(variant);
+    return SUCCEEDED(pso->GetPrivateData(kRectVariantPointerGuid, &size, &variant)) && size == sizeof(variant);
+}
+
+ID3D12PipelineState* no_rect_variant(ID3D12PipelineState* pso, unsigned reason, const char* why, HRESULT hr) {
+    ID3D12PipelineState* none = nullptr;
+    pso->SetPrivateData(kRectVariantPointerGuid, sizeof(none), &none);
+    if (!why) return pso;  // nothing to report: the pipeline draws the list as it is
+    g_rect_variants_refused.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> logged[5]{};
+    if (!logged[reason].exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: a rectangle list (topology 17) keeps a triangle pipeline, so each "
+                             "rectangle draws as one triangle: %s (0x%08lx); logged once\n",
+                     why, static_cast<unsigned long>(hr));
+    return pso;
+}
+
+// The pipeline a list binds for `pso` while topology 17 is set: its rectangle variant, or `pso` itself.
+ID3D12PipelineState* rect_list_pipeline(DeviceProxy* device, ID3D12PipelineState* pso) {
+    ID3D12PipelineState* variant = nullptr;
+    if (!pso) return nullptr;
+    if (known_rect_variant(pso, variant)) return variant ? variant : pso;
+    std::lock_guard lock(g_rect_variant_mutex);
+    if (known_rect_variant(pso, variant)) return variant ? variant : pso;  // another list made it meanwhile
+
+    const PsoStreamRecord* record = find_pso_record(pso);
+    if (!record) return no_rect_variant(pso, 0, "the pipeline has no kept stream", E_FAIL);
+    std::vector<unsigned char> stream;
+    switch (rect_list_variant_stream(*record, stream)) {
+        case RectVariantStatus::ok: break;
+        case RectVariantStatus::rectangles: return no_rect_variant(pso, 0, nullptr, S_OK);
+        case RectVariantStatus::not_triangles:
+            return no_rect_variant(pso, 1, "not a triangle pipeline with a vertex stage", E_INVALIDARG);
+        case RectVariantStatus::extra_stage:
+            return no_rect_variant(pso, 2, "the pipeline has a geometry, tessellation or mesh stage", E_INVALIDARG);
+        case RectVariantStatus::malformed: return no_rect_variant(pso, 3, "the kept stream does not walk", E_FAIL);
+    }
+    ID3D12Device2* device2 = nullptr;
+    HRESULT hr = device->slot_count <= 47 ? E_NOINTERFACE
+                                           : device->real->QueryInterface(__uuidof(ID3D12Device2),
+                                                                          reinterpret_cast<void**>(&device2));
+    ID3D12PipelineState* made = nullptr;
+    if (SUCCEEDED(hr) && device2) {
+        D3D12_PIPELINE_STATE_STREAM_DESC desc{};
+        desc.SizeInBytes = stream.size();
+        desc.pPipelineStateSubobjectStream = stream.data();
+        hr = device2->CreatePipelineState(&desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&made));
+        device2->Release();
+    }
+    // The layer refuses a vertex stage its rectangle geometry stage cannot follow (one that writes ClipDistance,
+    // CullDistance, Layer or ViewportIndex, src/rect_list_geometry.h), and a device without geometry shaders.
+    if (FAILED(hr) || !made)
+        return no_rect_variant(pso, 4, "the device refused the rectangle variant", FAILED(hr) ? hr : E_FAIL);
+    if (FAILED(pso->SetPrivateDataInterface(kRectVariantGuid, made))) {
+        made->Release();
+        return no_rect_variant(pso, 3, "the variant cannot be kept on its pipeline", E_FAIL);
+    }
+    made->Release();  // the pipeline holds it now
+    pso->SetPrivateData(kRectVariantPointerGuid, sizeof(made), &made);
+    if (g_rect_variants_made.fetch_add(1, std::memory_order_relaxed) == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: first rectangle variant made: topology 17 binds it in place of its "
+                             "triangle pipeline\n");
+    return made;
 }
 
 // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,

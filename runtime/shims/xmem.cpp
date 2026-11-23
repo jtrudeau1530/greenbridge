@@ -355,10 +355,11 @@ const Window* find_window(uintptr_t address, uint64_t bytes) {
 
 // With g_phys_mutex held: true when `address` lies inside a recorded reservation that starts before it.
 bool inside_reservation(uintptr_t address) {
-    auto it = g_reservations.lower_bound(address);
-    if (it == g_reservations.begin()) return false;
-    --it;
-    return address - it->first < it->second;
+    for (auto it = g_reservations.lower_bound(address); it != g_reservations.begin();) {
+        --it;
+        if (address - it->first < it->second) return true;
+    }
+    return false;
 }
 
 // A new host reservation (`result`, asked for at `address` with `size`) that lands in a hole the title released inside
