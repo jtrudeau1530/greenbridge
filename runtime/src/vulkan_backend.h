@@ -1397,8 +1397,14 @@ public:
     VkSemaphore semaphore() const { return semaphore_; }
 
     std::uint64_t completed() const {
+        if (context_.is_device_lost()) return UINT64_MAX;
         std::uint64_t value = 0;
-        context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore_, &value);
+        const VkResult result = context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore_, &value);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            context_.mark_device_lost();
+            return UINT64_MAX;
+        }
+        if (result != VK_SUCCESS) return 0;
         return value;
     }
 
