@@ -930,10 +930,11 @@ class UniformVote(unittest.TestCase):
 
     def test_c_scc_of_a_lane_mask_with_a_uniform_vcc_written_after_it(self):
         # SCC is the vote of the AND (vertex 1 on: the wave and the first half say yes); the uniform v_cmp after it
-        # writes VCC but not SCC, so the branch still votes on the lane mask
+        # writes VCC but not SCC, so the branch still votes on the lane mask; since SHADER-820 (#4620) the new VCC
+        # ends SCC's tag as a vote, so the branch is reported as a tainted one
         self.differs("vs_uv_scc_stale", ["v_cmp_eq_u32_e64 s[16:17], 1, v0", "s_and_b64 vcc, exec, s[16:17]",
                                          "v_mov_b32_e32 v1, s4", "v_cmp_lt_u32_e32 vcc, 5, v1", "s_cbranch_scc0 3"]
-                     + VCCZ_SIDES[1:], "unsafe-vote-branch")
+                     + VCCZ_SIDES[1:], "tainted-branch")
 
     def test_c_uniform_mask_anded_with_a_lane_mask(self):
         # only vertex 1 survives the AND: the wave and the first half vote yes, the second half no
@@ -1041,9 +1042,10 @@ class KillExit(unittest.TestCase):
                   "C", contains=["unsafe-vote-branch"])
 
     def test_c_mask_redefined_or_not_the_vote(self):
-        # the mask is rewritten after the vote (s_mov leaves SCC alone): the exit reads another value
+        # the mask is rewritten after the vote (s_mov leaves SCC alone): the exit reads another value. Since
+        # SHADER-820 (#4620) the new value ends SCC's tag as a vote on that mask, so the branch is a tainted one.
         self.tier("ps_kill_redef", kill(KILL + ["s_mov_b64 s[20:21], exec"], RUN_WQM, EXIT_PS),
-                  "C", contains=["unsafe-vote-branch"])
+                  "C", contains=["tainted-branch"])
         # SCC = (mask == 0): the branch to the "exit" is taken when the mask is not empty
         self.tier("ps_kill_cmp_eq", kill(KILL + ["s_cmp_eq_u64 s[20:21], 0"], RUN_WQM, EXIT_PS),
                   "C", contains=["unsafe-vote-branch"])
