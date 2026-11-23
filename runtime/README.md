@@ -168,10 +168,6 @@ Current limits, by design:
   title's callback on, gets its copy from `load()` itself, the way Windows gives one to running threads for a DLL it
   loads: a block, no `DLL_THREAD_ATTACH`, `DLL_THREAD_DETACH` when it ends, and `~Loader` takes the block back.
   `install_tls_for_thread()` and `uninstall_tls_for_thread()` are no-ops on such a thread. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
-  called `load()`.
-  existed before `load()` gets nothing:
-  call `install_tls_for_thread()` before mapped code runs on it and `uninstall_tls_for_thread()` before it
-  exits. Mapped DLLs' `DllMain` is not called with thread events. Destroy the `Loader` on the thread that
   called `load()`. As on Windows, a new thread gets every module's copy before any TLS callback runs, and the
   executable's callbacks come after the DLLs' ones, for attach and for detach.
 - One executable holds index 0 at a time, and only after `reserve_tls_index0()` has run at process start. An
