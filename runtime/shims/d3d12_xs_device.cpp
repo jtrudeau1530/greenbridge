@@ -1509,7 +1509,10 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
-    if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) pc_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // The Xbox layout word (0x101 tiled, 0x1 row-major buffer) is no PC layout: ROW_MAJOR for a buffer and UNKNOWN
+    // for everything else, as slot 76 does.
+    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,

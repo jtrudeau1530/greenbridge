@@ -6943,8 +6943,15 @@ public:
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            log_once("a title-placed texture (device slot 133) is not supported yet; dimension", int(desc.Dimension));
-            return d3d12_trace::result(method, E_NOTIMPL);
+            // A texture is not placed on the title's pages yet: it gets an ordinary committed DEFAULT texture of the
+            // same description, as slot 76 gives one, so the title has its resource instead of asserting (found in
+            // review). What the title writes at `address` does not reach it.
+            log_once("a title-placed texture (device slot 133) is an ordinary committed texture, not the title's pages; "
+                     "dimension",
+                     int(desc.Dimension));
+            const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
+            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
         }
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_CUSTOM;
