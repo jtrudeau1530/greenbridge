@@ -105,7 +105,14 @@ int compare_cases(const std::vector<Case>& ours, const std::vector<Case>& host, 
     for (size_t i = 0; i < ours.size() && i < host.size(); ++i) {
         const D3D12_HEAP_DESC& a = ours[i].desc;
         const D3D12_HEAP_DESC& b = host[i].desc;
-        const bool same = ours[i].hr == host[i].hr && a.SizeInBytes == b.SizeInBytes && a.Alignment == b.Alignment &&
+        // The host's Alignment varies from run to run for the same allocation (64 KiB on some runs, 4 MiB on others,
+        // on an RX 9070 XT, an RTX 5090 and WARP; found in review), so it is not compared: the layer's must be 64 KiB
+        // for an opened heap, and the host's either of the two.
+        const bool alignment_ok =
+            !SUCCEEDED(ours[i].hr) ||
+            (a.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+             (b.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT || b.Alignment == 4ull * 1024 * 1024));
+        const bool same = ours[i].hr == host[i].hr && a.SizeInBytes == b.SizeInBytes && alignment_ok &&
                           a.Properties.Type == b.Properties.Type &&
                           a.Properties.CPUPageProperty == b.Properties.CPUPageProperty &&
                           a.Properties.MemoryPoolPreference == b.Properties.MemoryPoolPreference && a.Flags == b.Flags;
