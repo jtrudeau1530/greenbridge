@@ -972,8 +972,8 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
                 return listing
 
             with mock.patch("os.scandir", scandir):
-                self.run_preflight(work, free_gb=180)
-                self.assert_fails(self.run_preflight, work, free_gb=60, match="about 180 GB is needed")
+                self.run_preflight(work, free_gb=250)
+                self.assert_fails(self.run_preflight, work, free_gb=60, match="about 250 GB is needed")
 
     def test_marker_with_other_contents_does_not_count(self):
         for ogg, xma in (("", self.XMA), (self.OGG, "something else\n"), (self.XMA, self.OGG)):
@@ -1145,23 +1145,23 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         return mock.patch("os.scandir", scandir)
 
     def test_mixed_resume_credits_the_finished_and_the_reusable_unfinished_output_once(self):
-        # 30 + 300 - 96 - 54 = 180 GB; the record files are a few bytes. Finished-only credit asked for 234 GB and a
-        # double credit for the finished step accepted 84 GB.
+        # 30 + 370 - 96 - 54 = 250 GB; the record files are a few bytes. Finished-only credit asked for 304 GB and a
+        # double credit for the finished step accepted 154 GB.
         with tempfile.TemporaryDirectory() as work, self.mixed_resume(work, with_partial=True):
             self.assertEqual(make_game.assets_bytes_on_disk(work) // 2**30, 150)
-            self.run_preflight(work, free_gb=180)
-            self.assert_fails(self.run_preflight, work, free_gb=179, match="about 180 GB is needed")
+            self.run_preflight(work, free_gb=250)
+            self.assert_fails(self.run_preflight, work, free_gb=249, match="about 250 GB is needed")
 
     def test_unfinished_output_of_another_decoder_is_not_credited(self):
         # assets() deletes a folder whose fingerprint differs and exports it again, so only the finished step counts.
         with tempfile.TemporaryDirectory() as work, self.mixed_resume(work, texture_fingerprint="older-decoder"):
-            self.run_preflight(work, free_gb=234)
-            self.assert_fails(self.run_preflight, work, free_gb=233, match="about 234 GB is needed")
+            self.run_preflight(work, free_gb=304)
+            self.assert_fails(self.run_preflight, work, free_gb=303, match="about 304 GB is needed")
 
     def test_a_finished_step_of_another_decoder_is_not_credited(self):
         with tempfile.TemporaryDirectory() as work, self.mixed_resume(work, model_fingerprint="older-decoder"):
-            self.run_preflight(work, free_gb=276)       # 30 + 300 - 54
-            self.assert_fails(self.run_preflight, work, free_gb=275, match="about 276 GB is needed")
+            self.run_preflight(work, free_gb=346)       # 30 + 370 - 54
+            self.assert_fails(self.run_preflight, work, free_gb=345, match="about 346 GB is needed")
 
     def test_the_credit_does_not_cache_a_decoder_digest_before_the_submodule_is_fetched(self):
         # preflight credits the exports before ensure_submodule(): a digest cached then (made from a missing or
@@ -1169,7 +1169,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         # A cached stand-in that would also match the records, so only the cache itself can tell the call happened.
         cached = functools.cache(lambda: self.DECODER)
         with mock.patch("make_game.decoder_digest", cached),                 tempfile.TemporaryDirectory() as work, self.mixed_resume(work):
-            self.run_preflight(work, free_gb=180)
+            self.run_preflight(work, free_gb=250)
         self.assertEqual(cached.cache_info().currsize, 0)
 
     def test_nothing_is_credited_before_the_submodule_is_checked_out(self):
@@ -1179,7 +1179,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
                 mock.patch("make_game.submodule_ready", return_value=False), \
                 mock.patch("make_game.compute_decoder_digest") as digest:
             self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
-            self.assert_fails(self.run_preflight, work, free_gb=329, match="about 330 GB is needed")
+            self.assert_fails(self.run_preflight, work, free_gb=399, match="about 400 GB is needed")
             digest.assert_not_called()
 
     def test_submodule_ready_needs_a_non_empty_core(self):
@@ -1199,7 +1199,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with tempfile.TemporaryDirectory() as work, self.mixed_resume(work), \
                 mock.patch("make_game.compute_decoder_digest", side_effect=FileNotFoundError("Program.cs")):
             self.assertEqual(make_game.assets_bytes_on_disk(work), 0)
-            self.assert_fails(self.run_preflight, work, free_gb=329, match="about 330 GB is needed")
+            self.assert_fails(self.run_preflight, work, free_gb=399, match="about 400 GB is needed")
 
     def test_the_decoder_is_not_hashed_when_there_is_room_or_nothing_is_exported(self):
         with tempfile.TemporaryDirectory() as work, mock.patch("make_game.compute_decoder_digest") as digest:
@@ -1209,7 +1209,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
 
     def test_wav_ignores_the_unfinished_output_too(self):
         with tempfile.TemporaryDirectory() as work, self.mixed_resume(work):
-            self.assert_fails(self.run_preflight, work, free_gb=329, wav=True, match="about 330 GB is needed")
+            self.assert_fails(self.run_preflight, work, free_gb=399, wav=True, match="about 400 GB is needed")
 
     def test_assets_bytes_on_disk_does_not_follow_a_linked_folder(self):
         with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as elsewhere:

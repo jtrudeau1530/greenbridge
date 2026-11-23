@@ -247,7 +247,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
                          emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY),
             call.assets(os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY),
             call.runtime(os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
-                         unittest.mock.ANY),
+                         unittest.mock.ANY, work=os.path.abspath(self.work_dir)),
             call.pipelines(os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
                            runtime_build=None),
         ]

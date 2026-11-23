@@ -401,7 +401,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
             f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader": {}}')   # a bare {} is an empty merge and is translated again (translated_index_is_empty)
         with open(os.path.join(spirv_dir, "wave64_emulate.txt"), "w", encoding="utf-8") as f:
             f.write("off\n")
         with open(os.path.join(spirv_dir, "translation_sources.sha256"), "w", encoding="utf-8") as f:
