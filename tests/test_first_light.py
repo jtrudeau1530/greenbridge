@@ -253,6 +253,22 @@ class ReadObjTests(unittest.TestCase):
             f.write(text)
         return path
 
+    def test_requires_finite_texture_coordinates(self):
+        def triangle(u, v):
+            return self._write_obj(
+                "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+                f"vt {u} {v}\n"
+                "f 1/1 2/1 3/1\n"
+            )
+
+        vertices, indices = fl.read_obj(triangle("-0.25", "1.5"))
+        self.assertEqual(indices, [0, 1, 2])
+        self.assertEqual([vertex[3:] for vertex in vertices], [(-0.25, 1.5)] * 3)
+        for u, v in (("nan", "0.75"), ("0.25", "inf"), ("-inf", "0.75"), ("0.25", "1e999")):
+            with self.subTest(u=u, v=v):
+                with self.assertRaisesRegex(SystemExit, "non-finite texture coordinates"):
+                    fl.read_obj(triangle(u, v))
+
     def test_negative_relative_indices_inline_comments_and_continuations(self):
         positive = self._write_obj(
             "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
