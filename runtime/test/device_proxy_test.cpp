@@ -11,6 +11,7 @@
 //   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
+#include <vector>
 #include <windows.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -106,6 +107,190 @@ bool load_compute_shader(ComPtr<ID3DBlob>& bytecode) {
     }
     check(SUCCEEDED(hr) && bytecode, "trivial compute shader compiles (cs_5_0)");
     return SUCCEEDED(hr) && bytecode;
+}
+
+// ---- Slot 55 (CreateDerivedPipelineState) ----
+
+constexpr std::size_t kRecordBytes = 0x14c;
+
+// One record: u32 tag, then the payload at +4 (d3d12_xs_pso_stream.h).
+void put_record(unsigned char* record, std::uint32_t tag, const void* payload, std::size_t size) {
+    std::memset(record, 0, kRecordBytes);
+    std::memcpy(record, &tag, sizeof(tag));
+    if (size) std::memcpy(record + 4, payload, size);
+}
+
+std::size_t align_up(std::size_t value, std::size_t align) { return (value + align - 1) / align * align; }
+
+// A stream written in the console's layout: u32 type, payload at its alignment, next entry 8-aligned.
+struct StreamBytes {
+    std::vector<unsigned char> bytes;
+    void add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const void* payload, std::size_t size, std::size_t align) {
+        const std::size_t at = bytes.size();
+        bytes.resize(at + 4);
+        const std::uint32_t t = type;
+        std::memcpy(bytes.data() + at, &t, sizeof(t));
+        bytes.resize(align_up(at + 4, align), 0);
+        const auto* p = static_cast<const unsigned char*>(payload);
+        bytes.insert(bytes.end(), p, p + size);
+        bytes.resize(align_up(bytes.size(), 8), 0);
+    }
+};
+
+bool compile_hlsl(const char* source, const char* target, ComPtr<ID3DBlob>& bytecode) {
+    HMODULE compiler = LoadLibraryExA("d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    auto compile = compiler ? reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+    if (!compile) return false;
+    ComPtr<ID3DBlob> errors;
+    const HRESULT hr = compile(source, std::strlen(source), "device_proxy_slot55.hlsl", nullptr, nullptr, "main",
+                               target, D3DCOMPILE_ENABLE_STRICTNESS, 0, bytecode.GetAddressOf(),
+                               errors.GetAddressOf());
+    if (FAILED(hr) && errors) std::printf("shader compile error: %s\n", static_cast<const char*>(errors->GetBufferPointer()));
+    return SUCCEEDED(hr) && bytecode;
+}
+
+// Graphics stream with every state a derived record can patch: DEPTH_STENCIL1, RASTERIZER, BLEND, SAMPLE_MASK.
+std::vector<unsigned char> graphics_stream(ID3D12RootSignature* root, ID3DBlob* vs, ID3DBlob* ps) {
+    StreamBytes s;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, sizeof(root), alignof(void*));
+    const D3D12_SHADER_BYTECODE vs_code{vs->GetBufferPointer(), vs->GetBufferSize()};
+    const D3D12_SHADER_BYTECODE ps_code{ps->GetBufferPointer(), ps->GetBufferSize()};
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs_code, sizeof(vs_code), alignof(void*));
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps_code, sizeof(ps_code), alignof(void*));
+    D3D12_RT_FORMAT_ARRAY rt{};
+    rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rt.NumRenderTargets = 1;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt, sizeof(rt), 4);
+    const DXGI_FORMAT dsv = DXGI_FORMAT_UNKNOWN;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &dsv, sizeof(dsv), 4);
+    const DXGI_SAMPLE_DESC sample{1, 0};
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &sample, sizeof(sample), 4);
+    const D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &topology, sizeof(topology), 4);
+
+    D3D12_BLEND_DESC blend{};
+    for (auto& rtb : blend.RenderTarget) {
+        rtb.SrcBlend = rtb.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rtb.DestBlend = rtb.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rtb.BlendOp = rtb.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rtb.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rtb.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend, sizeof(blend), 4);
+    const UINT mask = 0xffffffffu;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &mask, sizeof(mask), 4);
+    D3D12_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D12_FILL_MODE_SOLID;
+    raster.CullMode = D3D12_CULL_MODE_BACK;
+    raster.DepthClipEnable = TRUE;
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &raster, sizeof(raster), 4);
+    D3D12_DEPTH_STENCIL_DESC1 ds{};
+    ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    ds.StencilReadMask = ds.StencilWriteMask = 0xff;
+    for (D3D12_DEPTH_STENCILOP_DESC* op : {&ds.FrontFace, &ds.BackFace}) {
+        op->StencilFailOp = op->StencilDepthFailOp = op->StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        op->StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    }
+    s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, &ds, sizeof(ds), 4);
+    return s.bytes;
+}
+
+void check_derived_states(ID3D12Device* device, void** proxy_vtbl, ID3D12RootSignature* root,
+                          ID3D12PipelineState* compute_base, ID3D12PipelineState* native_base) {
+    using DeriveFn = HRESULT(WINAPI*)(void*, void*, std::uint64_t, const void*, const IID*, void**);
+    auto derive = reinterpret_cast<DeriveFn>(proxy_vtbl[55]);
+    const IID iid = __uuidof(ID3D12PipelineState);
+    unsigned char rec_tag5[kRecordBytes], rec_raster[kRecordBytes];
+    unsigned char five[5 * kRecordBytes] = {};
+    put_record(rec_tag5, 5, nullptr, 0);
+    D3D12_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    raster.CullMode = D3D12_CULL_MODE_BACK;
+    raster.DepthClipEnable = TRUE;
+    put_record(rec_raster, 1, &raster, sizeof(raster));
+    ComPtr<ID3D12PipelineState> out;
+
+    // Refusals: a compute base has no graphics subobjects, a native compute PSO was never kept, and the arguments.
+    out.Reset();
+    check(derive(device, compute_base, 1, rec_tag5, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_INVALIDARG
+              && !out, "slot 55 refuses tag 5 (E_INVALIDARG, null output)");
+    out.Reset();
+    check(derive(device, compute_base, 1, rec_raster, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_INVALIDARG
+              && !out, "slot 55 refuses a rasterizer record on a base without RASTERIZER (E_INVALIDARG)");
+    out.Reset();
+    check(derive(device, native_base, 1, rec_raster, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_FAIL
+              && !out, "slot 55 refuses a base PSO that was never kept (null output, no derivation)");
+    out.Reset();
+    check(derive(device, compute_base, 1, nullptr, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_POINTER,
+          "slot 55 with null records is E_POINTER");
+    out.Reset();
+    check(derive(device, compute_base, 0, rec_raster, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_INVALIDARG,
+          "slot 55 with n = 0 is E_INVALIDARG");
+    check(derive(device, compute_base, 5, five, &iid, reinterpret_cast<void**>(out.GetAddressOf())) == E_INVALIDARG,
+          "slot 55 with n = 5 is E_INVALIDARG");
+    check(derive(device, compute_base, 1, rec_raster, nullptr, reinterpret_cast<void**>(out.GetAddressOf())) == E_POINTER,
+          "slot 55 with null riid is E_POINTER");
+
+    // Positive: a graphics base through slot 86, then tags 0, 1 and 3 in one call, tag 2 alone, and tag 2 again on
+    // the derived PSO (a derived PSO is a base too).
+    ComPtr<ID3DBlob> vs, ps;
+    if (!compile_hlsl("float4 main() : SV_Position { return float4(0, 0, 0, 1); }", "vs_5_0", vs) ||
+        !compile_hlsl("float4 main() : SV_Target { return float4(0, 0, 0, 1); }", "ps_5_0", ps)) {
+        check(false, "graphics shaders compile for the slot 55 positive test");
+        return;
+    }
+    const std::vector<unsigned char> stream = graphics_stream(root, vs.Get(), ps.Get());
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{stream.size(), const_cast<unsigned char*>(stream.data())};
+    using CreateStreamFn = HRESULT(WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+    ComPtr<ID3D12PipelineState> base;
+    HRESULT hr = reinterpret_cast<CreateStreamFn>(proxy_vtbl[86])(device, &stream_desc, &iid,
+                                                                  reinterpret_cast<void**>(base.GetAddressOf()));
+    check(SUCCEEDED(hr) && base, "slot 86 creates the graphics base PSO (WARP accepts the stream)");
+    if (!base) return;
+
+    D3D12_DEPTH_STENCIL_DESC ds{};
+    ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    ds.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    ds.StencilReadMask = ds.StencilWriteMask = 0xff;
+    for (D3D12_DEPTH_STENCILOP_DESC* op : {&ds.FrontFace, &ds.BackFace}) {
+        op->StencilFailOp = op->StencilDepthFailOp = op->StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        op->StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    }
+    unsigned char recs[3 * kRecordBytes];
+    put_record(recs, 0, &ds, sizeof(ds));
+    put_record(recs + kRecordBytes, 1, &raster, sizeof(raster));
+    const UINT sample_mask = 0x1;
+    put_record(recs + 2 * kRecordBytes, 3, &sample_mask, sizeof(sample_mask));
+    ComPtr<ID3D12PipelineState> three;
+    hr = derive(device, base.Get(), 3, recs, &iid, reinterpret_cast<void**>(three.GetAddressOf()));
+    check(SUCCEEDED(hr) && three, "slot 55 derives a PSO from tags 0, 1 and 3 (n = 3) on the graphics base");
+
+    D3D12_BLEND_DESC blend{};
+    for (auto& rtb : blend.RenderTarget) {
+        rtb.SrcBlend = rtb.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rtb.DestBlend = rtb.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rtb.BlendOp = rtb.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rtb.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rtb.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    // Four records (raster, depth-stencil, sample mask, blend): the largest count the console builds.
+    unsigned char four_recs[4 * kRecordBytes];
+    std::memcpy(four_recs, recs, 3 * kRecordBytes);
+    put_record(four_recs + 3 * kRecordBytes, 2, &blend, sizeof(blend));
+    ComPtr<ID3D12PipelineState> quad;
+    hr = derive(device, base.Get(), 4, four_recs, &iid, reinterpret_cast<void**>(quad.GetAddressOf()));
+    check(SUCCEEDED(hr) && quad, "slot 55 derives a PSO from four records (n = 4)");
+
+    unsigned char rec_blend[kRecordBytes];
+    put_record(rec_blend, 2, &blend, sizeof(blend));
+    ComPtr<ID3D12PipelineState> blended;
+    hr = derive(device, base.Get(), 1, rec_blend, &iid, reinterpret_cast<void**>(blended.GetAddressOf()));
+    check(SUCCEEDED(hr) && blended, "slot 55 derives a PSO from tag 2 (blend), n = 1");
+
+    ComPtr<ID3D12PipelineState> chained;
+    hr = derive(device, three.Get(), 1, rec_blend, &iid, reinterpret_cast<void**>(chained.GetAddressOf()));
+    check(SUCCEEDED(hr) && chained, "slot 55 derives from a derived PSO (its stream is kept too)");
 }
 
 }  // namespace
@@ -530,6 +715,7 @@ int main(int argc, char** argv) {
                   "slot 86 creates a PSO via PC ID3D12Device2::CreatePipelineState (slot 47)");
             check(rt::d3d12_xs::device_slot_hits(86) == 1, "slot 86 hit counter is 1");
             check(rt::d3d12_xs::device_slot_first_call_seen(86), "slot 86 first-call flag is set");
+            check_derived_states(device.Get(), proxy_vtbl, root_signature.Get(), pso86.Get(), pso67.Get());
         }
     }
 
