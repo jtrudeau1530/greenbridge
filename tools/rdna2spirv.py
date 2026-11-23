@@ -376,7 +376,9 @@ class Gen:
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
+        self.fmt_norm_fn = None    # lines of the shared exact norm quotient for a run-time width (SHADER-849)
         self.fmt_enc_fn = None    # lines of the format-encode and element-size functions, once a typed store needs them
+        self.uses_fmt_tables = False    # %fmt_desc_tab / %fmt_norm_rep_tab: a format's kind and channel widths
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
@@ -2331,6 +2333,38 @@ class Gen:
                37: (4, "unorm", (10, 11, 11)), 38: (4, "snorm", (10, 11, 11)), 39: (4, "uscaled", (10, 11, 11)),
                40: (4, "sscaled", (10, 11, 11)), 41: (4, "uint", (10, 11, 11)), 42: (4, "sint", (10, 11, 11))}
 
+    # The run-time FORMAT decode (SHADER-849): a format's conversion is one of these kinds, and the tables below
+    # describe them per format code, so that the decode needs no branch and no copy per format.
+    FMT_RAW, FMT_SINT, FMT_USCALED, FMT_SSCALED, FMT_UNORM, FMT_SNORM, FMT_F16, FMT_UFLOAT = range(8)
+    FMT_NONE = 8                      # a code outside FORMATS: the decode gives 0
+    FMT_KINDS = {"f32": FMT_RAW, "u32": FMT_RAW, "i32": FMT_RAW, "uint": FMT_RAW,
+                 "sint": FMT_SINT, "uscaled": FMT_USCALED, "sscaled": FMT_SSCALED,
+                 "unorm": FMT_UNORM, "snorm": FMT_SNORM, "f16": FMT_F16, "ufloat": FMT_UFLOAT}
+
+    @classmethod
+    def fmt_desc_table(cls):
+        """One uint per format code: the conversion kind, the channel count and the four channel widths.
+
+        The bit offset of a channel is the sum of the widths before it, so the table holds the widths only and the
+        offsets follow. A code outside FORMATS gets FMT_NONE."""
+        table = []
+        for code in range(128):
+            entry = cls.FORMATS.get(code)
+            kind = cls.FMT_KINDS.get(entry[1], cls.FMT_NONE) if entry else cls.FMT_NONE
+            widths = entry[2] if entry else ()
+            word = kind | (len(widths) << 4)
+            for i in range(4):
+                word |= (widths[i] if i < len(widths) else 0) << (7 + 6 * i)
+            table.append(word)
+        return table
+
+    @classmethod
+    def fmt_norm_reps(cls):
+        """The 64-bit repeat constants of the exact norm quotient, one per width (1..16).
+
+        The quotient m / (2^n - 1) is m's n bits repeated; the constant holds the first 64 of them."""
+        return [0] + [sum(1 << (64 - n * (k + 1)) for k in range(64 // n)) for n in range(1, 17)]
+
     def encode_norm_bits(self, u, w, signed):
         """Exact single-rounded UNORM/SNORM channel bits from an f32 bit pattern u (NaN already mapped to 0).
 
@@ -2452,22 +2486,59 @@ class Gen:
         self.emit(f"{res} = OpSelect %uint {ng} {self.cu(0)} {r3}")
         return res
 
+    def field_extract(self, src, off, width):
+        """(src >> off) & ((1 << width) - 1). off and width are ints (constants) or ids (run-time values)."""
+        if isinstance(off, int) and isinstance(width, int):
+            f = self.tmp()
+            self.emit(f"{f} = OpBitFieldUExtract %uint {src} {self.cu(off)} {self.cu(width)}")
+            return f
+        o = self.cu(off) if isinstance(off, int) else off
+        w = self.cu(width) if isinstance(width, int) else width
+        sh, one, m1, shifted, res = (self.tmp() for _ in range(5))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {w} {self.cu(31)}")
+        self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {sh}")
+        self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
+        self.emit(f"{shifted} = OpShiftRightLogical %uint {src} {o}")
+        self.emit(f"{res} = OpBitwiseAnd %uint {shifted} {m1}")
+        return res
+
     def ufloat_decode_bits(self, f, w):
         """f32 bits of the w-bit unsigned float in the low bits of f (see ufloat_encode_bits): exact, integer ops only.
-        A NaN keeps its payload shifted up, unquieted; there is no sign."""
-        mb = w - 5
-        e, m, eb, es, ms, nrm, p, pi, pb, db, ds, dm, dsh, dmk, dn, nzm, isz, dres, inf, mz, r0, r1, r2 = \
-            (self.tmp() for _ in range(23))
-        self.emit(f"{e} = OpBitFieldUExtract %uint {f} {self.cu(mb)} {self.cu(5)}")
-        self.emit(f"{m} = OpBitFieldUExtract %uint {f} {self.cu(0)} {self.cu(mb)}")
+        A NaN keeps its payload shifted up, unquieted; there is no sign. w is an int (a constant width) or an id (a
+        run-time width, SHADER-849)."""
+        if isinstance(w, int):
+            mb = w - 5
+        else:
+            mb = self.tmp()
+            self.emit(f"{mb} = OpISub %uint {w} {self.cu(5)}")
+            # A width under 5 wraps around, and one over 23 would shift the mantissa out: the candidate is only
+            # used for the two ufloat formats (widths 10 and 11), so any value in range is fine here.
+            hi, mb2 = self.tmp(), self.tmp()
+            self.emit(f"{hi} = OpUGreaterThan %bool {mb} {self.cu(23)}")
+            self.emit(f"{mb2} = OpSelect %uint {hi} {self.cu(23)} {mb}")
+            mb = mb2
+        eb, es, ms, nrm, p, pi, pb, db, dsh, dm, dmk, dn, nzm, isz, dres, inf, mz, r0, r1, r2 = \
+            (self.tmp() for _ in range(20))
+        e = self.field_extract(f, mb, 5)
+        m = self.field_extract(f, 0, mb)
         self.emit(f"{eb} = OpIAdd %uint {e} {self.cu(112)}")
         self.emit(f"{es} = OpShiftLeftLogical %uint {eb} {self.cu(23)}")
-        self.emit(f"{ms} = OpShiftLeftLogical %uint {m} {self.cu(23 - mb)}")
+        if isinstance(w, int):
+            self.emit(f"{ms} = OpShiftLeftLogical %uint {m} {self.cu(23 - mb)}")
+        else:
+            sh = self.tmp()
+            self.emit(f"{sh} = OpISub %uint {self.cu(23)} {mb}")
+            self.emit(f"{ms} = OpShiftLeftLogical %uint {m} {sh}")
         self.emit(f"{nrm} = OpBitwiseOr %uint {es} {ms}")
         # exponent 0: a denormal m * 2^(-14 - mb); its top set bit p gives the f32 exponent p + 113 - mb
         self.emit(f"{pi} = OpExtInst %int %glsl FindUMsb {m}")
         self.emit(f"{p} = OpBitcast %uint {pi}")
-        self.emit(f"{pb} = OpIAdd %uint {p} {self.cu(113 - mb)}")
+        if isinstance(w, int):
+            self.emit(f"{pb} = OpIAdd %uint {p} {self.cu(113 - mb)}")
+        else:
+            pb2 = self.tmp()
+            self.emit(f"{pb2} = OpISub %uint {self.cu(113)} {mb}")
+            self.emit(f"{pb} = OpIAdd %uint {p} {pb2}")
         self.emit(f"{db} = OpShiftLeftLogical %uint {pb} {self.cu(23)}")
         self.emit(f"{dsh} = OpISub %uint {self.cu(23)} {p}")
         self.emit(f"{dm} = OpShiftLeftLogical %uint {m} {dsh}")
@@ -2481,6 +2552,30 @@ class Gen:
         self.emit(f"{r1} = OpBitwiseOr %uint {ms} {self.cu(0x7F800000)}")
         self.emit(f"{r2} = OpSelect %uint {inf} {r1} {r0}")
         return r2
+
+    def f16_widen_bits(self, f):
+        """The f32 bits of the half in the low 16 bits of f, with the NaN payload the hardware widens to.
+
+        A half NaN widens by shifting its payload, keeping the sign and the quiet bit as they are: measured natively
+        on RDNA2 (gfx1036, tools/f16_widen_probe.py) 0x7ddb (sNaN) -> 0x7FBB6000 and 0x7FE6 (qNaN) -> 0x7FFCC000,
+        the same words for formats 13, 29 and 71, MUBUF and MTBUF, wave32 and wave64. UnpackHalf2x16 leaves a NaN
+        undefined: the interpreter canonicalises it to 0x7FC00000 and v_cvt_f32_f16 (what a driver lowers it to) sets
+        the quiet bit, which the typed load does not, so the NaN case is built from the bits."""
+        v2, x = self.tmp(), self.tmp()
+        self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {f}")
+        self.emit(f"{x} = OpCompositeExtract %float {v2} 0")
+        mag, is_nan, sg, sgsh, fr, mant, nan0, nan_bits, xb, res = (self.tmp() for _ in range(10))
+        self.emit(f"{mag} = OpBitwiseAnd %uint {f} {self.cu(0x7FFF)}")
+        self.emit(f"{is_nan} = OpUGreaterThan %bool {mag} {self.cu(0x7C00)}")
+        self.emit(f"{sg} = OpBitwiseAnd %uint {f} {self.cu(0x8000)}")
+        self.emit(f"{sgsh} = OpShiftLeftLogical %uint {sg} {self.cu(16)}")
+        self.emit(f"{fr} = OpBitwiseAnd %uint {f} {self.cu(0x3FF)}")
+        self.emit(f"{mant} = OpShiftLeftLogical %uint {fr} {self.cu(13)}")
+        self.emit(f"{nan0} = OpBitwiseOr %uint {sgsh} {self.cu(0x7F800000)}")
+        self.emit(f"{nan_bits} = OpBitwiseOr %uint {nan0} {mant}")
+        self.emit(f"{xb} = OpBitcast %uint {x}")
+        self.emit(f"{res} = OpSelect %uint {is_nan} {nan_bits} {xb}")
+        return res
 
     def norm_bits(self, m, n):
         """f32 bits of m / (2^n - 1), correctly rounded, for an n-bit unsigned id m (1 <= n <= 16), integer ops only.
@@ -2561,27 +2656,7 @@ class Gen:
             f = self.tmp()
             self.emit(f"{f} = OpBitFieldUExtract %uint {src} {self.cu(bit % 32)} {self.cu(w)}")
             if kind == "f16":
-                v2, x = self.tmp(), self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {f}")
-                self.emit(f"{x} = OpCompositeExtract %float {v2} 0")
-                # A half NaN widens by shifting its payload, keeping the sign and the quiet bit as they are:
-                # measured natively on RDNA2 (gfx1036, tools/f16_widen_probe.py) 0x7ddb (sNaN) -> 0x7FBB6000 and
-                # 0x7FE6 (qNaN) -> 0x7FFCC000, the same words for formats 13, 29 and 71, MUBUF and MTBUF, wave32
-                # and wave64. UnpackHalf2x16 leaves a NaN undefined: the interpreter canonicalises it to
-                # 0x7FC00000 and v_cvt_f32_f16 (what a driver lowers it to) sets the quiet bit, which the typed
-                # load does not, so the NaN case is built from the bits.
-                mag, is_nan, sg, sgsh, fr, mant, nan0, nan_bits, xb, res = (self.tmp() for _ in range(10))
-                self.emit(f"{mag} = OpBitwiseAnd %uint {f} {self.cu(0x7FFF)}")
-                self.emit(f"{is_nan} = OpUGreaterThan %bool {mag} {self.cu(0x7C00)}")
-                self.emit(f"{sg} = OpBitwiseAnd %uint {f} {self.cu(0x8000)}")
-                self.emit(f"{sgsh} = OpShiftLeftLogical %uint {sg} {self.cu(16)}")
-                self.emit(f"{fr} = OpBitwiseAnd %uint {f} {self.cu(0x3FF)}")
-                self.emit(f"{mant} = OpShiftLeftLogical %uint {fr} {self.cu(13)}")
-                self.emit(f"{nan0} = OpBitwiseOr %uint {sgsh} {self.cu(0x7F800000)}")
-                self.emit(f"{nan_bits} = OpBitwiseOr %uint {nan0} {mant}")
-                self.emit(f"{xb} = OpBitcast %uint {x}")
-                self.emit(f"{res} = OpSelect %uint {is_nan} {nan_bits} {xb}")
-                out.append(res)
+                out.append(self.f16_widen_bits(f))
             elif kind == "unorm":
                 out.append(normalize(f, w))
             elif kind == "uscaled":
@@ -3042,65 +3117,237 @@ class Gen:
                 self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, self.tou(comp))
                 out += 1
 
-    def decode_any_format(self, fmt, words):
-        """Decode 4 packed dwords by the run-time FORMAT (0 for one outside FORMATS), executing only that format's
-        decode: a binary search over the codes, marked DontFlatten (decoding every format to select one was about
-        770 VALU instructions on every lane). Plain conditional branches, which the test interpreters run too."""
-        return self.decode_format_search(fmt, words, sorted(self.FORMATS))[0]
+    def fmt_table_get(self, ptr_type, table, index, elem="%uint"):
+        """One element of a module-level table (a Private array indexed by a run-time value).
 
-    def decode_format_search(self, fmt, words, codes):
-        """decode_any_format over the sorted ``codes`` -> (4 ids, the label of the block that defines them, or None
-        for the block the search started in)."""
-        cond, yes, no, end = self.tmp(), self.tmp() + "_fy", self.tmp() + "_fn", self.tmp() + "_fe"
-        leaf = len(codes) == 1
-        if leaf:
-            self.emit(f"{cond} = OpIEqual %bool {fmt} {self.cu(codes[0])}")
+        The result type is a pointer to the element, as an OpAccessChain into an array needs."""
+        p = self.tmp()
+        self.emit(f"{p} = OpAccessChain {ptr_type} {table} {index}")
+        v = self.tmp()
+        self.emit(f"{v} = OpLoad {elem} {p}")
+        return v
+
+    def fmt_norm_bits_dyn(self, m, n):
+        """The f32 bits of m / (2^n - 1), correctly rounded, with n a run-time width (SHADER-849).
+
+        The same code as norm_bits, but the 64-bit repeat constant of the width comes from a table and the width is a
+        value: the quotient of a field by 2^n - 1 depends on nothing else."""
+        rep = self.fmt_table_get("%_ptr_Private_fmt_elem64", "%fmt_norm_rep_tab", n, "%ulong")
+        m64, t, h64, hi, pi, p, s, s64, q64, q, s1, s164, r64, rb = (self.tmp() for _ in range(14))
+        self.emit(f"{m64} = OpUConvert %ulong {m}")
+        self.emit(f"{t} = OpIMul %ulong {m64} {rep}")
+        self.emit(f"{h64} = OpShiftRightLogical %ulong {t} {self.cu(32)}")
+        self.emit(f"{hi} = OpUConvert %uint {h64}")
+        self.emit(f"{pi} = OpExtInst %int %glsl FindUMsb {hi}")
+        self.emit(f"{p} = OpBitcast %uint {pi}")
+        self.emit(f"{s} = OpIAdd %uint {p} {self.cu(9)}")               # m = 0 gives p = -1: s = 8, result unused
+        self.emit(f"{s64} = OpUConvert %ulong {s}")
+        self.emit(f"{q64} = OpShiftRightLogical %ulong {t} {s64}")
+        self.emit(f"{q} = OpUConvert %uint {q64}")
+        self.emit(f"{s1} = OpISub %uint {s} {self.cu(1)}")
+        self.emit(f"{s164} = OpUConvert %ulong {s1}")
+        self.emit(f"{r64} = OpShiftRightLogical %ulong {t} {s164}")
+        self.emit(f"{rb} = OpUConvert %uint {r64}")
+        e, eb, b0, b1, b2, b3 = (self.tmp() for _ in range(6))
+        self.emit(f"{e} = OpIAdd %uint {p} {self.cu(95)}")              # biased exponent p - 32 + 127
+        self.emit(f"{eb} = OpShiftLeftLogical %uint {e} {self.cu(23)}")
+        self.emit(f"{b0} = OpISub %uint {q} {self.cu(0x800000)}")       # drop the hidden one
+        self.emit(f"{b1} = OpIAdd %uint {eb} {b0}")
+        self.emit(f"{b2} = OpBitwiseAnd %uint {rb} {self.cu(1)}")
+        self.emit(f"{b3} = OpIAdd %uint {b1} {b2}")
+        sh, one, m1, is_one, b4, z, res = (self.tmp() for _ in range(7))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {n} {self.cu(31)}")
+        self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {sh}")
+        self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
+        self.emit(f"{is_one} = OpIEqual %bool {m} {m1}")
+        self.emit(f"{b4} = OpSelect %uint {is_one} {self.cu(0x3F800000)} {b3}")
+        self.emit(f"{z} = OpIEqual %bool {m} {self.cu(0)}")
+        self.emit(f"{res} = OpSelect %uint {z} {self.cu(0)} {b4}")
+        return res
+
+    def fmt_norm_function(self):
+        """The shared %fmt_norm_bits(m, n): the exact quotient by 2^n - 1 for a run-time width."""
+        if self.fmt_norm_fn is None:
+            saved, self.body = self.body, []
+            res = self.fmt_norm_bits_dyn("%fn_m", "%fn_n")
+            lines, self.body = self.body, saved
+            self.fmt_norm_fn = (["%fmt_norm_bits = OpFunction %uint None %fn_fmt_norm",
+                                 "%fn_m = OpFunctionParameter %uint", "%fn_n = OpFunctionParameter %uint",
+                                 "%fmt_norm_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
+        return self.fmt_norm_fn
+
+    def fmt_dec_component(self, k, params):
+        """The value of output component k of an element of the run-time FORMAT, branch-free (SHADER-849).
+
+        The format's kind, channel count and channel widths come from one table word; the conversion the kind names
+        is chosen with selects, so the decode has no branch and the module carries one copy of it, not one per
+        format. A format with fewer channels repeats its own (component c = c mod n), as the RX 6700 does (SHADER-86)."""
+        fmt, wvec = params[0], params[1]
+        # The four dwords of the element, as a v4uint: the function type must not repeat another one in the module
+        # (SPIR-V forbids two non-aggregate types with the same structure).
+        words = []
+        for i in range(4):
+            e = self.tmp()
+            self.emit(f"{e} = OpCompositeExtract %uint {wvec} {i}")
+            words.append(e)
+        # The table word: kind | channel count << 4 | the four channel widths.
+        desc = self.fmt_table_get("%_ptr_Private_fmt_elem", "%fmt_desc_tab", fmt)
+        mode = self.tmp()
+        self.emit(f"{mode} = OpBitwiseAnd %uint {desc} {self.cu(15)}")
+        ncomp_raw, ncomp = self.tmp(), self.tmp()
+        self.emit(f"{ncomp_raw} = OpShiftRightLogical %uint {desc} {self.cu(4)}")
+        self.emit(f"{ncomp} = OpBitwiseAnd %uint {ncomp_raw} {self.cu(7)}")
+        widths = []
+        for i in range(4):
+            raw, w = self.tmp(), self.tmp()
+            self.emit(f"{raw} = OpShiftRightLogical %uint {desc} {self.cu(7 + 6 * i)}")
+            self.emit(f"{w} = OpBitwiseAnd %uint {raw} {self.cu(63)}")
+            widths.append(w)
+        # The channel of the format that output component k takes: component c = c mod n.
+        # Its width and its bit offset (the sum of the widths before it).
+        if k == 0:
+            wid, off = widths[0], self.cu(0)
         else:
-            mid = len(codes) // 2
-            self.emit(f"{cond} = OpULessThan %bool {fmt} {self.cu(codes[mid])}")
-        self.emit(f"OpSelectionMerge {end} DontFlatten")
-        self.emit(f"OpBranchConditional {cond} {yes} {no}")
-        self.emit(f"{yes} = OpLabel")
-        if leaf:
-            a, a_end = self.decode_format(words, codes[0]), None
-        else:
-            a, a_end = self.decode_format_search(fmt, words, codes[:mid])
-        self.emit(f"OpBranch {end}")
-        self.emit(f"{no} = OpLabel")
-        if leaf:
-            b, b_end = [self.cu(0)] * 4, None
-        else:
-            b, b_end = self.decode_format_search(fmt, words, codes[mid:])
-        self.emit(f"OpBranch {end}")
-        self.emit(f"{end} = OpLabel")
-        out = [self.tmp() for _ in range(4)]
-        for o, x, y in zip(out, a, b):
-            self.emit(f"{o} = OpPhi %uint {x} {a_end or yes} {y} {b_end or no}")
-        return out, end
+            offsets = [self.cu(0)]
+            for i in range(1, 4):
+                o = self.tmp()
+                self.emit(f"{o} = OpIAdd %uint {offsets[-1]} {widths[i - 1]}")
+                offsets.append(o)
+            if k == 1:
+                one, wid, off = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{one} = OpIEqual %bool {ncomp} {self.cu(1)}")
+                self.emit(f"{wid} = OpSelect %uint {one} {widths[0]} {widths[1]}")
+                self.emit(f"{off} = OpSelect %uint {one} {offsets[0]} {offsets[1]}")
+            elif k == 2:
+                two, wid, off = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{two} = OpULessThanEqual %bool {ncomp} {self.cu(2)}")
+                self.emit(f"{wid} = OpSelect %uint {two} {widths[0]} {widths[2]}")
+                self.emit(f"{off} = OpSelect %uint {two} {offsets[0]} {offsets[2]}")
+            else:
+                one, two, three = self.tmp(), self.tmp(), self.tmp()
+                w1, w2, wid, o1, o2, off = (self.tmp() for _ in range(6))
+                self.emit(f"{one} = OpIEqual %bool {ncomp} {self.cu(1)}")
+                self.emit(f"{two} = OpIEqual %bool {ncomp} {self.cu(2)}")
+                self.emit(f"{three} = OpIEqual %bool {ncomp} {self.cu(3)}")
+                # component 3 takes channel 0 of a one- or three-channel format, channel 1 of a two-channel one
+                # and channel 3 of a four-channel one
+                self.emit(f"{w1} = OpSelect %uint {three} {widths[0]} {widths[3]}")
+                self.emit(f"{w2} = OpSelect %uint {two} {widths[1]} {w1}")
+                self.emit(f"{wid} = OpSelect %uint {one} {widths[0]} {w2}")
+                self.emit(f"{o1} = OpSelect %uint {three} {offsets[0]} {offsets[3]}")
+                self.emit(f"{o2} = OpSelect %uint {two} {offsets[1]} {o1}")
+                self.emit(f"{off} = OpSelect %uint {one} {offsets[0]} {o2}")
+        # A code outside FORMATS has no channel: keep the width at 1, so the shifts below stay defined.
+        is0, wid2 = self.tmp(), self.tmp()
+        self.emit(f"{is0} = OpIEqual %bool {wid} {self.cu(0)}")
+        self.emit(f"{wid2} = OpSelect %uint {is0} {self.cu(1)} {wid}")
+        wid = wid2
+        # The dword the channel starts in, and the field itself.
+        wi = self.tmp()
+        self.emit(f"{wi} = OpShiftRightLogical %uint {off} {self.cu(5)}")
+        word = words[0]
+        for i in (1, 2, 3):
+            eq, sel = self.tmp(), self.tmp()
+            self.emit(f"{eq} = OpIEqual %bool {wi} {self.cu(i)}")
+            self.emit(f"{sel} = OpSelect %uint {eq} {words[i]} {word}")
+            word = sel
+        shift = self.tmp()
+        self.emit(f"{shift} = OpBitwiseAnd %uint {off} {self.cu(31)}")
+        shifted = self.tmp()
+        self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {shift}")
+        wsh, one, m1, is32, mask, raw = (self.tmp() for _ in range(6))
+        self.emit(f"{wsh} = OpBitwiseAnd %uint {wid} {self.cu(31)}")
+        self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {wsh}")
+        self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
+        self.emit(f"{is32} = OpIEqual %bool {wid} {self.cu(32)}")
+        self.emit(f"{mask} = OpSelect %uint {is32} {self.cu(0xFFFFFFFF)} {m1}")
+        self.emit(f"{raw} = OpBitwiseAnd %uint {shifted} {mask}")
+        # The field as a signed value, for the signed kinds.
+        sw, lsh, si = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{sw} = OpISub %uint {self.cu(32)} {wid}")
+        self.emit(f"{lsh} = OpShiftLeftLogical %uint {raw} {sw}")
+        self.emit(f"{si} = OpShiftRightArithmetic %int {self.as_int(lsh)} {sw}")
+        sv = self.int_bits(si)
+        # The candidates of the kinds that convert the field to a float.
+        fr, fs = self.tmp(), self.tmp()
+        self.emit(f"{fr} = OpConvertUToF %float {raw}")
+        self.emit(f"{fs} = OpConvertSToF %float {si}")
+        c_fraw, c_fsv = self.tou(fr), self.tou(fs)
+        # The exact quotient by 2^n - 1: UNORM divides the field by 2^w - 1, SNORM its magnitude by 2^(w-1) - 1.
+        ab, au = self.tmp(), self.tmp()
+        self.emit(f"{ab} = OpExtInst %int %glsl SAbs {si}")
+        self.emit(f"{au} = OpBitcast %uint {ab}")
+        is_snorm, num, w1, n, hi_n, zero_n, n2 = (self.tmp() for _ in range(7))
+        self.emit(f"{is_snorm} = OpIEqual %bool {mode} {self.cu(self.FMT_SNORM)}")
+        self.emit(f"{num} = OpSelect %uint {is_snorm} {au} {raw}")
+        self.emit(f"{w1} = OpISub %uint {wid} {self.cu(1)}")
+        self.emit(f"{n} = OpSelect %uint {is_snorm} {w1} {wid}")
+        self.emit(f"{hi_n} = OpUGreaterThan %bool {n} {self.cu(16)}")
+        self.emit(f"{n2} = OpSelect %uint {hi_n} {self.cu(16)} {n}")
+        self.emit(f"{zero_n} = OpIEqual %bool {n2} {self.cu(0)}")
+        n3 = self.tmp()
+        self.emit(f"{n3} = OpSelect %uint {zero_n} {self.cu(1)} {n2}")
+        c_norm = self.tmp()
+        self.emit(f"{c_norm} = OpFunctionCall %uint %fmt_norm_bits {num} {n3}")
+        # SNORM: the magnitude's quotient with the sign, and the most negative code as -1.0.
+        neg, sgn, signed_norm, lim, is_min, c_snorm = (self.tmp() for _ in range(6))
+        self.emit(f"{neg} = OpSLessThan %bool {si} {self.as_int(self.cu(0))}")
+        self.emit(f"{sgn} = OpBitwiseOr %uint {c_norm} {self.cu(0x80000000)}")
+        self.emit(f"{signed_norm} = OpSelect %uint {neg} {sgn} {c_norm}")
+        self.emit(f"{lim} = OpShiftLeftLogical %uint {self.cu(1)} {w1}")
+        self.emit(f"{is_min} = OpULessThan %bool {au} {lim}")
+        self.emit(f"{c_snorm} = OpSelect %uint {is_min} {signed_norm} {self.cu(0xBF800000)}")
+        # The two float kinds with their own layout.
+        c_f16 = self.f16_widen_bits(raw)
+        c_ufloat = self.ufloat_decode_bits(raw, wid)
+        # The kind picks the value: a code outside FORMATS (FMT_NONE) matches none and gives 0.
+        res = self.cu(0)
+        for kind, value in ((self.FMT_UFLOAT, c_ufloat), (self.FMT_F16, c_f16), (self.FMT_SNORM, c_snorm),
+                            (self.FMT_UNORM, c_norm), (self.FMT_SSCALED, c_fsv), (self.FMT_USCALED, c_fraw),
+                            (self.FMT_SINT, sv), (self.FMT_RAW, raw)):
+            eq, sel = self.tmp(), self.tmp()
+            self.emit(f"{eq} = OpIEqual %bool {mode} {self.cu(kind)}")
+            self.emit(f"{sel} = OpSelect %uint {eq} {value} {res}")
+            res = sel
+        return res
+
+    def fmt_dec_functions(self):
+        """The shared per-component decode functions (SHADER-849), one per output component."""
+        if self.fmt_fn is None:
+            self.uses_fmt_tables = True
+            # The tables are constants: register them here, while the constant section can still take them.
+            for v in Gen.fmt_desc_table():
+                self.cu(v)
+            for v in Gen.fmt_norm_reps():
+                self.cl(v)
+            fns = list(self.fmt_norm_function())
+            for k in range(4):
+                saved, self.body = self.body, []
+                params = [f"%fd{k}_fmt", f"%fd{k}_words"]
+                res = self.fmt_dec_component(k, params)
+                lines, self.body = self.body, saved
+                fns += ([f"%fmt_dec_c{k} = OpFunction %uint None %fn_fmt_dec"] +
+                        [f"{params[0]} = OpFunctionParameter %uint", f"{params[1]} = OpFunctionParameter %v4uint_fmt"] +
+                        [f"%fmt_dec_c{k}_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
+            self.fmt_fn = fns
+        return self.fmt_fn
 
     def format_decode_call(self, fmt, words):
-        """4 uint ids: the element decoded per the run-time FORMAT, through one function in the module.
+        """4 uint ids: the element decoded per the run-time FORMAT, through the shared per-component functions.
 
-        Decoding all FORMATS is about 900 instructions (the exact UNORM/SNORM quotients are integer code). Inlined at
-        every dynamic-format load, 3,281 loads made a 60 MB module whose id bound passed SPIR-V's 4,194,303 limit
-        (indirect_diffuse_lighting ScreenProbes_ActivateProbes under --wave64-emulate)."""
-        if self.fmt_fn is None:
-            params = ["%fd_fmt"] + [f"%fd_w{i}" for i in range(4)]
-            saved, self.body = self.body, []
-            dec = self.decode_any_format(params[0], params[1:])
-            res = self.tmp()
-            self.emit(f"{res} = OpCompositeConstruct %v4uint_fmt " + " ".join(dec))
-            lines, self.body = self.body, saved
-            self.fmt_fn = (["%fmt_decode_fn = OpFunction %v4uint_fmt None %fn_fmt_decode"] +
-                           [f"{q} = OpFunctionParameter %uint" for q in params] + ["%fd_entry = OpLabel"] +
-                           lines + [f"         OpReturnValue {res}", "OpFunctionEnd"])
-        r = self.tmp()
-        self.emit(f"{r} = OpFunctionCall %v4uint_fmt %fmt_decode_fn {fmt} " + " ".join(words[:4]))
+        One function per output component (SHADER-849): the run-time format picks the conversion with selects, so the
+        decode has no branch and the module carries one copy of it, not one copy per format. Before, the shared
+        function held every format's decode and a binary search over the codes: 3,498 instructions and 306 branches
+        in a module, 250 KB for a shader with one dynamic-format load."""
+        self.fmt_dec_functions()
+        # The four dwords of the element, as one v4uint: the decode functions take them as a vector.
+        wvec = self.tmp()
+        self.emit(f"{wvec} = OpCompositeConstruct %v4uint_fmt " + " ".join(words[:4]))
         comps = []
-        for c in range(4):
-            x = self.tmp()
-            self.emit(f"{x} = OpCompositeExtract %uint {r} {c}")
-            comps.append(x)
+        for k in range(4):
+            r = self.tmp()
+            self.emit(f"{r} = OpFunctionCall %uint %fmt_dec_c{k} {fmt} {wvec}")
+            comps.append(r)
         return comps
 
     def fmt_size_of(self, fmt):
@@ -14610,6 +14857,7 @@ def assemble(gen):
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
          (["%fmt_norm_mask", "%fmt_f32_mask"] if gen.uses_d16_image else []) + \
         (["%fmt_size_tab"] if gen.uses_fmt_size else []) + \
+        (["%fmt_desc_tab", "%fmt_norm_rep_tab"] if gen.uses_fmt_tables else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
         [f"%itx{c}_{d}" for d in sorted(gen.uses_int_fetch) for c in (1, 2)]
     psb = gen.uses_psb
@@ -14909,6 +15157,9 @@ def assemble(gen):
         for c in range(128):
             if c in Gen.FORMATS:
                 gen.cu(Gen.FORMATS[c][0])
+    if gen.uses_fmt_tables:
+        gen.cu(128)
+        gen.cu(17)
     if gen.uses_store_views or gen.uses_int_fetch:
         gen.cu(16)
         for words in Gen.int_format_masks():
@@ -14925,7 +15176,10 @@ def assemble(gen):
     if gen.fmt_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
     if gen.fmt_fn:
-        types.append("%fn_fmt_decode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 5))
+        # The decode function takes the format code and the element's four dwords as a v4uint: a type of its own
+        # structure, so it never repeats another function type in the module (SPIR-V forbids that).
+        types.append("%fn_fmt_dec = OpTypeFunction %uint %uint %v4uint_fmt")
+        types.append("%fn_fmt_norm = OpTypeFunction %uint %uint %uint")
     if gen.fmt_enc_fn:
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
@@ -14975,6 +15229,20 @@ def assemble(gen):
             types += ["%_ptr_Private_uint = OpTypePointer Private %uint"]
         types += ["%fmt_size_init = OpConstantComposite %fmt_size_arr " + " ".join(gen.cu(v) for v in sizes)]
         gvars += ["%fmt_size_tab = OpVariable %_ptr_Private_fmt_size Private %fmt_size_init"]
+    if gen.uses_fmt_tables:
+        # The run-time format's kind and channel widths, and the repeat constants of the exact norm quotient.
+        types += [f"%fmt_desc_arr = OpTypeArray %uint {gen.cu(128)}",
+                  "%_ptr_Private_fmt_desc = OpTypePointer Private %fmt_desc_arr",
+                  "%_ptr_Private_fmt_elem = OpTypePointer Private %uint",
+                  f"%fmt_rep_arr = OpTypeArray %ulong {gen.cu(17)}",
+                  "%_ptr_Private_fmt_rep = OpTypePointer Private %fmt_rep_arr",
+                  "%_ptr_Private_fmt_elem64 = OpTypePointer Private %ulong"]
+        types.append("%fmt_desc_init = OpConstantComposite %fmt_desc_arr " +
+                     " ".join(gen.consts[v] for v in Gen.fmt_desc_table()))
+        types.append("%fmt_norm_rep_init = OpConstantComposite %fmt_rep_arr " +
+                     " ".join(gen.lconsts[v] for v in Gen.fmt_norm_reps()))
+        gvars += ["%fmt_desc_tab = OpVariable %_ptr_Private_fmt_desc Private %fmt_desc_init",
+                  "%fmt_norm_rep_tab = OpVariable %_ptr_Private_fmt_rep Private %fmt_norm_rep_init"]
     if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
