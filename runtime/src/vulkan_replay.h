@@ -1713,8 +1713,8 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
                 block_format(p.binding.format, dst.aspectMask).bytes == block_format(p.source.format, src.aspectMask).bytes;
             if (!same_bytes || (box.left | box.top) % block || (copy.x | copy.y) % dst_block || box.left >= from.width ||
                 box.top >= from.height || !within(copy.z, box.back - box.front, to_depth) ||
-                copy.x / dst_block + blocks(box.right - box.left, block) > blocks(to.width, dst_block) ||
-                copy.y / dst_block + blocks(box.bottom - box.top, block) > blocks(to.height, dst_block))
+                std::uint64_t(copy.x / dst_block) + blocks(box.right - box.left, block) > blocks(to.width, dst_block) ||
+                std::uint64_t(copy.y / dst_block) + blocks(box.bottom - box.top, block) > blocks(to.height, dst_block))
                 return ReplayResult::invalid_copy;
             const std::uint32_t w = std::min(padded(box.right - box.left), from.width - box.left);
             const std::uint32_t h = std::min(padded(box.bottom - box.top), from.height - box.top);
@@ -1724,7 +1724,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
                                      {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)},
                                      {w, h, box.back - box.front}};
             const std::uint32_t dst_w = w * dst_block, dst_h = h * dst_block;
-            if (dst_block > 1 && (copy.x + dst_w > to.width || copy.y + dst_h > to.height)) {
+            if (dst_block > 1 && (std::uint64_t(copy.x) + dst_w > to.width || std::uint64_t(copy.y) + dst_h > to.height)) {
                 // Each uncompressed texel supplies a whole BC block. Keep the same scratch row and slice strides
                 // in bytes on both sides, with a destination extent clipped to the actual mip.
                 const VkBufferImageCopy read{0, w, h, region.srcSubresource, region.srcOffset, region.extent};

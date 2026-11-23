@@ -10,6 +10,7 @@
 
 namespace {
 
+std::vector<VkImageCopy> image_copies;
 std::vector<VkBufferCopy> buffer_copies;
 std::vector<VkBufferImageCopy> b2i_copies;
 std::vector<VkBufferImageCopy> i2b_copies;
@@ -34,8 +35,10 @@ VKAPI_ATTR void VKAPI_CALL rec_copy_i2b(VkCommandBuffer, VkImage, VkImageLayout,
     for (std::uint32_t i = 0; i < count; ++i) i2b_copies.push_back(regions[i]);
 }
 
-VKAPI_ATTR void VKAPI_CALL noop_copy_image(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
-                                           std::uint32_t, const VkImageCopy*) {}
+VKAPI_ATTR void VKAPI_CALL rec_copy_image(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
+                                          std::uint32_t count, const VkImageCopy* regions) {
+    for (std::uint32_t i = 0; i < count; ++i) image_copies.push_back(regions[i]);
+}
 
 template<typename T>
 T handle(std::uintptr_t n) {
@@ -60,7 +63,7 @@ int main() {
     vk.copy_buffer = rec_copy_buffer;
     vk.copy_buffer_to_image = rec_copy_b2i;
     vk.copy_image_to_buffer = rec_copy_i2b;
-    vk.copy_image = noop_copy_image;
+    vk.copy_image = rec_copy_image;
     vk.depth24_prepare = [](Depth24Job& job, std::vector<Depth24Job>& parts) {
         depth24_jobs.push_back(job);
         const std::uint64_t aw = std::uint64_t(job.width) * job.app_texel_words();
@@ -122,6 +125,15 @@ int main() {
     rgb96_img.samples = 1;
     rgb96_img.rgb96 = true;
 
+    ResourceBinding bc_img = rgba_img;
+    bc_img.image = handle<VkImage>(6);
+    bc_img.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    bc_img.width = bc_img.height = 4;
+    ResourceBinding uint_img = rgba_img;
+    uint_img.image = handle<VkImage>(7);
+    uint_img.format = VK_FORMAT_R32G32_UINT;
+    uint_img.width = uint_img.height = 1;
+
     const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
         switch (id) {
         case 1: return &src_buf;
@@ -129,11 +141,14 @@ int main() {
         case 3: return &rgba_img;
         case 4: return &d24_img;
         case 5: return &rgb96_img;
+        case 6: return &bc_img;
+        case 7: return &uint_img;
         default: return nullptr;
         }
     };
 
     const auto run = [&](const CommandList& list) {
+        image_copies.clear();
         buffer_copies.clear();
         b2i_copies.clear();
         i2b_copies.clear();
@@ -308,6 +323,28 @@ int main() {
         expect(run(up) == ReplayResult::unsupported, "rgb96 upload rejects misaligned backing buffer_offset");
         src_buf = saved_src;
         dst_buf = saved_dst;
+    }
+
+    // BC1 to uncompressed conversion: destination block offsets must not wrap.
+    {
+        const CopyLocation src{6, false, 0, 0, 0, 0, 0, 0};
+        const CopyLocation dst{7, false, 0, 0, 0, 0, 0, 0};
+        const auto check = [&](std::uint32_t x, std::uint32_t y, bool valid) {
+            CommandList list;
+            expect(list.copy_texture({dst, x, y, 0, src, false, {}}) && list.close(), "record conversion copy");
+            const auto result = run(list);
+            expect(result == (valid ? ReplayResult::success : ReplayResult::invalid_copy), "conversion bounds result");
+            if (valid) {
+                expect(image_copies.size() == 1 && image_copies[0].dstOffset.x == 0 &&
+                           image_copies[0].dstOffset.y == 0 && image_copies[0].dstOffset.z == 0,
+                       "valid conversion emits destination origin");
+            } else {
+                expect(image_copies.empty(), "invalid conversion emits no image copy");
+            }
+        };
+        check(UINT32_MAX, 0, false);
+        check(0, UINT32_MAX, false);
+        check(0, 0, true);
     }
 
     if (failures) return 1;
