@@ -30,7 +30,7 @@ REL_BRANCH = re.compile(b"[\xe8\xe9]")
 
 
 def import_slots(img):
-    """{IAT slot RVA: 'dll!name'} for every import of a PE32+ image."""
+    """{IAT slot RVA: (dll, name)} for every import of a PE32+ image, kept apart: a DLL name may contain '!'."""
     rva, size = img.directory(1)
     slots = {}
     if not rva or not size:
@@ -47,7 +47,7 @@ def import_slots(img):
         if dll is None or not lookup:
             continue
         for j, name in enumerate(img.thunk_names(lookup)):
-            slots[iat_rva + j * 8] = f"{dll}!{name}"
+            slots[iat_rva + j * 8] = (dll, name)
     return slots
 
 
@@ -63,14 +63,13 @@ def call_sites(data, wanted=None, dlls=None):
     lower_wanted = {w.lower() for w in wanted} if wanted else None
     lower_dlls = {d.lower() for d in dlls} if dlls else None
 
-    def selected(key):
-        dll, _, name = key.partition("!")
+    def selected(dll, name):
         if lower_wanted is None and lower_dlls is None:
             return True
         return (lower_wanted is not None and f"{dll.lower()}!{name}".lower() in lower_wanted) or \
                (lower_dlls is not None and dll.lower() in lower_dlls)
 
-    slots = {rva: key for rva, key in import_slots(img).items() if selected(key)}
+    slots = {rva: f"{dll}!{name}" for rva, (dll, name) in import_slots(img).items() if selected(dll, name)}
     code = [(s["rva"], img.section_data(s)) for s in img.sections if s["exec"]]
 
     thunks = {}
