@@ -22,6 +22,7 @@ struct Windows {
     HWND hidden = nullptr;   // never shown (like the IME windows and a driver's dummy window)
     HWND owned = nullptr;    // visible but owned by `title` (a dialog, not a top-level frame)
     HWND tool = nullptr;     // visible tool window
+    HWND offscreen = nullptr;  // visible, small, far off any monitor's work area
 };
 
 HWND make(const wchar_t* name, DWORD ex_style, DWORD style, int width, int height, HWND owner) {
@@ -31,7 +32,37 @@ HWND make(const wchar_t* name, DWORD ex_style, DWORD style, int width, int heigh
 
 }  // namespace
 
+// fitted_window_rect: the frame a window too large for its monitor's work area is moved to.
+int check_fitted_rect() {
+    RECT out{};
+    // A 3840 x 2160 client area with its frame, on a 3440 x 1440 monitor with a 48-pixel taskbar: limited by the
+    // height, scaled by 1392 / 2199, centred horizontally.
+    const RECT console_frame{-8, -31, 3848, 2168};
+    const RECT ultrawide{0, 0, 3440, 1392};
+    EXPECT(rt::d3d12::fitted_window_rect(console_frame, ultrawide, out));
+    EXPECT(out.top == 0 && out.bottom == 1392);
+    EXPECT(out.right - out.left == 3856LL * 1392 / 2199);
+    EXPECT(out.left == (3440 - (out.right - out.left)) / 2);
+    // Limited by the width: a wide frame on a 1920 x 1032 work area keeps its aspect ratio.
+    EXPECT(rt::d3d12::fitted_window_rect(RECT{0, 0, 3840, 1000}, RECT{-1920, 0, 0, 1032}, out));
+    EXPECT(out.left == -1920 && out.right == 0 && out.bottom - out.top == 500);
+    EXPECT(out.top == (1032 - 500) / 2);
+    // A frame inside the work area is left alone, even when it touches the edges.
+    EXPECT(!rt::d3d12::fitted_window_rect(RECT{0, 0, 3440, 1392}, ultrawide, out));
+    EXPECT(!rt::d3d12::fitted_window_rect(RECT{100, 100, 900, 700}, ultrawide, out));
+    // A frame that fits in size but lies partly off the work area is moved back whole, at its own size.
+    EXPECT(rt::d3d12::fitted_window_rect(RECT{3000, 0, 3800, 600}, ultrawide, out));
+    EXPECT(out.right - out.left == 800 && out.bottom - out.top == 600);
+    EXPECT(out.left >= 0 && out.right <= 3440 && out.top >= 0 && out.bottom <= 1392);
+    // Empty rectangles: nothing to do.
+    EXPECT(!rt::d3d12::fitted_window_rect(RECT{0, 0, 0, 0}, ultrawide, out));
+    EXPECT(!rt::d3d12::fitted_window_rect(console_frame, RECT{0, 0, 0, 0}, out));
+    return 0;
+}
+
 int main() {
+    if (check_fitted_rect()) return 1;
+
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = DefWindowProcW;
     window_class.hInstance = GetModuleHandleW(nullptr);
@@ -51,8 +82,12 @@ int main() {
         windows.title = make(L"title", 0, WS_OVERLAPPEDWINDOW | WS_VISIBLE, 320, 240, nullptr);
         windows.owned = make(L"owned", 0, WS_OVERLAPPEDWINDOW | WS_VISIBLE, 800, 600, windows.title);
         windows.tool = make(L"tool", WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW | WS_VISIBLE, 800, 600, nullptr);
+        windows.offscreen = CreateWindowExW(WS_EX_NOACTIVATE, L"LeonidaTitleWindowTest", L"offscreen",
+                                            WS_OVERLAPPEDWINDOW | WS_VISIBLE, -30000, 0, 100, 80, nullptr, nullptr,
+                                            GetModuleHandleW(nullptr), nullptr);
         SetEvent(made);
         WaitForSingleObject(release, INFINITE);  // no message loop: like a title window thread that is busy
+        DestroyWindow(windows.offscreen);
         DestroyWindow(windows.tool);
         DestroyWindow(windows.owned);
         DestroyWindow(windows.title);
@@ -89,6 +124,15 @@ int main() {
         CHECK(rt::d3d12::find_title_window(GetCurrentProcessId(), windows.title) == windows.small);
         // Another process's windows are not this title's.
         CHECK(rt::d3d12::find_title_window(GetCurrentProcessId() ^ 0x40000000u) == nullptr);
+
+        // fit_title_window: a window that lies off its monitor's work area gets a move, and the call does not wait for
+        // the window's thread, which never pumps here; a window that fits gets none.
+        CHECK(windows.offscreen != nullptr);
+        const auto fit_start = std::chrono::steady_clock::now();
+        CHECK(rt::d3d12::fit_title_window(windows.offscreen));
+        CHECK(std::chrono::steady_clock::now() - fit_start < std::chrono::milliseconds(100));
+        CHECK(!rt::d3d12::fit_title_window(windows.title));
+        CHECK(!rt::d3d12::fit_title_window(nullptr));
 #undef CHECK
     }();
     SetEvent(release);

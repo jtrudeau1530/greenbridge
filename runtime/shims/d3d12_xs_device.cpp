@@ -1459,6 +1459,7 @@ struct PresentState {
     }
     HWND window = nullptr;
     bool owns_window = false;
+    std::atomic<unsigned> early_presents{0};  // presents counted for the window fit (queue_present_x), to 1,200
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
 };
@@ -1503,6 +1504,8 @@ PresentState* present_state_for(DeviceProxy* device) {
         state->window = title;
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX shows its frames in the title's window %p\n",
                      static_cast<void*>(title));
+        if (rt::d3d12::fit_title_window(title))
+            std::fprintf(stderr, "[rt] d3d12_xs: the title's window is larger than its monitor's work area: fitted\n");
     } else {
         state->window = create_present_window();
         state->owns_window = state->window != nullptr;
@@ -1543,6 +1546,11 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
     // The tokens the proxy handed out before the presentation existed are ones PresentX must accept.
     state->xbox->adopt_frame_tokens(self->device->frame_next_token.load(std::memory_order_relaxed) - 1);
+    // The title can size its window after its first frames (measured: 3840 x 1460 on a 3440 x 1440 monitor some time
+    // after the first PresentX), so the fit is checked again on every 30th of the first 1,200 presents.
+    if (!state->owns_window && state->early_presents.load(std::memory_order_relaxed) < 1200 &&
+        state->early_presents.fetch_add(1, std::memory_order_relaxed) % 30 == 0)
+        rt::d3d12::fit_title_window(state->window);
     return hr_to_u64(state->xbox->PresentX(
         static_cast<UINT>(plane_count),
         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
