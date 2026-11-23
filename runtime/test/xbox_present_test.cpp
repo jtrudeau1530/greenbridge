@@ -294,12 +294,18 @@ int main() {
             for (const auto& e : available) loader_has = loader_has || !std::strcmp(e.extensionName, "VK_EXT_swapchain_colorspace");
             auto standalone_presenter = rt::d3d12::create_window_presenter(standalone.p, window);
             if (standalone_presenter) {
-                EXPECT(rt::d3d12::device_has_swapchain_colorspace(standalone.p) == loader_has);
+                const bool colorspace_enabled = rt::d3d12::device_has_swapchain_colorspace(standalone.p);
+                EXPECT(colorspace_enabled == loader_has);
+                // The presenter owns the remaining reference to the device and its Vulkan instance.
+                standalone.reset();
                 EXPECT(standalone_presenter->enable_capture());
                 EXPECT(SUCCEEDED(standalone_presenter->present_blank(1)));
+                Frame frame;
+                EXPECT(standalone_presenter->read_back(frame.bytes, &frame.extent, &frame.format));
+                EXPECT(!frame.bytes.empty());
                 std::printf("standalone device (real instance path): VK_EXT_swapchain_colorspace %s on the instance (loader has it: %s)\n",
-                            rt::d3d12::device_has_swapchain_colorspace(standalone.p) ? "enabled" : "not enabled",
-                            loader_has ? "yes" : "no");
+                            colorspace_enabled ? "enabled" : "not enabled", loader_has ? "yes" : "no");
+                std::printf("standalone presenter: frame captured after releasing the caller's device reference\n");
             } else {
                 std::printf("standalone device: no window presenter (skipped the instance-extension check)\n");
             }
