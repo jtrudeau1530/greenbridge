@@ -208,6 +208,7 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
             f"{path} has no [d3d12-trace] line among {trace['ignored_lines']} line(s); "
             "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
         )
+    trace["last_call"] = {"seq": seq, "method": method, "outcome": outcome}
     return trace
 
 
@@ -296,6 +297,8 @@ def format_text(summary: dict, limit: int) -> str:
             " (the [rt] diagnostics are not summarized)"
             + (f": {outcomes}" if outcomes else "")
         )
+        if last_call := d3d12.get("last_call"):
+            out.append(f"  last recorded call: #{last_call['seq']} {last_call['method']} {last_call['outcome']}")
         if d3d12["methods"]:
             out.append(f"  first per method: {_tail(d3d12['methods'], limit)}")
         if d3d12["unsupported"]:

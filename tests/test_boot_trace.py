@@ -300,8 +300,7 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["first"][method], {"seq": 1, "outcome": "ok"})
         self.assertEqual(trace["outcomes"]["partial"], 2)
         text = bt.format_text(bt.summarize(None, trace), 1)
-        self.assertIn(f"  partial: #2 {method}", text)
-        self.assertNotIn(f"#3 {method}", text)
+        self.assertIn(f"  partial: #2 {method}", text.splitlines())
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
@@ -355,6 +354,28 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
         self.assertIn(self.startup, err.getvalue())
         self.assertIn(self.d3d12, err.getvalue())
+
+    def test_last_recorded_d3d12_call_can_repeat_an_earlier_method(self):
+        self.write_lines(self.d3d12, [
+            "[d3d12-trace] #1 CreateCommandAllocator ok",
+            "[d3d12-trace] #2 CreateCommittedResource failed",
+            "[d3d12-trace] #3 CreateCommandAllocator failed",
+            "[rt] a runtime diagnostic after the last call",
+            "[d3d12-trace] #4",
+        ])
+        trace = bt.parse_d3d12(self.d3d12, limit=1)
+        self.assertEqual(trace["ignored_lines"], 2)
+        self.assertEqual(trace["first"]["CreateCommandAllocator"], {"seq": 1, "outcome": "ok"})
+        self.assertEqual(trace["failed"], [{"seq": 2, "method": "CreateCommittedResource"}])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--limit", "1", "--json"]), 0)
+        parsed = json.loads(output.getvalue())["d3d12"]
+        self.assertEqual(parsed["last_seq"], 3)
+        self.assertEqual(parsed["last_call"], {"seq": 3, "method": "CreateCommandAllocator", "outcome": "failed"})
+        text = bt.format_text(bt.summarize(None, trace), 1)
+        self.assertIn("  last recorded call: #3 CreateCommandAllocator failed", text.splitlines())
 
     def test_d3d12_log_without_trace_lines_is_an_error(self):
         self.write_lines(self.d3d12, ["[rt] one", "[rt] two"])
