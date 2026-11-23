@@ -658,6 +658,26 @@ def _map_tree_ids(tree, mapping):
     return out
 
 
+def _drop_tree_block(tree, b):
+    """Iterative copy of a cfg_structure tree without `("block", b)`, b being a sink with no successors: in
+    `structure` its only node is `("guard", b, [("block", b)])`, which is dropped whole."""
+    out = []
+    stack = [(tree, out)]
+    while stack:
+        src, dst = stack.pop()
+        for it in src:
+            if it[0] == "block":
+                if it[1] != b:
+                    dst.append(it)
+            elif it[0] == "guard" and it[2] == [("block", b)]:
+                continue
+            else:
+                child = []
+                dst.append((it[0], it[1], child))
+                stack.append((it[2], child))
+    return out
+
+
 def _unwrap_known_pc_guards(tree, out_pcs, entry_pc=0):
     """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths.
 
@@ -885,11 +905,14 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
         else:
             order = [run] + sorted(region - {run})
             idx_of = {u: i for i, u in enumerate(order)}
-            sub_succ = [[idx_of[s] for s in succ[u] if s in idx_of] for u in order]
+            sub_end = len(order)
+            # An edge to `skip` (e.g. an s_cbranch_scc to the join) goes to an exit node `sub_end`, so the blocks
+            # after it in the region get a `%pc` guard; dropping the edge would run them on the exit path too.
+            sub_succ = [list(dict.fromkeys(idx_of.get(s, sub_end) for s in succ[u])) for u in order] + [[]]
             sub_tree = cfg_structure.structure(sub_succ)
             if sub_tree is None:
                 continue
-            sub_end = len(order)
+            sub_tree = _drop_tree_block(sub_tree, sub_end)
             sub_out_pcs = {}
             for i, u in enumerate(order):
                 uedges = raw_edges[u]

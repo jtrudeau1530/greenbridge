@@ -968,6 +968,41 @@ class LocalExecFoldTests(unittest.TestCase):
             want = lane + (20 if lane >= 32 else 0)
             self.assertEqual(mem[lane * 4], want, f"lane {lane}")
 
+    def test_folded_region_scalar_branch_to_join_skips_the_rest(self):
+        # An s_cbranch_scc inside a folded s_cbranch_execz region that jumps straight to the join: the region's
+        # sub-CFG must keep that exit edge, or the block after the branch runs on the exit path too. Lanes whose
+        # (5 * lane) & 15 > 12 enter the region; s11 decides the scalar branch. The add must run only when the
+        # branch falls through.
+        for cmp, s11, taken in (("s_cmp_ge_u32 s11, 33", 5, True), ("s_cmp_ge_u32 s11, 33", 40, False),
+                                ("s_cmp_lt_u32 s11, 33", 5, True), ("s_cmp_lt_u32 s11, 33", 40, False)):
+            branch = "s_cbranch_scc0 2" if cmp.startswith("s_cmp_ge") else "s_cbranch_scc1 2"
+            insns = [
+                ("v_mul_lo_u32 v3, v0, 5", 8),
+                ("v_and_b32_e32 v3, 15, v3", 4),
+                ("v_mov_b32_e32 v4, 1", 4),
+                (f"s_mov_b32 s11, {s11}", 4),
+                ("v_cmp_lt_u32_e32 vcc, 12, v3", 4),
+                ("s_and_saveexec_b64 s[8:9], vcc", 4),
+                ("s_cbranch_execz 4", 4),                  # to the join (4 dwords)
+                (cmp, 4),
+                (branch, 4),                               # to the join (2 dwords)
+                ("v_add_nc_u32_e32 v4, 21, v4", 4),
+                ("v_add_nc_u32_e32 v4, 100, v4", 4),
+                ("s_or_b64 exec, exec, s[8:9]", 4),
+                ("v_lshlrev_b32_e32 v9, 2, v0", 4),
+                ("buffer_store_dword v4, v9, s[0:3], 0 offen", 8),
+                ("s_endpgm", 4),
+            ]
+            for threads in (64, 128):
+                with self.subTest(cmp=cmp, s11=s11, threads=threads):
+                    spv, gen = _translate_encoded("cs_fold_scc_exit", insns, (threads, 1, 1), emulate=True)
+                    self.assertEqual(_switch_case_count(gen), 1)      # the region is folded inline
+                    mem, _ = run_emulated_workgroup(spv, (threads, 1, 1), push_constants=VSHARP + [0] * 28)
+                    for lane in range(threads):
+                        inside = ((lane % 64) * 5) & 15 > 12
+                        want = 1 + (121 if inside and not taken else 0)
+                        self.assertEqual(mem[lane * 4], want, f"lane {lane}")
+
     def test_cs_w64x_saveexec_b64_fixture_emulated_exact(self):
         # Run the repo's real cs_w64x_saveexec_b64.s fixture under --wave64-emulate on the 64-lane barrier interpreter.
         fixture = os.path.join(HERE, "fixtures", "disasm", "cs_w64x_saveexec_b64.s")
