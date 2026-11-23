@@ -798,6 +798,9 @@ The compute path, end to end:
     topology, stencil references and the blend factor are dynamic, and so are vertex strides when the pipeline has
     vertex bindings. A pipeline without them (a full-screen pass from `SV_VertexID`) does not declare the stride
     state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
+    `d3d12_state_sweep_test` checks the mapping against the host on the same adapter: 482 full-screen draws over
+    every blend factor pair, blend operation, write mask, comparison function and stencil operation, with the stencil
+    plane read back, are byte-identical on an RTX 5080 and a Radeon iGPU.
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.

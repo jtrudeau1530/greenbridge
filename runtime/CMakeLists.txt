@@ -1591,6 +1591,31 @@ if(TARGET Vulkan::Headers)
       message(STATUS "glslangValidator not found: d3d12_typeless_families_test runs its clears only")
     endif()
 
+    # Fixed-function state (blend, depth, stencil) swept against the host D3D12 device on the same adapter. Needs
+    # glslangValidator for the GLSL stand-ins of translated shaders.
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      add_executable(d3d12_state_sweep_test test/d3d12_state_sweep_test.cpp)
+      target_link_libraries(d3d12_state_sweep_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_state_sweep_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(d3d12_state_sweep_test PRIVATE /W4 /permissive- /utf-8)
+      foreach(pair "vs_fullscreen.vert;LEONIDA_SWEEP_VS_SPV;sweep_vs.spv"
+                   "ps_sweep.frag;LEONIDA_SWEEP_PS_SPV;sweep_ps.spv")
+        list(GET pair 0 shader)
+        list(GET pair 1 definition)
+        list(GET pair 2 name)
+        set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${name})
+        add_custom_command(OUTPUT ${binary}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${binary}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader}
+          COMMENT "Compiling the state sweep test shader ${shader}" VERBATIM)
+        target_sources(d3d12_state_sweep_test PRIVATE ${binary})
+        target_compile_definitions(d3d12_state_sweep_test PRIVATE ${definition}="${binary}")
+      endforeach()
+      add_test(NAME d3d12_state_sweep COMMAND d3d12_state_sweep_test)
+      set_tests_properties(d3d12_state_sweep PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     # 96-bit R32G32B32 textures (D3D-62): footprints and every copy path against Windows WARP.
     add_executable(d3d12_rgb96_test test/d3d12_rgb96_test.cpp)
     target_link_libraries(d3d12_rgb96_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
