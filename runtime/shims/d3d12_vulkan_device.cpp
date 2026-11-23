@@ -3281,6 +3281,25 @@ void register_literal_samplers(DeviceState& device, const leonida::ShaderEntry& 
                      int(entry.literal_samplers.size()));
 }
 
+// LEONIDA_CAPTURE_FSPX=<dir>: writes the bytes of each compute shader the library cannot translate, once per
+// program, as <code sha>[_<state sha>].bin (the DXBC container or bare FSPX payload as the title passed it).
+static void capture_refused_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, const leonida::ComputeProgram& program) {
+    char dir[MAX_PATH];
+    size_t length = 0;
+    if (getenv_s(&length, dir, sizeof dir, "LEONIDA_CAPTURE_FSPX") != 0 || length <= 1) return;
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::string name = leonida::sha256_hex(program.bytes);
+    if (!program.state.empty()) name += "_" + leonida::sha256_hex(program.state);
+    if (program.kind == leonida::ComputeProgram::Kind::fssm) name = "fssm_" + name;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!seen.insert(name).second) return;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::ofstream out(std::filesystem::path(dir) / (name + ".bin"), std::ios::binary);
+    out.write(static_cast<const char*>(desc.CS.pShaderBytecode), std::streamsize(desc.CS.BytecodeLength));
+}
+
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
 // corpus), the one to build: the first that `fits` and declares no set-0 bindings (the cheaper pipeline); else the
 // first that fits; else the first without bindings; else the first. Null when there is none.
@@ -4339,6 +4358,7 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                              fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                              leonida::sha256_hex(program.bytes).c_str());
+            capture_refused_compute(desc, program);
             return E_INVALIDARG;
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose

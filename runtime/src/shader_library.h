@@ -758,6 +758,7 @@ public:
     //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
     //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
     //     like the FSPX ones (docs/shader_library.md);
+    //   - <dir>/captured/index.json, FSPX programs captured at run time (LEONIDA_CAPTURE_FSPX), entries named "captured/<name>";
     //   - <dir>/exe/index.json, game_scarlett_master.exe's embedded FSSM programs, entries named "exe/<name>" and
     //     found by fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
     // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The folders
@@ -773,7 +774,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* folder : {"fspx", "bvh", "library", "exe"}) {
+        for (const char* folder : {"fspx", "bvh", "library", "exe", "captured"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = dir / folder;
@@ -964,7 +965,7 @@ private:
             e.max_primitives = u32(meta.find("max_primitives"));
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
-            if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
+            if (by_fspx && (prefix == "fspx/" || prefix == "library/" || prefix == "captured/")) ++fspx_count_;
             if (prefix == "bvh/") ++bvh_count_;
             if (prefix == "exe/") ++exe_count_;
             ++count_;
