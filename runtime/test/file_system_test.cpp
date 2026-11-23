@@ -832,6 +832,19 @@ void run_checks(const std::filesystem::path& root) {
             BOOL cancel = TRUE;
             block.dwCopyFlags = 0;
             block.pfCancel = &cancel;
+            const auto parent = fallback ? "copy2_package_fallback" : "copy2_package_host";
+            const auto destination = fallback ? L"GAME:\\copy2_package_fallback\\copy.txt" :
+                                                L"GAME:\\copy2_package_host\\copy.txt";
+            std::filesystem::create_directories(package / parent);
+            check(copy2(L"GAME:\\misc\\keep.txt", destination, &block) ==
+                          HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
+                      !std::filesystem::exists(overlay / parent),
+                  ("a cancelled copy does not create its overlay parent" + mode).c_str());
+            cancel = FALSE;
+            check(copy2(L"GAME:\\misc\\keep.txt", destination, &block) == S_OK &&
+                      read_path(overlay / parent / "copy.txt") == "keep",
+                  ("an uncancelled copy creates its overlay parent" + mode).c_str());
+            cancel = TRUE;
             check(copy2(L"GAME:\\misc\\keep.txt", to(L"cancelled.txt").c_str(), &block) ==
                           HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
                       !std::filesystem::exists(out / "cancelled.txt"),
