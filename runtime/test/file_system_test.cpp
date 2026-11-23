@@ -450,6 +450,21 @@ void run_checks(const std::filesystem::path& root) {
         }
     }
 
+    // A failed delete of a package directory must not remove a same-named overlay file.
+    {
+        std::filesystem::create_directories(package / "delete-dir-conflict");
+        write_path(overlay / "delete-dir-conflict", "overlay");
+        SetLastError(0);
+        const BOOL result = delete_w(L"GAME:\\delete-dir-conflict");
+        const DWORD error = GetLastError();
+        check(result == FALSE && error == ERROR_ACCESS_DENIED, "DeleteFileW refuses a package directory");
+        check(read_path(overlay / "delete-dir-conflict") == "overlay", "the failed delete preserves the overlay file");
+
+        write_path(overlay / "delete-overlay-only", "overlay");
+        check(delete_w(L"GAME:\\delete-overlay-only") != FALSE, "DeleteFileW deletes an overlay-only file");
+        check(!std::filesystem::exists(overlay / "delete-overlay-only"), "the overlay-only file is gone");
+    }
+
     // A delete hides the package file without removing it.
     {
         check(delete_w(L"GAME:\\data\\dup.txt") != FALSE, "DeleteFileW accepts a package file");

@@ -951,6 +951,10 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
     std::error_code ec;
     const std::filesystem::path overlay_path = join(r.overlay, parts);
     if (std::filesystem::exists(overlay_path, ec)) {
+        // Refuse a package directory before changing a same-named overlay file.
+        if (!r.game.empty() && !deleted(r.overlay, parts) &&
+            std::filesystem::is_directory(join(r.game, parts), ec))
+            return fail_bool(ERROR_ACCESS_DENIED);
         if (!::DeleteFileW(overlay_path.c_str())) return FALSE;
         removed = true;
     }
