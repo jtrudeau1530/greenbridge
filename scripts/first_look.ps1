@@ -32,6 +32,13 @@ Write-Host "`n== Archetype lookup candidates for mods (docs/modding.md; pass the
 python -I (Join-Path $root "tools\find_hash_lookup.py") $Exe --json (Join-Path $out "hash_lookup.json")
 if ($LASTEXITCODE -ne 0) { Write-Warning "find_hash_lookup could not scan $Exe" }
 
+Write-Host "`n== What to confirm against this executable (every ASSUMPTION / UNVERIFIED / VERIFY note; called ones first)"
+$calls = Join-Path $out ((Split-Path $Exe -Leaf) + ".gdk_calls.json")
+$checklistArgs = @("--out", (Join-Path $out "checklist.md"))
+if (Test-Path $calls) { $checklistArgs += @("--gdk-calls", $calls) }
+python -I (Join-Path $root "tools\exe_checklist.py") @checklistArgs
+if ($LASTEXITCODE -ne 0) { Write-Warning "exe_checklist could not write the checklist" }
+
 $rt = Join-Path $root "runtime\build\gta6rt.exe"
 # A gta6rt.exe older than the runtime sources (a pull since the last build) would report the old shim table, so it
 # is rebuilt then too, not only when missing.
