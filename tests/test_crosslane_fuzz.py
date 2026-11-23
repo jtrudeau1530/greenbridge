@@ -340,6 +340,19 @@ class Modes(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("vk_compute_test not found", r.stderr)
 
+    def test_one_wave_with_the_default_modes_reaches_the_harness_check(self):
+        # The default --modes is native,emulate: native runs every wave32 program and emulate every wave64 one, so
+        # neither --wave 32 nor --wave 64 is empty. Both used to be refused by the guards above, which fired when any
+        # selected mode had nothing to run instead of when all of them had.
+        for wave in ("32", "64"):
+            with self.subTest(wave=wave):
+                r = subprocess.run([sys.executable, "-I", TOOL, "--wave", wave, "--programs", "1",
+                                    "--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test")],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("vk_compute_test not found", r.stderr)
+                self.assertNotIn("nothing", r.stderr)
+
     def test_wave64_and_both_still_accept_emulate(self):
         for wave in ("64", "both"):
             with self.subTest(wave=wave):
