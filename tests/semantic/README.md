@@ -75,6 +75,10 @@ instruction family per file; the list below describes some of them, not every fi
 - `test_saveexec_b64.py` does the same for `s_and_saveexec_b64`, `s_or_saveexec_b64`, `s_andn2_saveexec_b64` and
   `s_andn2_wrexec_b64` with S0 a compare result in VCC or in an SGPR pair (13 pairs of S0 and EXEC for each op and
   source), and runs the GPU test `cs_w64x_saveexec_b64`.
+- `test_exec_computed.py` runs the GPU tests `cs_w32_exec_computed` (32 lanes) and `cs_w64_exec_computed` (64
+  lanes): computed values (`s_lshl_b32`, `s_add_u32`, `s_bfm_b32`, `s_not_b32`, `s_mov_b32`, a lane mask
+  `s_and_b32` a number) written to `exec_lo` / `exec_hi` turn on only the lanes of that half whose bit is set
+  (SHADER-1264). A plain-Python reference recomputes the words from each case's EXEC.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
