@@ -89,8 +89,10 @@ struct Planes {
 };
 
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
-// `c` and reads every plane of the destination back. A list whose Close fails is executed only when `run_invalid`
-// (the layer runs what it recorded; the host runtime must not be given such a list).
+// `c` and reads every plane of the destination back. The clears, the resolve and the readback are three lists: the
+// layer refuses to execute a list whose Close failed, so a refused resolve shares its list with nothing the check
+// needs. That list is executed only when `run_invalid` (the layer must refuse it; the host runtime must not be given
+// such a list), and the readback after it then shows the destination as the clears left it.
 bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
                       const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
@@ -105,6 +107,22 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
                                              IID_PPV_ARGS(&list.p))));
     CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    Event event;
+    CHECK(event.handle);
+    UINT64 fence_value = 0;
+    // Executes the closed list, waits for it and opens the list again.
+    const auto submit = [&]() -> bool {
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        CHECK(SUCCEEDED(queue->Signal(fence.p, ++fence_value)));
+        CHECK(SUCCEEDED(fence->SetEventOnCompletion(fence_value, event.handle)));
+        // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
+        // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
+        CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+        CHECK(SUCCEEDED(allocator->Reset()));
+        CHECK(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        return true;
+    };
 
     D3D12_HEAP_PROPERTIES heap_properties{};
     heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -198,11 +216,18 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     barriers[1].Transition.pResource = target.p;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     list->ResourceBarrier(2, barriers);
+    CHECK(SUCCEEDED(list->Close()));
+    if (!submit()) return false;
+
     D3D12_RECT rect = source_rect;
     const UINT x = c.dst_x >= 0 ? UINT(c.dst_x) : c.rect ? UINT(rect.left) : 0;
     const UINT y = c.dst_y >= 0 ? UINT(c.dst_y) : c.rect ? UINT(rect.top) : 0;
     list1->ResolveSubresourceRegion(target.p, c.plane, x, y, source.p, c.plane, c.rect ? &rect : nullptr, c.format,
                                     c.mode);
+    out.close = list->Close();
+    if (FAILED(out.close) && !run_invalid) return true;
+    if (!submit()) return false;
+
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &barriers[1]);
@@ -216,17 +241,8 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         dst.PlacedFootprint = placed[i];
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
-    out.close = list->Close();
-    if (FAILED(out.close) && !run_invalid) return true;
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
-    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
-    Event event;
-    CHECK(event.handle);
-    CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
-    // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
-    // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
-    CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+    CHECK(SUCCEEDED(list->Close()));
+    if (!submit()) return false;
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
