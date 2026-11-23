@@ -54,7 +54,7 @@ their content.
 ## Type split
 
 Stream-level split, using the requested classes. `other` is 2 `MHIU` payloads (38 streams), 1 `PAMH` and 1
-`SPS1Z`; there are no `RBF0`, `PSIN` or Bink 2 streams in this archive.
+`SPS1`; there are no `RBF0`, `PSIN` or Bink 2 streams in this archive.
 
 | Type | Streams | Stored B | Inflated B | Logical payloads |
 |---|---:|---:|---:|---:|
@@ -63,7 +63,7 @@ Stream-level split, using the requested classes. `other` is 2 `MHIU` payloads (3
 | `PSIN` | 0 | 0 | 0 | 0 |
 | text / INI-like | 4 | 30,162 | 142,036 | 3 |
 | binary | 66 | 1,396,087 | 4,312,136 | 2 |
-| other (`MHIU`/`PAMH`/`SPS1Z`) | 40 | 456,483 | 2,492,026 | 4 |
+| other (`MHIU`/`PAMH`/`SPS1`) | 40 | 456,483 | 2,492,026 | 4 |
 | **total** | **954** | **5,647,255** | **50,231,123** | **276** |
 
 By inflated bytes: 86.2% XML, 8.6% binary, 5.0% `other`, 0.3% text. XML is only 66.7% of stored bytes,
@@ -72,7 +72,7 @@ root element. Non-XML grouping follows the 64 KiB block rule; none of the nine n
 that is an exact multiple of 64 KiB, so their counts are unambiguous too.
 
 The four non-XML structured payloads are the only readable binary metadata here: two `MHIU` blobs (about
-1.19 MB and 1.21 MB inflated), one `PAMH` blob (48.6 KB) and one `SPS1Z` shader-parameter table (43.8 KB).
+1.19 MB and 1.21 MB inflated), one `PAMH` blob (48.6 KB) and one `SPS1` shader-preset table (43,791 B).
 The two large opaque blobs (1.04 MB and 3.27 MB) have no recognised header and are left as binary. No model,
 texture or audio signature is present in `common.rpf`; the two opaque blobs are not identified.
 
@@ -225,6 +225,36 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
   body or the payload with 0x28..0x2B zeroed. They do not equal any count or
   sum of the grid. They are most likely uninitialised struct padding after the
   `u8` and are reported as `pad_29`; with N = 2 this is a hypothesis.
+
+## `SPS1` shader-preset table
+
+The single `SPS1` payload in `common.rpf` (`0x650000`, `43,791` B inflated, 1 stream) is the material shader-preset
+lookup table (`tools/gamedata_sps1.py`), not an `"SPS1Z"` five-byte magic:
+
+| Offset | Type | Meaning | Measured in 1.0.2.1 `common.rpf` |
+|---|---|---|---|
+| `0x00` | `char[4]` | Magic | `"SPS1"` |
+| `0x04` | `u32` | `entry_count` | `858` (`0x0000035A`; its low byte `0x5A == 'Z'` caused the old `"SPS1Z"` reading) |
+| `0x08` | `entry[858]` | `{u8 preset_len, char preset[], u8 effect_len, char effect[], u8 render_bucket}` | `43,783` B consuming the entire payload to EOF (`0` extra bytes) |
+
+Measured over all **858** records and cross-checked against `shaders.rpf`'s two `SGD5` databases:
+
+- **Presets:** all `858` carry a unique case-insensitive `.sps` path (`8`..`51` bytes), split into `846` root
+  names and `12` one-folder paths with zero basename stem collisions.
+- **100% `SGD5` target resolution:** all **858 of 858** records (`539 of 539` distinct target effects, `4`..`47`
+  bytes) match an effect in `shaders.rpf` `SGD5` Database 0 (`0x10E39`, `910` effects; `0` in Database 1).
+- **Aliases:** `532` presets have `preset_stem == effect` and `326` alias a preset name onto a shared effect; only
+  `589` preset stems match an `SGD5` effect name directly (`269` preset stems are defined only in `SPS1`).
+- **Default render buckets (`0..7`):** `0` (`401`), `1` (`161`), `2` (`101`), `3` (`162`), `4` (`1`), `5` (`1`),
+  `6` (`30`), `7` (`1`). `63` target effects span multiple buckets across their presets (`58` in `{0, 3}`, `2` in
+  `{0, 1, 3}`, `1` in `{1, 3}`, `1` in `{0, 1, 2, 3, 6, 7}`, and `1` in `{4, 5}` — the single bucket-`4` and bucket-`5`
+  presets both point to effect hash `0xFC34F08B`, matching [`models.md`](models.md#shader-render-buckets)).
+
+```powershell
+python -I tools/gamedata_sps1.py <work>\carve\common --shaders shaders.rpf --json sps1.json
+```
+
+Only counts, bucket distributions and `--preset-hash` hashes are written; preset and effect names stay local.
 
 ## Grid atlases
 
@@ -1007,7 +1037,7 @@ above), and how `controlValue` maps onto game state.
 
 | Archive | Size | Streams | Inflated | Dominant payloads | XML | `RBF0` | `PSIN` |
 |---|---:|---:|---:|---|---:|---:|---:|
-| `common.rpf` | 6.6 MB | 954 | 50.2 MB | XML/config, text, `MHIU`, `PAMH`, `SPS1Z` | 844 streams | 0 | 0 |
+| `common.rpf` | 6.6 MB | 954 | 50.2 MB | XML/config, text, `MHIU`, `PAMH`, `SPS1` | 844 streams | 0 | 0 |
 | `data.rpf` | 481.5 MB | 28,509 | 1,403.3 MB | models/GPU pages, 1,263 `RBF0`, 2,281 `PSIN`, 3,132 resource pages | 0 | 1,263 | 2,281 |
 | `script.rpf` | 4.4 MB | 714 | 5.0 MB | 671 `PSIN` plus binary | 0 | 0 | 671 |
 
@@ -1095,11 +1125,10 @@ location; a consumer of the field would settle it.
 ## Readable vs binary
 
 Readable: the 266 XML documents, 3 text/INI-like files, and the two `MHIU` 2048 x 2048
-heightmaps plus the `PAMH` max/min heightmap and the `SPS1Z` header. The XML is ordinary text
+heightmaps plus the `PAMH` max/min heightmap and the `SPS1` shader-preset table. The XML is ordinary text
 and can be consumed by any parser. `tools/gamedata_maps.py` decodes the `MHIU` row table and
-packed heights and the `PAMH` row table and max/min arrays. `SPS1Z` is a NUL-separated
-table of path/key strings with per-entry type/length markers; its structure is visible but its consumer is not
-implemented.
+packed heights and the `PAMH` row table and max/min arrays, and `tools/gamedata_sps1.py` decodes the
+`858`-entry `SPS1` preset table and joins it to `shaders.rpf`'s `SGD5` effect records.
 
 Not fully readable: the 8.6% unread span, the two opaque binary blobs, and the missing first blocks of the 9
 tail-only documents (their retained tails are readable but incomplete). The encrypted table of contents is

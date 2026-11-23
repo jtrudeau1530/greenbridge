@@ -43,7 +43,7 @@ XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
 # Tag-like text inside these cannot open or close an element.
 XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
-MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1Z": "SPS1Z", b"RBF0": "RBF0", b"PSIN": "PSIN"}
+MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1": "SPS1", b"RBF0": "RBF0", b"PSIN": "PSIN"}
 # A resource whose page directory starts the stream carries "0DRP" at +16 (docs/animation.md, "0DRP page marker").
 # Its first 4 KiB can be over 95% printable, so without this check such a stream reads as text, and as XML when it
 # holds a "<": data.rpf has 337 of them and no XML at all (docs/gamedata.md, "Relationship to data.rpf").

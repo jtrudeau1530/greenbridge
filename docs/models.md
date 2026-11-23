@@ -543,6 +543,11 @@ Names are per model and a building holds glass, decal and opaque shaders alike, 
 in absolute terms; the enrichment against bucket 0 is the signal. For export: bucket 1 needs blending, 2 is
 a projected decal, 3 needs alpha testing, 6 is a water surface.
 
+`common.rpf` carries the matching preset-to-effect table (`SPS1`, decoded by `tools/gamedata_sps1.py`,
+[`gamedata.md`](gamedata.md#sps1-shader-preset-table)): `858` `.sps` presets map onto `539` `SGD5` Database 0 effects
+with a default `u8` render bucket (`0..7`), `63` effects accept multiple buckets, and the single bucket-`4`
+and bucket-`5` presets both resolve to effect `fc34f08b`.
+
 ## Material shader hashes and the carved programs
 
 `rpf9dump` also writes each material's shader hash (`manifest.json` → `Materials[].Shader`, u32 as 8 hex digits).

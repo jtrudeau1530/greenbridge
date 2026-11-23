@@ -67,7 +67,7 @@ import unicodedata
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from report_paths import same_report_path  # noqa: E402
 
-MAGIC = (b"MHIU", b"PAMH", b"SPS1Z")
+MAGIC = (b"MHIU", b"PAMH")
 HEADER = 44
 
 
