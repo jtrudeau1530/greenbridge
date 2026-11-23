@@ -277,13 +277,13 @@ int main(int argc, char** argv) {
     if (!n) { std::fprintf(stderr, "unsupported: no Vulkan physical device\n"); return 77; }
     std::vector<VkPhysicalDevice> pds(n);
     CHECK(vkEnumeratePhysicalDevices(inst, &n, pds.data()));
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    VkPhysicalDeviceProperties props{};
-    int best = -1;
-    for (auto p : pds) {
-        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(p, &pp);
-        if (int r = leonida::vk_test::device_rank(pp.deviceType, pp.vendorID); r > best) { pd = p; props = pp; best = r; }
-    }
+    // The shared pick, so LEONIDA_VK_DEVICE names the GPU here too (vk_device_pick.h, docs/testing.md).
+    std::vector<VkPhysicalDeviceProperties> candidates(n);
+    for (uint32_t i = 0; i < n; ++i) vkGetPhysicalDeviceProperties(pds[i], &candidates[i]);
+    const std::size_t chosen = leonida::vk_test::pick_device(candidates);
+    if (chosen == candidates.size()) { leonida::vk_test::report_no_device(); return 1; }
+    VkPhysicalDevice pd = pds[chosen];
+    const VkPhysicalDeviceProperties props = candidates[chosen];
     constexpr uint32_t push_words = 36, push_bytes = push_words * 4;
     if (props.limits.maxPushConstantsSize < push_bytes) { std::fprintf(stderr, "unsupported: push constants\n"); return 77; }
     std::fprintf(stderr, "device: %s\n", props.deviceName);
