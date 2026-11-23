@@ -552,6 +552,15 @@ What is implemented (all of it testable without the game):
     fails, the presenter stops (`ok()` is false) and its owner makes a new one.
   - for `PresentX` (section 4.5): a source rectangle, a blank present, an sRGB swapchain format for an sRGB source,
     and an optional capture of each presented frame to host memory (what `xbox_present_test` reads back).
+  - Set `LEONIDA_PRESENT_DUMP=<dir>[,N]` to save the final swapchain image from `WindowPresenter::present`
+    and console `PresentX`. With the default interval of 60, the files are `present_000001.png`, `present_000061.png`, and so
+    on. Only presents accepted by the presentation engine count. The runtime creates the directory if needed.
+    An invalid setting logs once and disables dumping. Leave the variable unset to turn it off.
+    Readback requires transfer-source support on the surface. A sampled frame may stall for its GPU copy.
+    A worker writes the 8-bit RGBA PNG. For an HDR10 swapchain
+    the preview decodes PQ, clips each channel at 203 nits and applies the sRGB curve with no gamut conversion.
+    Floating-point swapchain channels are clamped to [0, 1]. Blits and composed planes are sampled after scaling
+    and colour conversion, at the swapchain's dimensions.
 
   The device needs `VK_KHR_swapchain` (and the instance the surface extensions). The standalone device enables
   them when present.
