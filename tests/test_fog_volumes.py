@@ -231,6 +231,15 @@ class FogVolumesTests(unittest.TestCase):
                 fv.main([os.path.join(td, "missing.rpf")])
             self.assertEqual(cm.exception.code, 2)
 
+    def test_jobs_below_one_is_a_usage_error(self):
+        # A --jobs of 0 used to run with max(1, 0) = one worker and exit 0, so a caller that meant to ask for
+        # an impossible worker count got a silent sequential run instead of an error.
+        with tempfile.TemporaryDirectory() as td:
+            for bad in ("0", "-3"):
+                with self.assertRaises(SystemExit) as cm:
+                    fv.main([td, "--jobs", bad])
+                self.assertEqual(cm.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

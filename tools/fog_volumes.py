@@ -411,8 +411,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, carved 0x7a file, or folder of carved files")
     ap.add_argument("--out", help="optional JSON summary output path")
-    ap.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 4),
-                    help="worker processes for RPF9 scanning")
+    ap.add_argument("--jobs", type=WC.job_count, default=min(16, os.cpu_count() or 4),
+                    help="worker processes for RPF9 scanning (at least 1)")
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error(f"no such file or folder: {a.path}")
@@ -422,7 +422,7 @@ def main(argv=None) -> int:
         if os.path.isfile(a.path) and same_report_path(a.path, a.out):
             ap.error(f"--out would overwrite input: {a.out}")
     try:
-        doc = summarize(a.path, jobs=max(1, a.jobs))
+        doc = summarize(a.path, jobs=a.jobs)
         if a.out:
             _write_json_atomic(a.out, doc)
     except OSError as exc:
