@@ -172,6 +172,12 @@ With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 program
   - 2 at a reachable word `llvm-mc` does not decode (the VOP3P words above);
   - 1 at an `src_scc` operand.
 
+These counts predate SHADER-813. A program whose reachable code falls through into those undecodable VOP3P words used
+to translate with the path cut at the gap, so its later stores were missing from a module that passed `spirv-val`;
+it is now refused (`fall-through into undecodable words`). On package 1.0.2.1 with `llvm-mc` 23.1.5 that is
+programs 04, 05, 06, 09, 12 and 15, which had been counted as translating (reported in the coordination issue by
+@aslan2142; not recounted here, since that needs the package).
+
 ## Unknown
 
 - Kind 0 words 0 and 1.
