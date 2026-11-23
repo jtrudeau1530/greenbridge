@@ -625,29 +625,30 @@ def read_dxbc_meta(data):
         p = parts[b"ISG1"]
         if len(p) >= 8:
             ecnt, eo = struct.unpack_from("<II", p, 0)
-            elems = []
-            for i in range(ecnt):
-                base = eo + 32 * i
-                if base + 32 > len(p):
-                    break
-                _, noff, sidx, sysv, ctype, reg = struct.unpack_from("<6I", p, base)
-                mask, rw_mask = p[base + 24], p[base + 25]
-                semantic = ""
-                if 8 <= noff < len(p):
+            strings = eo + 32 * ecnt
+            if 8 <= eo and strings <= len(p):
+                elems = []
+                for i in range(ecnt):
+                    base = eo + 32 * i
+                    _, noff, sidx, sysv, ctype, reg = struct.unpack_from("<6I", p, base)
+                    mask, rw_mask = p[base + 24], p[base + 25]
+                    if not strings <= noff < len(p):
+                        break
                     end = p.find(b"\x00", noff)
-                    if end > noff:
-                        semantic = p[noff:end].decode("ascii", "replace")
-                elems.append({
-                    "semantic": semantic,
-                    "semantic_index": sidx,
-                    "register": reg,
-                    "mask": mask,
-                    "rw_mask": rw_mask,
-                    "system_value": sysv,
-                    "component_type": COMPONENT_TYPES.get(ctype, str(ctype)),
-                })
-            if elems:
-                out["input_signature"] = elems
+                    if end <= noff:
+                        break
+                    semantic = p[noff:end].decode("ascii", "replace")
+                    elems.append({
+                        "semantic": semantic,
+                        "semantic_index": sidx,
+                        "register": reg,
+                        "mask": mask,
+                        "rw_mask": rw_mask,
+                        "system_value": sysv,
+                        "component_type": COMPONENT_TYPES.get(ctype, str(ctype)),
+                    })
+                if elems and len(elems) == ecnt:
+                    out["input_signature"] = elems
 
     if b"SFI0" in parts and len(parts[b"SFI0"]) >= 8:
         flags = struct.unpack_from("<Q", parts[b"SFI0"], 0)[0]

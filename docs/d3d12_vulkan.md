@@ -1989,7 +1989,8 @@ rendering silently wrong.
 fields into `spirv/index.json`: `user_sgpr_reads` (`const32`, `ptr64_lo`/`ptr64_hi`, `ptr32_lo`, `vsharp`, `tsharp`,
 `ssharp`), `descriptor_strides`, `uses_code_base`, `literal_samplers`, `input_signature` (ISG1 semantic name/index,
 register, masks, system value, component type), `fssm_sha256`, and `descriptor_access` (DXBC `SFI0` direct-indexing
-bits 25/26 plus table-load and high-dword-truncation flags).
+bits 25/26 plus table-load and high-dword-truncation flags). A missing or malformed ISG1 signature leaves the vertex shader
+without recorded inputs. In that case the runtime accepts any input layout when filtering shader candidates.
 
 ### 3.6 Shader identity, PSOs and feature selection
 
