@@ -31,6 +31,8 @@
 //
 // ASSUMPTION: the console executable is not available, so the DLL it imports GameInputCreate from is unknown. The PC
 // API lives in gameinput.dll; on console the GDK links it through xgameruntime. Both names are registered.
+// gameinput.lib imports GameInputCreate from GameInput.dll by ordinal 1, with no name (docs/gameinput.md, "The import
+// is by ordinal"), so "#1" is registered too: the loader looks an ordinal import up as "#<n>".
 #include <windows.h>
 
 #include <SDL3/SDL.h>
@@ -1644,7 +1646,19 @@ constexpr int kStickDiagonal = 23170;  // 32767 / sqrt(2)
 constexpr int kMouseAxisPerPixel = 1024;
 constexpr int kMouseDecayNum = 7, kMouseDecayDen = 8;
 
-bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+// LEONIDA_AUTO_A=s: the pad presses A for 200 ms every 5 s, from s seconds after start (unattended boot runs).
+bool async_key_down(int vk) {
+    static const double from = [] {
+        const char* v = std::getenv("LEONIDA_AUTO_A");
+        return v ? std::atof(v) : -1.0;
+    }();
+    if (from >= 0 && vk == VK_RETURN) {
+        static const ULONGLONG start = GetTickCount64();
+        const double t = (GetTickCount64() - start) / 1000.0 - from;
+        if (t >= 0 && t - 5.0 * static_cast<long long>(t / 5.0) < 0.2) return true;
+    }
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
 
 // ---- raw mouse input (its own thread) ----
 //
