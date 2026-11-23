@@ -52,8 +52,10 @@ def _read_c_string(blob: bytes, pos: int, label: str) -> tuple[str, int]:
         raise ValueError(f"truncated {label} length at {pos:#x}")
     length = blob[pos]
     pos += 1
-    if length < 2 or pos + length > len(blob):
-        raise ValueError(f"invalid or truncated {label} string at {pos - 1:#x}")
+    if length < 2:
+        raise ValueError(f"invalid {label} string length at {pos - 1:#x}")
+    if pos + length > len(blob):
+        raise ValueError(f"truncated {label} string at {pos - 1:#x}")
     raw = blob[pos:pos + length]
     if raw[-1] != 0 or 0 in raw[:-1]:
         raise ValueError(f"{label} string at {pos - 1:#x} must end with a single NUL")
@@ -175,14 +177,24 @@ def _load_from_source(rows: list[dict], read_row) -> list[dict]:
             continue
         parts = [data]
         j = i
-        while row.get("size", 0) and rows[j].get("size", 0) % 65536 == 0 and j + 1 < len(rows):
-            nxt = read_row(rows[j + 1])
-            if nxt[:4] in BOUNDARY_MAGICS or nxt.startswith(XML_PREFIXES):
+        blob = data
+        while True:
+            try:
+                parsed = parse_sps1(blob)
                 break
-            parts.append(nxt)
-            j += 1
-        blob = b"".join(parts)
-        parsed = parse_sps1(blob)
+            except ValueError as err:
+                if (
+                    "truncated" not in str(err)
+                    or not (len(parts[-1]) > 0 and len(parts[-1]) % 65536 == 0)
+                    or j + 1 >= len(rows)
+                ):
+                    raise
+                nxt = read_row(rows[j + 1])
+                if nxt[:4] in BOUNDARY_MAGICS or nxt.startswith(XML_PREFIXES):
+                    raise
+                parts.append(nxt)
+                j += 1
+                blob = b"".join(parts)
         parsed.update({
             "offset": row["off"],
             "offset_hex": f'{row["off"]:x}',

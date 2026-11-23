@@ -172,6 +172,37 @@ class GamedataSps1Test(unittest.TestCase):
             self.assertEqual(loaded[0]["size"], len(blob))
         self.assertEqual(gamedata_sps1.read_payloads(self.carve)[0]["chunks"], 2)
 
+    def test_exact_64k_sps1_does_not_absorb_following_opaque_row(self):
+        # 8B header + 327 * 200B + 128B == 65,536B exact, followed by an opaque binary row.
+        entries_64k = [(f"p{i:03d}_" + ("x" * 180) + ".sps", "fx_std", i % 7) for i in range(327)]
+        entries_64k.append(("p_end_" + ("y" * 107) + ".sps", "fx_std", 0))
+        exact_64k = sps1_payload(entries_64k)
+        self.assertEqual(len(exact_64k), 65536)
+
+        self.add(exact_64k)
+        self.add(b"\x01\x02\x03\x04" * 16)
+        self.finish()
+        loaded = gamedata_sps1.read_payloads(self.carve)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["size"], 65536)
+        self.assertEqual(loaded[0]["chunks"], 1)
+        self.assertEqual(loaded[0]["table"]["records"], 328)
+
+        # Also verify an exact 131,072B two-chunk table stops after 2 chunks instead of absorbing a 3rd opaque row.
+        self.rows.clear()
+        entries_128k = [(f"p{i:03d}_" + ("x" * 180) + ".sps", "fx_std", i % 7) for i in range(655)]
+        entries_128k.append(("p_end_" + ("z" * 43) + ".sps", "fx_std", 0))
+        exact_128k = sps1_payload(entries_128k)
+        self.assertEqual(len(exact_128k), 131072)
+        self.add(exact_128k, [exact_128k[:65536], exact_128k[65536:]])
+        self.add(b"\x05\x06\x07\x08" * 16)
+        self.finish()
+        loaded2 = gamedata_sps1.read_payloads(self.carve)
+        self.assertEqual(len(loaded2), 1)
+        self.assertEqual(loaded2[0]["size"], 131072)
+        self.assertEqual(loaded2[0]["chunks"], 2)
+        self.assertEqual(loaded2[0]["table"]["records"], 656)
+
     def test_cross_references_sgd5_and_matches_hashes_without_leaking_names(self):
         entries = [
             ("alpha_fx.sps", "alpha_fx", 0),
