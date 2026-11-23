@@ -42,6 +42,7 @@
 #include <cstring>
 #include <iterator>
 #include <new>
+#include <vector>
 #include <memory>
 #include <utility>
 
@@ -1699,6 +1700,17 @@ void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t
     }
     using Fn = void*(WINAPI*)(void*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_ALLOCATION_INFO1*);
     const UINT n = static_cast<UINT>(count);
+    // The per-resource array is optional (_Out_writes_opt_). The console total must not depend on whether the
+    // caller asked for it, so without one the host's per-resource answers go to a local array (found by Alpha325).
+    std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> local;
+    if (!each && descs && n) {
+        try {
+            local.resize(n);
+            each = local.data();
+        } catch (const std::bad_alloc&) {
+            each = nullptr;  // the host total stands
+        }
+    }
     void* const returned = reinterpret_cast<Fn>(self->real_vtable[56])(
         self->real, call.ret, static_cast<UINT>(visible_mask), n, descs, each);
     if (each) {

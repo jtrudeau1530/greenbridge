@@ -952,6 +952,10 @@ int check_render_target_layout() {
     EXPECT(total.SizeInBytes == 17694720 && total.Alignment == 65536);
     EXPECT(each[0].Offset == 0 && each[0].SizeInBytes == 8847360 && each[0].Alignment == 65536);
     EXPECT(each[1].Offset == 8847360 && each[1].SizeInBytes == 8847360 && each[1].Alignment == 65536);
+    // The per-description array is optional: without one the total is the same 17,694,720 B.
+    D3D12_RESOURCE_ALLOCATION_INFO no_array{};
+    EXPECT(get_info1(&no_array, device, 0, 2, two, nullptr) == &no_array);
+    EXPECT(no_array.SizeInBytes == 17694720 && no_array.Alignment == 65536);
     D3D12_RESOURCE_ALLOCATION_INFO1 mixed[2]{};
     D3D12_RESOURCE_ALLOCATION_INFO pc{};
     EXPECT(raw(device, 56, word(&pc), 0, 2, word(msaa_first), word(mixed)) == word(&pc));
