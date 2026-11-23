@@ -540,6 +540,18 @@ if(BUILD_TESTING)
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
+  # The title's own window, where PresentX shows its frames (shims/title_window.h): user32 only, no device.
+  if(WIN32)
+    add_executable(title_window_test test/title_window_test.cpp)
+    target_include_directories(title_window_test PRIVATE shims)
+    target_compile_definitions(title_window_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(title_window_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    target_link_libraries(title_window_test PRIVATE user32)
+    add_test(NAME title_window COMMAND title_window_test)
+  endif()
+
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
 
