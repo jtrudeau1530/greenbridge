@@ -249,16 +249,24 @@ def run_all(args, events):
     known = list(xcl.order)
 
     # 2. gta6rt, restarted with a hung check skipped, up to --max-restarts times.
-    def leonida_cmd(attempt):
-        if (work / "leonida").exists():
-            shutil.rmtree(work / "leonida")
-        game = work / "leonida" / "game"
-        prepare_game(xcl_dir, bins, game)
-        trace = work / "leonida" / ("trace_%d.jsonl" % attempt)
-        return [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
-                "--overlay", str(work / "leonida" / "overlay"), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
+    # Wipe stale output from an earlier run once; per-attempt restarts reset only game/ and
+    # overlay/ so earlier trace_<attempt>.jsonl files (including the hanging attempt's) survive.
+    leonida_dir = work / "leonida"
+    if leonida_dir.exists():
+        shutil.rmtree(leonida_dir)
+    leonida_dir.mkdir(parents=True, exist_ok=True)
 
-    run_with_restarts(leonida_cmd, dict(os.environ), str(work / "leonida"), leo, known, args.timeout, cdb, events,
+    def leonida_cmd(attempt):
+        game = leonida_dir / "game"
+        overlay = leonida_dir / "overlay"
+        if overlay.exists():
+            shutil.rmtree(overlay)
+        prepare_game(xcl_dir, bins, game)
+        trace = leonida_dir / ("trace_%d.jsonl" % attempt)
+        return [str(gta6rt), "--run", str(game / bins[1].name), "--game-dir", str(game),
+                "--overlay", str(overlay), "--trace-d3d12", "--trace", str(trace), "--", "--hello"]
+
+    run_with_restarts(leonida_cmd, dict(os.environ), str(leonida_dir), leo, known, args.timeout, cdb, events,
                       list(args.skip), args.max_restarts, transcripts["leonida"])
     for name in known:
         if name not in leo.checks:
