@@ -2250,9 +2250,14 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
         except OSError:
             return None
     doc = {"modules": [{"name": n, "spv_sha256": digest(n)} for n in crashed]}
-    with open(os.path.join(out, "pipeline_crashes.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=1)
-        f.write("\n")
+    try:
+        with open(os.path.join(out, "pipeline_crashes.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=1)
+            f.write("\n")
+    except OSError as error:
+        # The durable record is best-effort. A report path that cannot be written must not
+        # replace the checker diagnostic that names the modules which took the driver down.
+        log(f"pipelines: cannot write pipeline_crashes.json: {error.strerror or error}")
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the

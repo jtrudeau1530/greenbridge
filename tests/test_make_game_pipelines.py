@@ -281,6 +281,27 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertEqual(doc["modules"][0]["spv_sha256"],
                          __import__("hashlib").sha256(blob).hexdigest())
 
+    def test_a_failed_crash_report_does_not_hide_the_checker_diagnostic(self):
+        # The report is best-effort: a path that cannot be written warns, then the normal
+        # checker failure still names the modules.
+        os.makedirs(os.path.join(self.out, "pipeline_crashes.json"))
+
+        def script(args, n):
+            if self.is_probe(args):
+                self.inflight_is("b_mod")
+                return ABORT
+            if n == 1:
+                self.inflight_is("b_mod")
+                return ABORT
+            return 1
+
+        with mock.patch("sys.stderr", io.StringIO()):
+            err, logs = self.stage(script)
+        self.assertIsNotNone(err)
+        self.assertIn("vk_pipeline_check", err.getvalue())
+        self.assertIn("b_mod", err.getvalue())
+        self.assertTrue(any("cannot write pipeline_crashes.json" in line for line in logs))
+
     def test_a_clean_run_drops_an_old_crash_report(self):
         os.makedirs(self.out)
         report = os.path.join(self.out, "pipeline_crashes.json")
