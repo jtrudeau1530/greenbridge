@@ -68,6 +68,10 @@ CAUGHT = [
     ("anim.bin", b"MoVE" + (19).to_bytes(4, "little") + bytes(8), "MoVE animation container"),
     ("bones.dat", b"SKEL_" + b"SKEL_Head\x00" + bytes(8), "SKEL_ bone table"),
     ("script2.lol", b"SCRP" + bytes(12), "SCRP compiled script"),
+    ("story_save.txt", b"JSAV" + (3).to_bytes(4, "little") + bytes(8), "JSAV story save"),
+    ("profile.json", b"ASAV" + (1).to_bytes(4, "little") + bytes(8), "ASAV save record"),
+    ("chives.txt", b"SLAYER1\0" + bytes(8), "SLAYER1 packed save"),
+    ("chunk.json", b"LPK1" + (2).to_bytes(4, "little") + b"[]", "LPK1 world staging pack"),
 ]
 
 PASSED = [
@@ -77,6 +81,8 @@ PASSED = [
     ("metadata.txt", b"METADATA ADAT later in the line\n"),
     ("bones.md", b"# SKEL_HEAD, MoVE and SCRP name formats; none of them starts this file\n"),
     ("riff.bin", b"RIFF" + bytes(4) + b"AVI LIST"),
+    ("saves.md", b"# Saves\n\nA story save starts with JSAV, a profile with ASAV, its packed copy with SLAYER1.\n"),
+    ("slayer.txt", b"SLAYER1 without the zero byte after it is just a word\n"),
     ("empty.txt", b""),
     ("mz_past_end.txt", pe_header(0x80)[:0x40]),  # e_lfanew points past the end of the file
     ("mz_cut_signature.txt", pe_header(0x300)[:-2]),  # only "PE" of the signature is there
