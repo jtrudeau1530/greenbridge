@@ -2360,7 +2360,7 @@ def require_translated_shaders(work: str) -> str:
     if not os.path.isfile(index):
         fail("No translated shaders yet: run the shaders stage first.")
     try:
-        with open(index, encoding="utf-8") as f:
+        with open(index, encoding="utf-8-sig") as f:
             translated = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"The translated shader index {index} is unreadable ({getattr(e, 'strerror', None) or e}): "
@@ -2507,7 +2507,7 @@ def pipeline_names(spirv: str) -> "list[str]":
     """The checker's name-sorted index (byte order, as its std::map); ranges and diagnostic probes share it."""
     path = os.path.join(spirv, "index.json")
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"pipelines: cannot read {path}: {getattr(e, 'strerror', None) or e}")
