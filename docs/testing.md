@@ -604,6 +604,32 @@ a Linux RTX 5090 (595.99.02). On Windows, a Ryzen 7 9800X3D Radeon iGPU (25.10.3
 an RTX 3080 (616.64) and an RTX 3060 (621.14) preserved all 768 words in both formats.
 The device reports are in [PR #3260](https://github.com/ItsNotRexed/Leonida/pull/3260).
 
+### Which known problems the game's shaders reach
+
+Several rows of the table above are tied to particular instructions. A GPU test or fuzzer that hits one does
+not by itself mean the game does. The counts below say how many of the 26,503 1.0.2.1 shaders (`shaders.rpf`,
+LLVM gfx1013) contain those instructions, by stage and by the wave size their FSSM header gives. They are
+counts of instructions over the program up to each listing's last `s_endpgm`. They are not reproductions: a
+shader that contains an instruction does not have to take the exact path a row describes.
+
+```sh
+python -I tools/op_reach.py <work>/shaders/dxbc/disasm --index <work>/shaders/dxbc/index.json \
+    --fssm <work>/shaders/dxbc/fssm s_bfe_i64 '*_dpp' v_permlanex16_b32 ds_bpermute_b32 v_mul_f16 ...
+```
+
+The corpus has 2,662 wave32 shaders (1,535 CS, 1,127 PS) and 23,841 wave64 shaders (every VS, GS and MS, 1,154
+CS, 10,974 PS).
+
+| Row | What the game's shaders contain (1.0.2.1) |
+|---|---|
+| `cs_w32_salu64` on RDNA1 / RADV 25.2.8 (the high word of `s_bfe_i64`) | **No shader uses `s_bfe_i64`** (nor `s_bfe_u64`). The fixture's failure does not reach a game shader. |
+| `lds_fuzz.py --wave 64` `ds_bpermute_b32` on AMD's Windows driver | **No wave64 shader uses `ds_bpermute_b32`**: it occurs in 5 wave32 CS (74 instructions), and `ds_permute_b32` in none. |
+| `crosslane_fuzz.py --wave 64` on an AMD iGPU (a `v_permlanex16_b32` after a partial-`row_mask` DPP) | DPP in 4,313 shaders, 2,496 of them wave64 (2,364 PS, 113 CS, 17 MS, 2 VS). `v_permlanex16_b32` in 2,293 shaders, 561 of them wave64. Whether any of them pairs the two with a partial `row_mask` is not counted, so these are upper bounds. |
+| `cs_dpp_ops` on MoltenVK 1.4.2 | DPP (any `*_dpp`) in 4,313 shaders (66,354 instructions): 1,817 wave32, 2,496 wave64. |
+| `valu_fuzz.py --family f16` signed zero on MoltenVK | `v_mul_f16` 124 shaders, `v_fma_f16` 124, `v_fmac_f16` 130, `v_pk_mul_f16` 55, `v_pk_fma_f16` 47, mostly PS (113–115 for the scalar forms). |
+| `ps_interp_f16_high` on MoltenVK (16-bit interpolation) | `v_interp_p1ll_f16` / `v_interp_p2_f16` in 4,776 PS (679 wave32, 4,097 wave64), 59,367 instructions each. The count is the instruction, not the `high` operand. |
+| `gs_tri` and `ms_tri` on a Mac | 195 GS and 9,282 MS, all wave64. |
+
 ## Posting your result
 
 Use the template at the top of [#166](https://github.com/ItsNotRexed/Leonida/issues/166): GPU, driver, subgroup
