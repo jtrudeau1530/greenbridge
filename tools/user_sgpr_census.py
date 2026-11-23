@@ -42,6 +42,10 @@ import re
 import sys
 from collections import Counter, defaultdict
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 POINTER_KINDS = ("ptr32_lo", "ptr64_lo")
 
 
@@ -225,12 +229,8 @@ def main(argv=None):
     ap.add_argument("--pairs", action="store_true",
                     help="compare the VS and PS of one technique (root-parameter visibility, D3D-318)")
     a = ap.parse_args(argv)
-    if a.json:
-        try:
-            if os.path.samefile(a.index, a.json):
-                ap.error("--json must not overwrite the input index")
-        except OSError:
-            pass  # a missing or unreachable --json path is not the index; writing it reports the error
+    if a.json and same_report_path(a.index, a.json):
+        ap.error("--json must not overwrite the input index")
     try:
         index = load_index(a.index)
     except ValueError as e:

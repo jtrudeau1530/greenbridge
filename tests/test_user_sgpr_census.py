@@ -1,16 +1,19 @@
 """tools/user_sgpr_census.py on hand-written index.json data (no game files, no GPU)."""
+import contextlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import report_paths  # noqa: E402
 import user_sgpr_census as usc  # noqa: E402
 
 
@@ -97,8 +100,9 @@ def test_the_two_packing_models_are_told_apart():
     assert b["below_base"] == {"s1:const32": 1}
 
 
-@pytest.mark.parametrize("output_kind", ["same-path", "relative-alias", "hard-link"])
+@pytest.mark.parametrize("output_kind", ["same-path", "relative-alias", "hard-link", "folding-volume-case"])
 def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
+    assert usc.same_report_path is report_paths.same_report_path
     index = tmp_path / "index.json"
     original = json.dumps(INDEX).encode("utf-8")
     index.write_bytes(original)
@@ -113,9 +117,19 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
             output.hardlink_to(index)
         except OSError as err:
             pytest.skip(f"hard links unavailable: {err}")
+    elif output_kind == "folding-volume-case":
+        output = tmp_path / "INDEX.JSON"
 
-    with pytest.raises(SystemExit) as exc:
-        usc.main([str(index), "--json", str(output)])
+    probe = mock.Mock(return_value=True)
+    ctx = (mock.patch.multiple(report_paths, path_key=mock.Mock(side_effect=str),
+                               same_name_on_folding_volume=probe)
+           if output_kind == "folding-volume-case" else contextlib.nullcontext())
+    with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
+               if output_kind == "folding-volume-case" else contextlib.nullcontext()):
+        with pytest.raises(SystemExit) as exc:
+            usc.main([str(index), "--json", str(output)])
+    if output_kind == "folding-volume-case":
+        probe.assert_called_once()
 
     assert exc.value.code == 2
     assert "--json must not overwrite the input index" in capsys.readouterr().err
