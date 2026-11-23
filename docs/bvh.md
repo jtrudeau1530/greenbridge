@@ -598,8 +598,8 @@ python -I tests/test_bvh_index.py
 
 `--start` must be 0 or more, and `--limit` and `--max-inflate` at least 1. A value outside that, or a `--start` past
 the end of the archive, stops the tool with a one-line error and exit code 2. An empty archive, or one shorter
-than its 8-byte header, has no streams. In directory mode an archive that cannot be read is reported on stderr as
-`skipped` and the other archives are still indexed.
+than its 8-byte header, has no streams. In directory mode an archive that cannot be read, or a sub-folder that cannot be listed, is reported on stderr as
+`skipped` and the other archives are still indexed; the run then ends with an "incomplete" line and exit code 1.
 
 The `bvh4` signature is reported only when `flags == 0x81020006`, the `0x140 + 64*n == end` formula and the
 `u32@0x28 == end - 0x100` wrapper relation all hold; a larger payload whose declared end is past the chunk but

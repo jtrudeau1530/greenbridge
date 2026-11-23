@@ -199,6 +199,59 @@ class ScanTest(unittest.TestCase):
                 self.assertEqual(rows[0]["node_bytes"], 64)
                 self.assertNotIn("fill", rows[0])
 
+    def test_directory_with_an_unreadable_archive_keeps_the_others_but_exits_nonzero(self):
+        good = os.path.join(self.dir, "good.rpf")
+        with open(good, "wb") as f:
+            f.write(make_rpf([bvh_payload(3)]))
+        bad = bytearray(make_rpf([bvh_payload(2)]))
+        struct.pack_into("<I", bad, 4, len(bad) + 1000)       # the data area starts past the end of the file
+        with open(os.path.join(self.dir, "bad.rpf"), "wb") as f:
+            f.write(bad)
+        out = os.path.join(self.dir, "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(code, 1)
+        self.assertIn("bad.rpf: skipped", err.getvalue())
+        self.assertIn("incomplete", err.getvalue())
+        with open(out) as f:
+            self.assertEqual(json.load(f)["summary"]["streams"], 1)    # the readable archive is still reported
+
+    def test_directory_with_an_unlistable_subfolder_exits_nonzero_and_names_it(self):
+        with open(os.path.join(self.dir, "good.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(3)]))
+        locked = os.path.join(self.dir, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(locked, "hidden.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(2)]))
+        real = os.scandir
+
+        def scandir(path="."):   # chmod does not deny root, so the listing failure is made here
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(locked):
+                raise PermissionError(13, "Permission denied", os.fspath(path))
+            return real(path)
+
+        out = os.path.join(self.dir, "index.json")
+        err = io.StringIO()
+        with mock.patch.object(os, "scandir", scandir), contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(code, 1)
+        self.assertIn("locked: skipped", err.getvalue())
+        self.assertIn("incomplete", err.getvalue())
+        with open(out) as f:
+            self.assertEqual(json.load(f)["summary"]["streams"], 1)    # the readable archive is still reported
+
+    def test_hidden_folders_and_files_are_not_scanned(self):
+        os.makedirs(os.path.join(self.dir, ".cache"))
+        for rel in (os.path.join(".cache", "a.rpf"), ".b.rpf"):
+            with open(os.path.join(self.dir, rel), "wb") as f:
+                f.write(make_rpf([bvh_payload(2)]))
+        with open(os.path.join(self.dir, "c.rpf"), "wb") as f:
+            f.write(make_rpf([bvh_payload(3)]))
+        rows, _ = bvh_index.scan_dir(self.dir)
+        self.assertEqual([os.path.basename(r["source"]) for r in rows], ["c.rpf"])
+
     def test_index_outputs(self):
         path = os.path.join(self.dir, "pack.rpf")
         with open(path, "wb") as f:
