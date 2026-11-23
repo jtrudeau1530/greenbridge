@@ -257,6 +257,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(int3_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
+  # LEONIDA_SHADER_CAPTURE (src/shader_capture.h): a container the layer cannot translate is written for a build step.
+  add_executable(shader_capture_test
+    test/shader_capture_test.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(shader_capture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims
+                                                        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(shader_capture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(shader_capture_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(shader_capture_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
@@ -1021,6 +1031,10 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)
+  endif()
+  if(WIN32 AND TARGET shader_capture_test)
+    add_test(NAME shader_capture COMMAND shader_capture_test)
+    set_tests_properties(shader_capture PROPERTIES TIMEOUT 10)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)

@@ -288,6 +288,20 @@ readable `.spv`, every entry has to be reached, and in containers with more than
 payload may be the indexed program. Without `LEONIDA_SHADERS` it prints `SKIP` (CTest reports it as skipped).
 It prints counts only; on the 1.0.2.1 corpus all 26,503 containers resolve.
 
+### Shader programs the carve never sees
+
+Some of the title's shader programs are built at run time, so they sit in no archive and `--stages shaders` cannot
+carve them: a run stops at the first pipeline that asks for one (31 of them on retail 1.0.2.1). With
+`LEONIDA_SHADER_CAPTURE=<work>/shaders/captured` the layer writes each container it cannot resolve into that folder,
+with a sidecar naming the stage (`{"stage":"cs"}` - what `rdna2spirv.py` reads from an index entry and a container
+does not carry). The next `--stages shaders` run translates whatever it finds there with the same three tools the
+carve uses - `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` - and adds the module to the library, so the run
+gets past that pipeline.
+
+Off by default (`src/shader_capture.h`, tested by `shader_capture_test`). The captures are game data: keep the folder
+in your work directory, never in the repository, and never attach one to an issue or a pull request
+(`CONTRIBUTING.md`). A program already in the library is skipped, so the step costs nothing once a tree has caught up.
+
 ## Current limits
 
 `gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its

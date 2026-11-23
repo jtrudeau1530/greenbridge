@@ -23,6 +23,7 @@
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/shader_capture.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
@@ -3318,6 +3319,10 @@ public:
             });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                // LEONIDA_SHADER_CAPTURE keeps the container a build step can turn into a module (shader_capture.h).
+                leonida::capture_unresolved_shader(
+                    {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength},
+                    stage.name, hash);
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
@@ -3793,6 +3798,12 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                              fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                              leonida::sha256_hex(program.bytes).c_str());
+            // A missing translation is capturable; an ambiguous FSPX program is a choice the layer cannot
+            // make.
+            if (!ambiguous)
+                leonida::capture_unresolved_shader(
+                    {static_cast<const std::uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength},
+                    "cs", leonida::sha256_hex(program.bytes));
             return E_INVALIDARG;
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
