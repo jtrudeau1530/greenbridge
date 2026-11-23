@@ -726,6 +726,61 @@ if(BUILD_TESTING)
     add_dependencies(test_pe_loader_bounds gta6rt_tls_host)
     add_test(NAME pe_loader_bounds COMMAND test_pe_loader_bounds)
 
+    # RT-388: a deterministic mutation fuzzer over synthetic images through Loader::load (test/pe_loader_fuzz.cpp).
+    # ctest runs a fixed seed and case count; docs/testing.md has the long runs. With LEONIDA_LOADER_FUZZ_ASAN the
+    # fuzzer and the loader sources it compiles are built with AddressSanitizer (use RelWithDebInfo or Release:
+    # /fsanitize=address does not combine with the /RTC1 of a Debug build).
+    option(LEONIDA_LOADER_FUZZ_ASAN "Build pe_loader_fuzz with AddressSanitizer" OFF)
+    add_executable(pe_loader_fuzz
+      test/pe_loader_fuzz.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+      shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_include_directories(pe_loader_fuzz PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_compile_definitions(pe_loader_fuzz PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pe_loader_fuzz PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(pe_loader_fuzz PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
+    target_link_libraries(pe_loader_fuzz PRIVATE gta6rt_d3d12_xs_rootsig psapi)
+    add_dependencies(pe_loader_fuzz gta6rt_tls_host)
+    if(LEONIDA_LOADER_FUZZ_ASAN)
+      target_compile_options(pe_loader_fuzz PRIVATE /fsanitize=address /Zi)
+      target_link_options(pe_loader_fuzz PRIVATE /INCREMENTAL:NO /DEBUG)
+      # No STL container annotations: they need stl_asan.lib from the VS component, and the libraries linked here
+      # are built without ASan, so the annotate_string/annotate_vector /FAILIFMISMATCH keys must stay as theirs.
+      target_compile_definitions(pe_loader_fuzz PRIVATE _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
+      # The ASan runtime: next to cl.exe for MSVC (the VS "C++ AddressSanitizer" component), under the resource
+      # directory for clang-cl. Its objects name the runtime libraries; the folder goes on the library path, and the
+      # DLL is copied beside the test so it runs without a Developer prompt or a PATH change.
+      get_filename_component(_leonida_cc_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+      file(GLOB _leonida_asan_dll
+        "${_leonida_cc_dir}/clang_rt.asan_dynamic-x86_64.dll"
+        "${_leonida_cc_dir}/../lib/clang/*/lib/windows/clang_rt.asan_dynamic-x86_64.dll")
+      if(_leonida_asan_dll)
+        list(GET _leonida_asan_dll 0 _leonida_asan_dll)
+        get_filename_component(_leonida_asan_dir "${_leonida_asan_dll}" DIRECTORY)
+        target_link_directories(pe_loader_fuzz PRIVATE "${_leonida_asan_dir}")
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+          # clang-cl 23's stack-use-after-return frames break MSVC C++ exception dispatch at /O2: a rethrow faults
+          # in vcruntime's _C_specific_handler_noexcept (a five-line try/throw/catch does it). Without them it works.
+          target_compile_options(pe_loader_fuzz PRIVATE -fsanitize-address-use-after-return=never)
+          # clang-cl names these only when it runs the link itself; CMake calls the linker directly.
+          target_link_options(pe_loader_fuzz PRIVATE clang_rt.asan_dynamic-x86_64.lib
+                              /wholearchive:clang_rt.asan_dynamic_runtime_thunk-x86_64.lib)
+        endif()
+        add_custom_command(TARGET pe_loader_fuzz POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_leonida_asan_dll}" "$<TARGET_FILE_DIR:pe_loader_fuzz>")
+      else()
+        message(WARNING "LEONIDA_LOADER_FUZZ_ASAN: no clang_rt.asan_dynamic-x86_64.dll beside ${CMAKE_CXX_COMPILER}")
+      endif()
+    endif()
+    add_test(NAME pe_loader_fuzz COMMAND pe_loader_fuzz --quiet)
+
     # Static TLS fixture: a DLL with __declspec(thread) and a TLS callback. It is ordinary test code; no game data
     # is involved. loader_tls_test needs gta6rt_tls_host.dll next to its own EXE, because that is where
     # Loader::initialize_tls looks for the reserved module TLS index.
