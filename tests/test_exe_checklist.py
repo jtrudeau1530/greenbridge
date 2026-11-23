@@ -134,6 +134,27 @@ class ExeChecklist(unittest.TestCase):
         text = ec.render(ec.collect(self.root), ec.called_classes([report]))
         self.assertIn("demo.cpp:3` ASSUMPTION (not called)", text)
 
+    def test_verify_notes_in_code_are_collected(self):
+        verify = "// pad demo.\n//\n// The pads (VERIFY: against the game).\n// VERIFY: the timeout is not honoured.\n"
+        with open(os.path.join(self.root, "runtime", "shims", "verify.cpp"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(verify)
+        notes = [n for n in ec.collect(self.root) if n["file"] == "runtime/shims/verify.cpp"]
+        self.assertEqual([(n["line"], n["kind"]) for n in notes], [(3, "VERIFY"), (4, "VERIFY")])
+        self.assertEqual(notes[0]["text"], "against the game).")
+        self.assertEqual(notes[1]["text"], "the timeout is not honoured.")
+
+    def test_a_root_that_is_not_a_directory_is_exit_2(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ec.main(["--root", os.path.join(self.root, "no_such")]), 2)
+        self.assertIn("not a directory", stderr.getvalue())
+
+    def test_an_out_that_is_a_directory_is_exit_2(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ec.main(["--root", self.root, "--out", os.path.join(self.root, "docs")]), 2)
+        self.assertIn("is a directory", stderr.getvalue())
+
     def test_an_unreadable_report_is_exit_1(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

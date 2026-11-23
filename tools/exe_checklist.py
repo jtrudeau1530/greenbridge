@@ -35,7 +35,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ROOT = os.path.normpath(os.path.join(HERE, ".."))
 SOURCE_DIRS = ("runtime/src", "runtime/shims")
 SOURCE_EXTS = (".cpp", ".h", ".hpp", ".inl")
-CODE_MARK = re.compile(r"\b(ASSUMPTION|UNVERIFIED)\b")
+CODE_MARK = re.compile(r"\b(ASSUMPTION|UNVERIFIED|VERIFY)\b")
 # The docs spell the marker in caps (`**VERIFY:**`) and in prose (`**Assumption**`, `**Unverified:**`, `**Assumptions
 # to confirm:**`); all of them are notes.
 DOC_MARK = re.compile(r"\*\*(VERIFY|ASSUMPTION|UNVERIFIED)S?\b[^*]*:?\*\*", re.IGNORECASE)
@@ -181,6 +181,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="write the checklist here instead of stdout")
     ap.add_argument("--root", default=DEFAULT_ROOT, help="the repository (default: %(default)s)")
     a = ap.parse_args(argv)
+    if not os.path.isdir(a.root):
+        print(f"error: --root is not a directory: {a.root}", file=sys.stderr)
+        return 2
+    if a.out and os.path.isdir(a.out):
+        print(f"error: --out path is a directory: {a.out}", file=sys.stderr)
+        return 2
     if a.out:
         for report in a.gdk_calls:
             if same_report_path(a.out, report):
