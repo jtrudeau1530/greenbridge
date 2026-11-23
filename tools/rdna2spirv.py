@@ -1678,10 +1678,11 @@ class Gen:
         if d["k"] == "special" and d["t"] == "exec":
             self.set_exec(self.mask_src(s))
             return
-        if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
+        if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo") and (self.holds_lane_mask(s) or s["k"] == "imm"):
             self.emit(f"OpStore %vcc {self.mask_src(s)}")
             return
-        if d["k"] != "sgpr" or d.get("n") != 2:
+        to_vcc = d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")
+        if not to_vcc and (d["k"] != "sgpr" or d.get("n") != 2):
             raise Unsupported("s_mov_b64 destination")
         lit_lo = lit_hi = None
         if s["k"] == "special" and s["t"] == "exec":
@@ -1698,10 +1699,19 @@ class Gen:
             lit_hi = (v >> 32) & 0xFFFFFFFF
             lo, hi = self.cu(lit_lo), self.cu(lit_hi)
         elif s["k"] == "special" and s["t"] == "vcc":
-            lo = hi = self.tmp()            # this lane's bit in both halves, as for EXEC
+            lo = self.tmp()
             self.emit(f"{lo} = OpLoad %uint %vcc")
+            if "vcc" in self.cur_masks:
+                hi = lo                    # this lane's bit in both halves, as for EXEC
+            else:
+                hi = self.tmp()
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
         else:
             raise Unsupported("s_mov_b64 source")
+        if to_vcc:
+            self.emit(f"OpStore %vcc {lo}")
+            self.emit(f"OpStore %vcc_hi {hi}")
+            return
         self.store_reg("sgpr", d["r"], lo)
         self.store_reg("sgpr", d["r"] + 1, hi)
         if self.desc_cache_ok():
