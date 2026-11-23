@@ -12868,7 +12868,9 @@ class Gen:
             else:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
-            lod = f[ncoord] if kind == "_l" and len(f) > ncoord else "%f0"
+            # For image_sample_l, LOD is at f[ncoord] (SHADER-1275).
+            # On typed_sample (run-time T#), _l always has the LOD after coordinates.
+            lod = f[ncoord] if (kind == "_l" and len(f) > ncoord) or (kind == "_l" and typed_sample) else "%f0"
             if typed_sample:
                 operands = f"Lod {lod}"
                 if typed_implicit:
