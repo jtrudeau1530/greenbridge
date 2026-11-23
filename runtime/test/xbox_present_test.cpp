@@ -11,6 +11,7 @@
 // Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
 // the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
 #include "vk_test_device.h"
+#include "xbox_present_readback_size.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/xbox_present.h"
@@ -416,7 +417,8 @@ int main() {
         UINT want_w = width, want_h = height;  // the client size the frames are expected at (the resize case changes it)
         const auto grab = [&](Frame& frame) -> bool {
             return xbox.presenter().read_back(frame.bytes, &frame.extent, &frame.format) &&
-                   (want_w == 0 || (frame.extent.width == want_w && frame.extent.height == want_h));
+                   xbox_present_readback_size_matches(frame.bytes.size(), frame.extent.width, frame.extent.height,
+                                                     want_w, want_h);
         };
 
         const FLOAT blue_ish[4] = {0.2f, 0.6f, 0.9f, 1.0f};  // 51, 153, 230

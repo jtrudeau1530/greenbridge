@@ -354,6 +354,9 @@ if(BUILD_TESTING)
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
 
+  add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
+  add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
+
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
 
