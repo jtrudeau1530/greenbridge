@@ -229,6 +229,38 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertEqual(len([c for c in self.calls if not self.is_probe(c)]), make_game.PIPELINE_CRASH_RETRIES + 1)
         self.assertIn("still crashed after", err.getvalue())
 
+    def test_the_crash_report_names_the_module_and_its_spirv_hash(self):
+        blob = b"\x03\x02\x23\x07"
+        with open(os.path.join(self.spirv, "b_mod.spv"), "wb") as f:
+            f.write(blob)
+
+        def script(args, n):
+            if self.is_probe(args):
+                return ABORT
+            if n == 1:
+                self.inflight_is("b_mod")
+                return ABORT
+            return 1
+
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, _ = self.stage(script)
+        self.assertIsNotNone(failed)
+        with open(os.path.join(self.out, "pipeline_crashes.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc, {"modules": [{"name": "b_mod", "spv_sha256":
+                                            __import__("hashlib").sha256(blob).hexdigest()}]})
+        self.assertIn("pipeline_crashes.json", err.getvalue())
+
+    def test_a_clean_run_drops_an_old_crash_report(self):
+        os.makedirs(self.out)
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        with open(report, "w", encoding="utf-8") as f:
+            f.write('{"modules": []}')
+        failed, _ = self.stage(lambda args, n: 0)
+        self.assertIsNone(failed)
+        self.assertFalse(os.path.exists(report))
+
     def test_a_clean_run_is_one_call_and_an_old_skip_list_is_dropped(self):
         os.makedirs(self.out)
         with open(self.skip, "w", encoding="utf-8") as f:

@@ -2152,7 +2152,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     cache = os.path.join(out, "pipeline_cache.bin")
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
-    drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    report = os.path.join(out, "pipeline_crashes.json")
+    drop(inflight, skip, report)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
@@ -2223,12 +2224,29 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             break
     if crashed and not code:
         code = 1
+    if crashed:
+        record_crashes(out, spirv, crashed)
     drop(inflight)
     if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
-            if crashed else ""
+        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
+              f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     log("pipelines: done")
+
+
+def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
+    """pipeline_crashes.json: name and SHA-256 of each module that took the driver down, so a report names the
+    exact translation without attaching the shader. OSError (a missing .spv) leaves that module's hash null."""
+    def digest(name: str) -> "str | None":
+        try:
+            with open(os.path.join(spirv, name + ".spv"), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return None
+    doc = {"modules": [{"name": n, "spv_sha256": digest(n)} for n in crashed]}
+    with open(os.path.join(out, "pipeline_crashes.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
