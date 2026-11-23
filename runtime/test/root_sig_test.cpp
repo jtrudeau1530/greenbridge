@@ -497,10 +497,21 @@ void test_deserializer() {
         std::vector<uint8_t> out;
         check(!rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(corrupt.data(), corrupt.size(), out) && out.empty(),
               "blob helper refuses to rewrite a DXBC blob with a bad checksum");
+        ID3D12RootSignatureDeserializer* direct_bad = nullptr;
+        const HRESULT hr_direct = D3D12CreateRootSignatureDeserializer(
+            corrupt.data(), corrupt.size(), IID_PPV_ARGS(&direct_bad));
+        if (direct_bad) direct_bad->Release();
+
         ID3D12RootSignatureDeserializer* bad_de = nullptr;
         const HRESULT hr_bad = deserialize(corrupt.data(), corrupt.size(), IID_PPV_ARGS(&bad_de));
-        check(FAILED(hr_bad) && !bad_de,
-              "shim deserializer rejects a corrupted Xbox blob instead of forging a valid hash");
+        if (FAILED(hr_direct)) {
+            check(FAILED(hr_bad) && !bad_de,
+                  "shim deserializer rejects a corrupted Xbox blob when the host rejects it");
+        } else {
+            check(SUCCEEDED(hr_bad) && bad_de &&
+                      bad_de->GetRootSignatureDesc()->Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(kXboxFlags),
+                  "shim deserializer forwards a corrupted Xbox blob unchanged on hosts that accept bad hashes");
+        }
         if (bad_de) bad_de->Release();
     }
 
