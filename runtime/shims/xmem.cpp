@@ -382,6 +382,37 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
                                             PAGE_NOACCESS, parameter_count ? &parameter : nullptr, parameter_count);
 }
 
+// A reserve-only page-mode range is a placeholder here, and Windows refuses a commit inside a placeholder. The title
+// reserves such a range and commits it later: the measured shapes 0x20402000 (reserve, attributes 0x21) and 0x20401000
+// (commit, attributes 0x283) at the same address (docs/xmem_exe_calls.md). So the committed range is split out of its
+// placeholder and replaced by a committed allocation at the same address, and the window record loses that part.
+//
+// shortcut: a commit that spans more than one reserved window is not replaced, upgrade when a call site shows one.
+// With g_phys_mutex held.
+void* commit_window(void* address, SIZE_T size, DWORD host_type, DWORD protect) {
+    if (!isolate_placeholder(address, size)) return nullptr;
+    const DWORD type = (host_type | MEM_REPLACE_PLACEHOLDER | MEM_RESERVE) & ~MEM_RESERVE_PLACEHOLDER;
+    void* const result =
+        placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, type, protect, nullptr, 0);
+    if (!result) return nullptr;
+
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t end = start + size;
+    for (auto it = g_windows.begin(); it != g_windows.end();) {
+        const uintptr_t window_start = it->first;
+        const uintptr_t window_end = window_start + it->second.size;
+        if (window_end <= start || window_start >= end) {
+            ++it;
+            continue;
+        }
+        const Window window = it->second;
+        it = g_windows.erase(it);
+        if (window_start < start) g_windows.emplace(window_start, Window{start - window_start, window.protect});
+        if (window_end > end) g_windows.emplace(end, Window{window_end - end, window.protect});
+    }
+    return result;
+}
+
 // PVOID XMemVirtualAlloc(address, size, allocationType, attributes, protect). All 23 calls of the measured title pass a
 // nonzero attribute word; its bits are not decoded and nothing on the host depends on them, so it is accepted and only
 // recorded (xmem_attributes). Its types cover committed 2 MiB and 64 KiB pages, reserve-only 64 KiB windows for physical pages, one
@@ -492,6 +523,16 @@ void* xmem_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, DWOR
             else clear_window_range(result, size);
         }
         return result;
+    }
+    if (commit && address != nullptr) {
+        const std::lock_guard lock(g_phys_mutex);
+        if (find_window(reinterpret_cast<uintptr_t>(address), size) != nullptr) {
+            if (!placeholder_api().available()) {
+                SetLastError(ERROR_NOT_SUPPORTED);
+                return nullptr;
+            }
+            return commit_window(address, size, host_type, host_prot);
+        }
     }
     if ((large_pages || aligned_reservation) && address == nullptr) {
         MEM_ADDRESS_REQUIREMENTS requirements{};

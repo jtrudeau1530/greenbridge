@@ -352,6 +352,24 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(VirtualFree(pool, 0, MEM_RELEASE), "release the 8 GiB pool");
     }
 
+    // The measured reserve/commit pair (docs/xmem_exe_calls.md): a 64 KiB-page range is reserved and committed later at
+    // the same address. The reserve is a placeholder, which the host refuses to commit in place.
+    void* const committed_pool = virtual_alloc(nullptr, 0x40000, MEM_RESERVE | 0x20400000, 0x21, PAGE_READWRITE);
+    check(committed_pool != nullptr, "a 64 KiB-page range reserves");
+    if (committed_pool) {
+        void* const committed = virtual_alloc(committed_pool, 0x40000, MEM_COMMIT | 0x20400000, 0x283, 0x42404);
+        check(committed == committed_pool, "a later commit of that range succeeds at its address");
+        if (committed) {
+            MEMORY_BASIC_INFORMATION committed_info{};
+            check(VirtualQuery(committed, &committed_info, sizeof committed_info) && committed_info.State == MEM_COMMIT &&
+                      committed_info.Protect == (PAGE_READWRITE | PAGE_WRITECOMBINE),
+                  "the committed range is committed PAGE_READWRITE without the graphics bits");
+            static_cast<volatile uint8_t*>(committed)[0] = 0x5c;
+            check(static_cast<volatile uint8_t*>(committed)[0] == 0x5c, "the committed range is writable");
+        }
+        check(VirtualFree(committed_pool, 0, MEM_RELEASE), "release the committed range");
+    }
+
     void* const noaccess = virtual_alloc(nullptr, 0x10000, MEM_RESERVE | 0x20400000, 0x3, 0x801);
     check(noaccess != nullptr, "attributes 0x3 with protect PAGE_GRAPHICS_NOACCESS|PAGE_NOACCESS succeeds");
     if (noaccess) {
