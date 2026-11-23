@@ -568,6 +568,48 @@ class OperandClassificationTests(unittest.TestCase):
         self.assertFalse(got["table_loads"])
         self.assertTrue(got["truncates_high"])
 
+    @staticmethod
+    def _literal_samplers_with(build_s13):
+        # A literal S# in s[12:15]: s12 = 0x92, s14 = s15 = 0, and s13 built by the given hand-written lines.
+        # s8 = 0x80000000 and s9 = 0xf0 are known constants; s3 is a user SGPR (not a known constant).
+        import shader_ir
+        lines = ["s_mov_b32 s8, 0x80000000", "s_mov_b32 s9, 0xf0", "s_mov_b32 s12, 0x92", *build_s13,
+                 "s_mov_b32 s14, 0", "s_mov_b32 s15, 0",
+                 "image_sample v[4:7], v[0:1], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D", "s_endpgm"]
+        return M.analyse_instructions([[shader_ir.parse_line(ln) for ln in lines]], [[]])["literal_samplers"]
+
+    def test_inverted_scalar_logic_folds_into_literal_sampler(self):
+        # s_not_b32, s_nand_b32, s_nor_b32 and s_xnor_b32 of known constants give a known constant, so a literal
+        # S# with a dword built by one of them is reported in literal_samplers.
+        cases = [
+            (["s_not_b32 s13, 0"], 0xFFFFFFFF),
+            (["s_not_b32 s13, s9"], 0xFFFFFF0F),
+            (["s_not_b32 s13, s8"], 0x7FFFFFFF),
+            (["s_mov_b32 s13, 0xf0", "s_not_b32 s13, s13"], 0xFFFFFF0F),  # source and destination are one register
+            (["s_nand_b32 s13, s9, 0x30"], 0xFFFFFFCF),
+            (["s_nand_b32 s13, s8, s8"], 0x7FFFFFFF),
+            (["s_nor_b32 s13, s9, 0x0f"], 0xFFFFFF00),
+            (["s_nor_b32 s13, 0, 0"], 0xFFFFFFFF),
+            (["s_xnor_b32 s13, s9, 0xff"], 0xFFFFFFF0),
+            (["s_xnor_b32 s13, s9, s9"], 0xFFFFFFFF),
+            # The case found with #4289 open: the complement of 0, then a second fold of the result.
+            (["s_not_b32 s13, 0", "s_and_b32 s13, s13, 0xffff00ff"], 0xFFFF00FF),
+        ]
+        for build, want in cases:
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [[0x92, want, 0, 0]])
+
+    def test_inverted_scalar_logic_of_unknown_source_is_not_a_literal(self):
+        # A source that is not a known constant (the user SGPR s3) must not give a literal sampler, also when the
+        # destination held a known constant before the operation.
+        for build in (["s_not_b32 s13, s3"],
+                      ["s_mov_b32 s13, 0", "s_not_b32 s13, s3"],
+                      ["s_nand_b32 s13, s3, 0x30"],
+                      ["s_nor_b32 s13, s9, s3"],
+                      ["s_mov_b32 s13, 0", "s_xnor_b32 s13, s3, s9"]):
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [])
+
     def test_slist_operands_classify_pointers_and_descriptors(self):
         # LLVM VCCTuple slist syntax ([s0, s1], [s4, s5, s6, s7], ...) must be classified
         # identically to contiguous s[a:b] ranges.

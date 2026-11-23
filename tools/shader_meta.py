@@ -192,6 +192,12 @@ def _fold_scalar_alu(op, x, y):
         return x & (~y & 0xFFFFFFFF)
     if op == "s_orn2_b32":
         return (x | (~y & 0xFFFFFFFF)) & 0xFFFFFFFF
+    if op == "s_nand_b32":
+        return ~(x & y) & 0xFFFFFFFF
+    if op == "s_nor_b32":
+        return ~(x | y) & 0xFFFFFFFF
+    if op == "s_xnor_b32":
+        return ~(x ^ y) & 0xFFFFFFFF
     if op == "s_lshl_b32":
         return (x << (y & 31)) & 0xFFFFFFFF
     if op == "s_lshr_b32":
@@ -340,6 +346,11 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                     new_sym[d + i] = sym[s + i]
                 if s + i in ptr_stride:
                     new_pstride[d + i] = ptr_stride[s + i]
+    elif op == "s_not_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+        # A dword of a literal S# built as the complement of a known constant (for example 0xFFFFFFFF from 0).
+        c = _const_of(sym, a[1])
+        if c is not None:
+            new_sym[a[0]["r"]] = ("const", ~c & 0xFFFFFFFF)
     elif op == "v_readfirstlane_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         if a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1 and a[1]["r"] in vscale:
             new_scale[a[0]["r"]] = vscale[a[1]["r"]]
@@ -394,7 +405,8 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             # High-dword carry-add on a zeroed upper word (descriptor table truncated below 4 GB).
             new_sym[d] = ("const", 0)
     elif op in ("s_lshl_b32", "s_lshr_b32", "s_mul_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
-                "s_andn2_b32", "s_orn2_b32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+                "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32") and len(a) >= 3 \
+            and a[0]["k"] == "sgpr":
         d = a[0]["r"]
         cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
         if cx is not None and cy is not None:
