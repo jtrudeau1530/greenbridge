@@ -4078,8 +4078,9 @@ on a PC device behind the Xbox-ABI proxy). Measured:
 
 - `amd_fidelityfx_loader_xbox.dll`, `Bink2Scarlett.dll`, `libHttpClient.GDK.dll`, `XCurl.dll`: no `d3d12_xs`
   imports.
-- The package layout XML, chunk 1001, lists `game_scarlett_master.exe`; the file is absent from the folder. No
-  claim in this document depends on the executable's contents.
+- The package layout XML, chunk 1001, lists `game_scarlett_master.exe`; the file is absent from the folder. One
+  claim in this document comes from running the executable from a player's own copy: how it calls device slot 26
+  (section 4.1; register roles and argument values only). No other claim depends on the executable's contents.
 - The repository's existing import survey (`docs/design.md`, "Baseline already recorded") records that the 16
   bundled DLLs need only `xmem` and the two `d3d12_xs` root-signature calls; our scan of the six non-CRT DLLs is
   consistent.

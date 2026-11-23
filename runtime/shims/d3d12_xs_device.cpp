@@ -6,9 +6,10 @@
 // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
 // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
 // are IUnknown (0-2), slot 14 (which wraps the heap), 26 (the title passes the return buffer in RCX and the device in
-// RDX), 62 and 76, plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap
-// what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50 hand the real objects
-// behind heap, queue and fence proxies to the real device (see the command queue and fence section).
+// RDX), 62 and 76, plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
+// 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
+// the same way, and slots 31/34/35/45/46/50 hand the real objects behind heap, queue and fence proxies to the real
+// device (see the command queue and fence section).
 //
 // A thunk declares 14 argument words, but the title passes only as many as the method takes, so the caller's frame
 // may end right after the four register homes. The compiler owns a function's incoming stack-argument slots and may
