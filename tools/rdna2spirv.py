@@ -6978,7 +6978,14 @@ class Gen:
                 if kind in ("add", "sub"):
                     self.emit(f"{r} = {'OpIAdd' if kind == 'add' else 'OpISub'} %uint {v[0]} {v[1]}")
                 elif kind == "mul_lo":
-                    self.emit(f"{r} = OpIMul %uint {v[0]} {v[1]}")
+                    # The low 16 bits of the product as ((x << 16) * y) >> 16, not (x * y) & 0xffff: the AMD Windows driver
+                    # (26.10.1) dropped that mask when the other half of the result folded to zero (a constant half of 0:
+                    # 0x1234 * 0xaaaa came out 0x0c229e88 for 0x00009e88).
+                    xs = self.tmp()
+                    self.emit(f"{xs} = OpShiftLeftLogical %uint {v[0]} {self.cu(16)}")
+                    p16 = self.tmp()
+                    self.emit(f"{p16} = OpIMul %uint {xs} {v[1]}")
+                    self.emit(f"{r} = OpShiftRightLogical %uint {p16} {self.cu(16)}")
                 elif kind == "mad":
                     m = self.tmp()
                     self.emit(f"{m} = OpIMul %uint {v[0]} {v[1]}")

@@ -39,6 +39,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_sm
            "ps_valu16_mad", "ps_valu16_subrev",   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
            "ps_valu16_mad_sel",   # v_mad_u32_u16 / v_mad_i32_i16 op_sel S2 / D and clamp (EGEN-HW-MAD-U32-U16)
            "cs_cvt_pk_u8",   # v_cvt_pk_u8_f32 rounding and NaN (test_cvt_pk_u8.py)
+           "cs_pk_mul_lo_const",   # v_pk_mul_lo_u16 with a constant operand (test_pk_mul_lo_const.py)
            "ps_vint_logic3",
            "ps_vint_bits",
            "ps_vint_mul24",
