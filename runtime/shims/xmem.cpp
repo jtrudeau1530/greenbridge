@@ -822,6 +822,36 @@ bool commit_physical_range(const void* address, size_t size) {
     return true;
 }
 
+bool commit_physical_pages(const uint64_t* page_array, size_t count) {
+    if (count == 0) return true;
+    if (!page_array) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    size_t first = 0;
+    while (first < count) {
+        const auto it = g_pages.find(page_array[first]);
+        if (it == g_pages.end() || !it->second.section->scratch) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        size_t last = first + 1;
+        while (last < count) {
+            const auto next = g_pages.find(page_array[last]);
+            if (next == g_pages.end() || next->second.section != it->second.section ||
+                next->second.offset != it->second.offset + (last - first) * kPhysicalPageSize) {
+                break;
+            }
+            ++last;
+        }
+        void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
+        if (!VirtualAlloc(backing, (last - first) * kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
+        first = last;
+    }
+    return true;
+}
+
 }
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}

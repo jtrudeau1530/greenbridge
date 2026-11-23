@@ -565,6 +565,36 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
     check(api.free_pages(count, pages.data()) == TRUE, "XMemFreePhysicalPages frees them");
 }
 
+void test_commit_physical_pages(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 3;
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == kPages, "three physical pages for commit by number");
+    if (count != kPages) return;
+    check(rt::xmem::commit_physical_pages(pages, 0), "committing no pages succeeds");
+    check(!rt::xmem::commit_physical_pages(nullptr, 1), "committing from a null page array fails");
+    const uint64_t unknown = 0x1fffff0;
+    check(!rt::xmem::commit_physical_pages(&unknown, 1), "committing a page number that was never allocated fails");
+    check(rt::xmem::commit_physical_pages(pages, 2), "commit_physical_pages commits two pages that were never mapped");
+
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(window != nullptr, "XMemVirtualAlloc reserves a window for them");
+    if (window) {
+        check(api.map(window, kPages, pages) == window, "the three pages map");
+        MEMORY_BASIC_INFORMATION info[kPages]{};
+        bool queried = true;
+        for (uint64_t i = 0; i < kPages; ++i)
+            queried &= VirtualQuery(window + i * kPage64k, &info[i], sizeof(info[i])) == sizeof(info[i]);
+        check(queried && info[0].State == MEM_COMMIT && info[1].State == MEM_COMMIT && info[2].State == MEM_RESERVE,
+              "the two committed by number are committed in the window and the third is not yet");
+        check(read_u32(window, 0) == 0 && read_u32(window + kPage64k, 0) == 0,
+              "pages committed by number read as zero");
+        api.map(window, kPages, nullptr);
+    }
+    check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees them");
+}
+
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
@@ -844,6 +874,7 @@ int main() {
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
         test_physical_pages_commit_on_touch(physical);
+        test_commit_physical_pages(physical);
         test_placeholders(physical);
     }
 
