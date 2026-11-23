@@ -35,6 +35,14 @@ class F64DiffTests(unittest.TestCase):
         self.assertEqual(self.command("--ops", "v_not_real_f64").returncode, 2)
         self.assertEqual(self.command("--programs", "-1").returncode, 2)
 
+    def test_reference_reads_a_literal_by_its_printed_width(self):
+        # The translator's rule, mirrored: a spelling of more than 8 hex digits is the whole word,
+        # so a padded value that fits 32 bits is not shifted into the high half.
+        self.assertEqual(fd.read_source("0x12345678", {}, {}), 0x12345678_00000000)
+        self.assertEqual(fd.read_source("0x0000000012345678", {}, {}), 0x0000000012345678)
+        self.assertEqual(fd.read_source("0x3ff80000", {}, {}), 0x3FF80000_00000000)
+        self.assertEqual(fd.read_source("1", {}, {}), 1)
+
     def test_reference_rounds_all_four_binary64_modes(self):
         half_ulp = Fraction(1, 1 << 53)
         self.assertEqual(fd.round_fraction(Fraction(1) + half_ulp, 0), 0x3FF0000000000000)

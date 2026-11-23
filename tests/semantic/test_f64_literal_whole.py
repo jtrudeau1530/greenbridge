@@ -87,6 +87,13 @@ class WholeLiteralTests(unittest.TestCase):
         # The 32-bit rule is unchanged: 0x40100000 is the high word and the low word is zero.
         self.assertEqual(source_words("v_sqrt_f64", f"0x{FOUR_HIGH:08x}"), (0, FOUR_HIGH))
 
+    def test_a_printed_width_picks_the_rule_not_the_value(self):
+        # 0x12345678 fits one dword, but the 16-digit spelling is the full-width form, so its value
+        # is the whole constant: the low word here, not the high one (tools/f64_diff.py writes it).
+        self.assertEqual(source_words("v_sqrt_f64", "0x12345678"), (0, 0x12345678))
+        self.assertEqual(source_words("v_sqrt_f64", "0x0000000012345678"), (0x12345678, 0))
+        self.assertEqual(frexp_words("0x0000000012345678"), (0x12345678, 0))
+
     def test_inline_integer_is_sign_extended(self):
         self.assertEqual(source_words("v_sqrt_f64", "4"), (4, 0))
         self.assertEqual(source_words("v_sqrt_f64", "-1"), (MASK32, MASK32))

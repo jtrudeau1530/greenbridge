@@ -259,10 +259,10 @@ def read_source(tok, vgpr, sgpr):
     elif tok.startswith(("v", "s")) and tok[1:].isdigit():
         raise HarnessError("binary64 source must be an even register pair")
     elif tok.startswith("0x"):
-        # A printed 32-bit ISA literal occupies bits 63:32 in forms marked by shader_ir;
-        # a full 64-bit hexadecimal operand is already the complete IEEE word.
+        # A printed 32-bit ISA literal occupies bits 63:32; a spelling of more than 8 hex digits is
+        # the whole binary64 value (the full-width form gen_source writes), as in the translator.
         value = int(tok, 16)
-        if value <= M32: value <<= 32
+        if len(tok) - 2 <= 8: value <<= 32
         value &= M64
     elif re.fullmatch(r"[-+]?\d+", tok):
         n = int(tok)

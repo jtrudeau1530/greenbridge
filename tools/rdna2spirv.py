@@ -6038,13 +6038,26 @@ class Gen:
             x["k"] == "special" and x.get("t", "").startswith(("exec", "vcc"))
         )
 
+    def f64_literal_one_dword(self, src: dict) -> bool:
+        """True when a literal source is the one ISA dword that supplies bits 63:32.
+
+        LLVM prints a value that fits one literal dword without padding, so its hex width is at
+        most 8 digits; a spelling wider than that is the whole binary64 constant (the full-width
+        form `tools/f64_diff.py` writes). A decimal operand has no printed width and falls back to
+        the value, which is also what a padded one-dword spelling cannot survive.
+        """
+        digits = src.get("literal_hex_digits")
+        if digits is not None:
+            return digits <= 8
+        return -0x80000000 <= src["v"] <= 0xFFFFFFFF
+
     def f64_source_words(self, src: dict, op: str) -> tuple[str, str]:
         if src["k"] in ("vgpr", "sgpr") and src.get("n") == 2:
             return self.load_reg(src["k"], src["r"]), self.load_reg(src["k"], src["r"] + 1)
-        if src.get("f64_literal") and -0x80000000 <= src["v"] <= 0xFFFFFFFF:
+        if src.get("f64_literal") and self.f64_literal_one_dword(src):
             # One literal dword: bits 63:32 of the constant (docs/design.md, f64 literal sources).
             return self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
-        # A wider literal is LLVM's two-dword form, so both words of it are the constant: fall through.
+        # A wider literal is the whole constant, so both words of it are the value: fall through.
         if src["k"] == "fimm":
             bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
         elif src["k"] == "imm":
@@ -7695,11 +7708,11 @@ class Gen:
             elif src["k"] == "fimm":
                 bits = struct.unpack("<Q", struct.pack("<d", src["v"]))[0]
                 low, high = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
-            elif src.get("f64_literal") and -0x80000000 <= src["v"] <= 0xFFFFFFFF:
+            elif src.get("f64_literal") and self.f64_literal_one_dword(src):
                 # One literal dword: bits 63:32 of the constant (docs/design.md, f64 literal sources).
                 low, high = self.cu(0), self.cu(src["v"] & 0xFFFFFFFF)
             elif src["k"] == "imm" and (-16 <= src["v"] <= 64 or src.get("f64_literal")):
-                # An inline integer is sign-extended; a wider literal is LLVM's two-dword form, both words the constant.
+                # An inline integer is sign-extended; a wider literal is the whole constant.
                 bits = src["v"] & 0xFFFFFFFFFFFFFFFF
                 low, high = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
             else:
@@ -11052,14 +11065,14 @@ class Gen:
             sv = a[1]
             if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                 lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
-            elif sv.get("f64_literal"):
+            elif sv.get("f64_literal") and self.f64_literal_one_dword(sv):
                 lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
             elif sv["k"] == "fimm":
                 bits = struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
                 lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
             elif sv["k"] == "imm":
                 v = sv["v"]
-                if -16 <= v <= 64 or v > 0xFFFFFFFF or v < -0x80000000:
+                if -16 <= v <= 64 or not self.f64_literal_one_dword(sv):
                     bits = v & 0xFFFFFFFFFFFFFFFF
                     lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
                 else:
