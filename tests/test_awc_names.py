@@ -284,7 +284,10 @@ class TestCli(unittest.TestCase):
                         out = os.path.join(os.path.dirname(target), "..", "nested", os.path.basename(target))
                     elif alias == "hardlink":
                         out = os.path.join(tmp, "names.csv")
-                        os.link(target, out)
+                        try:
+                            os.link(target, out)
+                        except (OSError, NotImplementedError) as e:
+                            self.skipTest(f"hard links unavailable: {e}")
                     else:
                         out = target
                     err = io.StringIO()

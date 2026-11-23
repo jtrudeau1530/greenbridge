@@ -202,7 +202,10 @@ class GamedataGraphTest(unittest.TestCase):
         with open(xml_path, "wb") as f:
             f.write(ALPHA)
         alias = os.path.join(self.root, "alias.xml")
-        os.link(xml_path, alias)
+        try:
+            os.link(xml_path, alias)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
 
         r = self.run_tool(directory, "--json", alias)
         self.assertEqual(r.returncode, 2, r.stderr)

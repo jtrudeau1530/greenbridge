@@ -122,10 +122,16 @@ class Resolve(unittest.TestCase):
         inside = os.path.join(folder, "more.json")
         with open(inside, "w", encoding="utf-8") as f:
             f.write("{}")
+        cases = [(self.dict, [self.jsav]), (self.jsav, [self.jsav]), (inside, [folder])]
         link = os.path.join(self.dir, "link.bin")
-        os.link(self.dict, link)
-        for out, inputs in ((self.dict, [self.jsav]), (self.jsav, [self.jsav]), (inside, [folder]),
-                            (link, [self.jsav])):
+        try:
+            os.link(self.dict, link)
+        except (OSError, NotImplementedError) as e:
+            with self.subTest(out=os.path.basename(link)):
+                self.skipTest(f"hard links unavailable: {e}")
+        else:
+            cases.append((link, [self.jsav]))
+        for out, inputs in cases:
             with self.subTest(out=os.path.basename(out)):
                 with open(out, "rb") as f:
                     before = f.read()

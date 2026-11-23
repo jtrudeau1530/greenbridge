@@ -364,12 +364,18 @@ class ArchiveTest(unittest.TestCase):
 
         # A hard link at a JSON path naming the payload.
         link = os.path.join(self.root, "payload.json")
-        os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
-        linked = subprocess.run(
-            [sys.executable, "-I", TOOL, folder, link],
-            capture_output=True, text=True, encoding="utf-8", errors="replace")
-        self.assertEqual(linked.returncode, 2, linked.stderr)
-        self.assertIn("output must not overwrite the source archive", linked.stderr)
+        try:
+            os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
+        except (OSError, NotImplementedError) as e:
+            link = None
+            with self.subTest("hardlink"):
+                self.skipTest(f"hard links unavailable: {e}")
+        if link is not None:
+            linked = subprocess.run(
+                [sys.executable, "-I", TOOL, folder, link],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(linked.returncode, 2, linked.stderr)
+            self.assertIn("output must not overwrite the source archive", linked.stderr)
 
         # Overwriting index.json, part of the carve.
         idx = subprocess.run(
@@ -383,8 +389,9 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(f.read(), original, "the carved payload was overwritten")
         with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
             self.assertEqual(f.read(), "{}", "the index was overwritten")
-        with open(link, "rb") as f:
-            self.assertEqual(f.read(), original, "the hard link target changed")
+        if link is not None:
+            with open(link, "rb") as f:
+                self.assertEqual(f.read(), original, "the hard link target changed")
 
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")

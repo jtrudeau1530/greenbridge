@@ -776,7 +776,14 @@ class NavmeshDecodeTest(unittest.TestCase):
             with open(source, "wb") as f:
                 f.write(original)
             alias = os.path.join(tmp, "alias.csv")
-            os.link(source, alias)
+            targets = [("--out", source), ("--csv", source)]
+            try:
+                os.link(source, alias)
+            except (OSError, NotImplementedError) as e:
+                with self.subTest(flag="--csv", target=alias):
+                    self.skipTest(f"hard links unavailable: {e}")
+            else:
+                targets.append(("--csv", alias))
 
             out = os.path.join(carve, "report.json")
             csv_path = os.path.join(carve, "report.csv")
@@ -786,7 +793,7 @@ class NavmeshDecodeTest(unittest.TestCase):
                                         capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-            for flag, target in (("--out", source), ("--csv", source), ("--csv", alias)):
+            for flag, target in targets:
                 with self.subTest(flag=flag, target=target):
                     with open(source, "wb") as f:
                         f.write(original)
