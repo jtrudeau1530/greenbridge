@@ -20,6 +20,7 @@ from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+from report_paths import same_report_path  # noqa: E402
 import shader_ir  # noqa: E402
 from shader_meta import SGPR_RMW  # noqa: E402
 
@@ -381,6 +382,14 @@ def main(argv=None):
         if not os.path.isdir(path):
             print(f"ERROR: {label}{path}: not a folder", file=sys.stderr)
             return 2
+
+    if a.json_out and os.path.isfile(a.json_out):
+        with os.scandir(a.disasm_dir) as entries:
+            for entry in entries:
+                if entry.name.endswith(".s") and entry.is_file() and same_report_path(a.json_out, entry.path):
+                    print(f"ERROR: --json {a.json_out!r} must not overwrite an input listing {entry.path!r}",
+                          file=sys.stderr)
+                    return 2
 
     rep = audit(a.disasm_dir, fssm_dir=a.fssm, dxbc_dir=a.dxbc, limit=a.limit)
     print_report(rep)

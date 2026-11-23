@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -180,6 +181,50 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(len(stderr.splitlines()), 1)
             self.assertIn("cannot write", stderr)
             self.assertTrue(os.path.isdir(a_folder))
+
+    def make_temp_listing(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        disasm = Path(tmp.name) / "disasm"
+        disasm.mkdir()
+        listing = disasm / "cs_sample.s"
+        listing.write_bytes(b"\ts_endpgm\n")
+        return listing
+
+    def assert_json_refuses_listing(self, listing, output):
+        original = listing.read_bytes()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = audit_mod.main([str(listing.parent), "--json", str(output)])
+        self.assertEqual((rc, listing.read_bytes() == original), (2, True))
+        self.assertIn("must not overwrite an input listing", err.getvalue())
+
+    def test_json_cannot_overwrite_a_listing(self):
+        listing = self.make_temp_listing()
+        self.assert_json_refuses_listing(listing, listing)
+
+    def test_json_cannot_overwrite_a_listing_via_equivalent_path(self):
+        listing = self.make_temp_listing()
+        disasm = listing.parent
+        self.assert_json_refuses_listing(listing, disasm / ".." / disasm.name / listing.name)
+
+    def test_json_cannot_overwrite_a_listing_via_hard_link(self):
+        listing = self.make_temp_listing()
+        output = listing.parent.parent / "alias.json"
+        try:
+            os.link(listing, output)
+        except (AttributeError, NotImplementedError, OSError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        self.assert_json_refuses_listing(listing, output)
+
+    def test_json_can_replace_a_separate_report(self):
+        listing = self.make_temp_listing()
+        original = listing.read_bytes()
+        output = listing.with_name("report.json")
+        output.write_bytes(b"{}\n")
+
+        self.assertEqual(audit_mod.main([str(listing.parent), "--json", str(output)]), 0)
+        self.assertEqual(json.loads(output.read_bytes())["cs"]["count"], 1)
+        self.assertEqual(listing.read_bytes(), original)
 
     def test_synthetic_cs_ms_gs_audit_and_s3_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
