@@ -10,14 +10,12 @@ Depends on: <!-- #N for every pull request this one builds on or conflicts with 
 
 ### Tested
 
-<!-- What you ran (e.g. `python -I scripts/preflight_pr.py`) and on which GPU and driver (CONTRIBUTING.md).
-     For the shader translator: how many shaders translate and pass spirv-val, before and after.
-     For hardware/vendor-specific workarounds: state the premise and the direct measurement that confirmed it. -->
+<!-- What you ran and on which GPU and driver (CONTRIBUTING.md). For the shader translator: how many shaders
+     translate and pass spirv-val, before and after. -->
 
 AI-assisted: <!-- yes or no (AGENTS.md asks a coding agent to say so) -->
 
 ### Checklist
 
 - [ ] No game data, keys or decryption (CONTRIBUTING.md), including in logs or reports quoted here.
-- [ ] `python -I scripts/preflight_pr.py` passes on a fresh rebase of `main`.
-- [ ] A new translator rule is added under `docs/contracts/` and rendered into `docs/design.md` via `python -I tools/build_design_doc.py`.
+- [ ] A new translator rule is in the contract table of `docs/design.md`, with how it was confirmed.

@@ -1,9 +1,0 @@
-{
-  "piece": "Compute workgroup IDs Y/Z",
-  "status": "spec_only",
-  "rank": 120,
-  "sentences": [
-    "With four user SGPRs and only TGID_Y and TGID_Z enabled (RSRC2 `0x308`), s4 receives Y and s5 receives Z.",
-    "The synthetic `cs_workgroup_yz.asm` fixture checks a 2 × 3 × 4 dispatch and each of its 24 origins against a CPU reference."
-  ]
-}

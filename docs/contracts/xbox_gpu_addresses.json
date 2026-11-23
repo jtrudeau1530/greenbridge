@@ -1,9 +1,0 @@
-{
-  "piece": "Xbox GPU addresses",
-  "status": "spec_only",
-  "rank": 7,
-  "sentences": [
-    "Shaders build Xbox GPU virtual addresses, and some force the high dword to 0 (descriptor tables in the low 4 GB).",
-    "Every memory access goes to **heap base + Xbox VA**, so the runtime maps the console's GPU address window into one host buffer-device-address allocation."
-  ]
-}
