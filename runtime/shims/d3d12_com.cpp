@@ -979,6 +979,19 @@ private:
         state.layout = layout;
         state.data = {};
         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
+        // CreateRootSignature accepted it for the other bind point only (its log line says why).
+        if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
+            stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
+                                   : "SetGraphicsRootSignature(signature that does not fit the graphics layout)");
+            check(false);
+        }
+    }
+
+    bool is_compute(const RootState& state) const { return &state == &compute_; }
+
+    // The parameter's first user-data dword at this bind point (RootArgumentLayout).
+    std::uint32_t first_dword(const RootState& state, const RootArgumentLayout::Parameter& p) const {
+        return is_compute(state) ? p.compute_offset : p.user_offset;
     }
 
     // The parameter, if it exists and has the expected type; null after recording an invalid call.
@@ -1020,7 +1033,8 @@ private:
         if (!p) return;
         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
-        for (UINT i = 0; i < count; ++i) write(state, p->user_offset + offset + i, values[i]);
+        const std::uint32_t first = first_dword(state, *p);
+        for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
     }
 
     void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
@@ -1030,8 +1044,11 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
-        write(state, p->user_offset, std::uint32_t(va));
-        write(state, p->user_offset + 1, std::uint32_t(va >> 32));
+        const std::uint32_t first = first_dword(state, *p);
+        write(state, first, std::uint32_t(va));
+        // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
+        // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
+        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;

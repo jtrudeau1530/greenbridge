@@ -1915,7 +1915,10 @@ if(TARGET Vulkan::Headers)
       add_custom_command(
         OUTPUT ${LEONIDA_M4_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M4_DIR}
+        # LEONIDA_USER_DATA_SHIFT=4: the fixtures read their user data from s0; a D3D12 compute PSO gets its root
+        # arguments from s4 (rt::rootsig::pack_stage, D3D-448), so they are built with every SGPR 4 higher.
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M4_DIR} cs_m4_fill cs_m4_indirect
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
@@ -1943,7 +1946,9 @@ if(TARGET Vulkan::Headers)
       add_custom_command(
         OUTPUT ${LEONIDA_BUFFER_UAV_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_BUFFER_UAV_DIR}
+        # LEONIDA_USER_DATA_SHIFT=4: root arguments from s4 in a D3D12 compute PSO (see the M4 shaders above).
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_BUFFER_UAV_DIR} cs_buf_typed cs_buf_counter
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
@@ -2330,10 +2335,14 @@ if(TARGET Vulkan::Headers)
         set(index ${LEONIDA_SG_DIR}/${folder}/spirv/index.json)
         add_custom_command(
           OUTPUT ${index}
+          # The standalone harness runs these with the V# at s[0:3]; d3d12_subgroup_test passes it as four root
+          # constants, which the D3D12 compute layout puts at s[4:7] (LEONIDA_USER_DATA_SHIFT=4, D3D-448).
           COMMAND ${CMAKE_COMMAND} -E env LLVM_MC=${LEONIDA_LLVM_MC} LEONIDA_W64_EMULATE=${emulate}
+                  LEONIDA_USER_DATA_SHIFT=4
                   $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                   ${LEONIDA_SG_DIR}/${folder} ${shader}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/${shader}.asm
                   ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
           COMMENT "Translating ${shader} for the subgroup size test (${folder})"

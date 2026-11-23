@@ -310,7 +310,8 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // Root signature: [0] two constants (s0, s1), [1] a root UAV (s2:s3), [2] a one-CBV table (s4:s5).
+        // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
+        // the console compute layout (rt::rootsig::pack_stage, D3D-448).
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -544,7 +545,7 @@ int main() {
         list->SetComputeRootUnorderedAccessView(0, va_a);
         EXPECT(list->Close() == E_INVALIDARG);
 
-        // Two dispatches: the second changes s0 and the UAV; each must keep what it was recorded with.
+        // Two dispatches: the second changes s4 and the UAV; each must keep what it was recorded with.
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         ID3D12DescriptorHeap* heaps[] = {heap.p};
         list->SetDescriptorHeaps(1, heaps);

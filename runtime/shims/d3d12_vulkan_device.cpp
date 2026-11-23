@@ -5378,20 +5378,31 @@ public:
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
             return E_INVALIDARG;
         }
+        // Two layouts, one per bind point (RootArgumentLayout): graphics keeps pack(), compute takes the console
+        // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
         const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
-        if (!packed.ok) {
-            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s\n", packed.error.c_str());
+        const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
+        if (!packed.ok && !compute.ok) {
+            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", packed.error.c_str(),
+                         compute.error.c_str());
             return E_INVALIDARG;
         }
+        if (!packed.ok)
+            std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
+        if (!compute.ok)
+            std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
+        layout.graphics_ok = packed.ok;
+        layout.compute_ok = compute.ok;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
-            for (std::uint32_t d = 0; d < packed.dword_count; ++d)
+            for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
                 if (packed.provenance[d].param_index == i) {
                     first = d;
                     break;
                 }
-            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values});
+            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(

@@ -289,7 +289,8 @@ int main() {
             return 77;
         }
 
-        // Root signature: [0] two constants (s0, s1), [1] a root UAV (s2:s3), [2] a one-CBV table (s4:s5).
+        // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
+        // the console compute layout (rt::rootsig::pack_stage, D3D-448).
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;

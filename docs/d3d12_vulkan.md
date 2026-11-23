@@ -747,7 +747,8 @@ The compute path, end to end:
     and an integer field outside 0..2^32−1 reads as 0.
 - Root signatures use the model already on `main` (`runtime/src/root_signature.h`, `rt::rootsig`): `parse_rts0`
   reads the serialized blob and `pack()` lays out the 32 user-data dwords by the section 3.5 default mapping,
-  refusing anything that would spill.
+  refusing anything that would spill. `pack_stage()` lays them out in the console layout of one stage (section 3.5,
+  D3D-448); the compute bind point uses it.
 - **GPU address arena** (section 3.3, when the device has `bufferDeviceAddress`): one host-visible,
   device-addressable buffer, 256 MiB by default (`LEONIDA_ARENA_MB`, at most 4095 MiB, so every VA fits 32-bit
   table pointers).
@@ -773,6 +774,11 @@ The compute path, end to end:
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place from `pack()`; a
   signature `pack()` refuses (more than 32 user dwords: the spill layout is open; the translated shaders have no
   below-base spill-pointer candidates, section 3.5) is refused with its reason. Before
+- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
+  `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
+  table; section 3.5, D3D-448). A signature neither can place (the spill layout is open) is refused with both
+  reasons; one only a single layout places is created with a log line, and binding it at the other bind point
+  invalidates the list. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
   `S_FALSE` for a null output whatever the blob, then `E_INVALIDARG` for a node other than node 0 or a DXBC
   container whose size (the dword at +24) is not the size passed.
@@ -1690,6 +1696,34 @@ Measured on the corpus (`python -I tools/user_sgpr_census.py <spirv/index.json> 
 - Below those bases only `const32` reads appear, at odd SGPRs in PS/VS/CS (s1, s3, s5, s7), and s2 in GS: a reserved block whose meaning is not established here.
 
 Taken together this disagrees with the packing above (from s0, two dwords per table) and is consistent with a per-stage base (s8 VS/PS, s4 CS, s16 MS) and one dword per table pointer. It is a census of shader reads, not a confirmed mapping: it does not show which root parameter feeds which SGPR, and the GS behave differently. `--expect ps=8 vs=8 cs=4 ms=16` turns it into a check; `tests/test_user_sgpr_census.py` shows that the two packing models give different results.
+
+**Console layout, measured for compute (D3D-448).** `rt::rootsig::pack_stage` lays the parameters out for one stage:
+in root order from the stage base, each while it fits whole, a constant taking one dword per value, a root
+CBV/SRV/UAV two (its 64-bit VA), a descriptor table **one** (the 32-bit VA of its first descriptor; the heaps live
+below 4 GiB). A parameter that does not fit goes, with every later one, to the spill array behind `s[0:1]`
+(section 7), which is not modelled, so such a signature is refused. How each part is known:
+- **Compute, base s4: measured three ways.**
+  - The console compiler's output (section 7).
+  - The package's FidelityFX DLL, whose 29 compute containers carry their `RTS0` next to the console-compiled
+    program (`tools/rootsig_census.py <fspx> --disasm <fspx>/disasm`, Xbox Series 1.0.2.1). Base s4 plus the
+    signature's span in this layout equals the program's RSRC2 `USER_SGPR` count in 29 of 29: 27 signatures
+    (table, table, four root CBVs) span 10 dwords and launch with 14 user SGPRs, 2 (table, table, one root CBV)
+    span 4 and launch with 8. The `pack()` layout spans 12 and 6, two short of both.
+  - The reads: `tools/root_sig_contract.py <fspx index.json> --rootsig <that shape> --model console` finds all 20
+    translated programs compatible (tables read at s4/s5 as 32-bit pointers, each root CBV's VA copied whole as
+    two dwords from s6). The `pack()` layout contradicts 7 of them, which read the second table at s5, the first
+    table's high half in that layout.
+- **Vertex/pixel/geometry s8 and mesh s16: a hypothesis.** It rests on the census above only; no signature
+  confirms these bases, and visibility is not modelled (every parameter takes its place in every stage).
+
+The runtime uses the console layout for the **compute** bind point only. Graphics keeps `pack()`: every stage of a
+pipeline reads `s0..s31` from one push-constant block at offset 0 (`tools/rdna2spirv.py`, `ShaderUserData` in
+`runtime/src/vulkan_replay.h`), so a mesh shader (base s16) and a pixel shader (base s8) in one pipeline would need
+the same root argument at two offsets. That needs per-stage user-data windows in the translator's push-constant
+contract (D3D-448 follow-up). A root signature carries both layouts; one that only one of them can place is
+created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
+`s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
+42 `s3`; their meaning is open).
 
 **Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
 each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the

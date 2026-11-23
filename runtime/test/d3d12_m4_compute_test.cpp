@@ -138,7 +138,8 @@ int main() {
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
 
-        // [0] four 32-bit constants (s0..s3), [1] a table of five UAVs (s[4:5]).
+        // [0] four 32-bit constants (s4..s7), [1] a table of five UAVs (s8, its 32-bit VA): the console compute layout
+        // (D3D-448). The fixtures are built with LEONIDA_USER_DATA_SHIFT=4 (runtime/CMakeLists.txt).
         D3D12_DESCRIPTOR_RANGE uav_range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 5, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
