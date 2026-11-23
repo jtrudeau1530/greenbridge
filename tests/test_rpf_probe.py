@@ -307,6 +307,35 @@ runpy.run_path(sys.argv.pop(1), run_name="__main__")
         self.assertIn(blocked, err.getvalue())
         self.assertEqual(self.rows(), before)
 
+    def test_directory_out_is_refused_before_scanning_archives(self):
+        self.write("a.rpf", archive_bytes())
+        out_dir = os.path.join(self.tmp, "out_is_a_dir")
+        os.mkdir(out_dir)
+        err = io.StringIO()
+        argv = ["rpf_probe.py", self.game, "--out", out_dir]
+        with (mock.patch("sys.argv", argv), mock.patch.object(probe, "probe") as probe_fn,
+              contextlib.redirect_stderr(err)):
+            self.assertEqual(probe.main(), 2)
+        probe_fn.assert_not_called()
+        self.assertIn("directory", err.getvalue().lower())
+        self.assertEqual(os.listdir(out_dir), [])
+
+    def test_symlinked_out_updates_target_in_place(self):
+        self.write("a.rpf", archive_bytes())
+        target = os.path.join(self.tmp, "real_report.json")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("[]")
+        os.makedirs(os.path.dirname(self.out), exist_ok=True)
+        try:
+            os.symlink(target, self.out)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"symlinks unavailable: {e}")
+        self.run_main()
+        self.assertTrue(os.path.islink(self.out))
+        with open(target, encoding="utf-8") as f:
+            rows = json.load(f)
+        self.assertEqual(len(rows), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

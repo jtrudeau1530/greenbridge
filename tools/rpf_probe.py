@@ -52,6 +52,9 @@ def main() -> int:
     ap.add_argument("game_dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "rpf_probe.json"))
     a = ap.parse_args()
+    if os.path.isdir(a.out):
+        print(f"ERROR: {a.out}: is a directory, not a file", file=sys.stderr)
+        return 2
     rows = []
 
     def scan_failed(error: OSError) -> None:
@@ -76,14 +79,15 @@ def main() -> int:
         return 2
     rows.sort(key=lambda r: (-r["size"], r["file"]))
     try:
-        out_dir = os.path.dirname(os.path.abspath(a.out))
+        dest = os.path.realpath(a.out)
+        out_dir = os.path.dirname(dest) or "."
         os.makedirs(out_dir, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out_dir) as staging:
             staged = os.path.join(staging, "rpf_probe.json")
             with open(staged, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(rows, f, indent=1)
-            os.chmod(staged, published_mode(a.out))
-            os.replace(staged, a.out)
+            os.chmod(staged, published_mode(dest))
+            os.replace(staged, dest)
     except OSError as error:
         reason = error.strerror or str(error)
         print(f"ERROR: {a.out}: {reason}", file=sys.stderr)
