@@ -2175,8 +2175,9 @@ public:
 
     // A placed buffer is a range of the heap's arena memory: it has no VkBuffer of its own and its console VA is
     // where it sits in the arena. The arena is host-visible, so an upload or readback place maps that same range.
-    HRESULT create_placed_buffer() {
+    HRESULT create_placed_buffer(std::shared_ptr<const leonida::TileHeapAllocation> heap_range) {
         if (!device_.arena.mapped) return E_OUTOFMEMORY;
+        heap_range_ = std::move(heap_range);
         if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
         std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
         leonida::ResourceBinding binding{};
@@ -2632,6 +2633,9 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    // A placed buffer's heap range, held as a D3D12 placed resource holds its heap: the app may release the heap
+    // first, and the range must not go to another allocation while this buffer lives.
+    std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
 };
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -2833,6 +2837,7 @@ public:
     bool reserved() const { return bool(allocation_); }
     // An existing heap: the caller's memory, not an arena range, so offset() is not a place in the arena.
     const void* host_address() const { return host_address_; }
+    const std::shared_ptr<const leonida::TileHeapAllocation>& arena_range() const { return allocation_; }
     VkDeviceSize offset() const { return allocation_->offset; }
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
@@ -7359,7 +7364,7 @@ public:
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
-            hr = resource->create_placed_buffer();
+            hr = resource->create_placed_buffer(heap->arena_range());
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
