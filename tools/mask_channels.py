@@ -89,8 +89,15 @@ def main(argv=None) -> int:
         ap.error("--thresholds must be within 1..255")
     if a.json and same_file(a.dds, a.json):
         ap.error("--json names the input texture; writing it would replace the DDS")
-    with open(a.dds, "rb") as fh:
-        width, height, rgba = dds_png.decode_dds(fh.read())
+    if a.json and os.path.isdir(a.json):
+        print(f"error: --json path is a directory: {a.json}", file=sys.stderr)
+        return 2
+    try:
+        with open(a.dds, "rb") as fh:
+            width, height, rgba = dds_png.decode_dds(fh.read())
+    except (OSError, ValueError) as e:
+        print(f"error: cannot read {a.dds}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+        return 2
     counts = channel_counts(width, height, rgba, thresholds)
     print(f"{width}x{height}")
     for name, row in counts.items():
@@ -99,8 +106,15 @@ def main(argv=None) -> int:
         print(f"{name} min {row['min']} max {row['max']} mean {row['mean']} distinct {row['distinct']} | "
               + " | ".join(parts))
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
+        try:
+            parent = os.path.dirname(os.path.abspath(a.json))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
+        except OSError as e:
+            print(f"error: cannot write {a.json}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            return 2
     return 0
 
 
