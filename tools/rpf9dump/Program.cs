@@ -33,6 +33,9 @@ if (window && mode is not ("models" or "textures"))
     Console.WriteLine("--start/--length apply to models and textures; other modes need a recognized archive.");
     return 2;
 }
+// A missing source, or a directory passed as one, is a usage error. Check it before the output folder is
+// created: FileInfo.Length would otherwise throw after <out>/<name> already exists.
+if (!File.Exists(src)) { Console.Error.WriteLine($"source is not a file: {src}"); return 2; }
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);

@@ -64,6 +64,20 @@ def run(*args):
 
 @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires a built rpf9dump")
 class Rpf9dumpExitCodeTest(unittest.TestCase):
+    def test_missing_or_directory_source_exits_2_before_the_output_folder_is_created(self):
+        # A mistyped source used to create <out>/<name> and then die with an unhandled FileNotFoundException
+        # from FileInfo.Length. Both mistakes are usage errors (exit 2) and must leave the output alone.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for label, src in (("missing", root / "missing.rpf"), ("directory", root)):
+                with self.subTest(source=label):
+                    out = root / f"out-{label}"
+                    done = run("ttpf", src, out)
+                    self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                    self.assertIn("source is not a file", done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    self.assertFalse(out.exists(), f"{label} source left {out} behind")
+
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
