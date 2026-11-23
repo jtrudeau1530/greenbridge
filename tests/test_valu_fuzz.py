@@ -9,8 +9,10 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 from fractions import Fraction
 from itertools import permutations
+from pathlib import Path
 
 import pytest
 
@@ -623,3 +625,72 @@ def test_pc_tail_ubo_from_flag_or_env(monkeypatch, tmp_path):
                                           "--wave", "32", "--work", str(tmp_path), *extra])
         vf.main()
         assert seen_t == [want] and seen_g == [want], (extra, env_val)
+
+
+def test_parallel_assembly_preserves_wave_flags_and_inputs(monkeypatch, tmp_path):
+    progs = vf.programs("f16", 1, 2, (32, 64))
+    waves = {prog.asm(): prog.wave for prog in progs}
+    barrier = None
+
+    def fake_assemble(cmd, *, input, **kwargs):
+        assert ("-mattr=+wavefrontsize64,-wavefrontsize32" in cmd) == (waves[input] == 64)
+        if barrier:
+            barrier.wait(timeout=10)
+        return subprocess.CompletedProcess(cmd, 0, "\t.text\ns_endpgm\n", "")
+
+    def fake_translate(cmd, **kwargs):
+        output = Path(cmd[cmd.index("--out") + 1])
+        assert len(list((output.parent / "disasm").glob("*.s"))) == len(progs)
+        assert len(list((output.parent / "fssm").glob("*.fssm"))) == len(progs)
+        output.mkdir()
+        (output / "index.json").write_text("{}", encoding="utf-8", newline="\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(vf.mc_command, "mc_command", lambda: ["llvm-mc"])
+    monkeypatch.setattr(vf.mc_command, "run", fake_assemble)
+    monkeypatch.setattr(vf.subprocess, "run", fake_translate)
+    serial = tmp_path / "serial"
+    parallel = tmp_path / "parallel"
+    vf.translate(progs, serial, False)
+    barrier = threading.Barrier(2)
+    vf.translate(progs, parallel, False, asm_jobs=2)
+    for path in serial.rglob("*"):
+        if path.is_file():
+            assert path.read_bytes() == (parallel / path.relative_to(serial)).read_bytes()
+
+
+def test_parallel_assembly_bounds_submitted_jobs(monkeypatch, tmp_path):
+    programs = vf.programs("f16", 1, 5, (32, 64))
+    submitted = 0
+    collected = 0
+    peak = 0
+
+    class MeasuringExecutor(vf.ThreadPoolExecutor):
+        def submit(self, fn, *args, **kwargs):
+            nonlocal submitted, peak
+            future = super().submit(fn, *args, **kwargs)
+            submitted += 1
+            peak = max(peak, submitted - collected)
+            collect = future.result
+
+            def result(*args, **kwargs):
+                nonlocal collected
+                collected += 1
+                return collect(*args, **kwargs)
+
+            future.result = result
+            return future
+
+    def fake_translate(cmd, **kwargs):
+        output = Path(cmd[cmd.index("--out") + 1])
+        output.mkdir()
+        (output / "index.json").write_text("{}", encoding="utf-8", newline="\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(vf, "ThreadPoolExecutor", MeasuringExecutor)
+    monkeypatch.setattr(vf.mc_command, "mc_command", lambda: ["llvm-mc"])
+    monkeypatch.setattr(vf.mc_command, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "s_endpgm\n", ""))
+    monkeypatch.setattr(vf.subprocess, "run", fake_translate)
+    vf.translate(programs, tmp_path, False, asm_jobs=2)
+    assert submitted == collected == len(programs)
+    assert peak == 4

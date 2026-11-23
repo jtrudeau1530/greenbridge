@@ -1,7 +1,7 @@
 r"""Differential fuzzer for the translator, two instruction families on the GPU (FUZZ-2, FUZZ-5), standard
 library only.
 
-    python -I tools/valu_fuzz.py --family f16  --programs 200 --seed 1 [--wave 64|32|both] [--emulate]
+    python -I tools/valu_fuzz.py --family f16  --programs 200 --seed 1 [--wave 64|32|both] [--emulate] [--asm-jobs N]
     python -I tools/valu_fuzz.py --family mem  ...
     python -I tools/valu_fuzz.py --family f16 --show 1:7:32      # print program 7 of seed 1 (wave32) and its model
     python -I tools/valu_fuzz.py --family f16 --model-only ...   # generate and model only (no GPU)
@@ -46,7 +46,10 @@ import subprocess
 import sys
 import shutil
 import tempfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
+from itertools import islice
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -839,7 +842,7 @@ def pc_tail_env():
     return (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def translate(progs, work, emulate, pc_tail=False):
+def translate(progs, work, emulate, pc_tail=False, *, asm_jobs=1):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     for d in (disasm, fssm, spirv):
         if d.exists():
@@ -847,7 +850,8 @@ def translate(progs, work, emulate, pc_tail=False):
     for d in (disasm, fssm):
         d.mkdir(parents=True)
     mc = mc_command.mc_command()
-    for p in progs:
+
+    def assemble(p):
         text = p.asm()
         asm_path = work / (p.name + ".asm")
         asm_path.write_text(text, encoding="utf-8", newline="\n")
@@ -860,6 +864,22 @@ def translate(progs, work, emulate, pc_tail=False):
         code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
         (disasm / (p.name + ".s")).write_text(f"; {p.name}\n{code}", encoding="utf-8", newline="\n")
         (fssm / (p.name + ".fssm")).write_bytes(compute_header(asm_path))
+
+    if asm_jobs == 1:
+        for p in progs:
+            assemble(p)
+    else:
+        with ThreadPoolExecutor(max_workers=asm_jobs) as pool:
+            # Refill a small window in input order to bound the queue and report the first failure by program order.
+            remaining = iter(progs)
+            window = min(2 * asm_jobs, sys.maxsize)
+            pending = deque(pool.submit(assemble, p) for p in islice(remaining, window))
+            for p in remaining:
+                pending.popleft().result()
+                pending.append(pool.submit(assemble, p))
+            for job in pending:
+                job.result()
+
     cmd = [sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), str(disasm), "--out", str(spirv)]
     if emulate:
         cmd.append("--wave64-emulate")
@@ -989,8 +1009,12 @@ def run_translator(progs, a):
         return 2
     print(f"work dir {work}")
     pc_tail = bool(getattr(a, "pc_tail_ubo", False))
+    translate_options = {"pc_tail": True} if pc_tail else {}
+    asm_jobs = getattr(a, "asm_jobs", 1)
+    if asm_jobs != 1:
+        translate_options["asm_jobs"] = asm_jobs
     try:
-        index, log = translate(progs, work, a.emulate, pc_tail=True) if pc_tail else translate(progs, work, a.emulate)
+        index, log = translate(progs, work, a.emulate, **translate_options)
     except RuntimeError as e:
         print(e)
         return 2
@@ -1049,6 +1073,8 @@ def main():
     ap.add_argument("--family", choices=sorted(FAMILIES), required=True)
     ap.add_argument("--programs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--asm-jobs", type=int, default=1, metavar="N",
+                    help="assemble translator fixtures with N concurrent llvm-mc processes (default: 1)")
     ap.add_argument("--wave", choices=("64", "32", "both"), default="both")
     ap.add_argument("--emulate", action="store_true", help="translate with --wave64-emulate, run at subgroup 32")
     ap.add_argument("--pc-tail-ubo", action="store_true",
@@ -1080,6 +1106,8 @@ def main():
     W3_LAYOUT = "gfx10" if a.gfx10_word3 else None
     if a.programs < 1 or a.max_report < 1:
         ap.error("--programs and --max-report must be at least 1")
+    if a.asm_jobs < 1:
+        ap.error("--asm-jobs must be at least 1")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw") for t in backends):
         ap.error("--oracle takes translator, hw or translator,hw")
