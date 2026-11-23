@@ -206,6 +206,15 @@ class PathTests(unittest.TestCase):
             "s_endpgm")
         self.assertEqual([e[1:4] for e in site["reads"]], [(1, "ratio", "some")])
 
+    def test_inner_back_edge_drops_guards_and_saved_masks(self):
+        node = ("n", 8, census.ROOT)
+        st = census.SiteState({5: frozenset({(("w", 1), frozenset({("out", node)})),
+                                              (census.OTHER, frozenset({("in", node)}))})}, {40: node}, node)
+        out = census.strip(st)
+        self.assertEqual(out.masks, {})
+        self.assertEqual(out.vg[5], frozenset({(("w", 1), frozenset()), (census.OTHER, frozenset())}))
+        self.assertEqual(st.masks, {40: node})            # the state on the other edges is untouched
+
     def test_loop_around_the_call_is_cut_and_counted(self):
         (site,) = analyse(
             "top:",
@@ -250,6 +259,7 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(s["site_partition"], {"ratio+high_half": [1, 1], "raw_integer": [1, 1]})
         self.assertEqual(s["word_reads"]["sites"]["ratio"], [1, 0])
         self.assertEqual(s["word_reads"]["reads_some_paths"]["raw_integer"], 1)
+        self.assertEqual(s["some_paths_position"]["raw_integer"], [1, 0])     # before any later call
         self.assertEqual(s["word_reads"]["per_word_sites"]["0"]["raw_integer"], [1, 0])
         self.assertEqual(s["descriptor"]["fields"]["type"], {"5": 1, "not a literal": 1})
         self.assertEqual(s["descriptor"]["word0"], {"not a literal": 2})

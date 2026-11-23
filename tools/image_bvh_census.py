@@ -562,6 +562,7 @@ def join_site(old, inc, at=None):
 def strip(st):
     """Taken an inner back edge: the next pass of an instruction narrows to other lanes, so drop every guard."""
     out = st.copy()
+    out.masks = {}                          # a mask saved in this pass must not place a read in the next one
     out.vg = {r: frozenset((lab, frozenset()) for lab, _ in s) for r, s in st.vg.items()}
     out.vg = {r: s for r, s in out.vg.items() if s != OTHER_ENTRIES}
     return out
@@ -716,9 +717,10 @@ def descriptor_words(blocks, succ, calls):
 def analyse(insns):
     """Per-site records of one program: form, descriptor words, and the reads of its words with their pcs.
 
-    Returns [{"form", "pc", "reached", "desc": [w0..w3 or None], "reads": [(pc, word, category, reach, mnemonic)],
-    "product_reads": [(pc, reader, reach)]}] in program order; reach is "all" or "some" (paths). The pcs are for
-    local inspection; summarise() drops them."""
+    Returns [{"form", "pc", "reached", "desc": [w0..w3 or None],
+    "reads": [(pc, word, category, reach, mnemonic, past a later call)], "product_reads": [(pc, reader, reach)]}] in
+    program order; reach is "all" or "some" (paths), and the last field says whether the read lies after another
+    call in program order. The pcs are for local inspection; summarise() drops them."""
     blocks, succ = blocks_of(insns)
     where = {i["pc"]: (b, n) for b, blk in enumerate(blocks) for n, i in enumerate(blk)}
     calls = [i for i in insns if rdna2spirv.base_op(i["op"]) in FORMS]
@@ -731,7 +733,8 @@ def analyse(insns):
         sites.append({"form": rdna2spirv.base_op(c["op"]), "pc": c["pc"], "reached": c["pc"] in desc,
                       "loop_carried": any(lab[0] == "w" for st in at_cut for s in st.vg.values() for lab, _ in s),
                       "desc": desc.get(c["pc"], [None] * 4),
-                      "reads": [(pc,) + e for pc in sorted(events) for e in events[pc]],
+                      "reads": [(pc,) + e + (any(c["pc"] < x["pc"] < pc for x in calls),)
+                                for pc in sorted(events) for e in events[pc]],
                       "product_reads": [(pc,) + e for pc in sorted(product_reads) for e in product_reads[pc]]})
     return sites
 
@@ -804,6 +807,7 @@ def summarise(listings, records, skipped):
     partition, partition_shaders = Counter(), defaultdict(set)
     mnemonics = {c: pairs() for c in CATEGORIES}
     products = pairs()
+    position = pairs()
     total = 0
     for n, r in enumerate(records):
         stages[r["stage"]] += 1
@@ -830,6 +834,9 @@ def summarise(listings, records, skipped):
             for c in CATEGORIES:
                 mine = [e for e in reads if e[2] == c]
                 split_count(mnemonics[c], {e[4] for e in mine}, {e[4] for e in mine if e[3] == "all"})
+            partial = [e for e in reads if e[3] == "some"]
+            for c in {e[2] for e in partial}:
+                position[c][0 if any(not e[5] for e in partial if e[2] == c) else 1] += 1
             split_count(products, {p[1] for p in s["product_reads"]},
                         {p[1] for p in s["product_reads"] if p[2] == "all"})
             key = "+".join(c for c in CATEGORIES if c in every) or "none"
@@ -867,6 +874,9 @@ def summarise(listings, records, skipped):
         "site_partition": {k: [v, len(partition_shaders[k])] for k, v in ordered(partition).items()},
         "mnemonic_sites": {c: ordered(m) for c, m in mnemonics.items() if m},
         "high_half_product_readers": ordered(products),
+        "some_paths_position": {"pairs": "[sites with a some-paths read before the next call in program order, "
+                                          "sites whose some-paths reads all lie after a later call]",
+                                **{c: position[c] for c in CATEGORIES if c in position}},
         "limits": dict(sorted(limits.items())),
     }
 
@@ -899,6 +909,8 @@ def print_summary(s, out=None):
     if s["high_half_product_readers"]:
         w("high-half product read by (sites every/some): "
           + ", ".join(f"{k} {v[0]}/{v[1]}" for k, v in s["high_half_product_readers"].items()))
+    w("some-paths reads (sites with one before the next call / sites with all after a later call): "
+      + ", ".join(f"{c} {v[0]}/{v[1]}" for c, v in s["some_paths_position"].items() if c != "pairs"))
     w("limits: " + "; ".join(f"{k} {v}" for k, v in s["limits"].items()))
 
 
