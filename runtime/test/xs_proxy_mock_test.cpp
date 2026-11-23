@@ -770,9 +770,9 @@ int check_xbox_slots() {
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
 int run_env_slots(bool valid, bool on_slot74 = false) {
-    const char* frame_interval = on_slot74 ? "74" : valid ? "96" : "2";
+    const char* frame_interval = valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
-    const char* wait_event = valid ? "98" : "2";
+    const char* wait_event = on_slot74 ? "74" : valid ? "98" : "2";
     const char* queue_x = valid ? "99" : "2";
     const char* list_x = valid ? "100" : "2";
     EXPECT(SetEnvironmentVariableA("LEONIDA_XS_FRAME_INTERVAL_SLOT", frame_interval) != FALSE);
@@ -787,10 +787,10 @@ int run_env_slots(bool valid, bool on_slot74 = false) {
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
     if (on_slot74) {
-        // SetFrameIntervalX moved onto 74, which also has a built-in handler: the override wins, so (output, interval,
-        // latency, flags) is a frame-interval call that reaches no PC slot, not the stand-in that ignores its words.
-        EXPECT(hr_of(raw(device, 74, 0, 16667, 1, 0)) == S_OK && mock->calls[74] == 0);
-        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);  // the old default is a PC slot now
+        // WaitFrameEventX moved onto 74, which also has a built-in handler: the override wins, so the call writes its
+        // wait token through the last pointer, which the stand-in never does, and reaches no PC slot.
+        std::uint64_t token_74 = 0;
+        EXPECT(hr_of(raw(device, 74, 0, 0, 0, 0, word(&token_74))) == S_OK && token_74 && mock->calls[74] == 0);
     } else if (valid) {
         // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);

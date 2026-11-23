@@ -1551,9 +1551,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
     } else if constexpr (Slot == 74) {
+        note_slot(Slot);
         std::uint64_t routed = 0;
         if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;  // an override moved a route here
-        note_slot(Slot);
         return proxy_slot74(a1, a2, a3);
     } else if constexpr (Slot == 75) {
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
