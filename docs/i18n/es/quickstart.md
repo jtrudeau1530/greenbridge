@@ -54,12 +54,6 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 - [ffmpeg](https://ffmpeg.org/download.html) en el `PATH` *(opcional: decodifica los flujos XMA2 y es obligatorio
   con `--wav`)*.
 
-**Poco espacio en disco:** los ~400 GB son para la compilación completa. Para *ejecutar* el port,
-`--stages check,shaders,runtime` necesita unos 30 GB; la etapa `assets` (~370 GB) solo es para las herramientas de
-recursos, y `--wav` añade varias veces el tamaño del Ogg Opus (la comprobación previa muestra esta elección cuando
-la etapa `assets` es la que no cabe). `--work` y `--out` pueden estar en otra unidad.
-El runtime asigna el paquete en su lugar, por lo que una unidad de solo lectura requiere `gta6rt --overlay <carpeta escribible>`; `--overlay` es una opción de `gta6rt`, no de `make_game.py`. Deje los archivos `.s` en `work/shaders/dxbc/disasm` donde están: la siguiente ejecución los compara con la lista de `disasm.done` y vuelve a desensamblar los que faltan (todos los de una carpeta cuyo `disasm.done` sea anterior a esa lista) y después traduce todos los shaders de nuevo. Una carpeta `disasm` que sea un enlace simbólico se rechaza cuando la etapa tiene que vaciarla.
-
 ## Compilar
 
 ### La forma sencilla (Windows)
@@ -89,9 +83,8 @@ unidad.
 El runtime accede al paquete en su ubicación original. Si la unidad del paquete es de solo lectura, use
 `gta6rt --overlay <carpeta con permisos de escritura>`: `--overlay` es una opción de `gta6rt`.
 
-Conserve los archivos `.s` de `work/shaders/dxbc/disasm`: borrarlos junto con
-`work/shaders/spirv/index.json` puede hacer que la etapa de shaders parezca terminada con cero shaders. Si la
-etapa necesita vaciar `disasm`, rechazará esa carpeta cuando sea un enlace simbólico.
+Conserve los archivos `.s` de `work/shaders/dxbc/disasm`: la siguiente ejecución los compara con la lista de `disasm.done` y vuelve a desensamblar los que faltan (todos los de una carpeta cuyo `disasm.done` sea anterior a esa lista) y después traduce todos los shaders de nuevo. Borrarlos junto con `work/shaders/spirv/index.json` puede hacer que la etapa de shaders parezca terminada con cero shaders.
+Si la etapa necesita vaciar `disasm`, rechazará esa carpeta cuando sea un enlace simbólico.
 
 ### Desde un terminal (`make_game.py`)
 
