@@ -408,6 +408,21 @@ def _publish(dest, write, newline):
         raise
 
 
+def report_path_problem(path):
+    """Why a report can't be written at `path`, or None: its folder can't be created (a file in the way, a
+    missing drive) or can't be written to. Checked before the scan, so a mistyped destination doesn't cost a run."""
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as e:
+        return f"cannot create its folder: {e}"
+    if not os.access(parent, os.W_OK):
+        return f"its folder is not writable: {parent}"
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        return "the existing report is read-only"
+    return None
+
+
 def write_outputs(rows, summaries, out, csv_path):
     if out:
         payload = summaries if len(summaries) > 1 else (summaries[0] if summaries else {})
@@ -527,6 +542,10 @@ def main(argv=None):
                             ap.error(f"{flag} would overwrite an input file: {path}")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
+    for flag, path in (("--out", a.out), ("--csv", a.csv)):
+        problem = report_path_problem(path) if path else None
+        if problem:
+            ap.error(f"{flag} cannot be written to {path}: {problem}")
     below_normal()
     if os.path.isdir(a.target):
         skipped = []
@@ -540,7 +559,11 @@ def main(argv=None):
             return 2
     for s in summaries:
         print(json.dumps(s, indent=1))
-    write_outputs(rows, summaries, a.out, a.csv)
+    try:
+        write_outputs(rows, summaries, a.out, a.csv)
+    except OSError as e:   # a full disk, a folder removed or locked since the preflight: a line, not a traceback
+        print(f"cannot write the report: {e}", file=sys.stderr)
+        return 2
     if not rows:
         print("no zlib streams found", file=sys.stderr)
     if skipped:

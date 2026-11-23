@@ -284,6 +284,35 @@ class ScanTest(unittest.TestCase):
         self.assertIn("--out and --csv must use different paths", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
+    def test_report_under_a_file_is_refused_before_the_scan(self):
+        # Before: the scan ran to its end and os.makedirs then died in a NotADirectoryError traceback.
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(2))
+        blocker = os.path.join(self.dir, "blocker")
+        with open(blocker, "wb") as f:
+            f.write(b"not a folder")
+        out = os.path.join(blocker, "sub", "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(bvh_index, "scan_dir", side_effect=AssertionError("scanned anyway")):
+            with self.assertRaises(SystemExit) as cm:
+                bvh_index.main([self.dir, "--out", out])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--out cannot be written to", err.getvalue())
+        self.assertIn("cannot create its folder", err.getvalue())
+
+    def test_write_error_after_the_scan_is_a_message_and_exit_2(self):
+        with open(os.path.join(self.dir, "a.bin"), "wb") as f:
+            f.write(bvh_payload(2))
+        out = os.path.join(self.dir, "index.json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(bvh_index, "_publish", side_effect=OSError(28, "No space left on device")):
+            self.assertEqual(bvh_index.main([self.dir, "--out", out]), 2)
+        self.assertIn("cannot write the report", err.getvalue())
+        self.assertIn("No space left on device", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
     def test_directory_with_glob_metacharacters_in_its_name(self):
         # Before: os.path.join(path, "**", "*.bin"/"*.rpf") fed a root like "carve[1]" straight to glob, which
         # read "[1]" as a character class and matched nothing.
