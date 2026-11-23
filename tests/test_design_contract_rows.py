@@ -65,10 +65,13 @@ class DesignTable(unittest.TestCase):
             row = next(line for line in f.read().splitlines()
                        if line.startswith("| Image atomics, size and LOD queries |"))
         for fact in ("GPU-checked (TEST-184)", "Measured natively on RDNA2", "raw LOD includes",
-                     "Unverified:", "on other dimensions is", "A host quirk", "OpImageQuerySizeLod", "OpImageQueryLevels"):
+                     "Unverified:", "on other dimensions is", "A host quirk", "OpImageQuerySizeLod",
+                     "OpImageQueryLevels", "Gen.resinfo_words"):
             with self.subTest(fact=fact):
                 self.assertIn(fact, row)
+        self.assertEqual(row.count("(ISA: {num_mip_levels"), 1)  # one ISA parenthetical, not a splice
         self.assertNotIn("depth (1) and the level count", row)  # the superseded wording
+        self.assertNotIn("still differs in the first three", row)  # contradicts Gen.resinfo_words
         self.assertNotIn("`; the clamped LOD", row)             # join artifact from a mid-sentence cut
 
 
