@@ -106,6 +106,20 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(len(r["merges"]), 1)
         self.assertEqual(r["commits"], {"total": 1, "on_main": 1})
 
+    def test_batch_keeps_prior_merges_separate(self):
+        base = self.git("rev-parse", "main")
+        self.pr_branch("landed", base, PARAGRAPH)
+        self.merge(31, "landed")
+        merged_sha = self.git("rev-parse", "--short=12", "main")
+        self.pr_branch("next", "main", "A new line for the unmerged PR.\n")
+        with mock.patch.object(mc, "git", wraps=mc.git) as commands:
+            code, rows = self.run_check("32=next", "31=landed", "32=next")
+        scans = [call for call in commands.call_args_list if call.args[1] == "log" and "--first-parent" in call.args]
+        self.assertEqual(len(scans), 1)
+        self.assertEqual(code, 1)
+        self.assertEqual([(r["pr"], r["verdict"], r["merges"]) for r in rows],
+                         [(32, "clean", []), (31, "already-merged", [merged_sha]), (32, "clean", [])])
+
     def test_text_already_on_main_is_reported_even_when_the_patch_differs(self):
         base = self.git("rev-parse", "main")
         self.pr_branch("first", base, "\n" + PARAGRAPH)

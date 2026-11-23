@@ -3,7 +3,7 @@
     python -I scripts/merge_check.py [--main REF] [--json] [--min-length N] PR=REF [PR=REF ...]
 
 PR is the pull request number and REF its head (a branch, a fetched `refs/pull/PR/head`, a commit). For each one,
-against `--main` (default `origin/main`):
+against `--main` (default `origin/main`), using one history scan for the whole batch:
 
 - `merges`: merge commits on main whose subject is "Merge pull request #PR", newest first. A number that is already
   there is the case the repeated merges come from: a rebased copy merged again keeps both copies of what it added.
@@ -47,14 +47,14 @@ def git(repo, *args, check=True):
     return r
 
 
-def prior_merges(repo, main, number, depth):
+def prior_merges(repo, main, numbers, depth):
     out = git(repo, "log", main, "--merges", "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
-    hits = []
+    hits = {number: [] for number in numbers}
     for line in out.splitlines():
         sha, _, subject = line.partition("\t")
         m = MERGE_SUBJECT.match(subject)
-        if m and int(m.group(1)) == number:
-            hits.append(sha[:12])
+        if m and (number := int(m.group(1))) in hits:
+            hits[number].append(sha[:12])
     return hits
 
 
@@ -128,8 +128,7 @@ def duplicates(repo, main, tree, min_length, block=3):
     return found
 
 
-def check(repo, main, number, ref, min_length, depth):
-    merges = prior_merges(repo, main, number, depth)
+def check(repo, main, number, ref, min_length, merges):
     total, on_main = cherry(repo, main, ref)
     tree, conflict = merged_tree(repo, main, ref)
     dups = duplicates(repo, main, tree, min_length)
@@ -165,7 +164,8 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true", help="one JSON report instead of text")
     args = ap.parse_args(argv)
     try:
-        results = [check(args.repo, args.main, n, ref, args.min_length, args.depth) for n, ref in args.pairs]
+        history = prior_merges(args.repo, args.main, (n for n, _ in args.pairs), args.depth)
+        results = [check(args.repo, args.main, n, ref, args.min_length, history[n]) for n, ref in args.pairs]
     except GitError as e:
         print(f"merge_check: {e}", file=sys.stderr)
         return 2
