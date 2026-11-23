@@ -585,8 +585,8 @@ HRESULT WINAPI dxgi_get_adapter(void* self, IDXGIAdapter** out) {
     note_dxgi("XboxIDXGIDevice::GetAdapter");
     return dxgi_adapter(dxgi_owner(self), __uuidof(IDXGIAdapter), reinterpret_cast<void**>(out));
 }
-// CreateSurface and QueryResourceResidency are D3D10/11-era methods no D3D12 title has a use for; what the console
-// answers is not measured, so they are refused and say so once.
+// CreateSurface is a D3D10/11-era method no D3D12 title has a use for; what the console answers is not measured, so
+// it is refused and says so once.
 HRESULT WINAPI dxgi_create_surface(void*, const DXGI_SURFACE_DESC*, UINT, DXGI_USAGE, const DXGI_SHARED_RESOURCE*,
                                    IDXGISurface** out) {
     static std::atomic<bool> logged{false};
@@ -595,12 +595,15 @@ HRESULT WINAPI dxgi_create_surface(void*, const DXGI_SURFACE_DESC*, UINT, DXGI_U
     if (out) *out = nullptr;
     return E_NOTIMPL;
 }
-HRESULT WINAPI dxgi_query_resource_residency(void*, IUnknown* const*, DXGI_RESIDENCY*, UINT) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: IDXGIDevice::QueryResourceResidency is not implemented; returning E_NOTIMPL\n");
-    return E_NOTIMPL;
+// The layer never evicts (MakeResident and Evict are no-ops, docs/d3d12_vulkan.md), so every resource is reported
+// fully resident. A null array or a null entry is E_INVALIDARG; a count of 0 asks nothing and succeeds.
+HRESULT WINAPI dxgi_query_resource_residency(void*, IUnknown* const* resources, DXGI_RESIDENCY* status, UINT count) {
+    if (!count) return S_OK;
+    if (!resources || !status) return E_INVALIDARG;
+    for (UINT i = 0; i < count; ++i)
+        if (!resources[i]) return E_INVALIDARG;
+    for (UINT i = 0; i < count; ++i) status[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
+    return S_OK;
 }
 // The priority and the frame latency are kept and read back; nothing acts on them (the Xbox presenter's latency is
 // SetFrameIntervalX's). The ranges are the documented ones: -7..7, and 1..16 with 0 for the default of 3.

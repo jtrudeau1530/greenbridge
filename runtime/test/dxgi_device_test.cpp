@@ -183,7 +183,21 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     EXPECT(dxgi->GetGPUThreadPriority(nullptr) == E_POINTER);
     IDXGISurface* surface = reinterpret_cast<IDXGISurface*>(std::uintptr_t{1});
     EXPECT(dxgi->CreateSurface(nullptr, 0, 0, nullptr, &surface) == E_NOTIMPL && !surface);
-    EXPECT(dxgi->QueryResourceResidency(nullptr, nullptr, 0) == E_NOTIMPL);
+    // Nothing is ever evicted, so every object is fully resident; null arrays or entries are refused.
+    EXPECT(dxgi->QueryResourceResidency(nullptr, nullptr, 0) == S_OK);
+    {
+        Ref<ID3D12Fence> fence;
+        EXPECT(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                   reinterpret_cast<void**>(&fence.p)) == S_OK);
+        IUnknown* const objects[2] = {fence.p, fence.p};
+        DXGI_RESIDENCY residency[2] = {DXGI_RESIDENCY_EVICTED_TO_DISK, DXGI_RESIDENCY_EVICTED_TO_DISK};
+        EXPECT(dxgi->QueryResourceResidency(objects, residency, 2) == S_OK &&
+               residency[0] == DXGI_RESIDENCY_FULLY_RESIDENT && residency[1] == DXGI_RESIDENCY_FULLY_RESIDENT);
+        EXPECT(dxgi->QueryResourceResidency(nullptr, residency, 1) == E_INVALIDARG);
+        EXPECT(dxgi->QueryResourceResidency(objects, nullptr, 1) == E_INVALIDARG);
+        IUnknown* const with_null[2] = {fence.p, nullptr};
+        EXPECT(dxgi->QueryResourceResidency(with_null, residency, 2) == E_INVALIDARG);
+    }
 
     // Private data set through the DXGI interface is the device's, and the other way round.
     const std::uint32_t written = 0x12345678;
