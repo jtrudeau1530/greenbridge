@@ -575,6 +575,27 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_L_UpperArm_O", ped), 1)
         self.assertEqual(skinned_glb.infer_ped_parent("GM_TEST_R_UpperArm_O", ped), 2)
 
+    def test_write_uses_unique_temp_when_fixed_name_is_a_directory(self):
+        source_root = os.path.join(self.root, "stale")
+        skeleton = _skeleton_dir(source_root)
+        component = _component(source_root)
+        out = os.path.join(self.root, "nested", "out.glb")
+        stale = out + ".tmp"
+        os.makedirs(stale)
+        saved = skinned_glb._np
+        try:
+            skinned_glb._np = None
+            stats = skinned_glb.write_skinned_glb(out, skeleton, [component])
+        finally:
+            skinned_glb._np = saved
+        self.assertEqual(stats["joints"], 4)
+        self.assertTrue(os.path.isfile(out))
+        with open(out, "rb") as handle:
+            self.assertEqual(handle.read(4), b"glTF")
+        self.assertTrue(os.path.isdir(stale))
+        self.assertEqual([n for n in os.listdir(os.path.dirname(out)) if n.startswith("out.glb.")],
+                         ["out.glb.tmp"])
+
     def test_cli_returns_nonzero_for_bad_input(self):
         result = subprocess.run(
             [sys.executable, "-I", os.path.join(ROOT, "tools", "skinned_glb.py"),

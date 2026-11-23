@@ -69,6 +69,10 @@ import math
 import os
 import struct
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 try:  # optional: the stdlib path below is the fallback and is covered by the tests
     import numpy as _np
@@ -948,14 +952,19 @@ def write_skinned_glb(path: str, skeleton_path: str, component_paths: list[str],
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    temporary = path + ".tmp"
+    # A fixed `path + ".tmp"` blocks every later export when a stale directory keeps that
+    # name, and two writers to one output race on the same temporary file. Use a unique name
+    # in the output directory so os.replace() still publishes atomically.
+    fd, temporary = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
     try:
-        with open(temporary, "wb") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
+        os.chmod(temporary, published_mode(path))  # mkstemp creates 0600
         os.replace(temporary, path)
     except BaseException:
         try:
-            os.remove(temporary)
+            os.unlink(temporary)
         except OSError:
             pass
         raise
