@@ -61,6 +61,7 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
     uint64_t next = out.base;
     std::vector<uint32_t> first;
     first.reserve(sig.params.size());
+    std::string spill;  // the first parameter that does not fit; every parameter is still validated after it
     for (size_t i = 0; i < sig.params.size(); ++i) {
         const RootParameter& p = sig.params[i];
         if (p.type == ParamType::Constants && p.num_values == 0) {
@@ -73,15 +74,36 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
             return out;
         }
         const uint64_t dwords = stage_dwords(p.type, p.num_values);
-        if (next + dwords > kMaxUserSgprs) {
+        if (spill.empty() && next + dwords > kMaxUserSgprs)
             // The console moves this parameter and every later one to the spill array behind s[0:1]; that array's
             // layout is not modelled here, so refuse rather than drop arguments.
-            out.error = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
-                        std::to_string(out.base) + " (spill array not modelled)";
-            return out;
-        }
+            spill = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
+                    std::to_string(out.base) + " (spill array not modelled)";
         first.push_back(static_cast<uint32_t>(next));
         next += dwords;
+    }
+    if (!spill.empty()) {
+        out.error = std::move(spill);
+        out.spills = true;
+        return out;
+    }
+    // The heap bases follow the last parameter, the CBV/SRV/UAV heap's first (docs/d3d12_vulkan.md section 3.4).
+    const struct {
+        uint32_t flag;
+        uint32_t* slot;
+        const char* name;
+    } heaps[] = {{kFlagResourceHeapDirectlyIndexed, &out.resource_heap_sgpr, "CBV/SRV/UAV"},
+                 {kFlagSamplerHeapDirectlyIndexed, &out.sampler_heap_sgpr, "sampler"}};
+    for (const auto& heap : heaps) {
+        if (!(sig.flags & heap.flag)) continue;
+        if (next + 1 > kMaxUserSgprs) {
+            out.resource_heap_sgpr = out.sampler_heap_sgpr = kNoSgpr;
+            out.error = std::string("the ") + heap.name + " heap base does not fit in the user SGPRs from s" +
+                        std::to_string(out.base) + " (spill array not modelled)";
+            out.spills = true;
+            return out;
+        }
+        *heap.slot = static_cast<uint32_t>(next++);
     }
     out.first_sgpr = std::move(first);
     out.end_sgpr = static_cast<uint32_t>(next);

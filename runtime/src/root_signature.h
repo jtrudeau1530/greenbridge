@@ -133,6 +133,11 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
 // A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
 // every parameter after it; that array is not modelled, so such a signature is refused, never truncated.
+//
+// Direct heap indexing (docs/d3d12_vulkan.md section 3.4, D3D-329): a signature with
+// D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED gets one more SGPR right after its last parameter, the
+// 32-bit VA of the bound CBV/SRV/UAV heap's first descriptor; SAMPLER_HEAP_DIRECTLY_INDEXED one more after that, the
+// sampler heap's. Neither is a root parameter: the list fills them from SetDescriptorHeaps at each dispatch.
 enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
 
 [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
@@ -164,18 +169,28 @@ enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, 
 
 constexpr uint32_t kNoSgpr = 0xFFFFFFFFu;
 
+// D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED and SAMPLER_HEAP_DIRECTLY_INDEXED (d3d12.h values).
+constexpr uint32_t kFlagResourceHeapDirectlyIndexed = 0x400;
+constexpr uint32_t kFlagSamplerHeapDirectlyIndexed = 0x800;
+
 struct StagePackResult {
     bool ok = false;
     std::string error;            // set when !ok; names the refusing parameter
+    // !ok only because a parameter or heap base would spill (a valid D3D12 signature whose spill array is not
+    // modelled), not because the signature breaks a D3D12 limit.
+    bool spills = false;
     Stage stage = Stage::Compute;
     uint32_t base = 0;            // stage_base(stage)
     std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused)
+    uint32_t resource_heap_sgpr = kNoSgpr;  // the bound CBV/SRV/UAV heap's base (kNoSgpr: the flag is clear)
+    uint32_t sampler_heap_sgpr = kNoSgpr;   // the bound sampler heap's base (kNoSgpr: the flag is clear)
     uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
     uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
 };
 
-// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
-// constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
+// Lays the parameters out for `stage` in the console layout, then the heap bases the signature's flags ask for.
+// Fails like pack() on more than 64 parameters, a constant parameter of 0 values or the 64-dword cost limit, and on
+// any parameter or heap base that would spill.
 [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.

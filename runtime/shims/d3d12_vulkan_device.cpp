@@ -6413,34 +6413,43 @@ public:
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
             return E_INVALIDARG;
         }
-        // Two layouts, one per bind point (RootArgumentLayout): graphics keeps pack(), compute takes the console
-        // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
-        const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
+        // Two layouts, one per bind point (RootArgumentLayout), both the console's (pack_stage, D3D-448): graphics
+        // from s8 (the vertex, pixel and geometry stages), compute from s4. A signature that breaks a D3D12 limit is
+        // refused. One that is valid but would spill at a bind point (the console's spill array is not modelled) is
+        // created, as on the console, and marked unusable there: binding it there invalidates the list, loudly.
+        const rt::rootsig::StagePackResult packed = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Pixel);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
-        if (!packed.ok && !compute.ok) {
-            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", packed.error.c_str(),
-                         compute.error.c_str());
+        if ((!packed.ok && !packed.spills) || (!compute.ok && !compute.spills)) {
+            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s\n",
+                         (!packed.ok && !packed.spills ? packed : compute).error.c_str());
             return E_INVALIDARG;
         }
-        if (!packed.ok)
+        if (!packed.ok && !compute.ok)
+            std::fprintf(stderr, "[rt] d3d12: root signature usable at neither bind point: %s (compute: %s)\n",
+                         packed.error.c_str(), compute.error.c_str());
+        else if (!packed.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
-        if (!compute.ok)
+        else if (!compute.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
-        for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
-            std::uint32_t first = UINT32_MAX;
-            for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
-                if (packed.provenance[d].param_index == i) {
-                    first = d;
-                    break;
-                }
-            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
+        if (compute.ok) {
+            layout.compute_resource_heap_sgpr = compute.resource_heap_sgpr;
+            layout.compute_sampler_heap_sgpr = compute.sampler_heap_sgpr;
+        }
+        if (packed.ok) {
+            layout.graphics_resource_heap_sgpr = packed.resource_heap_sgpr;
+            layout.graphics_sampler_heap_sgpr = packed.sampler_heap_sgpr;
+            layout.graphics_end_sgpr = packed.end_sgpr;
+        }
+        for (std::size_t i = 0; i < parsed.sig.params.size(); ++i)
+            layout.parameters.push_back({parsed.sig.params[i].type,
+                                         packed.ok ? packed.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                         parsed.sig.params[i].num_values,
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
                                          table_view_descriptors(parsed.sig.params[i])});
-        }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
             std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));

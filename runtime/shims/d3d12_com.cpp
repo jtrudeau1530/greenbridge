@@ -513,8 +513,12 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        note_direct_heap_indexing(graphics_.layout);
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+        UserData data;
+        if (!graphics_user_data(true, data))
+            return stub("DispatchMesh(root arguments past s16: the mesh and pixel windows overlap)");
+        leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
         check(list_.draw(std::move(draw)));
@@ -880,7 +884,8 @@ public:
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_.data;
+            note_direct_heap_indexing(compute_.layout);
+            cmd.user_data = compute_user_data();
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1221,9 +1226,9 @@ private:
             tables_.push_back({va, p->table_descriptors});
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
-        // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
-        // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
-        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        // A descriptor table is one dword at both bind points, the 32-bit VA of its first descriptor (the heaps live
+        // below 4 GiB); a root view keeps both halves.
+        if (type != rt::rootsig::ParamType::Table) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -1324,18 +1329,49 @@ private:
 
     void note_direct_heap_indexing(const RootArgumentLayout* layout) const {
         if (!layout) return;
-        if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
-            if (!cbv_srv_uav_heap_)
-                note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
-            else
-                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
-        }
-        if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
-            if (!sampler_heap_)
-                note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
-            else
-                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
-        }
+        if ((layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && !cbv_srv_uav_heap_)
+            note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
+        if ((layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && !sampler_heap_)
+            note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
+    }
+
+    using UserData = std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs>;
+
+    // The 32-bit VA of each bound heap's first descriptor in the SGPR the signature gives it for direct heap indexing
+    // (pack_stage, section 3.4). The heaps live in the GPU address arena, below 4 GiB, like the descriptor tables. A
+    // heap the signature indexes but the list has not bound leaves its SGPR 0 (noted once): D3D12 leaves that case
+    // undefined.
+    void write_heap_bases(UserData& data, std::uint32_t resource_sgpr, std::uint32_t sampler_sgpr) const {
+        if (resource_sgpr < data.size()) data[resource_sgpr] = std::uint32_t(cbv_srv_uav_base_);
+        if (sampler_sgpr < data.size()) data[sampler_sgpr] = std::uint32_t(sampler_base_);
+    }
+
+    // The user data a dispatch records: the compute root arguments and the heap bases.
+    UserData compute_user_data() const {
+        UserData data = compute_.data;
+        if (const RootArgumentLayout* layout = compute_.layout)
+            write_heap_bases(data, layout->compute_resource_heap_sgpr, layout->compute_sampler_heap_sgpr);
+        return data;
+    }
+
+    // The user data a draw records: the graphics root arguments and the heap bases from s8, where the vertex, pixel
+    // and geometry stages read them. A mesh shader reads the same SGPRs from s16 (rt::rootsig::stage_base) while the
+    // pixel shader of its pipeline still reads from s8, and both read one push-constant block; so for a mesh draw
+    // the window [s8, end) is also copied eight SGPRs up. When the two windows overlap (the arguments and heap
+    // bases take more than eight SGPRs) or the upper one passes s31, no block can serve both stages: false, and the
+    // caller refuses the draw (a per-stage window is open, docs/d3d12_vulkan.md section 3.5).
+    bool graphics_user_data(bool mesh, UserData& data) const {
+        data = graphics_.data;
+        const RootArgumentLayout* layout = graphics_.layout;
+        if (!layout) return true;
+        write_heap_bases(data, layout->graphics_resource_heap_sgpr, layout->graphics_sampler_heap_sgpr);
+        if (!mesh) return true;
+        constexpr std::uint32_t base = rt::rootsig::stage_base(rt::rootsig::Stage::Pixel);
+        constexpr std::uint32_t shift = rt::rootsig::stage_base(rt::rootsig::Stage::Mesh) - base;
+        const std::uint32_t end = layout->graphics_end_sgpr;
+        if (end > base + shift || end + shift > data.size()) return false;
+        for (std::uint32_t s = base; s < end; ++s) data[s + shift] = data[s];
+        return true;
     }
 
     void reset_state(ID3D12PipelineState* state) {
@@ -1378,7 +1414,7 @@ private:
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
@@ -1401,7 +1437,9 @@ private:
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
+        UserData data;
+        graphics_user_data(false, data);  // the vertex window alone always fits
+        leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
         check(list_.draw(std::move(draw)));

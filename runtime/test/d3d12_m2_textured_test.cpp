@@ -186,7 +186,7 @@ int main() {
         indexed_params[0].DescriptorTable = {1, &indexed_range};
         indexed_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         indexed_params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        indexed_params[2].Constants = {0, 0, 2};  // s4 = SRV index, s5 = SRV stride in bytes
+        indexed_params[2].Constants = {0, 0, 2};  // s10 = SRV index, s11 = SRV stride in bytes
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC indexed_desc = root_desc;
         indexed_desc.Desc_1_0.NumParameters = 3;
         indexed_desc.Desc_1_0.pParameters = indexed_params;

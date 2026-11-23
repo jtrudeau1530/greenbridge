@@ -367,14 +367,15 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 // Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
 // 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it
 // carries both layouts:
-//   - graphics: rt::rootsig::pack() (from s0, two dwords per table; D3D-448 keeps it until per-stage user-data windows
-//     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
+//   - graphics: rt::rootsig::pack_stage(Stage::Pixel), the console layout of the vertex, pixel and geometry stages
+//     (from s8, one dword per table, then the heap bases). A mesh shader reads the same arguments from s16, eight
+//     SGPRs up; the list copies them there for a mesh draw when both windows fit without overlapping;
 //   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
 struct RootArgumentLayout {
     struct Parameter {
         rt::rootsig::ParamType type;
-        std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
+        std::uint32_t user_offset;     // graphics: first user SGPR (VS/PS/GS); unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
         // A table: the CBV/SRV/UAV slots its ranges declare (an unbounded range counts as 1024), for the scan of
@@ -383,6 +384,14 @@ struct RootArgumentLayout {
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
+    // The user SGPRs that take the bound heaps' base VAs when the flags ask for direct heap indexing (pack_stage;
+    // docs/d3d12_vulkan.md section 3.4), per bind point. kNoSgpr when the flag is clear.
+    std::uint32_t compute_resource_heap_sgpr = rt::rootsig::kNoSgpr;
+    std::uint32_t compute_sampler_heap_sgpr = rt::rootsig::kNoSgpr;
+    std::uint32_t graphics_resource_heap_sgpr = rt::rootsig::kNoSgpr;
+    std::uint32_t graphics_sampler_heap_sgpr = rt::rootsig::kNoSgpr;
+    // Graphics: one past the last user SGPR the arguments and heap bases take from s8 (the pixel stage's user count).
+    std::uint32_t graphics_end_sgpr = 0;
     bool graphics_ok = true;
     bool compute_ok = true;
 };
