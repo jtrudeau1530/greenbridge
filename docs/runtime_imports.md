@@ -202,8 +202,9 @@ answer 0. `XErrorImpl` logs each report and hands it to the callback `XErrorSetC
 `XNetworkingImpl` answers as a console without a network would: the connectivity hint is initialized with no
 connectivity (level None), the port and URL security-information queries fail with
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
-certificate check fails the same way, change registrations return tokens that never fire, and the three
-`IXNetworkingImpl2` additions are `E_NOTIMPL`.
+certificate check fails the same way, the two change registrations send the one initial notification Microsoft
+documents (on the queue's completion port, the process queue when none is given: the hint above, or port 0) and
+none after, and the three `IXNetworkingImpl2` additions are `E_NOTIMPL`.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
