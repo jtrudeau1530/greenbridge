@@ -1680,6 +1680,9 @@ def clip_test(tools, spirv, name):
 
 
 def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return 0
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     spirv = os.path.join(sys.argv[1], "spirv")
