@@ -54,6 +54,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <chrono>
+#include <deque>
 #include <map>
 #include <cstring>
 #include <memory>
@@ -3746,6 +3748,79 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     return S_OK;
 }
 
+// A pipeline stream kept for a pipeline that is built on first use (LEONIDA_LAZY_PSO=1): every pointer in it is copied.
+struct LazyStream {
+    PipelineStream stream;
+    std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> code;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    std::deque<std::string> names;
+    std::vector<D3D12_SO_DECLARATION_ENTRY> so_entries;
+    std::vector<UINT> so_strides;
+    ID3D12RootSignature* root = nullptr;
+
+    ~LazyStream() {
+        if (root) root->Release();
+    }
+
+    // The same bytes are shared between pipelines: a title's tens of thousands of pipelines use far fewer programs.
+    static std::shared_ptr<const std::vector<std::uint8_t>> shared(const void* data, std::size_t size) {
+        static std::mutex mutex;
+        static std::multimap<std::pair<std::size_t, std::uint64_t>, std::shared_ptr<const std::vector<std::uint8_t>>> seen;
+        std::uint64_t h = 1469598103934665603ull;
+        const auto* b = static_cast<const std::uint8_t*>(data);
+        std::size_t i = 0;
+        for (; i + 8 <= size; i += 8) {
+            std::uint64_t w;
+            std::memcpy(&w, b + i, 8);
+            h = (h ^ w) * 1099511628211ull;
+        }
+        for (; i < size; ++i) h = (h ^ b[i]) * 1099511628211ull;
+        const std::lock_guard lock(mutex);
+        auto [it, end] = seen.equal_range({size, h});
+        for (; it != end; ++it)
+            if (std::memcmp(it->second->data(), data, size) == 0) return it->second;
+        auto copy = std::make_shared<const std::vector<std::uint8_t>>(b, b + size);
+        seen.emplace(std::pair{size, h}, copy);
+        return copy;
+    }
+
+    void keep(D3D12_SHADER_BYTECODE& c) {
+        if (!c.pShaderBytecode || !c.BytecodeLength) return;
+        code.push_back(shared(c.pShaderBytecode, c.BytecodeLength));
+        c.pShaderBytecode = code.back()->data();
+    }
+
+    explicit LazyStream(const PipelineStream& in) : stream(in) {
+        auto& g = stream.graphics;
+        for (D3D12_SHADER_BYTECODE* c : {&g.VS, &g.PS, &g.DS, &g.HS, &g.GS, &stream.compute.CS, &stream.ms, &stream.as}) keep(*c);
+        g.CachedPSO = {};
+        stream.compute.CachedPSO = {};
+        if (g.InputLayout.pInputElementDescs && g.InputLayout.NumElements) {
+            elements.assign(g.InputLayout.pInputElementDescs, g.InputLayout.pInputElementDescs + g.InputLayout.NumElements);
+            for (auto& e : elements) {
+                names.emplace_back(e.SemanticName ? e.SemanticName : "");
+                e.SemanticName = names.back().c_str();
+            }
+            g.InputLayout.pInputElementDescs = elements.data();
+        }
+        if (g.StreamOutput.pSODeclaration && g.StreamOutput.NumEntries) {
+            so_entries.assign(g.StreamOutput.pSODeclaration, g.StreamOutput.pSODeclaration + g.StreamOutput.NumEntries);
+            for (auto& e : so_entries)
+                if (e.SemanticName) {
+                    names.emplace_back(e.SemanticName);
+                    e.SemanticName = names.back().c_str();
+                }
+            g.StreamOutput.pSODeclaration = so_entries.data();
+        }
+        if (g.StreamOutput.pBufferStrides && g.StreamOutput.NumStrides) {
+            so_strides.assign(g.StreamOutput.pBufferStrides, g.StreamOutput.pBufferStrides + g.StreamOutput.NumStrides);
+            g.StreamOutput.pBufferStrides = so_strides.data();
+        }
+        root = stream.has_cs ? stream.compute.pRootSignature : g.pRootSignature;
+        if (root) root->AddRef();
+    }
+};
+
 class PipelineState final
     : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12PipelineState> {
@@ -3753,6 +3828,27 @@ public:
     // {8d2f6c14-b0e7-4a93-9c58-1f4a7e3b6d20}
     static constexpr GUID kTag{0x8d2f6c14, 0xb0e7, 0x4a93, {0x9c, 0x58, 0x1f, 0x4a, 0x7e, 0x3b, 0x6d, 0x20}};
     explicit PipelineState(DeviceState& device) : device_(device) {}
+    // Built on first use (LEONIDA_LAZY_PSO=1); every path that asks for the Vulkan pipeline calls build_lazy first.
+    void defer(const PipelineStream& stream) { lazy_ = std::make_unique<LazyStream>(stream); }
+    void build_lazy() {
+        if (!lazy_) return;
+        std::call_once(lazy_once_, [this] {
+            const auto t0 = std::chrono::steady_clock::now();
+            const HRESULT hr = lazy_->stream.has_cs
+                                   ? create_compute(lazy_->stream.compute)
+                                   : create_graphics(lazy_->stream.graphics, &lazy_->stream.ms, &lazy_->stream.as);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            static std::atomic<int> n{0};
+            const int k = n.fetch_add(1) + 1;
+            if (k <= 200 || k % 100 == 0 || FAILED(hr))
+                std::fprintf(stderr, "[rt] lazy pipeline %d built in %.1f ms -> 0x%08lx (cs %d rts %u f0 %d)\n", k, ms,
+                             static_cast<unsigned long>(hr), int(lazy_->stream.has_cs), lazy_->stream.graphics.NumRenderTargets,
+                             int(lazy_->stream.graphics.RTVFormats[0]));
+        });
+    }
+
+    std::unique_ptr<LazyStream> lazy_;
+    std::once_flag lazy_once_;
 
     ~PipelineState() override {
         auto& vk = device_.context->vk;
@@ -6791,6 +6887,14 @@ public:
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return placeholder(hr);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
+        static const bool lazy = [] {
+            const char* v = std::getenv("LEONIDA_LAZY_PSO");
+            return v && *v == '1';
+        }();
+        if (lazy) {
+            pipeline->defer(stream);
+            return d3d12_trace::result(method, hand_out(pipeline, riid, out));
+        }
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
         if (FAILED(hr)) {
@@ -9458,17 +9562,20 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature) 
 }
 
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
-    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (p) p->build_lazy();
     return p && p->compute() ? p->id() : 0;
 }
 
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
-    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (p) p->build_lazy();
     return p && p->graphics() ? p->id() : 0;
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
-    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (p) p->build_lazy();
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
 }
 

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -831,6 +832,23 @@ private:
     }
 
     HRESULT execute_request(const Entry& e, HANDLE event) {
+        static const bool on = std::getenv("LEONIDA_IO_TRACE") != nullptr;
+        const HRESULT hr = execute_request_inner(e, event);
+        if (on) {
+            const DSTORAGE_REQUEST& r = e.request;
+            const uint64_t o = r.Options.AsUINT64;
+            static std::atomic<int> n{0};
+            if (FAILED(hr) || ((!e.file || e.file->path().find(L"shaders.rpf") == std::wstring::npos) && n.fetch_add(1) < 20000))
+                std::fprintf(stderr, "[io] ds %ls off %llu src %u dst %u inter %u opt 0x%llx bcpack %u swizzle %u zlib %d -> 0x%08lx\n",
+                             e.file ? e.file->path().c_str() : L"(memory)", static_cast<unsigned long long>(r.FileOffset),
+                             r.SourceSize, r.DestinationSize, r.IntermediateSize, static_cast<unsigned long long>(o),
+                             unsigned(options::bcpack(o)), unsigned(options::swizzle(o)), int(options::zlib(o)),
+                             static_cast<unsigned long>(hr));
+        }
+        return hr;
+    }
+
+    HRESULT execute_request_inner(const Entry& e, HANDLE event) {
         const DSTORAGE_REQUEST& r = e.request;
         const uint64_t o = r.Options.AsUINT64;
         if (o & options::kReservedMask) return E_DSTORAGE_RESERVED_FIELDS;
