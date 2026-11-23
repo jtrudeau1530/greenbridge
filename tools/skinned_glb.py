@@ -79,6 +79,10 @@ try:  # optional: the stdlib path below is the fallback and is covered by the te
 except ImportError:  # pragma: no cover - depends on the interpreter
     _np = None
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
 CHUNK_JSON = 0x4E4F534A
@@ -242,6 +246,30 @@ def _unpack_packed_joints(data: bytes, slot: int) -> bytes:
                 raise SkinError(f"skin stream slot {slot} joint index {index} does not fit u8")
             out.append(index)
     return bytes(out)
+
+
+def source_input_paths(source: str) -> list[str]:
+    """Files one --skeleton/--component source may read or reference: its model.json,
+    the model.glb beside it and the buffer files named in model.json. A source that cannot
+    be resolved or read yet contributes only the paths known so far; the normal input checks
+    report it."""
+    try:
+        model_dir, json_path = model_json_path(source)
+    except SkinError:
+        return []
+    paths = [json_path]
+    try:
+        model = _load_json(json_path)
+    except (OSError, ValueError, SkinError):
+        return paths
+    glb_name = model.get("glb", "model.glb")
+    if isinstance(glb_name, str) and glb_name:
+        paths.append(os.path.join(model_dir, glb_name))
+    buffer_files = model.get("buffer_files", [])
+    if isinstance(buffer_files, list):
+        paths += [os.path.join(model_dir, name) for name in buffer_files
+                  if isinstance(name, str) and name]
+    return paths
 
 
 def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
@@ -994,6 +1022,16 @@ def main(argv=None) -> int:
                         help="decoded component directory or its model.json (repeatable)")
     parser.add_argument("--generator", default="Leonida skinned_glb")
     args = parser.parse_args(argv)
+
+    # The output must never replace a file the export reads (a source's model.json, its model.glb or a
+    # buffer file). same_report_path also catches a case-only spelling on Windows and macOS's default
+    # volume; sources it cannot resolve yet are left to the normal input checks below.
+    for source in [args.skeleton] + args.component:
+        for source_path in source_input_paths(source):
+            if same_report_path(args.output, source_path):
+                print(f"error: {args.output} must not overwrite the source {source_path}",
+                      file=sys.stderr)
+                return 2
 
     try:
         stats = write_skinned_glb(args.output, args.skeleton, args.component,
