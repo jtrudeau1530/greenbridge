@@ -1,5 +1,7 @@
 #include "d3d12_xs_pso_stream.h"
 
+#include "../src/rect_list_geometry.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -406,6 +408,38 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
         std::memcpy(out.data() + sub->payload, record + kDerivedRecordPayload, target.bytes);
     }
     return DeriveStatus::ok;
+}
+
+RectVariantStatus rect_list_variant_stream(const PsoStreamRecord& base, std::vector<unsigned char>& out) {
+    out = base.bytes();
+    std::vector<Subobject> subs;
+    if (!walk(out.data(), out.size(), subs)) return RectVariantStatus::malformed;
+    const Subobject* topology = nullptr;
+    bool vertex = false;
+    for (const Subobject& s : subs) {
+        switch (s.type) {
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: topology = &s; break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: vertex = true; break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
+                D3D12_SHADER_BYTECODE code{};
+                std::memcpy(&code, out.data() + s.payload, sizeof(code));
+                if (code.pShaderBytecode && code.BytecodeLength) return RectVariantStatus::extra_stage;
+                break;
+            }
+            default: break;
+        }
+    }
+    std::uint32_t type = 0;
+    if (topology) std::memcpy(&type, out.data() + topology->payload, sizeof(type));
+    if (type == leonida::topology_type_rect_list) return RectVariantStatus::rectangles;
+    if (!topology || !vertex || type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return RectVariantStatus::not_triangles;
+    type = leonida::topology_type_rect_list;
+    std::memcpy(out.data() + topology->payload, &type, sizeof(type));
+    return RectVariantStatus::ok;
 }
 
 bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> record) {

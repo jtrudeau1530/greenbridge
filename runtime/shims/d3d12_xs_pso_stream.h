@@ -73,4 +73,18 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
 bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> record);
 const PsoStreamRecord* find_pso_record(ID3D12Object* object);
 
+// The console draws its rectangle lists (IA topology 17) with pipelines it made as triangles: its native pipeline
+// format (slot 57) carries topology types 0..4 only, and slot 55 derives from those. The layer draws rectangles
+// through a pipeline of the console's rectangle type 19, which adds each rectangle's fourth corner in a generated
+// geometry stage (src/rect_list_geometry.h). rect_list_variant_stream writes `base` with its PRIMITIVE_TOPOLOGY set
+// to that type; `out`'s pointers still refer to the base record's copies.
+enum class RectVariantStatus {
+    ok,
+    rectangles,     // already the rectangle type: the pipeline itself draws the list
+    not_triangles,  // a point, line or patch pipeline, or no topology subobject: not a rectangle list's pipeline
+    extra_stage,    // a GS, HS, DS or mesh stage: the generated stage only follows a vertex stage
+    malformed,
+};
+RectVariantStatus rect_list_variant_stream(const PsoStreamRecord& base, std::vector<unsigned char>& out);
+
 }  // namespace rt::d3d12_xs

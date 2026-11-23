@@ -4374,9 +4374,11 @@ public:
         if (rect_list) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
             std::string why;
             const std::vector<std::uint32_t> words = leonida::rect_list_geometry(vs_stage.words, why);
-            if (words.empty()) {
-                std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list: %s\n",
-                             vs_stage.entry->name.c_str(), why.c_str());
+            if (words.empty()) {  // refused (a ClipDistance output, say): logged once, not per pipeline
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list: %s (logged once)\n",
+                                 vs_stage.entry->name.c_str(), why.c_str());
                 return E_NOTIMPL;
             }
             const VkShaderModule module = device_.shader_modules().acquire(words);
