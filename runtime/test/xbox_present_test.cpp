@@ -40,17 +40,20 @@ namespace {
 
 using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: 8-byte handle in RAX
 
-// Sends stderr (where the D3D12 trace goes) to a file while it lives, with the trace on.
+// Sends stderr (where the D3D12 trace goes) to a file while it lives, with the trace on or off. `redirected` is false
+// when the file could not be opened (the capture then holds nothing, which must not read as "no trace line").
 struct TraceCapture {
     std::filesystem::path path;
     int saved = -1;
-    explicit TraceCapture(const std::filesystem::path& file) : path(file) {
+    bool redirected = false;
+    TraceCapture(const std::filesystem::path& file, bool trace_on) : path(file) {
         std::fflush(stderr);
-        std::FILE* out = std::fopen(path.string().c_str(), "wb");
+        std::FILE* out = nullptr;
+        if (_wfopen_s(&out, path.c_str(), L"wb") != 0) out = nullptr;  // wide: a TEMP outside the ANSI code page
         saved = _dup(2);
-        if (out && saved >= 0) _dup2(_fileno(out), 2);
+        if (out && saved >= 0) redirected = _dup2(_fileno(out), 2) == 0;
         if (out) std::fclose(out);
-        rt::d3d12_trace::set_enabled(true);
+        rt::d3d12_trace::set_enabled(trace_on);
     }
     std::string finish() {
         rt::d3d12_trace::set_enabled(false);
@@ -479,22 +482,33 @@ int main() {
         std::printf("1 plane, RGBA8 solid: ok (swapchain format %d)\n", int(frame.format));
 
         // 0 planes: a black frame, and no token is needed. With the D3D12 trace on, each PresentX writes one line
-        // with its outcome, a refused call included, and nothing when the trace is off.
+        // with its outcome, a refused call included; with it off, none.
         {
             std::error_code ignored;
             const std::filesystem::path trace_file =
                 std::filesystem::temp_directory_path(ignored) / "leonida_xbox_present_trace.txt";
-            std::string trace;
-            HRESULT blank = E_FAIL, refused = S_OK;
+            std::string trace, untraced;
+            HRESULT blank = E_FAIL, refused = S_OK, refused_untraced = S_OK;
+            bool captured = false, captured_untraced = false;
             {
-                TraceCapture capture(trace_file);
+                TraceCapture capture(trace_file, true);
+                captured = capture.redirected;
                 blank = xbox.PresentX(0, nullptr, nullptr);
                 refused = xbox.PresentX(3, &plane, nullptr);  // more than two planes: refused before anything is shown
                 trace = capture.finish();
             }
+            {
+                TraceCapture capture(trace_file, false);
+                captured_untraced = capture.redirected;
+                refused_untraced = xbox.PresentX(3, &plane, nullptr);
+                untraced = capture.finish();
+            }
             std::filesystem::remove(trace_file, ignored);
+            EXPECT(captured && captured_untraced);
             EXPECT(blank == S_OK);
             EXPECT(refused == E_INVALIDARG);
+            EXPECT(refused_untraced == E_INVALIDARG);
+            EXPECT(count_of(untraced, "[d3d12-trace]") == 0);
             EXPECT(count_of(trace, " XboxPresentation::PresentX ok\n") == 1);
             EXPECT(count_of(trace, " XboxPresentation::PresentX failed\n") == 1);
             EXPECT(count_of(trace, "[d3d12-trace] #") == 2);
