@@ -4504,7 +4504,7 @@ class Gen:
             x = self.tof(self.src_u(dat))
             lbl_hdr, lbl_cont, lbl_exit = (self.tmp() + t for t in ("_hdr", "_cont", "_exit"))
             init = self.tmp()
-            self.emit(f"{init} = OpLoad %uint {p}")
+            self.emit(f"{init} = OpAtomicLoad %uint {p} {sc} {sem}")
             entry = self.current_label_placeholder()
             self.emit(f"OpBranch {lbl_hdr}")
             self.emit(f"{lbl_hdr} = OpLabel")
