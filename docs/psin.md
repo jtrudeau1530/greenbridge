@@ -261,6 +261,41 @@ Uniform bytes in exact 16-byte units that repeat record by record fit a determin
 also fit 128-bit hashes of inputs outside the tested dictionary and functions. Which one it is has not been
 established. Per the project rules, no decryption is attempted.
 
+## `PMAP`, `PSCH`, `PSIG` and `STNS`: the PSO-style variant
+
+The 57 complete `PSIN` streams without `LSCH` (54 in `data.rpf`, 2 in `packs.rpf`, 1 in `anim.rpf`) replace
+`LSCH`/`LENM`/`LSNS`/`LRSC` with a big-endian PSO schema chain: `PMAP`, `PSCH`, `PSIG`, optional `STFN`/`STDN`, `STNS`
+and `CHKS`. Measured with `tools/psin_psch.py` over all **54** containers in `data.rpf` (`54/54` valid):
+
+- **Header and instance region:** bytes `+0x08..+0x0F` hold `pppppppp` (`0x70` x 8) and instance data blocks sit at
+  `+0x10..first_section` (in contrast to `LSCH` containers, which place the block table at `+8`).
+- **`PMAP` (287 blocks across 54 files):** starts with a 16-byte big-endian header (`u32 root_block_id`, `u16 flags`,
+  `u16 0`, `u16 block_count`, 6-byte `pppppp` fill), followed by `block_count` x 16-byte rows `{u32 name_hash, u32 offset,
+  u32 0, u32 length}`. On **54 of 54**, blocks begin at `0x10` and end at exact `first_section`; 237 blocks reference a
+  struct in `PSCH` (`237/237` have `length % struct_size == 0`) and 50 are anonymous (`0x1`: 41, `0xc`: 7, `0x8`: 1,
+  `0x6`: 1).
+- **`PSCH` (`689` structs / `69` distinct, `3,250` members / `500` distinct, `146` enums / `17` distinct, `662` values):**
+  `u32be entry_count` followed by `entry_count` directory pairs `(u32be name_hash, u32be section_offset)`. Kind `0`
+  entries are structs (`u8 0`, `u8 flags`, `u16be member_count`, `u32be byte_size`, `u32be 0`, then `12`-byte big-endian
+  members `{u32 hash, u8 type, u8 sub, u16 offset, u32 ref}`); kind `1` entries are enums (`u8 1`, `u8 flags`, `u16be
+  value_count`, then `16`-byte values `{u32 hash, u32 0, i64be value}`). Every array member (`0x0d`, 226/226) and map
+  member (`0x10`, 3/3 key/value pairs) points at `0x100` element descriptors inside its struct; all 185 enum members
+  (`0x0e`) resolve locally, and 718 struct members (`0x0c`) hold `671` local hashes, `11` zero references, `33`
+  cross-file `data.rpf` references and `3` external references.
+- **`PSIG` and `STNS`/`STDN`/`STFN`:** `PSIG` stores `entry_count` big-endian `u32` layout signatures (`83` distinct).
+  `STNS` mirrors `LSNS` as a little-endian `u32 block_count` table of `(u32 kind, u32 bytes)` pairs and 16-byte-aligned
+  records (`867` total across `54` blocks) padded with zeros to a 16-byte payload boundary
+  (`align16(4 + 8 * block_count + data_bytes)` on all 54 containers: 4 zero bytes for `1`-block sections and 12 zero
+  bytes for `0`- and `2`-block sections). Where present, `STDN` (`2/2`) matches the prefix of `STNS`'s block data
+  byte-for-byte.
+
+```text
+python -I tools/psin_psch.py <file_or_carve_dir_or_rpf> [--carve-dir DIR] [--json FILE]
+```
+
+`tests/test_psin_psch.py` builds synthetic `PMAP`/`PSCH`/`PSIG`/`STDN`/`STNS` containers and tests block validation,
+member descriptor checks, carve-directory filtering and `--json` collision refusal.
+
 ## Instance data
 
 The region between the 8-byte header and `LSCH` is a block table followed by its data blocks. The schema in
