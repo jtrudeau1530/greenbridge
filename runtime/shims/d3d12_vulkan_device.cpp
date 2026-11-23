@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <climits>
 #include <cstdlib>
@@ -487,6 +488,41 @@ struct TextureCreateInfo {
     TextureCreateInfo& operator=(const TextureCreateInfo&) = delete;
 };
 
+std::filesystem::path configured_shader_directory() {
+    constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
+    if (const DWORD size = ::GetEnvironmentVariableW(env_name, nullptr, 0)) {
+        std::wstring value(size, L'\0');
+        const DWORD length = ::GetEnvironmentVariableW(env_name, value.data(), size);
+        if (length && length < size) {
+            value.resize(length);
+            return std::filesystem::path(value);
+        }
+    }
+
+    std::wstring exe(32768, L'\0');
+    const DWORD length = ::GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+    if (!length || length >= exe.size()) return {};
+    exe.resize(length);
+    const auto config = std::filesystem::path(exe).parent_path() / L"shader_path.txt";
+    std::ifstream file(config, std::ios::binary);
+    if (!file) return {};
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    if (text.empty() || text.find('\0') != std::string::npos) return {};
+
+    // make_game records an absolute Unix path on Linux. Resolve it inside the running Wine prefix.
+    if (text.front() == '/') {
+        using WineDosPath = wchar_t* (CDECL*)(const char*);
+        const auto to_dos = std::bit_cast<WineDosPath>(
+            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"), "wine_get_dos_file_name"));
+        if (!to_dos) return {};
+        const auto release = [](wchar_t* path) { ::HeapFree(::GetProcessHeap(), 0, path); };
+        const std::unique_ptr<wchar_t, decltype(release)> path(to_dos(text.c_str()), release);
+        if (path) return std::filesystem::path(path.get());
+        return {};
+    }
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
+
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
     VulkanDeviceInfo info;
@@ -694,19 +730,23 @@ struct DeviceState {
         std::lock_guard lock(library_mutex);
         if (!library_tried) {
             library_tried = true;
-            std::string dir = info.shader_dir;
-            if (dir.empty()) {
-                char buffer[1024] = {};
-                size_t length = 0;
-                if (getenv_s(&length, buffer, "LEONIDA_SHADERS") == 0 && length > 1) dir = buffer;
+            std::filesystem::path dir;
+            try {
+                dir = info.shader_dir.empty() ? configured_shader_directory() : std::filesystem::path(info.shader_dir);
+            } catch (const std::filesystem::filesystem_error& e) {
+                std::fprintf(stderr, "[rt] d3d12: invalid translated shader path: %s\n", e.what());
+                return nullptr;
             }
             std::string error;
             if (dir.empty())
                 std::fprintf(stderr, "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
             else if (!shader_library.load(dir, &error))
                 std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
-            else
-                std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n", shader_library.size(), dir.c_str());
+            else {
+                const auto path = dir.u8string();
+                std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
+                             shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
+            }
         }
         return shader_library.loaded() ? &shader_library : nullptr;
     }

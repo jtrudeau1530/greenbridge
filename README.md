@@ -225,6 +225,9 @@ Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and wri
 starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
 skips the build on Windows.
 
+When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
+in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.
+
 ## How it works
 
 | Piece | What it does | Where |

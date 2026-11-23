@@ -176,8 +176,7 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
-    // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
-    // LEONIDA_SHADERS environment variable.
+    // The translator's output folder for pipeline creation. An empty value uses LEONIDA_SHADERS or the packaged path.
     std::string shader_dir;
     // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
     // `device`: samplers with custom border colours pass them through to Vulkan. Without it, custom border

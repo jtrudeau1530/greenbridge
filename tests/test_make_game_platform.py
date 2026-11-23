@@ -242,6 +242,15 @@ class RuntimePackagingTest(unittest.TestCase):
                 self.assertIn("is missing", log.call_args.args[0])
                 self.assertNotIn("--dry-run", log.call_args.args[0])
 
+    def test_runtime_records_shader_work_directory(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        work = os.path.join(self.root, "Shader Work \u03bb")
+        with mock.patch.object(make_game, "log"):
+            make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, self.build, work=work)
+        with open(os.path.join(self.out, "shader_path.txt"), "rb") as f:
+            recorded = f.read()
+        self.assertEqual(recorded, os.fsencode(os.path.join(work, "shaders", "spirv")))
+
     def package(self):
         with mock.patch.object(make_game.os, "name", "nt"), \
                 mock.patch.object(make_game, "ROOT", self.root), \

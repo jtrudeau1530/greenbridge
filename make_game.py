@@ -41,6 +41,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1745,7 +1746,8 @@ def build_pipeline_check(jobs: int) -> None:
                 "or VULKAN_SDK); the CMake output above says which is missing.")
 
 
-def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1) -> None:
+def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
+            *, work: str | None = None) -> None:
     if runtime_build:
         log(f"runtime: using the build in {runtime_build}")
         build = runtime_build
@@ -1769,6 +1771,18 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             shutil.copy2(built, out)
     with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(os.path.abspath(game))
+    if work is not None:
+        shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
+        # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
+        encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
+        pending = tempfile.NamedTemporaryFile(dir=out, delete=False)
+        try:
+            with pending:
+                pending.write(encoded)
+            os.replace(pending.name, os.path.join(out, "shader_path.txt"))
+        finally:
+            if os.path.exists(pending.name):
+                os.unlink(pending.name)
     start = os.path.join(out, "gta6rt.exe")
     if os.name != "nt":
         start = os.path.join(out, "gta6rt.sh")
@@ -2145,7 +2159,7 @@ def main() -> int:
     if "assets" in stages:
         assets(game, work, a.wav, a.jobs)
     if "runtime" in stages:
-        runtime(game, out, v, runtime_build, a.jobs)
+        runtime(game, out, v, runtime_build, a.jobs, work=work)
     if "pipelines" in stages:
         pipelines(work, out, a.jobs, runtime_build=runtime_build)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")

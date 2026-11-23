@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -721,7 +722,7 @@ public:
     // DLL's FSPX programs into that folder; their entries are named "fspx/<name>"). Entries with neither
     // fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The fspx folder is optional: a
     // missing or unreadable index there leaves the main one loaded.
-    bool load(const std::string& dir, std::string* error = nullptr) {
+    bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
             return false;
@@ -734,7 +735,7 @@ public:
         }
         try {
             const auto ignore = [](const std::string&) { return false; };
-            if (std::ifstream(dir + "/fspx/index.json", std::ios::binary)) load_index(dir + "/fspx", "fspx/", ignore);
+            if (std::ifstream(dir / "fspx/index.json", std::ios::binary)) load_index(dir / "fspx", "fspx/", ignore);
         } catch (...) {
         }
         return true;
@@ -796,7 +797,9 @@ public:
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
-        std::ifstream file(dir_ + "/" + entry.name + ".spv", std::ios::binary | std::ios::ate);
+        auto path = dir_;
+        path += "/" + entry.name + ".spv";
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
         return read_spirv_words(file, file.tellg());
     }
 
@@ -821,9 +824,13 @@ private:
     // Reads <dir>/index.json. With an empty prefix it replaces what was loaded (the main index); with a prefix it
     // adds its entries under "<prefix><name>", the path of their modules relative to the main folder.
     template<typename Fail>
-    bool load_index(const std::string& dir, const std::string& prefix, Fail&& fail) {
-        std::ifstream file(dir + "/index.json", std::ios::binary);
-        if (!file) return fail("cannot open " + dir + "/index.json");
+    bool load_index(const std::filesystem::path& dir, const std::string& prefix, Fail&& fail) {
+        const auto index = dir / "index.json";
+        std::ifstream file(index, std::ios::binary);
+        if (!file) {
+            const auto path = index.u8string();
+            return fail("cannot open " + std::string(path.begin(), path.end()));
+        }
         const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         Json root;
         if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
@@ -900,7 +907,7 @@ private:
         return true;
     }
 
-    std::string dir_;
+    std::filesystem::path dir_;
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
