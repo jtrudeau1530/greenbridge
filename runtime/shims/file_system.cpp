@@ -183,8 +183,9 @@ std::filesystem::path join(const std::filesystem::path& root, const std::vector<
     return p;
 }
 
-bool drive_root(const std::vector<std::wstring>& parts) {
-    return parts.empty() || (parts.size() == 1 && same_name(parts[0].c_str(), kScratchDir));
+bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts) {
+    size_t prefix_length = 0;
+    return parts.empty() || (parts.size() == 1 && console_drive(path, prefix_length) == Drive::Scratch);
 }
 
 struct Target {
@@ -880,7 +881,7 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (drive_root(parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
+    if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
     const View v = view(r, parts);
     if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
@@ -917,7 +918,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
-    if (drive_root(src) || drive_root(dst)) return fail_bool(ERROR_ACCESS_DENIED);
+    if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
     if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
     const View to_view = view(r, dst);
