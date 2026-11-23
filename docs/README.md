@@ -64,9 +64,10 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [d3d12_vulkan.md](d3d12_vulkan.md) | Xbox D3D12 to Vulkan plan and status; device proxy, queues, command lists, barriers, copies. |
+| [mobile.md](mobile.md) | arm64/mobile path: the x86-64 → arm64 static-recompiler groundwork (`tools/x64_recomp.py`), the `.pdata` coverage census (`tools/recomp_census.py`), and what still blocks iOS. |
 | [boot.md](boot.md) | The first real boot: the `gta6rt --trace`/`--trace-d3d12` runbook, the startup + D3D12 trace summary (`tools/boot_trace.py`), the triage order and the Q1–Q22 checklist. |
 | [retail_boot_chain.md](retail_boot_chain.md) | How far `gta6rt --run` gets with the retail executable: the stops in order and what clears each, the physical-page export shapes, and device slots 26, 48 and 73. |
-| [modding.md](modding.md) | The mod format: a `mods/<folder>/mod.json` next to `gta6rt.exe` or under `--mods DIR`, swapping a named (or `joaat`) archetype for another; load order, the start-up log, and the fact that a swap waits for the executable's archetype lookup address (RT-5). |
+| [modding.md](modding.md) | The mod format: a `mods/<folder>/mod.json` next to `gta6rt.exe` or under `--mods DIR`, swapping a named (or `joaat`) archetype for another; the `tools/leonida_mods.py` manager (`Mods.bat` on Windows); load order, the start-up log, and the fact that a swap waits for the executable's archetype lookup address (RT-5). |
 | [descriptor_lookup_apple.md](descriptor_lookup_apple.md) | M3 Max GPU timings for texture and sampler descriptor lookups at 1k, 10k and 100k live entries. |
 | [descriptor_lookup_ada.md](descriptor_lookup_ada.md) | RTX 4070 SUPER (Ada, Windows) timings for the same lookups in VRAM, host-visible and ReBAR memory. |
 | [descriptor_lookup_intel.md](descriptor_lookup_intel.md) | Intel UHD Graphics 770 (Xe-LP, Windows, driver 101.6129) timings for the same lookups at 1k–100k live entries; both memory placements within 0.6% of each other. |
