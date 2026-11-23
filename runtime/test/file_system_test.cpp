@@ -60,6 +60,12 @@ using SetFileAttributesAFn = BOOL(WINAPI*)(LPCSTR, DWORD);
 using RemoveFn = int(__cdecl*)(const char*);
 using WRemoveFn = int(__cdecl*)(const wchar_t*);
 using WStat64Fn = int(__cdecl*)(const wchar_t*, struct _stat64*);
+using GetDiskFreeSpaceExWFn = BOOL(WINAPI*)(LPCWSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+using GetDiskFreeSpaceExAFn = BOOL(WINAPI*)(LPCSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+using GetDiskFreeSpaceWFn = BOOL(WINAPI*)(LPCWSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD);
+using GetDiskFreeSpaceAFn = BOOL(WINAPI*)(LPCSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD);
+using GetDriveTypeWFn = UINT(WINAPI*)(LPCWSTR);
+using GetDriveTypeAFn = UINT(WINAPI*)(LPCSTR);
 
 int g_checks = 0;
 int g_failures = 0;
@@ -1451,6 +1457,173 @@ void run_checks(const std::filesystem::path& root) {
         SetLastError(0);
         check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a case rename of a package folder is refused like any other move of one");
+    }
+
+    // Disk-space and drive-type queries for GAME:, G:, and T: match host semantics without creating folders.
+    {
+        const auto disk_ex_w = resolve<GetDiskFreeSpaceExWFn>("api-ms-win-core-file-l1-1-0.dll", "GetDiskFreeSpaceExW");
+        const auto disk_ex_a = resolve<GetDiskFreeSpaceExAFn>("kernel32.dll", "GetDiskFreeSpaceExA");
+        const auto disk_w = resolve<GetDiskFreeSpaceWFn>("kernel32.dll", "GetDiskFreeSpaceW");
+        const auto disk_a = resolve<GetDiskFreeSpaceAFn>("kernelbase.dll", "GetDiskFreeSpaceA");
+        const auto drive_w = resolve<GetDriveTypeWFn>("api-ms-win-core-file-l1-1-0.dll", "GetDriveTypeW");
+        const auto drive_a = resolve<GetDriveTypeAFn>("kernel32.dll", "GetDriveTypeA");
+        check(disk_ex_w && disk_ex_a && disk_w && disk_a && drive_w && drive_a,
+              "GetDiskFreeSpaceEx*, GetDiskFreeSpace* and GetDriveType* resolve through the shim registry");
+
+        if (disk_ex_w && disk_ex_a && disk_w && disk_a && drive_w && drive_a) {
+            write_path(package / "disk_pkg" / "file.dat", "pkg");
+            check(mkdir_w(L"GAME:\\disk_ov", nullptr) != FALSE, "overlay subdir created for disk queries");
+            write_path(package / "disk_del" / "inner.txt", "pkg");
+            check(delete_w(L"GAME:\\disk_del\\inner.txt") != FALSE && rmdir_w(L"GAME:\\disk_del") != FALSE,
+                  "deleted package dir prepared for disk queries");
+            check(mkdir_w(L"T:\\disk_scratch", nullptr) != FALSE, "T:\\ subdir created for disk queries");
+            {
+                const HANDLE hf = create_w(L"T:\\disk_scratch\\s.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0,
+                                           nullptr);
+                check(hf != INVALID_HANDLE_VALUE, "T:\\ file created for disk queries");
+                if (hf != INVALID_HANDLE_VALUE) ::CloseHandle(hf);
+            }
+
+            ULARGE_INTEGER host_avail{}, host_total{}, host_free{};
+            check(::GetDiskFreeSpaceExW(package.c_str(), &host_avail, &host_total, &host_free) != FALSE,
+                  "host GetDiskFreeSpaceExW succeeds on package root");
+            DWORD host_spc = 0, host_bps = 0, host_fc = 0, host_tc = 0;
+            check(::GetDiskFreeSpaceW(package.c_str(), &host_spc, &host_bps, &host_fc, &host_tc) != FALSE,
+                  "host GetDiskFreeSpaceW succeeds on package root");
+            wchar_t host_vol_root[MAX_PATH] = {};
+            const bool have_vol = ::GetVolumePathNameW(package.c_str(), host_vol_root, MAX_PATH) != FALSE;
+            const UINT host_drive = have_vol ? ::GetDriveTypeW(host_vol_root) : DRIVE_UNKNOWN;
+
+            // Missing overlay / .gta6rt-temp: read-only queries on T: succeed via existing ancestor and create nothing.
+            const std::filesystem::path fresh_overlay = root / "disk_fresh_overlay";
+            rt::fs::configure(package, fresh_overlay);
+            ULARGE_INTEGER avail{}, total{}, free_b{};
+            check(disk_ex_w(L"T:\\", &avail, &total, &free_b) != FALSE && total.QuadPart == host_total.QuadPart &&
+                      total.QuadPart > 0,
+                  "GetDiskFreeSpaceExW(T:\\) succeeds on missing overlay");
+            DWORD spc = 0, bps = 0, fc = 0, tc = 0;
+            check(disk_w(L"T:", &spc, &bps, &fc, &tc) != FALSE && spc == host_spc && bps == host_bps &&
+                      tc == host_tc,
+                  "GetDiskFreeSpaceW(T:) succeeds on missing overlay");
+            check(!have_vol || drive_w(L"T:\\") == host_drive, "GetDriveTypeW(T:\\) matches backing drive type");
+            check(!std::filesystem::exists(fresh_overlay),
+                  "read-only disk/drive queries on T:\\ do not create the overlay or .gta6rt-temp");
+            rt::fs::configure(package, overlay);
+
+            // Virtual drive roots and subdirs match host volume capacity and geometry.
+            for (const wchar_t* ok_dir : {L"GAME:", L"GAME:\\", L"game:/", L"GAME:\\.", L"G:", L"G:\\", L"T:",
+                                          L"T:\\", L"T:\\.", L"GAME:\\disk_pkg", L"GAME:\\disk_ov", L"T:\\disk_scratch"}) {
+                avail = total = free_b = {};
+                check(disk_ex_w(ok_dir, &avail, &total, &free_b) != FALSE && total.QuadPart == host_total.QuadPart &&
+                          avail.QuadPart > 0,
+                      "GetDiskFreeSpaceExW answers console dir/root");
+                spc = bps = fc = tc = 0;
+                check(disk_w(ok_dir, &spc, &bps, &fc, &tc) != FALSE && spc == host_spc && bps == host_bps &&
+                          tc == host_tc,
+                      "GetDiskFreeSpaceW answers console dir/root");
+            }
+            for (const char* ok_dir_a : {"GAME:\\", "G:\\", "T:\\", "GAME:\\disk_pkg", "T:\\disk_scratch"}) {
+                avail = total = free_b = {};
+                check(disk_ex_a(ok_dir_a, &avail, &total, &free_b) != FALSE && total.QuadPart == host_total.QuadPart,
+                      "GetDiskFreeSpaceExA answers console dir/root");
+                spc = bps = fc = tc = 0;
+                check(disk_a(ok_dir_a, &spc, &bps, &fc, &tc) != FALSE && tc == host_tc,
+                      "GetDiskFreeSpaceA answers console dir/root");
+            }
+            // Partial / all-null optional output pointers work.
+            avail = {};
+            check(disk_ex_w(L"GAME:\\", &avail, nullptr, nullptr) != FALSE && avail.QuadPart > 0,
+                  "GetDiskFreeSpaceExW with only lpFreeBytesAvailableToCaller succeeds");
+            check(disk_ex_w(L"GAME:\\", nullptr, nullptr, nullptr) != FALSE &&
+                      disk_w(L"GAME:\\", nullptr, nullptr, nullptr, nullptr) != FALSE,
+                  "GetDiskFreeSpaceExW and GetDiskFreeSpaceW accept all-null output pointers");
+
+            // Files, missing/deleted folders, empty strings, and escaped/reserved paths match Windows error codes.
+            for (const wchar_t* file_path : {L"GAME:\\disk_pkg\\file.dat", L"T:\\disk_scratch\\s.bin"}) {
+                SetLastError(0);
+                check(disk_ex_w(file_path, &avail, nullptr, nullptr) == FALSE && GetLastError() == ERROR_DIRECTORY,
+                      "GetDiskFreeSpaceExW on a file fails with ERROR_DIRECTORY");
+                SetLastError(0);
+                check(disk_w(file_path, &spc, &bps, &fc, &tc) == FALSE && GetLastError() == ERROR_DIRECTORY,
+                      "GetDiskFreeSpaceW on a file fails with ERROR_DIRECTORY");
+            }
+            for (const wchar_t* missing : {L"GAME:\\disk_missing", L"GAME:\\disk_del", L"T:\\disk_missing"}) {
+                SetLastError(0);
+                check(disk_ex_w(missing, &avail, nullptr, nullptr) == FALSE && GetLastError() == ERROR_PATH_NOT_FOUND,
+                      "GetDiskFreeSpaceExW on missing/deleted dir fails with ERROR_PATH_NOT_FOUND");
+                SetLastError(0);
+                check(disk_w(missing, &spc, &bps, &fc, &tc) == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
+                      "GetDiskFreeSpaceW on missing/deleted dir fails with ERROR_FILE_NOT_FOUND");
+            }
+            SetLastError(0);
+            check(disk_ex_w(L"", &avail, nullptr, nullptr) == FALSE && GetLastError() == ERROR_PATH_NOT_FOUND,
+                  "GetDiskFreeSpaceExW on empty string fails with ERROR_PATH_NOT_FOUND");
+            SetLastError(0);
+            check(disk_w(L"", &spc, &bps, &fc, &tc) == FALSE && GetLastError() == ERROR_PATH_NOT_FOUND,
+                  "GetDiskFreeSpaceW on empty string fails with ERROR_PATH_NOT_FOUND");
+            for (const wchar_t* bad : {L"GAME:\\..\\escape", L"GAME:\\.gta6rt-deleted", L"GAME:\\bad:stream"}) {
+                SetLastError(0);
+                check(disk_ex_w(bad, &avail, nullptr, nullptr) == FALSE && GetLastError() == ERROR_INVALID_NAME,
+                      "GetDiskFreeSpaceExW refuses traversal/reserved/stream path with ERROR_INVALID_NAME");
+                SetLastError(0);
+                check(disk_w(bad, &spc, &bps, &fc, &tc) == FALSE && GetLastError() == ERROR_INVALID_NAME,
+                      "GetDiskFreeSpaceW refuses traversal/reserved/stream path with ERROR_INVALID_NAME");
+                check(drive_w(bad) == DRIVE_NO_ROOT_DIR,
+                      "GetDriveTypeW returns DRIVE_NO_ROOT_DIR on refused path");
+            }
+
+            // GetDriveTypeW/A: console roots report backing drive type; subdirs/files/missing report DRIVE_NO_ROOT_DIR.
+            if (have_vol) {
+                for (const wchar_t* rt : {L"GAME:", L"GAME:\\", L"game:/", L"GAME:\\.", L"G:", L"G:\\", L"T:",
+                                          L"T:\\", L"T:\\."}) {
+                    check(drive_w(rt) == host_drive, "GetDriveTypeW answers backing drive type for console root");
+                }
+                for (const char* rt_a : {"GAME:", "GAME:\\", "G:\\", "T:\\"}) {
+                    check(drive_a(rt_a) == host_drive, "GetDriveTypeA answers backing drive type for console root");
+                }
+            }
+            for (const wchar_t* non_root : {L"GAME:\\disk_pkg", L"GAME:\\disk_pkg\\file.dat", L"GAME:\\disk_missing",
+                                            L"T:\\disk_scratch", L""}) {
+                check(drive_w(non_root) == DRIVE_NO_ROOT_DIR,
+                      "GetDriveTypeW returns DRIVE_NO_ROOT_DIR for non-root/missing path");
+            }
+            check(drive_a("GAME:\\disk_pkg") == DRIVE_NO_ROOT_DIR,
+                  "GetDriveTypeA returns DRIVE_NO_ROOT_DIR for non-root path");
+
+            // Host paths and nullptr (current directory) pass through matching ::Get* directly.
+            ULARGE_INTEGER cwd_ex_direct{}, cwd_ex_shim{}, cwd_ex_shim_a{};
+            const BOOL host_cwd_ex = ::GetDiskFreeSpaceExW(nullptr, &cwd_ex_direct, nullptr, nullptr);
+            check(disk_ex_w(nullptr, &cwd_ex_shim, nullptr, nullptr) == host_cwd_ex &&
+                      disk_ex_a(nullptr, &cwd_ex_shim_a, nullptr, nullptr) == host_cwd_ex,
+                  "GetDiskFreeSpaceExW/A(nullptr) matches host");
+            DWORD d_spc = 0, d_bps = 0, d_fc = 0, d_tc = 0, s_spc = 0, s_bps = 0, s_fc = 0, s_tc = 0;
+            const BOOL host_cwd = ::GetDiskFreeSpaceW(nullptr, &d_spc, &d_bps, &d_fc, &d_tc);
+            check(disk_w(nullptr, &s_spc, &s_bps, &s_fc, &s_tc) == host_cwd && s_spc == d_spc && s_bps == d_bps,
+                  "GetDiskFreeSpaceW(nullptr) matches host");
+            check(disk_a(nullptr, &s_spc, &s_bps, &s_fc, &s_tc) == host_cwd && s_spc == d_spc && s_bps == d_bps,
+                  "GetDiskFreeSpaceA(nullptr) matches host");
+            check(drive_w(nullptr) == ::GetDriveTypeW(nullptr) && drive_a(nullptr) == ::GetDriveTypeW(nullptr),
+                  "GetDriveTypeW/A(nullptr) matches host");
+            check(disk_ex_w(package.c_str(), &avail, &total, &free_b) != FALSE &&
+                      total.QuadPart == host_total.QuadPart,
+                  "GetDiskFreeSpaceExW forwards host path directly");
+
+            // Unconfigured roots: GAME: fails cleanly while G:/T: revert to host paths.
+            rt::fs::configure({}, {});
+            SetLastError(0);
+            check(disk_ex_w(L"GAME:\\", &avail, nullptr, nullptr) == FALSE &&
+                      GetLastError() == ERROR_PATH_NOT_FOUND,
+                  "unconfigured GAME:\\ fails with ERROR_PATH_NOT_FOUND");
+            check(drive_w(L"GAME:\\") == DRIVE_NO_ROOT_DIR, "unconfigured GAME:\\ reports DRIVE_NO_ROOT_DIR");
+            rt::fs::configure(package, {});
+            check(disk_ex_w(L"GAME:\\", &avail, nullptr, nullptr) != FALSE,
+                  "GAME:\\ succeeds even with empty overlay");
+            SetLastError(0);
+            check(disk_ex_w(L"T:\\", &avail, nullptr, nullptr) == FALSE && GetLastError() == ERROR_PATH_NOT_FOUND,
+                  "T:\\ with empty overlay fails with ERROR_PATH_NOT_FOUND");
+            check(drive_w(L"T:\\") == DRIVE_NO_ROOT_DIR, "T:\\ with empty overlay reports DRIVE_NO_ROOT_DIR");
+            rt::fs::configure(package, overlay);
+        }
     }
 }
 
