@@ -480,10 +480,23 @@ void test_long_run(const PhysicalApi& api) {
         if (i != 10) kept &= page_holds(window + i * kPage64k, static_cast<uint32_t>(i + 1));
     }
     check(kept, "every other page of the run keeps its contents");
+    // Several pages across the boundary of two capped views unmap together; the pages on both sides stay.
+    check(api.map(window + 1000 * kPage64k, 50, nullptr) == window + 1000 * kPage64k &&
+              reserved_only(window + 1000 * kPage64k) && reserved_only(window + 1049 * kPage64k),
+          "a multi-page range across two views unmaps");
+    check(page_holds(window + 999 * kPage64k, 1000u) && page_holds(window + 1050 * kPage64k, 1051u),
+          "the pages on both sides of it keep their contents");
+    // Mapping other pages over the middle of a live run replaces just those pages.
+    check(api.map(window + 500 * kPage64k, 3, &pages[600]) == window + 500 * kPage64k &&
+              page_holds(window + 500 * kPage64k, 601u) && page_holds(window + 502 * kPage64k, 603u),
+          "pages mapped over the middle of a live run replace it there");
+    check(page_holds(window + 499 * kPage64k, 500u) && page_holds(window + 503 * kPage64k, 504u),
+          "and the run's pages around them keep their contents");
     check(api.map(window, kPages, nullptr) == window && reserved_only(window) &&
               reserved_only(window + (kPages - 1) * kPage64k),
           "the whole run unmaps");
     check(api.free_pages(kPages, pages.data()) == TRUE, "the long run's pages are freed");
+    check(api.map(window, 1, pages.data()) == nullptr && reserved_only(window), "a freed page does not map again");
 }
 
 void test_placeholders(const PhysicalApi& api) {
