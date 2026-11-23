@@ -638,9 +638,7 @@ These are stated plainly because a future reader will otherwise trust the wrong 
 9. **The Wine results are not reproducible here.** "All 7 DLLs load", "the whole console graphics
    stack runs on Linux", and the DMA round-trip are **Reported**. This page did not open
    `d3d12_xs.dll` and did not run Wine. Nothing in this doc depends on them.
-10. **`docs/dll-surface.md` is stale.** It says the console `d3d12_xs.dll` is "not obtainable"
-    (line 83), while `d3d12_xs-findings.md` documents the acquired binary. Use the findings doc.
-11. **The package's D3D12 DLL exports do not contain the four command-list IIDs with 1.0.2.1.**
+10. **The package's D3D12 DLL exports do not contain the four command-list IIDs with 1.0.2.1.**
     The package has 16 DLLs and no D3D12 runtime DLL, and `gameos.xvd` is encrypted; SCARAB's
     provenance says the runtime does not export these four IIDs. There is no export ordinal to
     read in this package or in the vendor DLL. A `QueryInterface` trace from the running title is
