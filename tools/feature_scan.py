@@ -23,6 +23,7 @@ remain in the existing unreadable count. DXIL permits InnerCoverage outside the 
 so ISG1 absence is not evidence of non-use. These counts do not identify an Xbox input VGPR.
 
 Standard library only. Nothing from the game is printed or written: names, code and data stay in the work folder.
+Usage: `python -I tools/feature_scan.py --help` lists the options.
 """
 import argparse
 import json
