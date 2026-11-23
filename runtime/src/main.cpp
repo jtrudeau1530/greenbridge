@@ -111,6 +111,15 @@ int wmain(int argc, wchar_t** argv) {
     };
     game_dir = game_dir.empty() ? absolute_or_same(image).parent_path() : absolute_or_same(game_dir);
     if (!overlay_dir.empty()) overlay_dir = absolute_or_same(overlay_dir);
+    // LEONIDA_SHADERS too: the D3D12 device reads it at the title's first pipeline state, after it may have moved.
+    if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_SHADERS", nullptr, 0)) {
+        std::wstring shaders(size, L'\0');
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SHADERS", shaders.data(), size);
+        if (n && n < size) {
+            shaders.resize(n);
+            SetEnvironmentVariableW(L"LEONIDA_SHADERS", absolute_or_same(shaders).c_str());
+        }
+    }
     // An image without relocations whose range this process already uses (arm64 Wine on macOS) runs in a new
     // process that has the range reserved from the start (base_reservation.h); that process does not do this again.
     if (!rt::base_reservation::inherited())

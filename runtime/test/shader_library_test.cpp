@@ -408,6 +408,22 @@ int main() {
           emulated->emulated());
     CHECK(emulated->lds_bytes == 33332 && entry->lds_bytes == 0);  // workgroup bytes, emulation included (SHADER-309)
     CHECK(library.spirv(*entry).size() == 5);
+    // A relative folder (LEONIDA_SHADERS=spirv) is fixed when it is loaded: the modules are read later, after the title
+    // may have changed the current directory, and must still come from the folder that was loaded.
+    {
+        const auto cwd = std::filesystem::current_path();
+        std::filesystem::current_path(dir.parent_path());
+        ShaderLibrary relative;
+        const bool loaded = relative.load(dir.filename(), &error);
+        std::filesystem::current_path(dir);  // <dir>/<dir's name> does not exist
+        const ShaderEntry* found = loaded ? relative.find("cs", entry->fssm_sha256) : nullptr;
+        const bool read = found && relative.spirv(*found).size() == 5;
+        std::filesystem::current_path(cwd);
+        std::error_code ec;
+        CHECK(loaded && relative.directory().is_absolute() &&
+              std::filesystem::equivalent(relative.directory(), dir, ec));
+        CHECK(read);
+    }
     CHECK(!library.load((dir / "missing").string(), &error) && !error.empty());
     {
         std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);

@@ -528,22 +528,9 @@ struct TextureCreateInfo {
     TextureCreateInfo& operator=(const TextureCreateInfo&) = delete;
 };
 
-std::filesystem::path configured_shader_directory() {
-    constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
-    if (const DWORD size = ::GetEnvironmentVariableW(env_name, nullptr, 0)) {
-        std::wstring value(size, L'\0');
-        const DWORD length = ::GetEnvironmentVariableW(env_name, value.data(), size);
-        if (length && length < size) {
-            value.resize(length);
-            return std::filesystem::path(value);
-        }
-    }
-
-    std::wstring exe(32768, L'\0');
-    const DWORD length = ::GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
-    if (!length || length >= exe.size()) return {};
-    exe.resize(length);
-    const auto config = std::filesystem::path(exe).parent_path() / L"shader_path.txt";
+// The folder make_game recorded in shader_path.txt at `config`, or empty without one. Throws when the path cannot be
+// converted: MSVC's STL reports a Windows path that is not UTF-8 as std::system_error, libstdc++ as filesystem_error.
+std::filesystem::path shader_directory_from_file(const std::filesystem::path& config) {
     std::ifstream file(config, std::ios::binary);
     if (!file) return {};
     const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
@@ -777,22 +764,26 @@ struct DeviceState {
         std::lock_guard lock(library_mutex);
         if (!library_tried) {
             library_tried = true;
-            std::filesystem::path dir;
+            // Nothing may leave here into Create*PipelineState: a path the STL cannot convert throws std::system_error
+            // under MSVC, which is not a filesystem_error, so every std::exception gives the message.
             try {
-                dir = info.shader_dir.empty() ? configured_shader_directory() : std::filesystem::path(info.shader_dir);
-            } catch (const std::filesystem::filesystem_error& e) {
+                std::string error;
+                const std::filesystem::path dir = info.shader_dir.empty() ? configured_shader_directory(&error)
+                                                                          : std::filesystem::path(info.shader_dir);
+                if (!error.empty())
+                    std::fprintf(stderr, "[rt] d3d12: invalid translated shader path: %s\n", error.c_str());
+                else if (dir.empty())
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
+                else if (!shader_library.load(dir, &error))
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
+                else {
+                    const auto path = shader_library.directory().u8string();
+                    std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
+                                 shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
+                }
+            } catch (const std::exception& e) {
                 std::fprintf(stderr, "[rt] d3d12: invalid translated shader path: %s\n", e.what());
-                return nullptr;
-            }
-            std::string error;
-            if (dir.empty())
-                std::fprintf(stderr, "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
-            else if (!shader_library.load(dir, &error))
-                std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
-            else {
-                const auto path = dir.u8string();
-                std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
-                             shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
             }
         }
         return shader_library.loaded() ? &shader_library : nullptr;
@@ -9513,6 +9504,29 @@ bool has_global_realtime_privilege() {
 
 void set_global_realtime_privilege_override_for_test(int state) {
     g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
+}
+
+std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
+    try {
+        constexpr wchar_t env_name[] = L"LEONIDA_SHADERS";
+        if (const DWORD size = ::GetEnvironmentVariableW(env_name, nullptr, 0)) {
+            std::wstring value(size, L'\0');
+            const DWORD length = ::GetEnvironmentVariableW(env_name, value.data(), size);
+            if (length && length < size) {
+                value.resize(length);
+                return std::filesystem::path(value);
+            }
+        }
+        if (!config.empty()) return shader_directory_from_file(config);
+        std::wstring exe(32768, L'\0');
+        const DWORD length = ::GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+        if (!length || length >= exe.size()) return {};
+        exe.resize(length);
+        return shader_directory_from_file(std::filesystem::path(exe).parent_path() / L"shader_path.txt");
+    } catch (const std::exception& e) {
+        if (error) *error = e.what();
+        return {};
+    }
 }
 
 }  // namespace rt::d3d12
