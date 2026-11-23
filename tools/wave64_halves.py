@@ -205,7 +205,7 @@ def operands(ins):
     op, a = base_op(ins["op"]), ins["args"]
     mods = ins.get("mods") or []
     defs, uses = [], []
-    if op.startswith(NO_DEST) and not op.startswith(("s_cmp", "s_bitcmp")) or op in ("s_endpgm", "s_barrier"):
+    if op.startswith(NO_DEST) and not op.startswith(("s_cmp", "s_bitcmp", "v_cmpx")) or op in ("s_endpgm", "s_barrier"):
         dests, srcs = [], list(a)
     elif op.startswith(("s_cmp", "s_bitcmp")):
         dests, srcs = [], list(a)

@@ -400,6 +400,16 @@ class Classification(unittest.TestCase):
         self.tier("ps_c_half2", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_mov_b32 s6, vcc_hi", "v_mov_b32_e32 v6, s6"]),
                   "C", contains=["mask-half"])
 
+    def test_c_vcmpx_on_the_lane_id(self):
+        # v_cmpx writes EXEC like v_cmp + s_and_b64 exec: on 32-wide waves lanes 32..63 see ids 0..31 and stay on.
+        for form in ("e32", "e64"):
+            self.tier(f"vs_c_vcmpx_{form}", vs([*LANE_ID, "v_mov_b32_e32 v6, 1", f"v_cmpx_gt_u32_{form} 32, v10",
+                                                "v_mov_b32_e32 v6, 2"]), "C", ["tainted-exec"])
+
+    def test_a_vcmpx_on_a_uniform_value(self):
+        self.tier("vs_a_vcmpx_uniform", vs(["s_mov_b32 s20, 5", "v_mov_b32_e32 v6, 1", "v_cmpx_gt_u32_e32 s20, 3",
+                                             "v_mov_b32_e32 v6, 2"]), "A", [])
+
     def test_c_mask_stored_as_data(self):
         self.tier("ps_c_maskdata", ps(["v_cmp_eq_u32_e32 vcc, 1, v0", "s_mov_b64 s[6:7], vcc",
                                        "v_mov_b32_e32 v6, s6"]), "C")
