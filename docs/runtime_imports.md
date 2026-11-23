@@ -257,7 +257,7 @@ with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the h
 version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
 `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
 (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
-`XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs' layout (below); for any other class it logs
+`XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and `XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` serves slot by slot.
@@ -378,8 +378,8 @@ on the executable, the rest is not:
 
 `xgameruntime_store_test` drives the license check, add-ons, updates, package licenses and product queries.
 
-`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl`
-(`runtime/shims/xgameruntime_offline.cpp`), from the same layout, also **not measured**:
+`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and
+`XLauncherImpl` (`runtime/shims/xgameruntime_offline.cpp`), from the same layout, also **not measured**:
 - **`XGameEventWrite`** succeeds; the events are dropped. The first one's name is logged, and
   `LEONIDA_LOG_GAME_EVENTS=1` logs each with its dimensions and measurements.
 - **Dialogs:** a message dialog's title, text and buttons go to the log (`[rt] game dialog:`), and it completes at
@@ -397,6 +397,17 @@ on the executable, the rest is not:
   `XGameStreamingImpl` or `XUserDeviceImpl` slot. Of `XGameUiImpl` it links slots 7-8 and 17-19 only: the profile
   card and text entry, which fail before starting.
 
+- **Accessibility and speech** (`IXAccessibilityImpl2`, slots 3-21): `XHighContrastGetMode` (5) answers Off and
+  `XClosedCaptionSetEnabled` (4) is accepted. No voice is installed: `XSpeechSynthesizerEnumerateInstalledVoices`
+  (8) calls back zero times and returns `S_OK`, `XSpeechSynthesizerCreate` (9) fails (`E_FAIL`) with a null handle,
+  and the handle calls (10-16, 21: close, default and custom voice, streams from text and SSML, stream size and
+  data) refuse the handle they were never given (`E_INVALIDARG`, outputs zeroed). The closed-caption properties (3)
+  and the speech-to-text display calls (6, 7, 17-20) fail with `E_FAIL`, writing nothing: their parameter lists
+  are not in the docs' layout.
+- **`XLauncherImpl`** (`IXLauncherImpl`, slots 3-5): `XLaunchUri`, `XDisplayAcquireTimeoutDeferral` (null handle)
+  and `XDisplayCloseTimeoutDeferralHandle` fail with `E_FAIL`; nothing is launched.
+- **ASSUMPTION:** the parameter lists of the speech calls and `XHighContrastGetMode` (Off is 0), from the GDK
+  reference; only the argument counts were measured, from `tools/gdk_runtime_calls.py` on the executable.
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
@@ -416,11 +427,11 @@ layout with the documented argument count, and each behaves as Microsoft's refer
 
 | Class | Interface asked for | Slots (args after `this`) | Offline behaviour |
 |---|---|---|---|
-| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XAccessibility and XSpeechSynthesizer, XAppCapture, XGameInvite, XLauncher) and for values past the enum |
+| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAccessibility, XSpeechSynthesizer, XLauncher, XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XAppCapture, XGameInvite) and for values past the enum |
 | `XSystemAnalyticsImpl` | its class id | 3 `XSystemGetAnalyticsInfo` (1: the result's address, as MSVC passes a returned struct to a member function) | The named export's `XSystemAnalyticsInfo` |
 
-Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XAccessibilityImpl` (slots 3-21) and
-`XLauncherImpl` (3-5), among others.
+Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XAppCaptureImpl` and `XGameInviteImpl`,
+among others.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
