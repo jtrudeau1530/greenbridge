@@ -998,13 +998,23 @@ def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, ma
     assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
 
 
+def _gather_rounded_lod(defs):
+    """The LOD the explicit-LOD gather rounds to a mip: the operand of the Floor whose fraction (an FSub from the same
+    LOD) is compared with %fhalf_g."""
+    cmp, = (e for e in defs.values() if e.startswith("OpFOrdGreaterThanEqual %bool ") and e.endswith(" %fhalf_g"))
+    sub = defs[cmp.split()[2]].split()
+    assert sub[:2] == ["OpFSub", "%float"], sub
+    lod, floor = sub[2], sub[3]
+    assert defs[floor].split() == ["OpExtInst", "%float", "%glsl", "Floor", lod]
+    return lod
+
+
 def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
     shader = make_shader(_gather_l(0x12, s_word1=(192 << 12) | 64))  # [0.25, 0.75] in unsigned 4.8
     text = shader.translate()
     shader.validate(text)
     defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
-    biassed, = (expr for expr in defs.values() if expr.startswith("OpFAdd ") and expr.endswith(" %fhalf_g"))
-    clamp = defs[biassed.split()[-2]].split()
+    clamp = defs[_gather_rounded_lod(defs)].split()
     assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FClamp"]
     for limit, bits in zip(clamp[-2:], (0x3e800000, 0x3f400000)):
         cast, scalar, value = defs[limit].split()
@@ -1024,11 +1034,8 @@ def test_gather4_l_run_time_lod_bounds_clamp_without_fclamp(make_shader):
     text = shader.translate()
     shader.validate(text)
     defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
-    # The LOD rounds as Floor(lod + 0.5) (ties up, SHADER-152); the lod it adds the half to is the clamp's FMin.
-    biased, = (defs[e.split()[-1]].split() for e in defs.values()
-               if " Floor " in e and defs.get(e.split()[-1], "").startswith("OpFAdd %float ")
-               and defs[e.split()[-1]].endswith(" %fhalf_g"))
-    clamp = defs[biased[2]].split()
+    # The LOD rounds to the nearest mip, ties up (SHADER-152); the lod it rounds is the clamp's FMin.
+    clamp = defs[_gather_rounded_lod(defs)].split()
     assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FMin"]
     assert "FMax" in text
     assert "FClamp" not in text
@@ -1101,30 +1108,100 @@ def test_gather4_l_run_time_sampler_reads_the_border_type_from_word3(make_shader
     assert len(re.findall(r"= OpSelect %float %\w+ %\w+ %\w+$", text, re.M)) >= 4
 
 
-# SHADER-152: the explicit-LOD gather's mip is floor(LOD + 0.5), ties up, like the native gather on Radeon
-# (LOD 0.5 with bounds [0,1] picked mip 1); the old RoundEven picked mip 0 there.
-def _gather_l_at_lod(lod):
+# SHADER-152: the explicit-LOD gather's mip is the nearest one, ties up, like the native gather on Radeon
+# (LOD 0.5 with bounds [0,1] picked mip 1); the old RoundEven picked mip 0 there. It is computed as
+# floor(LOD) + (fraction >= 0.5), exact in binary32, not Floor(LOD + 0.5), whose sum rounds 0x3effffff up to 1.0.
+def _gather_l_at_lod(lod, word1=0x100000):
     return program(
         "s_mov_b32 s8, 0\ns_mov_b32 s9, 0\ns_mov_b32 s10, 0\ns_mov_b32 s11, 0\n"
         "s_mov_b32 s12, 0\ns_mov_b32 s13, 0\ns_mov_b32 s14, 0\ns_mov_b32 s15, 0\n"
-        # S# word 1: MIN_LOD 0, MAX_LOD 1.0 (unsigned 4.8), so the clamp below is [0, 1].
-        "s_mov_b32 s16, 0\ns_mov_b32 s17, 0x100000\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
+        # S# word 1: by default MIN_LOD 0, MAX_LOD 1.0 (unsigned 4.8), so the clamp below is [0, 1].
+        f"s_mov_b32 s16, 0\ns_mov_b32 s17, {word1:#x}\ns_mov_b32 s18, 0\ns_mov_b32 s19, 0\n"
         f"v_mov_b32 v10, 0.5\nv_mov_b32 v11, 0.5\nv_mov_b32 v12, {lod}\n"
         "image_gather4_l v[0:3], v[10:12], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D")
 
 
 def test_gather4_l_rounds_the_lod_tie_up(make_shader):
-    """The LOD is clamped to the S# bounds first, then biased by +0.5 and floored; the result is not rounded to
-    even (which would send a 0.5 tie to mip 0)."""
+    """The LOD is clamped to the S# bounds first, then floored, and its fraction compared with 0.5; the result is
+    not rounded to even (which would send a 0.5 tie to mip 0), and no +0.5 is added in binary32."""
     shader = make_shader(_gather_l_at_lod(0.5))
     text = shader.translate()
     shader.validate(text)
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
     clamp = re.search(r"(%\w+) = OpExtInst %float %glsl FClamp (%\w+) (%\w+) (%\w+)", text)
-    add = re.search(r"(%\w+) = OpFAdd %float (%\w+) %fhalf_g", text)
-    assert clamp and add, text
-    assert add.group(2) == clamp.group(1)              # the clamped LOD, not the raw one
-    assert re.search(rf"= OpExtInst %float %glsl Floor {add.group(1)}\b", text), text
+    assert clamp, text
+    assert _gather_rounded_lod(defs) == clamp.group(1)  # the clamped LOD, not the raw one
     assert "= OpExtInst %float %glsl RoundEven" not in text
+    assert not re.search(r"= OpFAdd %float %\w+ %fhalf_g", text), text
+
+
+def _f32(x):
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def _f32_bits(bits):
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _translated_gather_mip(text, lod, levels):
+    """Evaluate the translated mip choice (the level operand of OpImageQuerySizeLod) for a raw LOD, with every float
+    result rounded to binary32 as the GPU computes it. The raw LOD is the first operand of the literal S#'s FClamp;
+    QueryLevels gives levels."""
+    defs = dict(re.findall(r"^\s*(%\w+) = (.+)$", text, re.M))
+    raw, = re.findall(r"= OpExtInst %float %glsl FClamp (%\w+) %\w+ %\w+$", text, re.M)
+    env = {raw: _f32(lod), "%fhalf_g": 0.5}
+
+    def ev(name):
+        if name in env:
+            return env[name]
+        e = defs[name].split()
+        op, args = e[0], e[2:]
+        if op == "OpConstant":
+            v = float(args[0]) if e[1] == "%float" else int(args[0], 0)
+            return v - (1 << 32) if e[1] == "%int" and v >= 1 << 31 else v
+        if op == "OpBitcast":
+            v = ev(args[0])
+            if e[1] == "%float":
+                return _f32_bits(v & 0xFFFFFFFF)
+            return v if e[1] == "%int" else v & 0xFFFFFFFF
+        if op == "OpImageQueryLevels":
+            return levels
+        if op == "OpExtInst":
+            fn, a = args[1], [ev(x) for x in args[2:]]
+            out = {"Floor": lambda: float(math.floor(a[0])), "FClamp": lambda: min(max(a[0], a[1]), a[2]),
+                   "FMax": lambda: max(a), "FMin": lambda: min(a), "SMax": lambda: max(a), "SMin": lambda: min(a),
+                   "SClamp": lambda: min(max(a[0], a[1]), a[2])}[fn]()
+            return _f32(out) if isinstance(out, float) else out
+        a = [ev(x) for x in args]
+        return {"OpFAdd": lambda: _f32(a[0] + a[1]), "OpFSub": lambda: _f32(a[0] - a[1]),
+                "OpIAdd": lambda: a[0] + a[1], "OpISub": lambda: a[0] - a[1],
+                "OpConvertFToS": lambda: int(a[0]), "OpFOrdGreaterThanEqual": lambda: a[0] >= a[1],
+                "OpSelect": lambda: a[1] if a[0] else a[2]}[op]()
+
+    level, = re.findall(r"= OpImageQuerySizeLod %v2int %\w+ (%\w+)$", text, re.M)
+    return ev(level)
+
+
+@pytest.mark.parametrize("word1, lod, mip", [
+    (0x100000, _f32_bits(0x3effffff), 0),   # just below 0.5: Floor(lod + 0.5) rounded the sum to 1.0 and gave mip 1
+    (0x100000, 0.5, 1), (0x100000, _f32_bits(0x3f000001), 1), (0x100000, 0.25, 0), (0x100000, 0.75, 1),
+    (0x100000, -1.0, 0), (0x100000, 2.0, 1),                    # clamped to the S# bounds [0, 1] first
+    (0xfff000, _f32_bits(0x3fbfffff), 1), (0xfff000, 1.5, 2), (0xfff000, 2.5, 3),
+    (0xfff000, _f32_bits(0x401fffff), 2), (0xfff000, 9.0, 3),   # the last clamped to levels - 1
+])
+def test_gather4_l_mip_is_the_nearest_level_in_binary32(word1, lod, mip, make_shader):
+    shader = make_shader(_gather_l_at_lod(0, word1=word1))
+    text = shader.translate()
+    shader.validate(text)
+    assert _translated_gather_mip(text, lod, 4) == mip
+
+
+def test_gather4_l_binary32_sum_rounds_just_below_half_up():
+    # Negative control: the old Floor(lod + 0.5) in binary32 gives mip 1 for 0x3effffff (the sum is halfway between
+    # 1 - 2^-24 and 1.0 and rounds to even); computed exactly it is mip 0.
+    lod = _f32_bits(0x3effffff)
+    assert math.floor(_f32(lod + 0.5)) == 1
+    assert math.floor(lod) + (lod - math.floor(lod) >= 0.5) == 0
 
 
 def _gather_mip(lod, levels):
