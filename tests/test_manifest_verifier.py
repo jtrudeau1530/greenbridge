@@ -111,7 +111,7 @@ class TestManifestVerifier(unittest.TestCase):
         target = "/target"
         posix_os = Mock(sep="/", path=Mock(wraps=posixpath))
         posix_os.path.isdir.return_value = True
-        posix_os.path.isfile.side_effect = os.path.isfile
+        posix_os.stat.side_effect = os.stat
         posix_os.path.getsize.return_value = len(payload)
         posix_os.walk.return_value = [(target, [], [literal_name])]
         with (patch.object(mv, "os", posix_os),
@@ -296,6 +296,35 @@ class TestManifestVerifier(unittest.TestCase):
         missing_path = os.path.join(self.root, "non_existent.json")
         with self.assertRaises(mv.ManifestError):
             mv.load_manifest(missing_path)
+
+    def test_cli_distinguishes_manifest_path_errors(self) -> None:
+        stat_path = os.stat
+
+        def stat_with_denied_manifest(path, *args, **kwargs):
+            if path == self.manifest_path:
+                raise PermissionError("Simulated permission denied")
+            return stat_path(path, *args, **kwargs)
+
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags):
+                with (
+                    patch.object(mv.os, "stat", side_effect=stat_with_denied_manifest),
+                    patch("sys.stdout", new_callable=io.StringIO) as stdout,
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    rc = mv.main([self.game_dir, "--manifest", self.manifest_path, "--quiet", *flags])
+                self.assertEqual(rc, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("cannot read manifest", stderr.getvalue())
+                self.assertIn("Simulated permission denied", stderr.getvalue())
+
+    def test_cli_reports_non_regular_manifest_path(self) -> None:
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags):
+                res = self.run_cli(self.game_dir, "--manifest", self.root, "--quiet", *flags)
+                self.assertEqual(res.returncode, 2)
+                self.assertEqual(res.stdout, "")
+                self.assertIn("manifest path is not a regular file", res.stderr)
 
     def test_load_manifest_malformed_entries(self) -> None:
         invalid_entries = os.path.join(self.root, "invalid_entries.json")
