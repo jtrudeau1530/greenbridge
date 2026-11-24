@@ -30,6 +30,7 @@ needs bash (Git for Windows' on Windows) and skips without it, except on a GitHu
 """
 import ast
 import fnmatch
+import importlib.util
 import os
 import re
 import shutil
@@ -324,6 +325,34 @@ def stdlib_loop_jobs_with_spirv_tools(workflow):
             and re.search(r"apt-get\s+install[^\n]*\bspirv-tools\b", job)]
 
 
+def macos_split_problem(workflow):
+    """Keep complete macOS semantics independent from the ordered stdlib/dependency/pytest job."""
+    jobs = dict(re.findall(r"^  ([A-Za-z0-9_-]+):\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                           workflow, re.M | re.S))
+    semantic, python = jobs.get("macos-semantic-tests", ""), jobs.get("macos-python", "")
+    if not semantic or not python:
+        return "both macOS jobs must exist"
+    for job in (semantic, python):
+        for required in ("runs-on: macos-26", "timeout-minutes: 20", 'python-version: "3.12"',
+                         "python -m compileall -q make_game.py tools tests",
+                         "brew install spirv-tools", "spirv-as --version", "spirv-val --version",
+                         "needs: change-scope", "needs.change-scope.outputs.docs-only != 'true'"):
+            if required not in job:
+                return "macOS job is missing " + required
+    command = "run: python -I scripts/run_semantic_tests.py tests/semantic -v"
+    if semantic.count(command + "\n") != 1 or semantic.count("run_semantic_tests.py") != 1:
+        return "macOS semantics must run complete discovery once with visible module results"
+    if "unittest discover" in python or "run_semantic_tests.py" in python or "semantic.log" in python:
+        return "macOS Python job still duplicates or waits for semantics"
+    if "LEONIDA_REQUIRE_SPIRV_TOOLS: '1'" not in semantic:
+        return "macOS semantics must require its validation tools"
+    positions = [python.find(text) for text in ('python -I "$t"', "brew install llvm",
+                                                "pip install -r tests/requirements.txt", 'python -m pytest')]
+    if -1 in positions or positions != sorted(positions):
+        return "macOS stdlib must precede dependency installation and pytest"
+    return None
+
+
 def has_main_guard(source):
     """A real ``if __name__ == "__main__":`` block that runs something.
 
@@ -361,6 +390,34 @@ class RepositoryRegistrationTest(unittest.TestCase):
         # A glob that stops matching, or a git call that fails, must not turn the checks below into no-ops.
         self.assertGreaterEqual(len(self.files), 300, f"only {len(self.files)} test files found: {self.files[:5]}")
         self.assertTrue(any(f.startswith("tests/semantic/") for f in self.files))
+
+    def test_macos_jobs_preserve_complete_semantics_and_dependency_order(self):
+        workflow = read(ROOT, WORKFLOW)
+        self.assertIsNone(macos_split_problem(workflow))
+        spec = importlib.util.spec_from_file_location("semantic_runner", os.path.join(ROOT, "scripts",
+                                                                                     "run_semantic_tests.py"))
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        actual = runner.test_modules(os.path.join(ROOT, "tests", "semantic"))
+        expected = [f.removeprefix("tests/semantic/").removesuffix(".py").replace("/", ".")
+                    for f in self.files if job_of(ROOT, f, self.rules) == "semantic"]
+        self.assertTrue(expected)
+        self.assertCountEqual(actual, expected)
+        self.assertEqual(len(actual), len(set(actual)))
+
+    def test_macos_split_contract_rejects_missing_partial_or_recoupled_coverage(self):
+        workflow = read(ROOT, WORKFLOW)
+        variants = [("missing job", workflow.replace("  macos-semantic-tests:\n", "  renamed-macos-semantic:\n", 1)),
+                    ("raised budget", workflow.replace("timeout-minutes: 20", "timeout-minutes: 21", 1)),
+                    ("partial suite", workflow.replace("run_semantic_tests.py tests/semantic -v",
+                                                       "run_semantic_tests.py tests/semantic -p test_mutations.py -v")),
+                    ("recoupled", workflow.replace("  macos-python:\n", "  macos-python:\n    # semantic.log\n", 1)),
+                    ("missing LLVM", workflow.replace("brew install llvm", "brew install other-tool", 1)),
+                    ("optional tools", workflow.replace("LEONIDA_REQUIRE_SPIRV_TOOLS: '1'",
+                                                        "LEONIDA_REQUIRE_SPIRV_TOOLS: '0'"))]
+        for label, changed in variants:
+            with self.subTest(change=label):
+                self.assertIsNotNone(macos_split_problem(changed))
 
     def test_the_scan_falls_back_when_git_is_missing(self):
         with mock.patch("subprocess.run", side_effect=FileNotFoundError("git")):

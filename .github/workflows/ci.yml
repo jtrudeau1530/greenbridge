@@ -249,9 +249,39 @@ jobs:
           LEONIDA_REQUIRE_SPIRV_TOOLS: '1'
         run: python -I scripts/run_semantic_tests.py tests/semantic -v
 
-  # The Python suites on an Apple Silicon Mac: the standard-library loop of the check job, the translator semantic
-  # tests and the pytest files of the translator-tests job, with Homebrew's llvm-mc and SPIRV-Tools. macos-26, not
-  # macos-15: the Homebrew bottles cover Sequoia and later, but the runtime needs Xcode 26's libc++ (runtime.yml).
+  # The combined stdlib/semantic stage exhausted the job's budget before LLVM setup and pytest.
+  # Give semantics its own Apple Silicon runner; both jobs keep their twenty-minute limit.
+  macos-semantic-tests:
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: tests/requirements.txt
+      - name: Python tools compile
+        run: python -m compileall -q make_game.py tools tests
+      - name: Install semantic validation tools
+        run: |
+          brew install spirv-tools
+          spirv-as --version
+          spirv-val --version
+      - name: Translator semantic tests
+        env:
+          LEONIDA_REQUIRE_SPIRV_TOOLS: '1'
+        # The existing runner preserves complete unittest discovery and prints each module as it finishes.
+        run: python -I scripts/run_semantic_tests.py tests/semantic -v
+
+  # The remaining Python suites keep stdlib tests before LLVM and Python packages are installed, then pytest.
   macos-python:
     needs: change-scope
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
@@ -278,13 +308,10 @@ jobs:
           brew install spirv-tools
           spirv-as --version
           spirv-val --version
-      # Before Python packages are installed, as in the check job, so these files stay standard library only. The semantic
-      # suite runs alongside the loop, on another of the runner's three cores; together they take about 6 minutes.
-      - name: Translator semantic tests and tests (standard library only, no game data)
+      # Before Python packages are installed, as in the check job, so these files stay standard library only.
+      - name: Tests (standard library only, no game data)
         shell: bash
         run: |
-          python -m unittest discover -s tests/semantic > "$RUNNER_TEMP/semantic.log" 2>&1 &
-          semantic=$!
           while IFS= read -r t; do
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               continue
@@ -292,11 +319,6 @@ jobs:
             echo "== $t"
             python -I "$t" || exit 1
           done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)
-          status=0
-          wait "$semantic" || status=$?
-          echo "== tests/semantic"
-          cat "$RUNNER_TEMP/semantic.log"
-          exit "$status"
       - name: Install llvm-mc and Python test dependencies
         run: |
           brew install llvm
