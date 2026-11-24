@@ -1,0 +1,49 @@
+name: VIctory
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "runtimes/victory"
+      - ".gitmodules"
+      - ".github/workflows/victory.yml"
+  pull_request:
+    paths:
+      - "runtimes/victory"
+      - ".gitmodules"
+      - ".github/workflows/victory.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: victory-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: runtimes/victory
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out the pinned runtime
+        working-directory: .
+        run: git submodule update --init --depth 1 -- runtimes/victory
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target x86_64-pc-windows-msvc
+      - name: Clippy
+        run: cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        run: cargo +1.98.1 clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo +1.98.1 test --workspace --locked

@@ -1,12 +1,61 @@
 # Greenbridge
 
-An experimental Xbox Series compatibility runtime and shader translation project.
+An experimental Xbox Series compatibility project, now using the upstream
+[VIctory runtime](https://github.com/Marvisak/VIctory) as its primary runtime path.
+The earlier Vulkan engine, shader translator and recovery material remain available below.
 
-[Status](#project-status) · [Build](#how-to-build) · [Recovered test results](gpu-test-results/2026-11-23-rx7900xt/README.md) · [Source recovery](recovery/README.md) · [Credits](#credits) · [License](#license)
+[Status](#project-status) · [VIctory runtime](#victory-runtime) · [Reference engine](#reference-engine) · [Recovered test results](gpu-test-results/2026-11-23-rx7900xt/README.md) · [Source recovery](recovery/README.md) · [Credits](#credits) · [License](#license)
 
 Original source authorship and licenses are retained. Greenbridge is an independent continuation; the original maintainers are not represented as its operators.
 
-Greenbridge is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
+## Project status
+
+**The VIctory integration is being built and tested; no gameplay has been verified here.**
+The [pinned upstream README](https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md)
+reports working menus and entry into the world on Windows 11 with an AMD RX 6700 XT.
+Upstream still describes it as **not playable**: world rendering is incomplete and slow,
+and entering the world can hang a real GPU and cause a display-driver reset.
+These are upstream observations, not Greenbridge test results.
+
+## VIctory runtime
+
+`runtimes/victory` is a git submodule of the official
+[Marvisak/VIctory repository](https://github.com/Marvisak/VIctory), pinned to
+[`ffe310eb2098e52169f4c44db5ffdabf43a72622`](https://github.com/Marvisak/VIctory/commit/ffe310eb2098e52169f4c44db5ffdabf43a72622).
+It runs the title's x86-64 code with a Rust runtime and host Direct3D 12, translating
+console shaders to DXIL. It is separate from the Vulkan reference engine below.
+
+For a local Windows build, install the Rust toolchain manager and the Visual Studio C++
+build tools, then run:
+
+```powershell
+git clone https://github.com/jtrudeau1530/greenbridge.git
+cd greenbridge
+git submodule update --init -- runtimes/victory
+cd runtimes/victory
+rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target x86_64-pc-windows-msvc
+cargo +1.98.1 test --workspace --locked
+cargo +1.98.1 build --release --locked -p victory
+```
+
+Building and the default tests require no game files. Running requires your own readable
+copy, Windows 10/11 x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6
+(plus mesh shaders for the world). Follow the pinned upstream README for configuration
+and runtime options; keep game files, caches and saves outside the repository.
+The dedicated [VIctory CI workflow](.github/workflows/victory.yml) checks both default
+and all-feature Clippy builds and runs the locked workspace tests on Windows with Rust 1.98.1.
+It does not publish build artifacts or releases.
+
+**Dependency provenance:** the gitlink retains upstream authorship and keeps upstream
+source and history separate from Greenbridge. VIctory uses GPL-3.0-or-later, but its
+[asset policy](https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/docs/asset-policy.md)
+explicitly excludes `crates/victory-formats/src/bcpack-tables.bin` from that license.
+Initializing the submodule downloads that upstream file. Greenbridge does not copy it
+or its history into this repository and does not distribute binaries containing it.
+
+## Reference engine
+
+The preserved engine is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
 and run natively, and the console's system software is reimplemented. The console's precompiled RDNA2 GPU programs
 are translated to SPIR-V for Vulkan. The game's models, textures and audio are read from your package. All of this
 happens **on your PC, from your own copy of the game**.
@@ -19,11 +68,11 @@ happens **on your PC, from your own copy of the game**.
 
 Historical upstream links and source identities are recorded in [the recovery index](recovery/README.md). Their current availability is not guaranteed.
 
-## Project status
+### Reference engine status
 
 **Experimental; no playable state or non-black game image has been verified here.** Saved Linux/Wine experiments reached repeated submissions and presents, including bounded two-minute runs without an observed exception. Sampled normal images remained black. See the [recovered validation record](docs/validation-recovery.md), including failed experiments and corrections.
 
-The table below is the inherited upstream feature summary, not a fresh test of this default branch. `main` retains the last saved GitHub source; forge-based and diagnostic snapshots are archived separately.
+The table below is the inherited upstream feature summary, not a fresh test of this default branch. The reference engine retains the last saved GitHub source; forge-based and diagnostic snapshots are archived separately.
 
 | What | Status |
 |---|---|
@@ -47,9 +96,9 @@ and the `D3D-` items), run `python -I tools/progress_dashboard.py --out <folder 
 `progress.html` ([notes](docs/progress_dashboard.md)).
 
 
-## Platforms
+### Platforms
 
-Nothing is playable on any platform yet (see *Project status*). What runs where today:
+The reference engine has no verified playable state on any platform (see *Reference engine status*). What runs where today:
 
 | Platform | Today |
 |---|---|
@@ -60,7 +109,7 @@ Nothing is playable on any platform yet (see *Project status*). What runs where 
 
 GPU results from every platform are collected in #166; how to run the tests is in [docs/testing.md](docs/testing.md).
 
-## How to build
+### How to build
 
 The port isn't downloaded ready-made. It's built on your PC from your own copy.
 
@@ -177,7 +226,7 @@ per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.
 
-### Vulkan diagnostics on Linux
+#### Vulkan diagnostics on Linux
 
 With CMake 3.24+, a C++20 compiler, and Vulkan development headers and loader installed:
 
@@ -192,7 +241,7 @@ Pass the directory containing `index.json` and the translated SPIR-V files to `v
 `make_game.py` runs on Linux too. The `pipelines` stage uses the `vk_pipeline_check` built above
 (`runtime/build/linux`, or `runtime/build`), and builds it there itself before any other work if it is missing.
 
-### Running the loader on Linux
+#### Running the loader on Linux
 
 The loader is a Windows program and runs under Wine or Proton; CI runs its tests under Wine on every push to
 `main` that changes `runtime/`, and on demand from the Actions tab (the `wine` job of the Runtime workflow). On Linux the `runtime` stage cross-builds it into
@@ -219,7 +268,7 @@ These commands use the package in `game_path.txt`, the port's `overlay` for writ
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
 in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.
 
-## How it works
+### How it works
 
 | Piece | What it does | Where |
 |---|---|---|
@@ -237,7 +286,7 @@ and validation notes are indexed in [docs/README.md](docs/README.md). The Xbox D
 [docs/audio.md](docs/audio.md); [docs/related_projects.md](docs/related_projects.md) records the prior art we may
 read and the licence limits on it.
 
-## Want to help?
+### Want to help?
 
 The biggest open pieces:
 
@@ -255,6 +304,8 @@ pull requests.
 
 Greenbridge preserves the work of the original source authors and contributors. Available commit authorship is retained; [the recovery index](recovery/README.md) records original and exported source identities. The additional validation archive documents local experiments and does not claim ownership of upstream fixes.
 
+- [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and its contributors: the primary runtime
+  (pinned git submodule; see the dependency provenance and license limitation above).
 - [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) by breadbbbb: the RPF9 model, texture-pool and AWC
   decoders used by `tools/rpf9dump` (git submodule).
 - [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (MIT): GFX10 resource-descriptor layout (`tools/gfx10_formats.json`),
