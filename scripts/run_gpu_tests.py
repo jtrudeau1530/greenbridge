@@ -1567,17 +1567,18 @@ def run_suite(a, work: str) -> int:
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
+            # Both multi-wave fixtures require exact wave64; ms_tri has no such restriction.
+            require64 = name != "ms_tri" and not w64_emulated()
+            if require64:
+                env["VKH_SUBGROUP_SIZE"] = "64"
+                env["VKH_REQUIRE_MESH_SUBGROUP_SIZE"] = "1"
             rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs_passthru, raw], env=env)
-            # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
-            # the wave64 compute dumps are.
-            no64 = (name == "ms_w64x_ballot" and not w64_emulated() and
-                    not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))
             elif rc != 0:
                 results.append((name, False, msg))
-            elif no64:
-                results.append((name, None, "SKIP (no 64-wide subgroup on this device)"))
+            elif require64 and "mesh subgroup size: 64" not in msg.splitlines():
+                results.append((name, False, "mesh harness did not confirm a 64-wide producer"))
             else:
                 ok, detail = check_grad(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
