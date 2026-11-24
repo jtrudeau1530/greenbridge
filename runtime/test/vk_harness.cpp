@@ -672,6 +672,19 @@ int main(int argc, char** argv) {
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
     reqSg.requiredSubgroupSize = req_sg;
+    // Strict mesh fixtures must run at the requested wave size, including when lowered to compute.
+    // A device-wide maximum alone does not guarantee that the tested stage supports size control.
+    if (req_sg > 0 && (mesh || mesh_compute)) {
+        const VkShaderStageFlagBits producer = mesh_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_MESH_BIT_EXT;
+        const bool fixed = sgProps.minSubgroupSize == req_sg && sgProps.maxSubgroupSize == req_sg;
+        const bool selectable = f13q.subgroupSizeControl && req_sg >= sgProps.minSubgroupSize &&
+                                req_sg <= sgProps.maxSubgroupSize && (sgProps.requiredSubgroupSizeStages & producer);
+        if (!fixed && !selectable && std::getenv("VKH_REQUIRE_MESH_SUBGROUP_SIZE")) {
+            std::fprintf(stderr, "unsupported: mesh producer cannot run subgroup size %u\n", req_sg);
+            return 77;
+        }
+        if (fixed || selectable) std::fprintf(stderr, "mesh subgroup size: %u\n", req_sg);
+    }
     if (req_sg > 0 && f13q.subgroupSizeControl &&
         req_sg >= sgProps.minSubgroupSize && req_sg <= sgProps.maxSubgroupSize) {
         // VKH_GS_HELPER=1: the geometry shader only feeds the pixel shader under test (the --bary-fallback
