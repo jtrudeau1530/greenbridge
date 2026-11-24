@@ -164,8 +164,7 @@ da instalação. No Windows, `--runtime-build` também permite reutilizar um bui
 2. Rode os testes relevantes com entradas sintéticas. Por exemplo, para testar o verificador de manifestos,
    execute `python -I tests/test_manifest_verifier.py` na raiz do repositório.
 3. No PR, inclua o ID da tarefa, descreva o que testou e informe a GPU e o driver se rodou testes de GPU.
-   Confira as regras em [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). Se usou assistência de IA, indique
-   isso no PR, conforme [`AGENTS.md`](../../../AGENTS.md).
+   Confira as regras em [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 O [guia de testes em GPU](../../testing.md) mostra como executar os testes sem arquivos do jogo.
 Publique os resultados de GPU na [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).

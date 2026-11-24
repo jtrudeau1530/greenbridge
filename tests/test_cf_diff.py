@@ -114,6 +114,16 @@ def test_small_fixed_seed_run_is_clean(wave, structured):
     assert counts["pass"] == 6, counts
 
 
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("structured", (True, False))
+@pytest.mark.parametrize("value", (0, 1))
+def test_scalar_not_equal_branch_matches_reference(wave, structured, value):
+    body = [("op", f"s_mov_b32 s10, {value}"),
+            ("sif", ("ne", 10, 0), True, [("probe", 11)], [("probe", 12)])]
+    status, detail = cf_diff.run_case("ps_scalar_not_equal", body, wave, structured)
+    assert status == "match", detail
+
+
 @pytest.mark.parametrize("case", sorted(SCC_MASK_CASES))
 @pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
 def test_scc_of_wave32_mask_ops_is_wave_wide(case, structured):

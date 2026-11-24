@@ -224,6 +224,9 @@ def parse_line(line):
         # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
+    if op == "exp" and args and args[0].get("t") == "null":
+        # An export's null destination is a target, not the scalar null register.
+        args[0] = {"k": "target", "t": "null"}
     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
                       "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_ldexp_f64", "v_trunc_f64",
                       "v_ceil_f64", "v_rndne_f64", "v_floor_f64")):

@@ -174,8 +174,7 @@ está em [`docs/d3d12_vulkan.md`](../../d3d12_vulkan.md), os formatos de áudio 
 2. Execute os testes relevantes com entradas sintéticas. Por exemplo, na raiz do repositório:
    `python -I tests/test_manifest_verifier.py`.
 3. No PR, indique o ID da tarefa, o que testou e a GPU/controlador se executou testes GPU. Siga as regras em
-   [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e indique o uso de IA conforme
-   [`AGENTS.md`](../../../AGENTS.md).
+   [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 O [guia de testes GPU](../../testing.md) explica como executar os testes sem ficheiros do jogo. Publique os
 resultados na [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).

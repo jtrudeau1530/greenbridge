@@ -980,11 +980,14 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             elif fn == "SRC2":
                 args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
         if op_sel:
-            # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
-            nbits = nsrc if opc < 0x100 else (nsrc + 1)
-            bits = [(op_sel >> i) & 1 for i in range(nsrc)]
-            if nbits > nsrc:
-                bits.append((op_sel >> 3) & 1)
+            if name in ("v_permlane16_b32", "v_permlanex16_b32"):
+                # These instructions use the low two bits as [FI, BOUND_CTRL], not source/destination halves.
+                bits = [op_sel & 1, (op_sel >> 1) & 1]
+            else:
+                # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
+                bits = [(op_sel >> i) & 1 for i in range(nsrc)]
+                if opc >= 0x100:
+                    bits.append((op_sel >> 3) & 1)
             mods.append(f"op_sel:[{','.join(str(b) for b in bits)}]")
         if clamp:
             mods.append("clamp")

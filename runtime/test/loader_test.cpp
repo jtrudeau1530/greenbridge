@@ -1409,6 +1409,16 @@ void test_compat_modules() {
             std::filesystem::create_directories(bad);
             write_image_as(std::vector<uint8_t>(64, 0x5A), "compat_bad/testcompat.dll");
             try {
+                // The intentionally bad image must report an error, not open a
+                // native Windows error dialog that waits for user input in CI.
+                struct ErrorMode {
+                    DWORD previous;
+                    ErrorMode() {
+                        if (!SetThreadErrorMode(GetThreadErrorMode() | SEM_FAILCRITICALERRORS, &previous))
+                            throw std::runtime_error("could not disable the bad-image error dialog");
+                    }
+                    ~ErrorMode() { SetThreadErrorMode(previous, nullptr); }
+                } error_mode;
                 bind_with_compat(bad, "testcompat.dll", "Answer", bound);
                 failed(what, "the load succeeded");
             } catch (const std::exception& e) {
@@ -1427,6 +1437,9 @@ void test_compat_modules() {
 }  // namespace
 
 int main() {
+    // Keep completed assertions visible if the process stalls and CTest terminates it.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::puts("loader_test: checking synthetic image access");
     g_dir = work_dir();
     std::error_code ec;
     std::filesystem::remove_all(g_dir, ec);

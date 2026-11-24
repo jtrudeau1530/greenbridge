@@ -1610,10 +1610,10 @@ class Gen:
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
         if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
-            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
+            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, self.lane_bit_mask(val))
             return
         if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
-            self.set_exec(val)
+            self.set_exec(self.lane_bit_mask(val) if a["t"] == "exec_lo" else val)
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
             # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR
@@ -5870,6 +5870,16 @@ class Gen:
             self.emit(f"{r} = OpCopyObject %uint {self.wave_lane()}")
         else:
             self.emit(f"{r} = OpLoad %uint %sg_lane")
+
+    def lane_bit_mask(self, word):
+        """Bit lane&31 of a computed 32-bit word as this lane's all-ones/zero mask. Already-expanded lane
+        masks remain unchanged: every bit of 0 or 0xFFFFFFFF is that lane's bit, so bitwise mask writes are safe."""
+        sh, shr, bit, r = (self.tmp() for _ in range(4))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+        self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        return r
 
     def exec_half_write(self, half, val, const=None):
         """Write one 32-bit half of EXEC. In the per-lane model a lane is active iff its bit is set. A constant
