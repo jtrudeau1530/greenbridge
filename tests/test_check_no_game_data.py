@@ -288,7 +288,10 @@ class CheckNoGameData(unittest.TestCase):
         # the other files are still scanned; a real match wins over the unreadable one
         rc, out, err = self.run_with_unreadable(locked, [locked, sibling, clean])
         self.assertEqual(rc, 1, out + err)
-        self.assertEqual(out.splitlines(), [f"{os.path.relpath(sibling)}: DDS texture"], out)
+        # The CLI reports an absolute path when Windows cannot make it relative across drives.
+        same_drive = os.path.splitdrive(sibling)[0].lower() == os.path.splitdrive(os.getcwd())[0].lower()
+        shown = os.path.relpath(sibling) if same_drive else sibling
+        self.assertEqual(out.splitlines(), [f"{shown}: DDS texture"], out)
         self.assertIn("cannot read", err)
         self.assertIn("1 file(s) start like game data", err)
         self.assertNotIn("Traceback", err)
