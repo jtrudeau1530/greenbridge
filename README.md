@@ -38,6 +38,15 @@ does not include these changes.
 | Scalar loads from root buffer views | adamfx | [`417f4e3`](https://github.com/adamdotpy/VIctory/commit/417f4e30d22f8ffc1801d60e1b480bbc29781594) |
 | Serialized descriptor refresh and bounded root SRVs | slaktarn, hophaver, Hiiva; regression by swarm | [Adapted source commits](runtimes/victory-patches/amd-world-guards.patch) |
 | Test allocation and write-journal isolation | Jason Trudeau | [Synthetic fixture fix](runtimes/victory-patches/watch-fixture-retirement.patch) |
+| Declared structured SRV scalar loads and counts | Jeremy Goldberg; fixture by Jason Trudeau | [`78c8078`](https://github.com/jeremygold02/VIctory/commit/78c8078a859f66d6a823b2ab8bc52e36e04c2bf3) |
+
+The [structured-buffer patch](runtimes/victory-patches/78c8078-structured-srv-loads.patch)
+retains the upstream declaration checks and adds a synthetic fixture using the public
+[#984 instruction layout](https://github.com/Marvisak/VIctory/pull/984).
+Its count regression failed before the change and passed afterward; twelve synthetic
+dispatches checked structured record boundaries, count guards and raw-buffer controls
+on an RX 7900 XT with native DXIL validation ([results](https://github.com/Marvisak/VIctory/pull/995#issuecomment-7138017095)).
+These checks do not establish correct world rendering.
 
 For a local Windows build, install the Rust toolchain manager and the Visual Studio C++
 build tools, then run:
@@ -51,7 +60,8 @@ $patches = @(
   '../victory-patches/61474f6-region-copy.patch',
   '../victory-patches/417f4e3-root-view-loads.patch',
   '../victory-patches/amd-world-guards.patch',
-  '../victory-patches/watch-fixture-retirement.patch'
+  '../victory-patches/watch-fixture-retirement.patch',
+  '../victory-patches/78c8078-structured-srv-loads.patch'
 )
 foreach ($patch in $patches) {
   git apply --check --index $patch
@@ -75,6 +85,18 @@ The dedicated [VIctory CI workflow](.github/workflows/victory.yml) checks both d
 and all-feature Clippy builds and runs the locked workspace tests on the patched source
 on Windows with Rust 1.98.1.
 It does not publish build artifacts or releases.
+
+The structured-buffer hardware proof is ignored by default because it requires a physical
+SM 6.6 GPU and a native DXIL validator. The default tests retain its declaration and raw-count
+guards, and CI compiles the hardware fixture. To run the proof on supported hardware, make
+the native validator available through the Windows SDK or `VICTORY_DXIL`, then run:
+
+```powershell
+cargo +1.98.1 test --locked -p victory-shader --features host,diagnostics --lib emit::structured_buffer_tests::scalar_structured_boundaries_counts_and_raw_control_read_back -- --ignored --exact --nocapture --test-threads=1
+```
+
+This explicit test requires successful validation, physical GPU execution and exact readbacks;
+missing hardware or a validator fails the test.
 
 **Dependency provenance:** the gitlink retains upstream authorship and keeps upstream
 source and history separate from Greenbridge. VIctory uses GPL-3.0-or-later, but its

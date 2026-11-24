@@ -1,0 +1,1027 @@
+Upstream: https://github.com/Marvisak/VIctory/pull/995
+Commit: 78c8078a859f66d6a823b2ab8bc52e36e04c2bf3
+Original author: Jeremy Goldberg (jeremygold02)
+Original base: ffe310eb2098e52169f4c44db5ffdabf43a72622
+Local adaptation and synthetic fixture: Jason Trudeau
+Fixture instruction layout: https://github.com/Marvisak/VIctory/pull/984 (CitizenCinema)
+
+Preserves the upstream declared-structured-SRV implementation and guards.
+Adds psv_bindings: None to the earlier root-view fixture for compatibility.
+The synthetic fixture checks structured record boundaries, count guards and
+raw views with matching native stride. Only its physical-GPU/DXIL readback
+is ignored by default; its no-skip checks and verified function body remain
+intact. Run it explicitly with --ignored --exact on supported hardware.
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 63cda03..2821013 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -51,6 +51,7 @@ pub(crate) struct Parts<'a> {
+     pub st: &'a Structured,
+     pub io: &'a Io,
+     pub res: &'a Resources,
++    pub(super) psv_bindings: Option<super::PsvBindings<'a>>,
+     pub inputs: Vec<SigElement>,
+     pub outputs: Vec<SigElement>,
+     pub prims: Vec<SigElement>,
+@@ -66,8 +67,10 @@ enum Stop {
+
+ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+     let mut bad = HashMap::new();
++    let scalar = parts.res.scalar.iter().copied().collect();
++    let scalar_srv_uses = ScalarSrvUses::collect(parts, &scalar);
+     loop {
+-        match Lower::new(parts, &bad).run() {
++        match Lower::new(parts, &bad, &scalar, &scalar_srv_uses).run() {
+             Ok(l) => return Ok(l),
+             Err(Stop::Retry(v, why)) => {
+                 if bad.insert(v, why).is_some() {
+@@ -170,7 +173,8 @@ struct Lower<'a> {
+     user_reads: BTreeMap<u32, UserData>,
+     samplers: Vec<[u32; 4]>,
+     descriptors: HashMap<(Site, bool), &'a Source>,
+-    scalar: HashMap<Site, Address>,
++    scalar: &'a HashMap<Site, Address>,
++    scalar_srv_uses: &'a ScalarSrvUses,
+     exports: HashMap<Site, &'a Export>,
+     interps: HashMap<Site, &'a Interp>,
+     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+@@ -342,8 +346,106 @@ fn unsupported(offset: usize, what: Why) -> Stop {
+     Stop::Fail(ShaderError::Unsupported { offset, what })
+ }
+
++/// A statically addressed resource-table slot: root slot, user-data dword and table dword.
++type TableSlot = (u8, u8, u32);
++
++fn table_slot(parts: &Parts, scalar: &HashMap<Site, Address>, src: &Source) -> Option<TableSlot> {
++    let Source::Loaded { load, first } = src else {
++        return None;
++    };
++    let a = scalar.get(load)?;
++    let rp = parts.native.layout.get(a.param)?;
++    let byte = a.offset.checked_add(4 * u32::from(*first))?;
++    (a.dynamic.is_none() && rp.root == RootType::Table && byte.is_multiple_of(32)).then_some((
++        rp.slot,
++        rp.user_data,
++        byte / 4,
++    ))
++}
++
++#[derive(Default)]
++struct ScalarSrvUses {
++    other_consumers: HashSet<TableSlot>,
++    data_reads: HashSet<Value>,
++}
++
++fn record_count_word(inst: &Inst, first: u8) -> Option<Value> {
++    let Fields::Smem {
++        data: Some(Operand::Scalar { code, .. }),
++        ..
++    } = inst.fields
++    else {
++        return None;
++    };
++    inst.write(Reg::S(code.checked_add(first)?.checked_add(2)?))
++}
++
++impl ScalarSrvUses {
++    fn collect(x: &Parts, scalar: &HashMap<Site, Address>) -> Self {
++        let mut uses = Self::default();
++        if x.psv_bindings.is_none() {
++            return uses;
++        }
++        let mut counts = HashSet::new();
++        for d in &x.res.descriptors {
++            let inst = &x.p.blocks[d.site.0].insts[d.site.1];
++            if d.role == Role::Resource
++                && let Source::Loaded { load, first } = d.source
++                && inst.name().starts_with("s_buffer_load_dword")
++            {
++                if let Some(v) = record_count_word(&x.p.blocks[load.0].insts[load.1], first) {
++                    counts.insert(v);
++                }
++                continue;
++            }
++            // Keep mixed consumers and phi-selected descriptors on their existing path.
++            for leaf in d.source.leaves() {
++                if let Some(slot) = table_slot(x, scalar, leaf) {
++                    uses.other_consumers.insert(slot);
++                }
++            }
++        }
++        if counts.is_empty() {
++            return uses;
++        }
++        let mut read = |v: Value| {
++            if counts.contains(&v) {
++                uses.data_reads.insert(v);
++            }
++        };
++        for block in &x.p.blocks {
++            for phi in &block.phis {
++                phi.args.iter().copied().for_each(&mut read);
++            }
++            for inst in &block.insts {
++                // Resource operands consume the handle. Their scalar byte offset is data.
++                let offset = match &inst.fields {
++                    Fields::Smem { soffset, .. } if inst.name().starts_with("s_buffer_") => soffset,
++                    Fields::Buffer { soffset, .. } => soffset,
++                    Fields::Image { .. } => continue,
++                    _ => {
++                        inst.reads.iter().for_each(|&(_, v)| read(v));
++                        continue;
++                    }
++                };
++                if let Operand::Scalar { code, .. } = offset
++                    && let Some(v) = inst.read(Reg::S(*code))
++                {
++                    read(v);
++                }
++            }
++        }
++        uses
++    }
++}
++
+ impl<'a> Lower<'a> {
+-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
++    fn new(
++        x: &'a Parts<'a>,
++        bad: &'a HashMap<Value, Why>,
++        scalar: &'a HashMap<Site, Address>,
++        scalar_srv_uses: &'a ScalarSrvUses,
++    ) -> Self {
+         let p = x.p;
+         let mut phi_at = HashMap::new();
+         for (b, block) in p.blocks.iter().enumerate() {
+@@ -475,7 +577,8 @@ impl<'a> Lower<'a> {
+                 .iter()
+                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
+                 .collect(),
+-            scalar: x.res.scalar.iter().copied().collect(),
++            scalar,
++            scalar_srv_uses,
+             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
+             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+             handles: HashMap::new(),
+@@ -2862,19 +2965,32 @@ impl<'a> Lower<'a> {
+             return Ok(());
+         }
+         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+-            let h = self.handle(site, src, false, (11, 0))?;
++            let stride = self.scalar_structured_stride(src);
++            let props = stride.map_or((11, 0), |bytes| (12, bytes));
++            let h = self.handle(site, src, false, props)?;
+             for k in 0..count {
+                 let off = self.s.m.i32(4 * k);
+                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                 let mask = self.s.m.i8(1);
+-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
++                // A wide load may cross a record boundary. Split each dword's byte address.
++                let (index, within) = match stride {
++                    Some(bytes) => {
++                        let s = self.s.m.i32(bytes);
++                        (
++                            self.s.m.bin(c, Bin::UDiv, a, s),
++                            self.s.m.bin(c, Bin::URem, a, s),
++                        )
++                    }
++                    None => (a, self.s.m.undef(self.s.t.i32)),
++                };
++                let al = self.s.m.i32(4);
+                 let r = self.s.op(
+                     c,
+                     "rawBufferLoad.f32",
+                     Attr::ReadOnly,
+                     self.s.t.res_ret,
+                     139,
+-                    &[h, a, u, mask, al],
++                    &[h, index, within, mask, al],
+                 );
+                 let x = self.s.m.extract(c, r, 0);
+                 let x = self.as_int(x);
+@@ -3006,6 +3122,18 @@ impl<'a> Lower<'a> {
+                 }
+                 (props, None)
+             }
++            Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
++                let count_word = record_count_word(inst, first);
++                if !count_word.is_some_and(|v| self.scalar_srv_uses.data_reads.contains(&v)) {
++                    return Err("a scalar memory read as data");
++                }
++                let stride = self
++                    .descriptors
++                    .get(&(at, false))
++                    .and_then(|source| self.scalar_structured_stride(source))
++                    .ok_or("a scalar memory read as data")?;
++                ((12, stride), None)
++            }
+             _ => return Err("a scalar memory read as data"),
+         };
+         let h = self.handle(site, &src, false, props)?;
+@@ -3347,6 +3475,29 @@ impl<'a> Lower<'a> {
+         }
+     }
+
++    /// Scalar loads carry only a byte offset. Trust a structured stride only for the
++    /// exact table slot whose original shader declares a single structured SRV.
++    fn scalar_structured_stride(&self, src: &Source) -> Option<u32> {
++        let psv = self.x.psv_bindings.as_ref()?;
++        let slot = table_slot(self.x, self.scalar, src)?;
++        if self.scalar_srv_uses.other_consumers.contains(&slot) {
++            return None;
++        }
++        let (root_slot, user_data, offset) = slot;
++        let mut entries = self.x.native.used.iter().filter(|u| {
++            u.root == RootType::Table && u.user_data == user_data && u.table_offset_dwords == offset
++        });
++        let u = entries.next()?;
++        (entries.next().is_none()
++            && u.slot == root_slot
++            && u.kind == ResourceType::Srv
++            && u.dwords == 4
++            && (4..=2048).contains(&u.stride)
++            && u.stride.is_multiple_of(4)
++            && psv.singleton_structured_srv(u.lower_bound))
++        .then_some(u.stride)
++    }
++
+     /// The used-resource entry a descriptor loaded from a table falls in.
+     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
+         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
+@@ -7069,6 +7220,7 @@ mod tests {
+             st: &st,
+             io: &io,
+             res: &res,
++            psv_bindings: None,
+             inputs: vec![],
+             outputs: vec![],
+             prims: vec![],
+@@ -7119,6 +7271,7 @@ mod tests {
+             st: &st,
+             io: &io,
+             res: &res,
++            psv_bindings: None,
+             inputs: vec![],
+             outputs: vec![],
+             prims: vec![],
+@@ -7222,6 +7375,7 @@ mod tests {
+             st: &st,
+             io: &io,
+             res: &res,
++            psv_bindings: None,
+             inputs: vec![],
+             outputs: vec![],
+             prims: vec![],
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index f903113..3b8a5e5 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -43,7 +43,9 @@
+ //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
+ //!   typed-format loads without an index; structured with the used-resource
+ //!   entry's stride when indexed; typed with four 32-bit float channels for
+-//!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
++//!   `buffer_load_format_*` and `buffer_store_format_*`. Scalar buffer loads
++//!   also use a structured view when the original PSV0 declares a unique,
++//!   single-register structured SRV at the exact table binding. The host's view at
+ //!   that index must be of that kind and start at the console descriptor's
+ //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
+ //!   title's view description says. Typed-format loads from heap
+@@ -77,6 +79,9 @@
+
+ mod bitcode;
+ mod container;
++#[cfg(test)]
++pub(crate) use container::{Binding as TestBinding, Psv as TestPsv, psv as test_psv};
++
+ #[cfg(all(test, windows))]
+ mod diff_tests;
+ #[cfg(all(windows, any(test, feature = "host")))]
+@@ -92,6 +97,8 @@ mod valu_tests;
+ mod waterfall_tests;
+ #[cfg(all(test, windows))]
+ mod root_view_tests;
++#[cfg(all(test, windows))]
++mod structured_buffer_tests;
+ mod wave;
+
+ use crate::dxbc::{Container, FourCC};
+@@ -286,6 +293,9 @@ pub fn emit(
+         st,
+         io,
+         res,
++        psv_bindings: c
++            .part(FourCC::PSV0)
++            .and_then(|p| PsvBindings::parse(p.data)),
+         inputs,
+         outputs,
+         prims,
+@@ -313,6 +323,45 @@ pub fn emit(
+     })
+ }
+
++/// The resource declarations in the original PSV0, when the records include a kind.
++struct PsvBindings<'a>(std::slice::ChunksExact<'a, u8>);
++
++impl<'a> PsvBindings<'a> {
++    fn parse(data: &'a [u8]) -> Option<Self> {
++        use crate::dxbc::u32_at;
++        let info_size = u32_at(data, 0).ok()? as usize;
++        if info_size < 24 || !info_size.is_multiple_of(4) {
++            return None;
++        }
++        let table = data.get(4..)?.get(info_size..)?;
++        let count = u32_at(table, 0).ok()? as usize;
++        let size = u32_at(table, 4).ok()? as usize;
++        // PSVResourceBindInfo1 adds resource kind and flags to the four-word header.
++        if size < 24 || !size.is_multiple_of(4) {
++            return None;
++        }
++        let records = table.get(8..)?.get(..count.checked_mul(size)?)?;
++        Some(Self(records.chunks_exact(size)))
++    }
++
++    fn singleton_structured_srv(&self, register: u32) -> bool {
++        let mut found = false;
++        for record in self.0.clone() {
++            let word = |at| crate::dxbc::u32_at(record, at).expect("complete PSV binding");
++            let (ty, lo, hi) = (word(0), word(8), word(12));
++            // Only SRVTyped, SRVRaw and SRVStructured share the t-register namespace.
++            if (3..=5).contains(&ty) && (lo..=hi).contains(&register) {
++                // The native used-resource entry omits the register space.
++                if found || lo != hi || hi == u32::MAX || ty != 5 || word(16) != 12 {
++                    return false;
++                }
++                found = true;
++            }
++        }
++        found
++    }
++}
++
+ /// The rows of an `ISG1`/`OSG1` part.
+ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
+     use crate::dxbc::u32_at;
+@@ -425,6 +474,28 @@ mod tests {
+     use super::*;
+     use crate::native::{ComputeIo, StageIo};
+
++    #[test]
++    fn structured_srv_proof_requires_a_complete_single_register_binding() {
++        // RuntimeInfo0, one ResourceBindInfo1 for a structured t7 in space 3.
++        let mut words = [24u32, 0, 0, 0, 0, 0, 0, 1, 24, 5, 3, 7, 7, 12, 0];
++        let bytes = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>();
++        let psv = bytes(&words);
++        assert!(
++            PsvBindings::parse(&psv)
++                .unwrap()
++                .singleton_structured_srv(7)
++        );
++        assert!(PsvBindings::parse(&psv[..psv.len() - 1]).is_none());
++        words[12] = 9; // A range starting at t7.
++        assert!(
++            !PsvBindings::parse(&bytes(&words))
++                .unwrap()
++                .singleton_structured_srv(7)
++        );
++        words[8] = 16; // ResourceBindInfo0 omits the resource kind.
++        assert!(PsvBindings::parse(&bytes(&words)).is_none());
++    }
++
+     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
+     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
+     /// output signature has SV_StencilRef, and the feature bit
+diff --git a/crates/victory-shader/src/emit/root_view_tests.rs b/crates/victory-shader/src/emit/root_view_tests.rs
+index d0fbc83..dcc7736 100644
+--- a/crates/victory-shader/src/emit/root_view_tests.rs
++++ b/crates/victory-shader/src/emit/root_view_tests.rs
+@@ -101,6 +101,7 @@ fn build(kind: ResourceType) -> HostShader {
+         st: &st,
+         io: &io,
+         res: &res,
++        psv_bindings: None,
+         inputs: Vec::new(),
+         outputs: Vec::new(),
+         prims: Vec::new(),
+diff --git a/crates/victory-shader/src/emit/structured_buffer_tests.rs b/crates/victory-shader/src/emit/structured_buffer_tests.rs
+new file mode 100644
+index 0000000..33650d7
+--- /dev/null
++++ b/crates/victory-shader/src/emit/structured_buffer_tests.rs
+@@ -0,0 +1,335 @@
++//! Synthetic scalar buffer readbacks: declaration proof, record boundaries,
++//! and descriptor counts. Uses only generated instructions and buffer data.
++
++use super::container::{Binding, Psv, psv};
++use super::host::{Dispatch, Host, Root, Stride, View};
++use super::{HostShader, PsvBindings, lower, validator};
++use crate::native::{
++    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
++};
++use crate::{ShaderError, io, ir, resource, structure};
++
++const STRIDE: u32 = 80;
++const OUTPUT_WORDS: u32 = 8;
++const S_ENDPGM: u32 = 0xBF81_0000;
++
++fn sentinel(index: u32) -> u32 {
++    0xC0DE_0000 | index
++}
++
++fn store(words: &mut Vec<u32>, index: u32) {
++    // buffer_store_dword v0, off, s[8:11], 0 offset:index*4
++    words.extend([0xE070_0000 | (index * 4), 0x8002_0000]);
++}
++
++/// Public #984's scalar/table instruction layout, restricted to scalar reads;
++/// #995's PSV proof with an 80-byte stride. s0 is a byte offset, s1 a count
++/// guard, and s4 the table address. The UAV is slot 0 and the SRV is slot 1.
++fn build(structured: bool, count_used: bool, width: u32) -> Result<HostShader, ShaderError> {
++    assert!(matches!(width, 2 | 4));
++    let mut words = vec![
++        0xBE85_0380, // s_mov_b32 s5, 0
++        0xF408_0202,
++        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
++        0xF408_0302,
++        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 32
++    ];
++    for index in 0..OUTPUT_WORDS {
++        words.extend([0x7E00_02FF, sentinel(index)]); // v_mov_b32 v0, literal
++        store(&mut words, index);
++    }
++    let branch = if count_used {
++        words.push(0x7E00_020E); // v_mov_b32 v0, s14 (NUM_RECORDS)
++        store(&mut words, 1);
++        words.push(0xBF07_010E); // s_cmp_lg_u32 s14, s1
++        let at = words.len();
++        words.push(0); // s_cbranch_scc1 -> end, patched below
++        words.extend([
++            0x8080_810E, // s_sub_u32 s0, s14, 1
++            0x9300_FF00,
++            STRIDE, // s_mul_i32 s0, s0, 80: last record's byte offset
++        ]);
++        Some(at)
++    } else {
++        None
++    };
++    let opcode = if width == 2 { 0x09 } else { 0x0A };
++    words.extend([
++        0x3D << 26 | opcode << 18 | 16 << 6 | (12 >> 1),
++        0, // s_buffer_load_dwordx{2,4} s[16:...], s[12:15], s0
++    ]);
++    for k in 0..width {
++        words.push(0x7E00_0200 | (16 + k)); // v_mov_b32 v0, s[16+k]
++        store(&mut words, 2 + k);
++    }
++    if let Some(at) = branch {
++        let delta = u16::try_from(words.len() - at - 1).expect("short branch");
++        words[at] = 0xBF85_0000 | u32::from(delta);
++    }
++    words.push(S_ENDPGM);
++
++    let native = NativeProgram {
++        stage: HwStage::Cs,
++        wave64: false,
++        vgprs: 4,
++        layout: vec![
++            RootParam {
++                root: RootType::Constants,
++                table_offset_dwords: 0,
++                sgprs: 2,
++                base_register: 0,
++                user_data: 0,
++                slot: 0,
++            },
++            RootParam {
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                sgprs: 1,
++                base_register: 0,
++                user_data: 4,
++                slot: 1,
++            },
++        ],
++        used: vec![
++            UsedResource {
++                kind: ResourceType::Uav,
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                lower_bound: 0,
++                stride: 0,
++                dwords: 4,
++                user_data: 4,
++                slot: 1,
++            },
++            UsedResource {
++                kind: ResourceType::Srv,
++                root: RootType::Table,
++                table_offset_dwords: 8,
++                lower_bound: 7,
++                stride: STRIDE, // Deliberately identical for raw and structured cases.
++                dwords: 4,
++                user_data: 4,
++                slot: 1,
++            },
++        ],
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: 5 << 1,
++            threads: [1; 3],
++        }),
++        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    };
++    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("decode synthetic program");
++    let names: Vec<_> = p
++        .blocks
++        .iter()
++        .flat_map(|b| b.insts.iter().map(|i| i.name()))
++        .collect();
++    let load = if width == 2 {
++        "s_buffer_load_dwordx2"
++    } else {
++        "s_buffer_load_dwordx4"
++    };
++    assert_eq!(names.iter().filter(|&&n| n == load).count(), 1);
++    assert_eq!(names.iter().filter(|&&n| n == "s_load_dwordx4").count(), 2);
++    assert_eq!(
++        names.iter().filter(|&&n| n == "buffer_store_dword").count(),
++        OUTPUT_WORDS as usize + width as usize + usize::from(count_used)
++    );
++    if count_used {
++        assert!(names.contains(&"s_cmp_lg_u32"));
++        assert!(names.contains(&"s_sub_u32"));
++        assert!(names.contains(&"s_mul_i32"));
++    }
++    let st = structure::structure(&p).expect("structure synthetic program");
++    let res =
++        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track resources");
++    let io = io::raise(&p, &native).expect("raise IO");
++    let declarations = psv(&Psv {
++        stage: 5,
++        flag: false,
++        inputs: &[],
++        outputs: &[],
++        prims: &[],
++        mesh: None,
++        bindings: &[
++            Binding {
++                kind: 7,
++                space: 0,
++                register: 0,
++                dxil_kind: 11,
++            },
++            Binding {
++                kind: if structured { 5 } else { 4 },
++                space: 3,
++                register: 7,
++                dxil_kind: if structured { 12 } else { 11 },
++            },
++        ],
++        threads: [1; 3],
++        wave_size: None,
++    });
++    let lowered = lower::lower(&lower::Parts {
++        native: &native,
++        p: &p,
++        st: &st,
++        io: &io,
++        res: &res,
++        psv_bindings: Some(PsvBindings::parse(&declarations).expect("synthetic PSV declarations")),
++        inputs: Vec::new(),
++        outputs: Vec::new(),
++        prims: Vec::new(),
++        mesh_stride: 0,
++    })?;
++    Ok(HostShader {
++        stage: HwStage::Cs,
++        dxil: lowered.dxil,
++        user_data: lowered.user_data,
++        samplers: lowered.samplers,
++        static_samplers: Vec::new(),
++        root_cbvs: lowered.root_cbvs,
++        root_srvs: lowered.root_srvs,
++    })
++}
++
++#[test]
++fn scalar_structured_count_uses_original_declaration() {
++    build(true, true, 4).expect("declared structured count and last-record address must lower");
++}
++
++#[test]
++fn scalar_raw_count_is_not_inferred_from_structured_stride() {
++    assert!(matches!(
++        build(false, true, 2),
++        Err(ShaderError::Unsupported {
++            what: "a scalar memory read as data",
++            ..
++        })
++    ));
++}
++
++#[test]
++#[ignore = "requires a physical SM 6.6 GPU and native DXIL validator"]
++fn scalar_structured_boundaries_counts_and_raw_control_read_back() {
++    use windows::Win32::Graphics::Dxgi::{
++        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
++        IDXGIFactory4,
++    };
++    let _one = super::valu_tests::ONE_AT_A_TIME
++        .lock()
++        .unwrap_or_else(|e| e.into_inner());
++    assert_ne!(
++        std::env::var("VICTORY_WARP").as_deref(),
++        Ok("1"),
++        "physical hardware is required"
++    );
++    let host = Host::new(false).expect("physical SM 6.6 device required");
++    // SAFETY: query the adapter of this existing device, using valid DXGI interfaces.
++    let desc = unsafe {
++        let factory: IDXGIFactory4 =
++            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("DXGI factory");
++        let adapter: IDXGIAdapter1 = factory
++            .EnumAdapterByLuid(host.device.GetAdapterLuid())
++            .expect("device adapter");
++        adapter.GetDesc1().expect("adapter description")
++    };
++    assert_eq!(
++        desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
++        0,
++        "software adapter is not this gate"
++    );
++    let end = desc
++        .Description
++        .iter()
++        .position(|&c| c == 0)
++        .unwrap_or(desc.Description.len());
++    eprintln!(
++        "physical adapter: {} vendor={:#06x} device={:#06x}",
++        String::from_utf16_lossy(&desc.Description[..end]),
++        desc.VendorId,
++        desc.DeviceId
++    );
++    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref())
++        .expect("DXIL validator required");
++    let data: Vec<u32> = (0..60).map(|i| 0xA000_0000 | (i * 0x101 + 7)).collect();
++    for (structured, count_used, width) in [
++        (true, false, 2),
++        (true, false, 4),
++        (true, true, 4),
++        (false, false, 4),
++    ] {
++        let shader = build(structured, count_used, width).expect("lower numerical fixture");
++        validator
++            .validate(&mut shader.dxil.clone())
++            .expect("validate numerical fixture");
++        let (root, pso) = host
++            .compute_pipeline(&shader)
++            .expect("create numerical pipeline");
++        let offsets: &[u32] = if count_used {
++            // Neither input names the last record: the scalar count arithmetic
++            // must replace s0 with (3 - 1) * 80 before the load.
++            &[0, 76]
++        } else if width == 2 {
++            &[76, 156]
++        } else {
++            &[0, 76, 156]
++        };
++        let guards: &[u32] = if count_used { &[3, 4] } else { &[0] };
++        for &byte_offset in offsets {
++            for &guard in guards {
++                let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
++                for u in &shader.user_data {
++                    ud[u.index as usize] = match (u.root, u.slot, u.dword) {
++                        (RootType::Constants, 0, 0) => byte_offset,
++                        (RootType::Constants, 0, 1) => guard,
++                        (RootType::Table, 1, _) => 0,
++                        other => panic!("unexpected user data {other:?}"),
++                    };
++                }
++                let out = host
++                    .dispatch(
++                        &root,
++                        &pso,
++                        &Dispatch {
++                            roots: vec![(0, Root::Constants(ud))],
++                            views: &[
++                                View::RawUav(OUTPUT_WORDS),
++                                View::Buffer {
++                                    data: &data,
++                                    stride: if structured {
++                                        Stride::Structured(STRIDE)
++                                    } else {
++                                        Stride::Raw
++                                    },
++                                },
++                            ],
++                            samplers: &[],
++                            groups: [1; 3],
++                        },
++                    )
++                    .expect("dispatch and read back");
++                let mut want: Vec<_> = (0..OUTPUT_WORDS).map(sentinel).collect();
++                if count_used {
++                    want[1] = 3;
++                }
++                if !count_used || guard == 3 {
++                    let read_byte = if count_used {
++                        (3 - 1) * STRIDE
++                    } else {
++                        byte_offset
++                    };
++                    for k in 0..width {
++                        want[(2 + k) as usize] = data[(read_byte / 4 + k) as usize];
++                    }
++                }
++                assert_eq!(
++                    out[0], want,
++                    "structured={structured} count={count_used} width={width} byte={byte_offset} guard={guard}"
++                );
++                eprintln!(
++                    "exact readback: structured={structured} count={count_used} width={width} byte={byte_offset} guard={guard} data={:08x?}",
++                    out[0]
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index b4ee77d..d3cd52c 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -133,6 +133,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
+         st: &st,
+         io: &io,
+         res: &res,
++        psv_bindings: None,
+         inputs: Vec::new(),
+         outputs: Vec::new(),
+         prims: Vec::new(),
+diff --git a/crates/victory-shader/src/emit/waterfall_tests.rs b/crates/victory-shader/src/emit/waterfall_tests.rs
+index 104fc6d..8761b84 100644
+--- a/crates/victory-shader/src/emit/waterfall_tests.rs
++++ b/crates/victory-shader/src/emit/waterfall_tests.rs
+@@ -65,6 +65,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
+         st: &st,
+         io: &io,
+         res: &res,
++        psv_bindings: None,
+         inputs: Vec::new(),
+         outputs: Vec::new(),
+         prims: Vec::new(),
+diff --git a/crates/victory-shader/src/native.rs b/crates/victory-shader/src/native.rs
+index 4bdd39b..c999559 100644
+--- a/crates/victory-shader/src/native.rs
++++ b/crates/victory-shader/src/native.rs
+@@ -845,6 +845,251 @@ mod tests {
+         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
+     }
+
++    /// Reads the last record of a table SRV and stores its first dword to a
++    /// separate UAV. Native metadata gives t7 a stride of 80, independently
++    /// of the original PSV declarations supplied by each test.
++    fn scalar_table_program(bindings: &[crate::emit::TestBinding], load_offset: u32) -> Vec<u8> {
++        scalar_table_program_with_shape(bindings, load_offset, false, None)
++    }
++
++    /// The static-offset form leaves NUM_RECORDS unused. `vector_first` adds a
++    /// MUBUF read of the same t7 descriptor before or after the scalar read.
++    fn scalar_table_program_with_shape(
++        bindings: &[crate::emit::TestBinding],
++        load_offset: u32,
++        static_byte_offset: bool,
++        vector_first: Option<bool>,
++    ) -> Vec<u8> {
++        use crate::dxbc::{FourCC, build};
++        use crate::emit::{TestPsv, test_psv};
++        let mut words = vec![
++            0xbe81_0380, // s_mov_b32 s1, 0 (table high)
++            0xf408_0200,
++            0xfa00_0000 | load_offset, // s_load_dwordx4 s[8:11], s[0:1], offset
++        ];
++        if !static_byte_offset {
++            words.extend([
++                0x808c_810a, // s_sub_u32 s12, s10, 1 (NUM_RECORDS - 1)
++                0x930c_ff0c,
++                80, // s_mul_i32 s12, s12, 80
++            ]);
++        }
++        let vector_load = [
++            0xe030_0000, // buffer_load_dword v4, v2, s[8:11], s1
++            0x0102_0402,
++        ];
++        if vector_first == Some(true) {
++            words.extend(vector_load);
++        }
++        words.extend([
++            0xf420_0344,
++            if static_byte_offset {
++                0xfa00_0028 // s_buffer_load_dword s13, s[8:11], offset:40
++            } else {
++                0x1800_0000 // s_buffer_load_dword s13, s[8:11], s12
++            },
++        ]);
++        if vector_first == Some(false) {
++            words.extend(vector_load);
++        }
++        words.extend([
++            0x7e00_020d, // v_mov_b32 v0, s13
++            0xf408_0400,
++            0xfa00_0000, // s_load_dwordx4 s[16:19], s[0:1], 0
++            0xe070_0000,
++            0x8004_0000, // buffer_store_dword v0, off, s[16:19], 0
++        ]);
++        if vector_first.is_some() {
++            words.extend([
++                0xe070_0004, // buffer_store_dword v4, off, s[16:19], 4
++                0x8004_0400,
++            ]);
++        }
++        words.push(0xbf81_0000); // s_endpgm
++        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++        let mut blob = fssm(&[(HwStage::Cs, &code)]);
++        let stage = stage_data_at(&blob, HwStage::Cs);
++        blob[stage + CS_RSRC2..][..4].copy_from_slice(&2u32.to_le_bytes());
++        for k in 0..3 {
++            blob[stage + CS_THREADS + 4 * k..][..4].copy_from_slice(&1u32.to_le_bytes());
++        }
++        let record = stage - RECORD_SIZE as usize;
++        let layout = (blob.len() - FSSM_HEADER) as u64;
++        // Both ranges share the table address in s0.
++        for entry in [
++            [3u32, 0, 1, 0, 0],
++            [3, 8, 1, 7, 0],
++            [0x303, 0, 0, 0, 4],
++            [0x300, 8, 7, 80, 4],
++        ] {
++            blob.extend(entry.iter().flat_map(|w| w.to_le_bytes()));
++        }
++        let size = (blob.len() - FSSM_HEADER) as u64;
++        blob[8..16].copy_from_slice(&size.to_le_bytes());
++        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&layout.to_le_bytes());
++        blob[record + RECORD_USED..][..8].copy_from_slice(&(layout + 2 * ENTRY_SIZE).to_le_bytes());
++        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[2, 0, 0, 0, 2, 0, 0, 0]);
++        let native = part(&[(KIND_NATIVE, &xbch(&blob))]);
++        let mut bindings = bindings.to_vec();
++        bindings.push(crate::emit::TestBinding {
++            kind: 7,
++            space: 0,
++            register: 0,
++            dxil_kind: 11,
++        });
++        let psv = test_psv(&TestPsv {
++            stage: 5,
++            flag: false,
++            inputs: &[],
++            outputs: &[],
++            prims: &[],
++            mesh: None,
++            bindings: &bindings,
++            threads: [1; 3],
++            wave_size: None,
++        });
++        build(&[(FourCC::DXIL, &native), (FourCC::PSV0, &psv)])
++    }
++
++    #[cfg(windows)]
++    fn validate_with_sdk(shaders: &[&[u8]]) {
++        if let Some(path) = crate::emit::validator::Validator::default_path() {
++            let mut validator =
++                crate::emit::validator::Validator::load(Some(&path)).expect("load DXIL validator");
++            for shader in shaders {
++                validator.validate(&mut shader.to_vec()).unwrap();
++            }
++        }
++    }
++
++    #[test]
++    fn scalar_table_record_count_uses_the_declared_structured_srv() {
++        use crate::emit::TestBinding;
++        let structured = TestBinding {
++            kind: 5,
++            space: 3,
++            register: 7,
++            dxil_kind: 12,
++        };
++        let shader = crate::emit::translate(&scalar_table_program(&[structured], 32)).unwrap();
++        assert_eq!(shader.stage, HwStage::Cs);
++        #[cfg(windows)]
++        if let Ok(mut validator) = crate::emit::validator::Validator::load(
++            crate::emit::validator::Validator::default_path().as_deref(),
++        ) {
++            validator.validate(&mut shader.dxil.clone()).unwrap();
++        }
++    }
++
++    #[test]
++    fn scalar_table_record_count_requires_an_exact_unambiguous_declaration() {
++        use crate::emit::TestBinding;
++        let structured = TestBinding {
++            kind: 5,
++            space: 3,
++            register: 7,
++            dxil_kind: 12,
++        };
++        let raw = TestBinding {
++            kind: 4,
++            dxil_kind: 11,
++            ..structured
++        };
++        for (bindings, offset) in [
++            (vec![raw], 32), // Native stride alone cannot distinguish a raw SRV.
++            (vec![structured, TestBinding { space: 4, ..raw }], 32),
++            (
++                vec![TestBinding {
++                    register: 8,
++                    ..structured
++                }],
++                32,
++            ),
++            (vec![structured], 64), // An earlier used-resource entry also has stride 80.
++        ] {
++            let result = crate::emit::translate(&scalar_table_program(&bindings, offset));
++            assert!(
++                matches!(
++                    result,
++                    Err(ShaderError::Unsupported {
++                        what: "a scalar memory read as data",
++                        ..
++                    })
++                ),
++                "{bindings:?} at {offset}"
++            );
++        }
++    }
++
++    #[test]
++    fn static_scalar_table_offset_only_uses_an_exact_structured_declaration() {
++        use crate::emit::TestBinding;
++        let structured = TestBinding {
++            kind: 5,
++            space: 3,
++            register: 7,
++            dxil_kind: 12,
++        };
++        let raw = TestBinding {
++            kind: 4,
++            dxil_kind: 11,
++            ..structured
++        };
++        let translate = |bindings: &[TestBinding]| {
++            crate::emit::translate(&scalar_table_program_with_shape(bindings, 32, true, None))
++                .unwrap()
++        };
++        let raw_shader = translate(&[raw]);
++        let missing_shader = translate(&[]);
++        let structured_shader = translate(&[structured]);
++
++        assert_eq!(raw_shader.dxil, missing_shader.dxil);
++        assert_ne!(raw_shader.dxil, structured_shader.dxil);
++        #[cfg(windows)]
++        validate_with_sdk(&[
++            &raw_shader.dxil,
++            &missing_shader.dxil,
++            &structured_shader.dxil,
++        ]);
++    }
++
++    #[test]
++    fn mixed_scalar_and_vector_reads_keep_the_raw_baseline_in_either_order() {
++        use crate::emit::TestBinding;
++        let structured = TestBinding {
++            kind: 5,
++            space: 3,
++            register: 7,
++            dxil_kind: 12,
++        };
++        let raw = TestBinding {
++            kind: 4,
++            dxil_kind: 11,
++            ..structured
++        };
++        for vector_first in [true, false] {
++            let translate = |bindings: &[TestBinding]| {
++                crate::emit::translate(&scalar_table_program_with_shape(
++                    bindings,
++                    32,
++                    true,
++                    Some(vector_first),
++                ))
++                .unwrap()
++            };
++            // Raw and missing PSV declarations capture the pre-existing behavior
++            // for this same mixed-consumer shader; structured metadata must opt
++            // out rather than change only the scalar half of the resource use.
++            let raw_shader = translate(&[raw]);
++            let missing_shader = translate(&[]);
++            let structured_shader = translate(&[structured]);
++            assert_eq!(raw_shader.dxil, missing_shader.dxil, "{vector_first}");
++            assert_eq!(raw_shader.dxil, structured_shader.dxil, "{vector_first}");
++            #[cfg(windows)]
++            validate_with_sdk(&[&structured_shader.dxil]);
++        }
++    }
++
+     #[test]
+     fn reads_pixel_io_and_applies_the_full_export_patch() {
+         let code = [0xBF80_0000u32; 4]; // s_nop
