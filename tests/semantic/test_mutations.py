@@ -5,12 +5,15 @@ Each mutation is an exact-text replacement that must match exactly once (so a re
 this test fail loudly instead of silently mutating nothing). The repository's own tools/ is never modified.
 Each baseline run on the unmutated copy must pass first.
 """
+import contextlib
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -82,9 +85,13 @@ def run_semantics(tools_dir):
     # than 258 characters (WinError 267), which a checkout in a deep folder reaches.
     path = os.pathsep.join(filter(None, [HERE, os.environ.get("PYTHONPATH")]))
     env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=path)
-    p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], env=env,
-                       capture_output=True, text=True, timeout=300)
-    return p.returncode, p.stdout + p.stderr
+    started = time.monotonic()
+    try:
+        p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], env=env,
+                           capture_output=True, text=True, timeout=300)
+        return p.returncode, p.stdout + p.stderr
+    finally:
+        print(f"[mutation timing] child run {time.monotonic() - started:.3f}s", flush=True)
 
 
 def failed_tests(output):
@@ -109,26 +116,83 @@ def apply_mutation(path, old, new):
         f.write(text.replace(old, new).replace("\n", sep))
 
 
+@contextlib.contextmanager
+def restored_mutation(path, old, new):
+    """Restore the exact source bytes even when mutation, child execution or an assertion fails."""
+    with open(path, "rb") as f:
+        original = f.read()
+    try:
+        apply_mutation(path, old, new)
+        yield
+    finally:
+        with open(path, "wb") as f:
+            f.write(original)
+
+
+def tools_fingerprint(directory):
+    """Detect any child-created or changed state before reusing the private tree."""
+    result = {}
+    for base, dirs, files in os.walk(directory):
+        for name in dirs:
+            result[os.path.relpath(os.path.join(base, name), directory) + "/"] = None
+        for name in files:
+            path = os.path.join(base, name)
+            with open(path, "rb") as f:
+                result[os.path.relpath(path, directory)] = hashlib.sha256(f.read()).digest()
+    return result
+
+
+def cleanup_copy(tmp):
+    started = time.monotonic()
+    try:
+        tmp.cleanup()
+    finally:
+        print(f"[mutation timing] cleanup {time.monotonic() - started:.3f}s", flush=True)
+
+
 class MutationTests(unittest.TestCase):
-    def make_copy(self, tmp):
-        dst = os.path.join(tmp, "tools")
-        shutil.copytree(os.path.join(ROOT, "tools"), dst, ignore=shutil.ignore_patterns("__pycache__", "rpf9dump"))
-        return dst
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cleanup_copy, cls.tmp)
+        started = time.monotonic()
+        cls.tools = os.path.join(cls.tmp.name, "tools")
+        shutil.copytree(os.path.join(ROOT, "tools"), cls.tools,
+                        ignore=shutil.ignore_patterns("__pycache__", "rpf9dump"))
+        cls.original_tree = tools_fingerprint(cls.tools)
+        print(f"[mutation timing] copy {time.monotonic() - started:.3f}s", flush=True)
+
+    def assert_pristine_tools(self):
+        actual = tools_fingerprint(self.tools)
+        changed = sorted(name for name in actual.keys() | self.original_tree.keys()
+                         if actual.get(name) != self.original_tree.get(name) or
+                         (name in actual) != (name in self.original_tree))
+        self.assertFalse(changed, "child changed the private tools tree; do not reuse contaminated state: "
+                         + repr(changed))
 
     def test_baseline_copy_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            rc, out = run_semantics(self.make_copy(tmp))
+        self.assert_pristine_tools()
+        try:
+            rc, out = run_semantics(self.tools)
             self.assertEqual(rc, 0, out)
+        finally:
+            self.assert_pristine_tools()
 
     def test_each_mutation_is_caught(self):
+        # translate() writes only its temporary input fixtures, not tools/. Every child imports afresh with
+        # bytecode disabled. Restore the changed source and fingerprint the whole tree between mutations;
+        # a failed assertion still restores bytes, while unexpected child state prevents the next run.
         for label, fname, old, new, expect in MUTATIONS:
-            with self.subTest(mutation=label), tempfile.TemporaryDirectory() as tmp:
-                tools = self.make_copy(tmp)
-                path = os.path.join(tools, fname)
-                apply_mutation(path, old, new)
-                rc, out = run_semantics(tools)
-                self.assertNotEqual(rc, 0, f"mutation not detected: {label}\n{out}")
-                self.assertIn(expect, failed_tests(out), f"{label}: expected {expect} to fail\n{out}")
+            with self.subTest(mutation=label):
+                self.assert_pristine_tools()
+                try:
+                    path = os.path.join(self.tools, fname)
+                    with restored_mutation(path, old, new):
+                        rc, out = run_semantics(self.tools)
+                        self.assertNotEqual(rc, 0, f"mutation not detected: {label}\n{out}")
+                        self.assertIn(expect, failed_tests(out), f"{label}: expected {expect} to fail\n{out}")
+                finally:
+                    self.assert_pristine_tools()
 
     def test_anchors_match_crlf_translator_copies(self):
         # Regression: on a CRLF checkout of tools/ the four multiline anchors (v_bfe_i32, v_subrev_co_ci_u32,
