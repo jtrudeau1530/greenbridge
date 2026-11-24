@@ -162,7 +162,7 @@ albo tłumaczenie z zachowaniem wyodrębnionych wejść shaderów.
    poleceniem `python -I tests/test_manifest_verifier.py` w głównym folderze repozytorium, a suite translatora —
    `python -m unittest discover -s tests/semantic -v`.
 3. W PR podaj ID zadania, opisz, co przetestowałeś, a jeśli uruchamiałeś testy GPU — podaj kartę i wersję
-   sterownika. Zaznacz, czy korzystałeś z pomocy AI, zgodnie z [`AGENTS.md`](../../../AGENTS.md). Zasady znajdziesz
+   sterownika. Zasady znajdziesz
    w [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 **Nigdy** nie załączaj do issues ani PR-ów plików gry, wyodrębnionych zasobów ani wygenerowanych shaderów: dziel się

@@ -144,8 +144,7 @@ avvio non devono essere compilati. La traduzione degli shader è il passaggio pi
    `python -I tests/test_manifest_verifier.py` dalla radice del repository. La suite del traduttore si esegue
    con `python -m unittest discover -s tests/semantic -v`.
 3. Nella pull request indica l'ID dell'attività, cosa hai provato e, se hai eseguito test GPU, quale GPU e
-   quale driver. Le regole sono in [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). Se hai usato un assistente
-   IA, dichiaralo nella pull request, come richiesto da [`AGENTS.md`](../../../AGENTS.md).
+   quale driver. Le regole sono in [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 **Mai** allegare a issue o pull request file del gioco, asset estratti o shader generati: condividi solo
 risultati (conteggi, esito dei test, classi di errore).
