@@ -1,6 +1,6 @@
 // Console Xbox CreateDescriptorHeap (issue #313 comment 7107265058) passes a 16-byte PC
 // D3D12_DESCRIPTOR_HEAP_DESC followed by address at +0x10 and size at +0x18. The title asserts
-// GetCPUDescriptorHandleForHeapStart() == address. This tests the explicit Leonida console-heap
+// GetCPUDescriptorHandleForHeapStart() == address. This tests the explicit console-heap
 // creation path used by the Xbox device proxy slot 14. It does not cover title-memory aliasing /
 // section 3.3 backing.
 #include "vk_test_device.h"
@@ -24,6 +24,7 @@ struct Ref {
         return &p;
     }
     T* get() const { return p; }
+    T* operator->() const { return p; }
 };
 
 bool check_console_addressed_heap(ID3D12Device* device) {
@@ -65,12 +66,19 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
     void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    real_device->AddRef();  // create_device_proxy takes one reference on success
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device), &proxy_raw)) || !proxy_raw) {
+        real_device->Release();
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
     Ref<ID3D12Device> proxy;
     proxy.p = static_cast<ID3D12Device*>(proxy_raw);
+    rt::d3d12::set_device_outer(real_device, proxy.p);
+    struct ClearOuter {
+        ID3D12Device* real;
+        ~ClearOuter() { rt::d3d12::set_device_outer(real, nullptr); }
+    } clear_outer{real_device};
 
     struct ConsoleDescriptorHeapDesc {
         D3D12_DESCRIPTOR_HEAP_DESC desc{};
@@ -90,10 +98,15 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
                      static_cast<unsigned long>(hr));
         return false;
     }
-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
-    if (cpu.ptr != static_cast<SIZE_T>(console.address)) {
+    // This is an Xbox heap proxy: slots 9/10 return the handle in RAX, unlike the PC C++ interface's hidden
+    // return buffer. Call the proxy ABI, as the title does.
+    using Handle = std::uint64_t(WINAPI*)(void*);
+    auto** table = *reinterpret_cast<void***>(heap.get());
+    const auto cpu = reinterpret_cast<Handle>(table[9])(heap.get());
+    const auto gpu = reinterpret_cast<Handle>(table[10])(heap.get());
+    if (cpu != console.address || gpu != console.address) {
         std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
-                     static_cast<unsigned long long>(cpu.ptr),
+                     static_cast<unsigned long long>(cpu),
                      static_cast<unsigned long long>(console.address));
         return false;
     }

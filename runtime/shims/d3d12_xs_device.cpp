@@ -63,6 +63,7 @@ struct DeviceProxy {
     // The device's IDXGIDevice1 (see "IDXGIDevice1 on the device" below): a title's IDXGIDevice1* points here.
     void** dxgi_vtable;
     DxgiAdapterProvider adapter_provider;
+    DescriptorHeapProvider descriptor_heap_provider = nullptr;
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
@@ -1590,7 +1591,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     void* created = nullptr;
     HRESULT hr = E_INVALIDARG;
     bool console_extended = false;
-    if (desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
+    if (self->descriptor_heap_provider && desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
         (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
         const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
         const void* tail = bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
@@ -1600,10 +1601,10 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
+            // non-zero console VA is present and the proxy has an explicit backend for that extension.
             if (address != 0) {
                 console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
+                hr = self->descriptor_heap_provider(
                     self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
                     __uuidof(ID3D12DescriptorHeap), &created);
             }
@@ -2016,6 +2017,13 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
         return false;
     }
     proxy->adapter_provider = provider;
+    return true;
+}
+
+bool set_device_descriptor_heap_provider(void* device, DescriptorHeapProvider provider) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) return false;
+    proxy->descriptor_heap_provider = provider;
     return true;
 }
 

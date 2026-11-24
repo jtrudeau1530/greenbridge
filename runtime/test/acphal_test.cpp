@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <malloc.h>
+#include <initializer_list>
+#include <utility>
 
 #include "shims.h"
 
@@ -227,8 +230,8 @@ int main() {
 
     // Verify zeroed memory across all 350 * 64 bytes
     const uint8_t* xma_bytes = static_cast<const uint8_t*>(ctx.xmaContextArray);
-    bool all_zero = true;
-    for (size_t i = 0; i < 350 * 64; ++i) {
+    bool all_zero = xma_bytes && _msize(ctx.xmaContextArray) >= 350 * 64;
+    for (size_t i = 0; all_zero && i < 350 * 64; ++i) {
         if (xma_bytes[i] != 0) {
             all_zero = false;
             break;
@@ -251,6 +254,20 @@ int main() {
     check(ctx_all.dmaContextArray != nullptr, "dmaContextArray is allocated");
     check(ctx_all.xmaContextArray != nullptr, "xmaContextArray is allocated");
     check(ctx_all.pcmContextArray != nullptr, "pcmContextArray is allocated");
+
+    // Check the allocation extent before walking it, so a too-small context stride fails without an overread.
+    for (auto [buffer, bytes] : {std::pair<void*, size_t>{ctx_all.xmaContextArray, 12 * 64},
+                                 {ctx_all.pcmContextArray, 6 * 32}}) {
+        const bool enough = buffer && _msize(buffer) >= bytes;
+        check(enough, "XMA/PCM allocation covers every context at its expected stride");
+        if (enough) {
+            bool zero = true;
+            auto* data = static_cast<uint8_t*>(buffer);
+            for (size_t i = 0; i < bytes; ++i) zero = zero && data[i] == 0;
+            check(zero, "XMA/PCM context arrays start zeroed across their full extent");
+            std::memset(buffer, 0xa5, bytes);
+        }
+    }
 
     // Release shape contexts
     check(release_ctx(&ctx_all) == S_OK, "AcpHalReleaseShapeContexts succeeds");

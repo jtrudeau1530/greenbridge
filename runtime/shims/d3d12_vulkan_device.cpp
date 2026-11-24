@@ -5965,6 +5965,17 @@ public:
         return d3d12_trace::result(method, hand_out(heap, riid, out));
     }
 
+    HRESULT create_console_heap(const D3D12_DESCRIPTOR_HEAP_DESC& desc,
+                                D3D12_GPU_VIRTUAL_ADDRESS address, std::uint64_t size, REFIID riid, void** out) {
+        auto* heap = new DescriptorHeap(state_, desc, address, size);
+        heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            return E_OUTOFMEMORY;
+        }
+        return hand_out(heap, riid, out);
+    }
+
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
         // The host runtime's order (compare_invalid_arguments, "query heap:"): the description first, refused with
@@ -8804,6 +8815,7 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
     // a host DXGI object from it.
     if (!rt::d3d12_xs::is_device_proxy(outer)) return;
+    rt::d3d12_xs::set_device_descriptor_heap_provider(outer, create_console_descriptor_heap);
     rt::d3d12_xs::set_device_adapter_provider(outer, [](ID3D12Device* real, REFIID riid, void** out) {
         IDXGIFactory1* factory = nullptr;
         HRESULT hr = create_dxgi_factory(real, __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
@@ -9998,13 +10010,7 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
 
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
-    if (!heap->ok()) {
-        heap->Release();
-        return E_OUTOFMEMORY;
-    }
-    return hand_out(heap, riid, out);
+    return d->create_console_heap(*desc, console_address, console_size, riid, out);
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {

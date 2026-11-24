@@ -54,7 +54,7 @@ on y trouve le chemin critique, qui construit quoi, et les méthodes D3D12 qui r
 - `python -I tests/test_<name>.py` lance un test unitaire (bibliothèque standard uniquement ; la CI les lance tous).
   Les fichiers de test sans bloc `__main__`, ou qui contiennent un `import pytest` (ils ont besoin des paquets de
   `tests/requirements.txt`), se lancent plutôt avec `python -m pytest tests/test_<name>.py`, comme l'explique
-  [AGENTS.md](../../../AGENTS.md). Avec `python -I`, ils échouent à l'import ou ne lancent rien.
+  [docs/testing.md](../../testing.md). Avec `python -I`, ils échouent à l'import ou ne lancent rien.
 - Tests du runtime : `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`,
   puis `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. Les tests CPU qui ne demandent aucune
   donnée du jeu sont configurés sous Windows ; Linux et macOS configurent le sous-ensemble portable (`gta6rt` et les

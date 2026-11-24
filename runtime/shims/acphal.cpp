@@ -123,48 +123,18 @@ struct SHAPE_DMA_CONTEXT {
 };
 static_assert(sizeof(SHAPE_DMA_CONTEXT) == 16, "SHAPE_DMA_CONTEXT is 16 bytes per GDK");
 
+// XMA and PCM contexts are opaque to this shim: it allocates and releases them but never reads their fields.
+// Preserve the existing 64/32-byte allocation contract without relying on incomplete bitfield declarations
+// (which occupied only 60/28 bytes on both MSVC and clang-cl).
 struct SHAPE_XMA_CONTEXT {
-    uint32_t sizeRead0 : 12;
-    uint32_t numLoops : 8;
-    uint32_t validBuffer : 2;
-    uint32_t sizeWrite : 5;
-    uint32_t offsetWrite : 5;
-    uint32_t sizeRead1 : 12;
-    uint32_t sequenceNumber : 12;
-    uint32_t stopSampleAddress : 8;
-    uint32_t subframeOffset : 4;
-    uint32_t reserved0 : 1;
-    uint32_t isLooping : 1;
-    uint32_t subframeSkip : 2;
-    uint32_t packetMetadata : 16;
-    uint32_t currentByteOffset : 26;
-    uint32_t reserved1 : 6;
-    uint32_t loopStartOffset : 26;
-    uint32_t loopEndOffset : 6;
-    uint32_t reserved[10];
+    uint32_t storage[16];
 };
-static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64, "SHAPE_XMA_CONTEXT is 64 bytes per GDK");
+static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64, "SHAPE XMA allocation stride");
 
 struct SHAPE_PCM_CONTEXT {
-    uint32_t timestamp : 21;
-    uint32_t reserved0 : 11;
-    uint32_t loopCount : 8;
-    uint32_t reserved1 : 8;
-    uint32_t full : 1;
-    uint32_t reserved2 : 15;
-    uint32_t readPointer : 21;
-    uint32_t reserved3 : 11;
-    uint32_t loopStartWritePointer : 21;
-    uint32_t reserved4 : 11;
-    uint32_t loopEnd : 21;
-    uint32_t reserved5 : 11;
-    uint32_t mode : 1;
-    uint32_t reserved6 : 15;
-    uint32_t format : 2;
-    uint32_t reserved7 : 14;
-    uint32_t reserved[1];
+    uint32_t storage[8];
 };
-static_assert(sizeof(SHAPE_PCM_CONTEXT) == 32, "SHAPE_PCM_CONTEXT is 32 bytes per GDK");
+static_assert(sizeof(SHAPE_PCM_CONTEXT) == 32, "SHAPE PCM allocation stride");
 
 // The SHAPE_CONTEXTS structure (from the GDK)
 struct SHAPE_CONTEXTS {

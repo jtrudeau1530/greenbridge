@@ -20,6 +20,9 @@ class F64ConversionTest(unittest.TestCase):
             line for line in FIXTURE.read_text(encoding="utf-8").splitlines()
             if not line.startswith(";")
         )
+        # Keep EXEC dynamic so the data-flow checks below exercise the predicated destination write.
+        prefix, conversion = body.rsplit("\n", 1)
+        body = prefix + "\ns_mov_b32 exec_lo, s12\n" + conversion
         cases = (
             ("", None, False),
             ("mul:2", 0x40000000, False),
@@ -31,7 +34,9 @@ class F64ConversionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for modifiers, scale_bits, clamp in cases:
                 with self.subTest(modifiers=modifiers):
-                    spv = translate_listing(Path(directory), f"{body} {modifiers}".rstrip())
+                    # A scalar instruction separates this write from the epilogue's VALU run, so its
+                    # predication remains local and the checked data flow does not span a guard block.
+                    spv = translate_listing(Path(directory), f"{body} {modifiers}\ns_nop 0")
                     self.check_conversion(spv, scale_bits, clamp)
 
     def check_conversion(self, spv, scale_bits, clamp):

@@ -378,8 +378,8 @@ class ShadersStageWithTheDlls(unittest.TestCase):
                     out = args[args.index("--out") + 1]
                     # the FSPX step keeps its output only when the index names a program whose module is there
                     name = "SortKeys" if builder else "Upscale"
-                    write('{"%s": {"stage": "cs", "fssm_sha256": "%s"}}' % (name, "a" * 64) if builder else
-                          '{"%s": {"stage": "cs"}}' % name, out, "index.json")
+                    key = "fssm_sha256" if builder else "fspx_code_sha256"
+                    write(json.dumps({name: {"stage": "cs", key: "a" * 64}}), out, "index.json")
                     write("", out, name + ".spv")
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
