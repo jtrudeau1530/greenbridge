@@ -53,7 +53,8 @@ jobs:
             '../victory-patches/61474f6-region-copy.patch',
             '../victory-patches/417f4e3-root-view-loads.patch',
             '../victory-patches/amd-world-guards.patch',
-            '../victory-patches/watch-fixture-retirement.patch'
+            '../victory-patches/watch-fixture-retirement.patch',
+            '../victory-patches/78c8078-structured-srv-loads.patch'
           )
           foreach ($patch in $patches) {
             git apply --check --index $patch
