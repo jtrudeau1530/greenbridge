@@ -11,7 +11,7 @@ dropped valid models in three validation paths, all in `third_party/rpf9-explore
 
 ## Upstream status
 
-[Leonida issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
+[Greenbridge issue #29](https://github.com/ItsNotRexed/Leonida/issues/29) tracks this work. The decoder
 fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) is merged, and
 `third_party/rpf9-explorer` is now pinned at upstream `e293917` (was `917e9b9`, originally
 `48557ea`). Commits up to `917e9b9` added the `packs.rpf` drawable-dictionary roots (one drawable
@@ -26,7 +26,7 @@ triangles** (the `levels.rpf` cells from a full export, see the table note), and
 measured state; it is not a competing patch.
 
 PR #1 reports 190,792 of 190,792 recognized candidates across the ten archives configured in
-Leonida, including 169 previously rejected candidates (also verified after archive readback). A
+Greenbridge, including 169 previously rejected candidates (also verified after archive readback). A
 later full-archive run at the same head independently reproduced the ten-archive total: 190,792
 candidates, 190,792 recovered, read back and decoded, 0 decode or readback failures, no duplicate
 model names, and 2.22 billion triangles (the pre-fix export was 155,598 models / 1.95 billion
@@ -526,10 +526,10 @@ models (27,435 shaders):
 
 - `RenderBucketMask == 0xFF00 | (1 << (RenderBucket & 0x7F))` in all 27,435. Bit 7 of `RenderBucket` is a
   separate flag (set in 438) that does not change the mask.
-- `RenderBucket & 0x7F` takes the values 0-6, the GTA V drawable bucket list. Model-name tokens (counted per
+- `RenderBucket & 0x7F` takes the values 0-6, the earlier title drawable bucket list. Model-name tokens (counted per
   shader, from the model's name) line up with it:
 
-| Bucket | GTA V meaning | Shaders | Name evidence (share of shaders whose model name matches) |
+| Bucket | earlier title meaning | Shaders | Name evidence (share of shaders whose model name matches) |
 |---:|---|---:|---|
 | 0 | opaque | 17,826 | baseline: water 0.6%, vegetation 0.5%, glass/window 0.2%, decal 0.1% |
 | 1 | alpha | 725 | glass/window 7.6% (38x baseline) |

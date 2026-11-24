@@ -95,7 +95,7 @@ component table.
 | `jacket` | 327 | `jacketbiker`, `jacketdenim`, `jacketblazer`, `jackettrack`, … |
 | `uppr` | 17 | 14 are `slod_uppr_*`; 3 are `char_bipedbounds_female_armor…_uppr_l/r.#ft` |
 | `lowr` | 21 | 17 are `slod_lowr_*`; 4 are `char_bipedbounds_female_armor…_lowr_l/r.#ft` |
-| `jbib` | 0 | the GTA V slot code is not a name token here |
+| `jbib` | 0 | the earlier title slot code is not a name token here |
 | `hands` | 8 | the singular `hand_` appears in 35 names |
 | `feet` | 26 | bare feet plus creature variants |
 | `bikini` | 45 | `brabikini_*` and related |

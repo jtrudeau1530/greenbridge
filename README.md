@@ -1,12 +1,12 @@
 # Greenbridge
 
-An experimental Xbox Series compatibility runtime and shader translation project, continuing the available [Leonida](https://github.com/ProjectLeonida/Leonida) source.
+An experimental Xbox Series compatibility runtime and shader translation project.
 
 [Status](#project-status) · [Build](#how-to-build) · [Recovered test results](gpu-test-results/2026-11-23-rx7900xt/README.md) · [Source recovery](recovery/README.md) · [Credits](#credits) · [License](#license)
 
 Original source authorship and licenses are retained. Greenbridge is an independent continuation; the original maintainers are not represented as its operators.
 
-Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
+Greenbridge is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
 and run natively, and the console's system software is reimplemented. The console's precompiled RDNA2 GPU programs
 are translated to SPIR-V for Vulkan. The game's models, textures and audio are read from your package. All of this
 happens **on your PC, from your own copy of the game**.
@@ -101,7 +101,7 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
-**Is this PC strong enough?** [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/) is a lightweight browser-based checker that compares your PC against reference profiles. It's a rough estimate, not a benchmark.
+**Is this PC strong enough?** [Community hardware checker](https://assttro.github.io/can-i-run-leonida/) is a lightweight browser-based checker that compares your PC against reference profiles. It's a rough estimate, not a benchmark.
 
 **Low disk space:** the ~400 GB figure is for the full build. To *run* the port, `--stages check,shaders,runtime`
 needs about 30 GB; the `assets` stage (~370 GB) is only for the asset tools, and `--wav` adds several times the
@@ -170,7 +170,7 @@ share the machine, that budget is split between them and passed to `rpf9dump` as
 lets `rpf9dump` use every core. Progress lines include percent and a rough ETA for translation shards, asset steps,
 and overall stage completion.
 
-On an interactive terminal, a LEONIDA setup screen lets you set jobs and whether stages overlap, then a key-switchable
+On an interactive terminal, a GREENBRIDGE setup screen lets you set jobs and whether stages overlap, then a key-switchable
 per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage logs go under `work/logs/`. Use
 `--no-tui` (or redirect stdout) for the plain console.
 
@@ -253,7 +253,7 @@ pull requests.
 
 ## Credits
 
-Greenbridge preserves the work of Leonida's original authors and contributors. Available commit authorship is retained; [the recovery index](recovery/README.md) records original and exported source identities. The additional validation archive documents local experiments and does not claim ownership of upstream fixes.
+Greenbridge preserves the work of the original source authors and contributors. Available commit authorship is retained; [the recovery index](recovery/README.md) records original and exported source identities. The additional validation archive documents local experiments and does not claim ownership of upstream fixes.
 
 - [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) by breadbbbb: the RPF9 model, texture-pool and AWC
   decoders used by `tools/rpf9dump` (git submodule).
@@ -262,11 +262,10 @@ Greenbridge preserves the work of Leonida's original authors and contributors. A
 - [libHttpClient](https://github.com/microsoft/libHttpClient) (MIT) by Microsoft: the XTaskQueue/XAsync implementation
   in `third_party/xtaskqueue`, used by the offline `xgameruntime` shim.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
-- Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
 
-Grand Theft Auto and all related names are trademarks of their owners. This project is not affiliated with or
-endorsed by them.
+All third-party names and trademarks belong to their respective owners. This project is independent and is not
+affiliated with any game publisher or platform vendor.
 
 ## License
 

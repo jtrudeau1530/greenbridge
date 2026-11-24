@@ -1,4 +1,4 @@
-# Leonida クイックスタート（`ja`）
+# Greenbridge クイックスタート（`ja`）
 
 > [!NOTE]
 > 英語のドキュメント（[`README.md`](../../../README.md)、[`CONTRIBUTING.md`](../../../CONTRIBUTING.md)、
@@ -6,9 +6,9 @@
 > まとめたもので、commit `003e781` に同期しています。日々の進捗は [`README.md`](../../../README.md)
 > を参照してください。
 
-## Leonida とは
+## Greenbridge とは
 
-Leonida は、Xbox Series 版 Grand Theft Auto VI を Windows 上でネイティブに動かすための**静的リコンパイル**
+Greenbridge は、Xbox Series 版 対応タイトル を Windows 上でネイティブに動かすための**静的リコンパイル**
 プロジェクトです。Xbox Series の CPU は PC と同じ x86-64 なので、ゲームのコードはそのまま読み込まれて
 ネイティブに実行され、本体側のシステムソフトウェアは shim として再実装されます。本体用にコンパイル済みの
 RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル・テクスチャ・音声はあなたのパッケージから
@@ -57,7 +57,7 @@ RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル
 2. サブモジュール込みでリポジトリを取得します。
 
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
 
    GitHub の "Download ZIP" では `third_party/rpf9-explorer` が含まれません。`git` があればビルドが自動で

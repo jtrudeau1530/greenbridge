@@ -9,4 +9,4 @@ The upstream NOTICE identifies this package as a Rust port of FFmpeg's WMA Pro/X
 > Copyright (c) 2008 - 2011 Sascha Sommer, Benjamin Larsson
 > This file is part of FFmpeg and is licensed under the GNU Lesser General Public License, version 2.1 or later.
 
-Leonida's C ABI wrapper is independently written and licensed under GPL-3.0-or-later. No upstream implementation source is copied or vendored.
+Greenbridge's C ABI wrapper is independently written and licensed under GPL-3.0-or-later. No upstream implementation source is copied or vendored.

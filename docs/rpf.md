@@ -1,6 +1,6 @@
 # RPF9 archives and the carve tools
 
-GTA VI ships its assets in RPF9 archives. The **table of contents** (names, sizes, offsets and flags) is
+the supported title ships its assets in RPF9 archives. The **table of contents** (names, sizes, offsets and flags) is
 encrypted/packed; this project does not decode it and does not search for keys. The **data area** is mostly
 zlib streams laid end to end, so it can be measured and carved without the TOC. Names in the recovery view
 are offset-based (`recovered/...`), not the original paths.

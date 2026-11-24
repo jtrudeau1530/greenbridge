@@ -89,10 +89,10 @@ z = bounds.min.z + value / 255 * (bounds.max.z - bounds.min.z)
 ```
 
 `common.rpf`'s manifest names `common:/data/levels/americas/heightmap.dat` as a
-`WORLD_HEIGHTMAP_FILE`, and the `PAMH` magic is the GTA V `HMAP` magic stored
-little-endian. The row-table layout matches the published GTA V
+`WORLD_HEIGHTMAP_FILE`, and the `PAMH` magic is the earlier title `HMAP` magic stored
+little-endian. The row-table layout matches the published earlier title
 `heightmap.dat` reader (`HMAP`, 44-byte header, 8-byte row headers, max/min
-u8 arrays). The measured file is version 1.2; GTA V writes 1.1.
+u8 arrays). The measured file is version 1.2; earlier title writes 1.1.
 
 ### `MHIU`: 2048 x 2048 single-layer heightmap
 
@@ -142,7 +142,7 @@ the payload end happened to fit the byte count, but it is not the format.
 | magic | 0x00 | 4 bytes | `PAMH` (little-endian `HMAP`) |
 | version | 0x04 | 2 x `u8` | 1.2 in `common.rpf`; overwritten in the `levels.rpf` tiles |
 | pad | 0x06 | `u16` | 0 in `common.rpf`; text in the tiles |
-| word at the GTA V `compressed` offset | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`. Level tiles contain label bytes with bit 0 set. |
+| word at the earlier title `compressed` offset | 0x08 | `u32` | `0x1BBC8CED` in `common.rpf`. Level tiles contain label bytes with bit 0 set. |
 | width, height | 0x0C | 2 x `u16` | 144, 164 in `common.rpf`; 64, 64 in every tile |
 | six bounds | 0x10 | 6 x `f32` | `(-13312, -9728, -302)` to `(5120, 11264, 404)` |
 | data size | 0x28 | `u32` | 48,544 in `common.rpf`; 8,704 in a tile |
@@ -199,7 +199,7 @@ with **IoU 0.61**. Row 0 is therefore `bounds.min.y`, column 0 is
 
 The HMAP header and row-table rules were cross-checked against the public
 [rage-formats](https://github.com/VIRUXE/rage-formats) reader (`Unlicense`)
-and [gta-op/heightmap](https://github.com/gta-op/heightmap) (`MIT`); no code is
+and [Community heightmap reference](https://github.com/gta-op/heightmap) (`MIT`); no code is
 copied. The MHIU field offsets, the span checks and the Z correlation are
 measured on this package.
 
@@ -209,7 +209,7 @@ python -I tools/gamedata_maps.py <work>\carve\common --json maps.json
 
 ### Checksum and unknown fields
 
-- The `common.rpf` `PAMH` payload holds `0x1BBC8CED` at GTA V's `compressed`
+- The `common.rpf` `PAMH` payload holds `0x1BBC8CED` at earlier title's `compressed`
   offset, 0x08. The level tiles overlap this word with the coordinate label
   described above. The common value is not CRC32, Adler32, FNV-1a, joaat32 or a hashlib
   digest of the max/min arrays; it is reported as a flag word, not a proven
@@ -835,7 +835,7 @@ Two of the three most repeated roots are the timecycle tables: 27 `timecycle_key
 | `cycle/region` | 54 | exactly two per cycle; attribute `name` |
 | `cycle/region/<variable>` | 59,170 | one element per variable, text = **13** space-separated numbers |
 
-Every one of the 59,170 variables has 13 values, the same as GTA V's 13 time-of-day samples, so a keyframe
+Every one of the 59,170 variables has 13 values, the same as earlier title's 13 time-of-day samples, so a keyframe
 document reads as one weather's day curve per variable and region. In 25 documents each region has
 **1,142 variables**; the other two have 515 and 520. Within every document the two regions list the same
 variables in the same order. The 1,142-variable set and the two short documents together use 1,301 distinct
@@ -856,7 +856,7 @@ bind variables by element name, not by position.
 
 Modifiers come in two shapes:
 
-- **Plain** (4,291): variables are direct children with two numbers each, as in GTA V's modifier files.
+- **Plain** (4,291): variables are direct children with two numbers each, as in earlier title's modifier files.
   Per modifier: 0 to 407 variables. 1,025 have none: 759 of those only list submodifiers and 266 are empty. The 1,054 modifier variable
   names include 947 keyframe variables and 107 that occur only in modifiers.
 - **Axis-driven** (302): every variable sits inside an `axis` and has exactly `numKeyframes` values; the axis's
@@ -878,7 +878,7 @@ The one unresolved item points outside this archive or at a document lost to the
 hours are integers from 0 to 22 in strictly increasing order, with gaps of 1 hour (7 times), 2 (twice), 3 (once)
 and 4 (twice); `interpolation_type` is `EASE_LINEAR_IN` on 9 samples and `EASE_QUARTIC_INOUT` on 4, and all 13
 `uw_tc_mod` values are the same name, which resolves to one of the 4,592 modifier names. The `region` name equals one of the two keyframe
-region names. So unlike GTA V, where the 13 sample times are compiled in, this build stores them in `time_data`;
+region names. So unlike earlier title, where the 13 sample times are compiled in, this build stores them in `time_data`;
 their count matches the 13 values of every keyframe variable. The `interpolation_type` labels are stored metadata:
 how the runtime selects the interval between two samples, and whether it applies the label, is not verified.
 
@@ -894,7 +894,7 @@ python -I tools/gamedata_reader.py <work>/carve/common --root time_data --out <s
 ```
 
 Not measured here (hypothesis): how the two regions are chosen at runtime, what the two plain-modifier numbers
-are (GTA V reads them as a value pair blended by strength), and how `controlValue` maps onto game state.
+are (earlier title reads them as a value pair blended by strength), and how `controlValue` maps onto game state.
 
 **The two plain-modifier numbers.** Measured over the 29,727 two-number variables of the plain modifiers
 (1,051 variable names, 3,257 modifiers with at least one such variable):
@@ -915,7 +915,7 @@ are (GTA V reads them as a value pair blended by strength), and how `controlValu
 So `0` is the most frequent stored value of the second number. What it means, and how the runtime blends the
 two numbers by strength, is not settled by these counts.
 
-Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
+Not measured here (hypothesis): the hour of each of the 13 samples (earlier title's are fixed in code), how the two
 regions are chosen at runtime, what the two plain-modifier numbers mean and how the runtime blends them (see
 above), and how `controlValue` maps onto game state.
 **Plain-modifier number pairs `(a, b)`** (`tools/timecycle_pairs.py`, measured over all **29,727** two-number
@@ -948,7 +948,7 @@ Three patterns establish what the pair stores (matching RAGE's two-float `tcModD
    `b < 0`, `a` in `-1,000..5,000`, `b` in `-3..5,000`, `a == b` in 94, `a < b` in 89, `a > b` in 7), and
    `fog_isotropic_phase` (`a == b` in all `10/10`, `1.0..6.0`).
 
-Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
+Not measured here (hypothesis): the hour of each of the 13 samples (earlier title's are fixed in code), how the two
 regions are chosen at runtime, the exact runtime rule distinguishing `b == 0` from `b == 1` on the 343 variables
 where both occur, and how `controlValue` maps onto game state.
 ## Vehicle and tyre XML documents
@@ -1039,7 +1039,7 @@ entry combines up to four nested parameter groups with 12 direct scalar `value=`
 hours are integers from 0 to 22 in strictly increasing order, with gaps of 1 hour (7 times), 2 (twice), 3 (once)
 and 4 (twice); `interpolation_type` is `EASE_LINEAR_IN` on 9 samples and `EASE_QUARTIC_INOUT` on 4, and all 13
 `uw_tc_mod` values are the same name, which resolves to one of the 4,592 modifier names. The `region` name equals one of the two keyframe
-region names. So unlike GTA V, where the 13 sample times are compiled in, this build reads them (and the easing
+region names. So unlike earlier title, where the 13 sample times are compiled in, this build reads them (and the easing
 between them) from `time_data`; their count matches the 13 values of every keyframe variable.
 
 Not measured here (hypothesis): how the two regions are chosen at runtime, the exact runtime rule distinguishing

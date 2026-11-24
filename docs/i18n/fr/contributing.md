@@ -1,4 +1,4 @@
-# Leonida : contribuer (`fr`)
+# Greenbridge : contribuer (`fr`)
 
 > [!NOTE]
 > La version anglaise de [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) **fait foi**. Cette traduction est

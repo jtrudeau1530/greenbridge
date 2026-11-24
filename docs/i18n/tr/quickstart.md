@@ -1,4 +1,4 @@
-# Leonida — Hızlı Başlangıç (`tr`)
+# Greenbridge — Hızlı Başlangıç (`tr`)
 
 > [!NOTE]
 > İngilizce dokümantasyon ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) ve
@@ -6,9 +6,9 @@
 > yönergelerini kapsar (`561b65a` commit'ine göre eşitlenmiştir). Günlük değişen proje durumu için
 > [`README.md`](../../../README.md) dosyasına bakın.
 
-## Leonida Nedir?
+## Greenbridge Nedir?
 
-Leonida, Grand Theft Auto VI'nın Xbox Series sürümünü Windows üzerinde yerel olarak çalıştırmayı hedefleyen statik
+Greenbridge, desteklenen oyunun Xbox Series sürümünü Windows üzerinde yerel olarak çalıştırmayı hedefleyen statik
 yeniden derleme (recompilation) projesidir. Port, **kendi bilgisayarınızda ve kendi oyun kopyanızdan** oluşturulur.
 Konsolun önceden derlenmiş RDNA2 GPU shader'ları Vulkan için SPIR-V'ye çevrilir, oyun varlıkları doğrudan kendi
 paketinizden okunur ve konsolun sistem yazılımları shim katmanlarıyla yeniden uygulanır.
@@ -62,7 +62,7 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
 1. Yukarıdaki gereksinimleri kurun.
 2. Depoyu **alt modülüyle birlikte** klonlayın:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
 3. **`Build.bat`** dosyasına çift tıklayın.
 

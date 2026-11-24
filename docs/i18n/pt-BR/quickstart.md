@@ -1,4 +1,4 @@
-# Leonida — Guia rápido (`pt-BR`)
+# Greenbridge — Guia rápido (`pt-BR`)
 
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
@@ -6,9 +6,9 @@
 > configuração e compilação (sincronizado com o commit `f847748c`). Para o status diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
-## O que é o Leonida
+## O que é o Greenbridge
 
-O Leonida é um projeto de recompilação estática do Grand Theft Auto VI (Xbox Series) para rodar nativamente no
+O Greenbridge é um projeto de recompilação estática de um título compatível (Xbox Series) para rodar nativamente no
 Windows, construído **no seu próprio PC a partir da sua própria cópia**. Os shaders RDNA2 do console são
 traduzidos para SPIR-V (Vulkan), os assets são lidos diretamente do seu pacote e o software de sistema do
 console é reimplementado em shims.
@@ -64,9 +64,9 @@ o estágio parecer concluído com zero shaders, e um link simbólico em `disasm`
 1. Instale os pré-requisitos acima.
 2. Clone o repositório **com o submódulo**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
-3. Abra a pasta `Leonida` e dê duplo clique em **`Build.bat`**.
+3. Abra a pasta `greenbridge` e dê duplo clique em **`Build.bat`**.
 
 O script procura automaticamente sua cópia (Downloads, Desktop, Documentos, Games, pasta de usuário e raiz dos
 discos até dois níveis), valida os pré-requisitos e o espaço livre e grava o resultado em `Documents\Leonida`.

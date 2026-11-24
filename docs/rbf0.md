@@ -104,13 +104,13 @@ Every record is a 1-byte descriptor index and a 1-byte type:
 The three u16 element words are `0, 0, attribute_count` in every stream. Across **475,461 elements**, word 0 and
 word 1 are always zero and word 2 is 0 (389,525), 1 (84,541) or 2 (1,395). The declared attribute count matches
 the number of leading value records after the open in **475,461 of 475,461** elements, with zero mismatches. This
-is the same rule the public `rage_engine_formats` RBF reader describes for the GTA V form; the measurements here
+is the same rule the public `rage_engine_formats` RBF reader describes for the earlier title form; the measurements here
 are independent.
 
-One difference from the GTA V reader matters: this corpus **reuses a descriptor with more than one value type**.
-The GTA V reader rejects a record whose type differs from the descriptor's first type; this corpus does that in
+One difference from the earlier title reader matters: this corpus **reuses a descriptor with more than one value type**.
+The earlier title reader rejects a record whose type differs from the descriptor's first type; this corpus does that in
 **6,131 of 591,064 reused-descriptor records (1.0%), spread over 536 of the 1,263 resources**. The descriptor is a
-name index, not a type declaration, and the index tool does not enforce the GTA V rule.
+name index, not a type declaration, and the index tool does not enforce the earlier title rule.
 
 ### Aggregate record counts
 
@@ -256,14 +256,14 @@ the rig-set root, an `anim/` string or a `SKEL_` string. The `data.rpf` RBF0s ar
    continuation starts mid-record. Stop when the root close consumes the buffer exactly, or at the next known
    signature. There is no length field to trust.
 2. **Parse the descriptor table and the type byte together.** A new descriptor is introduced when the index
-   equals the current descriptor count. Do not enforce the GTA V "type must match the declaration" rule; this
+   equals the current descriptor count. Do not enforce the earlier title "type must match the declaration" rule; this
    corpus reuses names with different value types.
 3. **Select the value width from the prologue.** `FB FF 01 00` means 8-byte integers and floats; its absence means
    4-byte. Do not guess from the root schema.
 4. **Use the attribute count.** The third u16 of an element header is the number of leading value records that
    are attributes; the rest are children. The measured range is 0-2, and the rule holds for every element.
 5. **Build the element tree, then map to XML.** Text records attach to the open element. The public
-   `rage_engine_formats` RBF reader documents the same mapping for the GTA V form; the `data.rpf` corpus follows
+   `rage_engine_formats` RBF reader documents the same mapping for the earlier title form; the `data.rpf` corpus follows
    its record grammar with the wider scalar values.
 6. **Do not look for a section directory or a hash table.** There is none. Names are literal; integers are
    values. Mapping a value to a field requires a schema, not a hash lookup.

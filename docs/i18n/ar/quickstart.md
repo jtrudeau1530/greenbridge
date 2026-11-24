@@ -1,13 +1,13 @@
 <div dir="rtl" lang="ar">
 
-# دليل البدء السريع لمشروع Leonida
+# دليل البدء السريع لمشروع Greenbridge
 
 الوثائق الإنجليزية هي المرجع المعتمد. يستند هذا الدليل إلى المراجعة `561b65a` ويغطي خطوات البدء الأساسية.
 راجع [ملف README بالإنجليزية](../../../README.md#project-status) لمعرفة حالة المشروع الحالية، و[فهرس الوثائق](../../README.md) للمزيد من التفاصيل.
 
-## ما هو Leonida؟
+## ما هو Greenbridge؟
 
-Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand Theft Auto VI لتشغيله مباشرةً على Windows.
+Greenbridge مشروع لإعادة ترجمة إصدار Xbox Series من اللعبة المدعومة لتشغيله مباشرةً على Windows.
 يُبنى المشروع على جهازك من نسختك الخاصة من اللعبة. تُترجم برامج التظليل من RDNA2 إلى SPIR-V لاستخدامها مع Vulkan،
 وتُقرأ الموارد من حزمة اللعبة المحلية، ويُعيد المشروع تنفيذ واجهات النظام التي تحتاجها اللعبة.
 
@@ -39,8 +39,8 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 بعد تثبيت المتطلبات، استنسخ المستودع مع وحدته الفرعية.
 
 ```powershell
-git clone --recursive https://github.com/ItsNotRexed/Leonida
-cd Leonida
+git clone --recursive https://github.com/jtrudeau1530/greenbridge
+cd greenbridge
 ```
 
 انقر نقرًا مزدوجًا على `Build.bat`. يبحث البرنامج عن نسختك على الجهاز. إذا وجد أكثر من نسخة فسيطلب منك الاختيار،

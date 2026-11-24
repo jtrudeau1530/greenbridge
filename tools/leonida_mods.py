@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and manage Leonida mods (docs/modding.md).
+"""Install and manage Greenbridge mods (docs/modding.md).
 
 A mod is a folder containing `mod.json`; `gta6rt` reads those folders from `mods/` next to itself. This tool manages
 that folder without touching the game package or the generated work files. It can create a manifest, install a mod
@@ -621,7 +621,7 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
             if self.mods_var.get():
                 self.refresh()
             else:
-                self.status("Choose the built Leonida port folder")
+                self.status("Choose the built Greenbridge port folder")
 
         def read_game_path(self, port):
             if not port:
@@ -633,7 +633,7 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
                 return ""
 
         def build_layout(self):
-            self.root.title("Leonida Mod Manager")
+            self.root.title("Greenbridge Mod Manager")
             self.root.minsize(860, 620)
             self.root.columnconfigure(0, weight=1)
             self.root.rowconfigure(0, weight=1)
@@ -758,7 +758,7 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
                 fn(*argv)
             except Exception as exc:
                 self.log(f"ERROR: {exc}")
-                messagebox.showerror("Leonida Mod Manager", str(exc))
+                messagebox.showerror("Greenbridge Mod Manager", str(exc))
 
         def mods_dir(self):
             path = self.mods_var.get().strip()
@@ -767,7 +767,7 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
             return os.path.abspath(path)
 
         def choose_port(self):
-            folder = filedialog.askdirectory(title="Choose the built Leonida port folder")
+            folder = filedialog.askdirectory(title="Choose the built Greenbridge port folder")
             if folder:
                 self.port_var.set(folder)
                 self.mods_var.set(os.path.join(folder, "mods"))
@@ -800,7 +800,7 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
             self.tree.delete(*self.tree.get_children())
             self.mods = {}
             if not path:
-                self.status("Choose the built Leonida port folder")
+                self.status("Choose the built Greenbridge port folder")
                 return
             self.mods_list, self.errors = load_mods(path)
             for mod in self.mods_list:
@@ -848,7 +848,7 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
         def install_package(self):
             source = filedialog.askopenfilename(
                 title="Install a mod package",
-                filetypes=(("Leonida mod packages", "*.leonidamod *.zip"), ("All files", "*.*")))
+                filetypes=(("Mod packages", "*.leonidamod *.zip"), ("All files", "*.*")))
             if source:
                 self.install_source(source)
 
@@ -886,7 +886,7 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
             mod = self.selected()
             output = filedialog.asksaveasfilename(
                 title="Pack mod", defaultextension=".leonidamod", initialfile=mod.folder + ".leonidamod",
-                filetypes=(("Leonida mod package", "*.leonidamod"), ("ZIP", "*.zip"), ("All files", "*.*")))
+                filetypes=(("Mod package", "*.leonidamod"), ("ZIP", "*.zip"), ("All files", "*.*")))
             if output:
                 replace = os.path.exists(output)
                 if replace and not messagebox.askyesno("Replace package?", f"{output} exists. Replace it?"):

@@ -1,6 +1,6 @@
 # Source and validation recovery
 
-Greenbridge continues the available Leonida source and validation record. Original
+Greenbridge preserves the available source and validation record. Original
 authors, commit messages, license text, copyright notices and third-party attribution
 are retained. New recovery documentation does not claim authorship of upstream fixes.
 

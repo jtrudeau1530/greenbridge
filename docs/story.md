@@ -547,7 +547,7 @@ The bytes support a **new RAGE resource family in an RPF9 container**:
 
 - RPF9 data areas are zlib streams, with page-aligned embedded RPF9 sub-archives (437 of the 442
   `story000` headers are page-aligned).
-- `0DRP` is a page header, not a GTA V `RSC7` header: magic at +16, version 122, page count at
+- `0DRP` is a page header, not a earlier title `RSC7` header: magic at +16, version 122, page count at
   +0x20, and payload pages after it.
 - `RSC8` is the resource header in the raw story region: version 8001, a u32 at +8, flags and a
   name string. It is the payload of AWC tag `0x5c`, a facial/lip-sync clip dictionary, and the u32

@@ -1,4 +1,4 @@
-# Leonida — Szybki start (`pl-PL`)
+# Greenbridge — Szybki start (`pl-PL`)
 
 > [!NOTE]
 > Dokumentacja w języku angielskim ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) i
@@ -6,9 +6,9 @@
 > konfiguracji i budowania (zsynchronizowany z commitem `f847748c`). Aktualny stan projektu znajdziesz w
 > [`README.md`](../../../README.md).
 
-## Czym jest Leonida
+## Czym jest Greenbridge
 
-Leonida to projekt statycznej rekompilacji Grand Theft Auto VI (Xbox Series), który uruchamia grę natywnie na
+Greenbridge to projekt statycznej rekompilacji the supported title (Xbox Series), który uruchamia grę natywnie na
 Windowsie. Port jest budowany **na Twoim komputerze z Twojej własnej kopii gry**. Procesor Xbox Series jest x86-64
 tak jak w komputerze PC, więc kod gry jest ładowany i wykonywany natywnie, a oprogramowanie systemowe konsoli jest
 implementowane od nowa w postaci tzw. shimów. Skompilowane wcześniej programy GPU konsoli (RDNA2) są tłumaczone na
@@ -66,7 +66,7 @@ Portu nie pobiera się gotowego. Buduje się go na Twoim komputerze z Twojej kop
 1. Zainstaluj wymagania powyżej.
 2. Pobierz projekt **razem z submodułem**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
    „Download ZIP” z GitHuba pomija `third_party/rpf9-explorer`. Build pobierze go sam, jeśli masz `git`, a w
    przeciwnym razie powie, co zrobić.

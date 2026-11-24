@@ -421,7 +421,7 @@ the serial or path and the order; for pads already connected at start, that orde
 
 ## ABI
 
-`runtime/shims/gameinput_abi.h` declares the v0 GameInput API as Leonida's own code: the interfaces in vtable order,
+`runtime/shims/gameinput_abi.h` declares the v0 GameInput API as Greenbridge's own code: the interfaces in vtable order,
 the enums the shim uses and the structs it has to lay out. It was written against Microsoft's public v0 header (the
 GDK version, also published as the `Microsoft.GameInput` NuGet package 0.2303.22621.3038). The header is not in the
 repository. Its struct offsets were checked by compiling both side by side with `offsetof` asserts for every field the

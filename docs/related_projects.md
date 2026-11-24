@@ -1,6 +1,6 @@
 # Related projects and prior art
 
-Leonida is **GPL-3.0-or-later**. Some useful reverse-engineering work lives under other licences, and some of it
+Greenbridge is **GPL-3.0-or-later**. Some useful reverse-engineering work lives under other licences, and some of it
 cannot be mixed with this repository. This page records what we may learn from each project and where the line is.
 
 The rule is the same for every entry: **facts are fine; code is not.** A format layout, an ABI observation or a
@@ -18,7 +18,7 @@ placement in user SGPRs, thread-group lane layout on PC drivers and GFX10 textur
 **Licence:** **GPL-2.0-only**, which is **incompatible with GPL-3.0-or-later**, as for americas-recomp below. **No
 code, tables or comments may be copied.**
 
-**What we use it for:** its measured facts only. Verify each one with Leonida's own census, a synthetic test or a
+**What we use it for:** its measured facts only. Verify each one with Greenbridge's own census, a synthetic test or a
 public specification before relying on it. This repository never contains game data, so a fact XCL measured on a retail package is checked here with synthetic inputs or a contributor's own copy.
 
 ## rpatty-dev/PercyStar
@@ -30,7 +30,7 @@ decoder. Its format observations are relevant to the archive, texture and audio 
 
 **Licence:** the "PercyStar Non-Commercial Attribution & Copyleft License (v1.2)". It is source-available, says
 "All rights reserved", and adds non-commercial, attribution, naming and share-alike conditions. It is not
-GPL-compatible, so **no PercyStar code, comments or tables may be copied into Leonida**.
+GPL-compatible, so **no PercyStar code, comments or tables may be copied into Greenbridge**.
 
 **What we use it for:** reading about format facts, then implementing them independently. If a fact is useful,
 record the observation in our own words, cite the project and verify it against the package or a public
@@ -53,9 +53,9 @@ example `xbox_dxil_lower.py`, `d3d12_xs.cpp`, `xmem.cpp`, `xbox_device_proxy.h`)
 tools/xbox/platform/xgr, its 20 tools/tests/test_xbox_*.py tests and its docs/xbox/BVH_CONTAINER.md. Everything else,
 including the recompiler in its core directory and the `xgameruntime` stand-in sources, stays GPL-2.0-only.
 
-**Rule until the maintainer decides:** **no americas-recomp code is copied into Leonida**, MIT-listed or not. MIT is
+**Rule until the maintainer decides:** **no americas-recomp code is copied into Greenbridge**, MIT-listed or not. MIT is
 compatible with GPL-3.0-or-later, so the listed files could be used the way `third_party/xtaskqueue` is (per file, only
-paths listed in `REUSE.toml` at the commit used, the MIT notice kept); whether Leonida does that is the maintainer's
+paths listed in `REUSE.toml` at the commit used, the MIT notice kept); whether Greenbridge does that is the maintainer's
 decision, not a contributor's.
 
 **What we use it for:** the measured ABI facts only. The useful findings are summarised in
@@ -73,7 +73,7 @@ TTPF pools and AWC audio). It is a `third_party` **submodule**, not code copied 
 
 **Licence:** the repository has **no licence file** (GitHub reports no licence), so all rights are reserved by
 default. A submodule is an external dependency; it is not a grant to copy its code. Do not paste its functions,
-tables or comments into Leonida. If a format fact learned from it is useful, verify it against the package and
+tables or comments into Greenbridge. If a format fact learned from it is useful, verify it against the package and
 write our own implementation. The model-recovery gap measured in [models.md](models.md) is in that submodule; the
 fix should go upstream, not into a copy.
 
@@ -86,7 +86,7 @@ does not decode the TOC.
 **Licence: none.** The repository has no `LICENSE` file (GitHub reports `license: null`); only the
 vendored cimgui/imgui carry MIT. With no grant, default copyright applies and the project is
 **all rights reserved** — stricter than PercyStar. **No 6stars code, comment, identifier or table may
-be copied into Leonida.**
+be copied into Greenbridge.**
 
 **What we use it for:** corroboration and a small number of hypotheses. As an independent reading of
 the same formats it matches our `CEntityDef` member hashes (9/9), the PRD0 header, the navmesh tile
@@ -99,7 +99,7 @@ PSO member hashing) our measurements are the validated ones.
 A macOS Swift/Metal engine that reads the world from RPF9, with its own archive index and format readers.
 
 **Licence: none.** There is no `LICENSE` file and GitHub reports no licence, so all rights are reserved.
-**No 6stars code, comments, identifiers or tables may be copied into Leonida.**
+**No 6stars code, comments, identifiers or tables may be copied into Greenbridge.**
 
 **What we use it for:** corroboration. Its RPF9 stream-boundary predicate and PRD0 member type codes were
 re-measured against this package before entering [rpf.md](rpf.md) and [world.md](world.md); its navmesh
@@ -121,9 +121,9 @@ say in the pull request which file a borrowed fact came from. Do not copy a whol
 licence allows it.
 
 **What we use it for:** the measured console runtime surface (see `docs/d3d12_xs_surface.md` when that study
-lands), the IID/extension tables, and the call-sequence observations that Leonida's own
+lands), the IID/extension tables, and the call-sequence observations that Greenbridge's own
 [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) still lists as unknown. SCARAB forwards to
-D3D12; Leonida translates to Vulkan. The ABI facts carry over, the forwarding architecture does not.
+D3D12; Greenbridge translates to Vulkan. The ABI facts carry over, the forwarding architecture does not.
 
 ## holdmysocks/SixNG
 

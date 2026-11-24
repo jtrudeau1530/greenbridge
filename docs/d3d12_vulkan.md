@@ -3780,7 +3780,7 @@ minimum. The trace decides, not the milestone labels.
 
 ## 7. Prior art and measured Xbox ABI
 
-A GPL-2.0-only fork of AnyPS5 (`americas-recomp`, branch `xbox-series`) recompiles the same GTA VI Xbox Series
+A GPL-2.0-only fork of AnyPS5 (`americas-recomp`, branch `xbox-series`) recompiles the same the supported title Xbox Series
 shaders and has run the package's DLLs against a PC D3D12 device behind an Xbox-ABI proxy. Its measurements are
 prior art for this design. The findings below are paraphrased; no code or long passages are copied. They were
 verified there by running the package DLLs (`XS_TRACE=1`, per-slot hit counters) or by static import analysis, not
@@ -3876,7 +3876,7 @@ Correctness is still unverified on a GPU and the call sites need the executable 
 
 `americas-recomp` / AnyPS5 is **GPL-2.0-only**. GPL-2.0-only is not compatible with this repository's
 GPL-3.0-or-later, so no code, headers, generated stubs or other implementation text from that tree may be copied
-into Leonida. This section records ABI/format facts and links only; the designs in this document are independent.
+into Greenbridge. This section records ABI/format facts and links only; the designs in this document are independent.
 Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code source. The same line holds for the
 other compatibility-layer efforts whose measurements are folded in above: facts and numbers only, paraphrased —
 nothing is copied from their trees.
@@ -4074,7 +4074,7 @@ on a PC device behind the Xbox-ABI proxy). Measured:
   which the constructor throws. Other runs end the process inside `nvwgf2umx.dll` with `0xC0000409`, after the
   driver's LLVM 7.0.1 bitcode reader prints `Invalid record` or `Never resolved value found in function`. That
   can't be caught. The D3D12 debug layer prints nothing first.
-  - **Cause: the input, not Leonida.** The proxy passes the bytecode through unchanged, so nothing is wrong in what
+  - **Cause: the input, not Greenbridge.** The proxy passes the bytecode through unchanged, so nothing is wrong in what
     it forwards. The input is the problem: `LEONIDA_BVH_RECORD62=1 LEONIDA_BVH_DXIL=1` shows that every one of the
     53 PSO calls (52 distinct containers) is signed, has the same 9 parts, and is shader model 6.5 / DXIL 1.5. But dxil.dll (Windows SDK
     10.0.26100) rejects all 53 (`0x80aa0009`): the target triple is `dxil-ms-xb2` and the module carries

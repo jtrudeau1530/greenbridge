@@ -42,7 +42,7 @@ body:
         - assets
         - runtime
         - pipelines
-        - Running gta6rt
+        - Running the runtime
         - A tool run by hand (tools/, scripts/)
     validations:
       required: true

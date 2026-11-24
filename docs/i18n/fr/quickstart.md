@@ -1,4 +1,4 @@
-# Leonida — Guide de démarrage (`fr`)
+# Greenbridge — Guide de démarrage (`fr`)
 
 > [!NOTE]
 > La documentation en anglais ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) et
@@ -6,9 +6,9 @@
 > et de compilation (synchronisé avec le commit `aa2988cc`). Pour l'état d'avancement du projet, qui change tous les
 > jours, consultez le [`README.md`](../../../README.md).
 
-## Ce qu'est Leonida
+## Ce qu'est Greenbridge
 
-Leonida est un projet de recompilation statique de Grand Theft Auto VI (version Xbox Series) pour le faire tourner
+Greenbridge est un projet de recompilation statique d’un jeu compatible (version Xbox Series) pour le faire tourner
 nativement sous Windows. Il se construit **sur votre PC, à partir de votre propre copie du jeu**. Les shaders RDNA2 de
 la console sont traduits en SPIR-V (Vulkan), les ressources sont lues directement dans votre paquet et le logiciel
 système de la console est réimplémenté sous forme de shims.
@@ -80,7 +80,7 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
 1. Installez les prérequis ci-dessus.
 2. Clonez le dépôt **avec son sous-module** :
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
    Un « Download ZIP » depuis GitHub n'inclut pas `third_party/rpf9-explorer` : la compilation le récupère si `git`
    est installé, et sinon vous dit quoi faire.

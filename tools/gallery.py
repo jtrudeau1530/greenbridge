@@ -518,7 +518,7 @@ def start_server(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Leonida 3D Asset Studio local web gallery.")
+    parser = argparse.ArgumentParser(description="Greenbridge 3D Asset Studio local web gallery.")
     parser.add_argument("--port", type=int,
                         help="HTTP port from 0 to 65535 (default 8080, or 8081 if unavailable)")
     parser.add_argument("--models-dir", type=str, default=None, help="Directory containing .glb models")

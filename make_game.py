@@ -40,7 +40,7 @@ rpf9dump; a solo assets run still lets rpf9dump use every core.
 Long steps log percent and a rough ETA (shader translation shards, asset exports, XMA decode, and overall
 weighted stage completion while they overlap).
 
-On an interactive terminal, a LEONIDA setup screen asks for --jobs and whether to overlap stages, then a
+On an interactive terminal, a Greenbridge setup screen asks for --jobs and whether to overlap stages, then a
 key-switchable per-stage log view (1-4 / Tab) keeps parallel output demuxed; full logs land in <work>/logs/.
 Pass --no-tui (or redirect stdout) for the plain interleaved console.
 """
@@ -566,7 +566,7 @@ def native_picker():
 def native_ask(tool: str, exe: str, start: str) -> str:
     """One folder dialog from `tool`: the chosen folder, or "" on cancel. OSError when the tool itself fails."""
     if tool == "kdialog":
-        cmd = [exe, "--title", "Leonida", "--getexistingdirectory", start]
+        cmd = [exe, "--title", "Greenbridge", "--getexistingdirectory", start]
     else:
         cmd = [exe, "--file-selection", "--directory", "--title=" + PICK_TITLE,
                "--filename=" + os.path.join(start, "")]
@@ -579,8 +579,8 @@ def native_ask(tool: str, exe: str, start: str) -> str:
 
 
 def native_warn(tool: str, exe: str, msg: str) -> None:
-    cmd = ([exe, "--title", "Leonida", "--sorry", msg] if tool == "kdialog"
-           else [exe, "--warning", "--title=Leonida", "--text=" + msg])
+    cmd = ([exe, "--title", "Greenbridge", "--sorry", msg] if tool == "kdialog"
+           else [exe, "--warning", "--title=Greenbridge", "--text=" + msg])
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -624,7 +624,7 @@ def pick_game() -> str:
                 log(f"chose {v['title']} {v['version']} in {d}")
                 return d
             notes = "".join(f"\n\n{container_message(p, h)}" for p, h in containers_in(d))
-            messagebox.showwarning("Leonida", PICK_UNSUPPORTED + notes, parent=root)
+            messagebox.showwarning("Greenbridge", PICK_UNSUPPORTED + notes, parent=root)
     finally:
         root.destroy()
 
@@ -1037,7 +1037,7 @@ def ensure_submodule() -> None:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if submodule_ready():
         return
-    clone = "git clone --recursive https://github.com/ItsNotRexed/Leonida"
+    clone = "git clone --recursive https://github.com/jtrudeau1530/greenbridge"
     git = shutil.which("git")
     if not git:
         fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). Install Git "
@@ -2759,7 +2759,7 @@ def main() -> int:
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
     ap.add_argument("--no-tui", action="store_true",
-                    help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
+                    help="plain console logs (default when stdout is not a TTY); skip the Greenbridge setup screen "
                          "and per-stage log view")
     a = ap.parse_args()
     stages = STAGES

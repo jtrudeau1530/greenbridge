@@ -2,7 +2,7 @@
 
 Status: reference, sourced. This page records what SCARAB measured about the Xbox Series
 `d3d12_xs.dll` ABI, checks those claims against the files and the Windows SDK, and states what
-Leonida can use. It does **not** adopt SCARAB's forwarding architecture: Leonida translates D3D12
+Greenbridge can use. It does **not** adopt SCARAB's forwarding architecture: Greenbridge translates D3D12
 to Vulkan, while SCARAB forwards to PC `d3d12.dll` / vkd3d-proton. Only ABI facts, IID values and
 call-sequence constraints are taken from it. No SCARAB code is copied.
 
@@ -35,7 +35,7 @@ string would carry the platform name; §2.3 covers the consequence for export na
 
 SCARAB also measured that the console runtime and the PC D3D12 runtime define the same COM
 interfaces: 28 `IID_*` data exports that exist on both sides are byte-identical. That is the fact
-that makes the standard D3D12 surface forwardable rather than reimplementable — and for Leonida it
+that makes the standard D3D12 surface forwardable rather than reimplementable — and for Greenbridge it
 means a `QueryInterface` for a standard interface can be answered with the PC GUID without a
 translation table.
 
@@ -57,15 +57,15 @@ Ordinals are documented in
 [`docs/d3d12-xs-bridge.md:99-113`](https://github.com/p-portela/SCARAB/blob/d304fa2/docs/d3d12-xs-bridge.md)
 and the individual stubs in
 [`components/runtime-bridge/src/d3d12_xs_bridge.cpp`](https://github.com/p-portela/SCARAB/blob/d304fa2/components/runtime-bridge/src/d3d12_xs_bridge.cpp).
-"Leonida today" describes `runtime/shims/d3d12_xs.cpp` at the time of writing.
+"Greenbridge today" describes `runtime/shims/d3d12_xs.cpp` at the time of writing.
 
-| # | Export (SCARAB's spelling) | Kind | Leonida today | Note |
+| # | Export (SCARAB's spelling) | Kind | Greenbridge today | Note |
 |---:|---|---|---|---|
 | 1 | `D3D12ZeroMemoryX` | console | absent | console fast-zero; `memset` is equivalent |
 | 2 | `PixGetPixieEntryPoints` | console (PIX) | absent | no PIX path |
 | 3 | `D3D10CreateBlob` | console (D3D10) | absent | local `ID3D10Blob`; no D3D10 dependency needed |
 | 4 | `D3D12ConfigureVirtualMemoryX` | console | present (returns `S_OK`) | VM policy; PC/Vulkan owns it. Measured: one pointer argument (a zeroed 32-byte block, dword +4 set to a count); the title only tests the result for failure |
-| 5 | `D3D12CreateDevice` | standard | **absent** | Leonida exports only the Xbox entry point; see §2.3 |
+| 5 | `D3D12CreateDevice` | standard | **absent** | Greenbridge exports only the Xbox entry point; see §2.3 |
 | 6 | `D3D12CreateRootSignatureDeserializer` | standard | present | forwarded |
 | 7 | `D3D12CreateVersionedRootSignatureDeserializer` | standard | absent | forward if imported |
 | 8 | `D3D12EnableExperimentalFeatures` | standard | absent | forward if imported |
@@ -85,7 +85,7 @@ and the individual stubs in
 | 22 | `DXGIXSetVLineNotification` | console present | absent | scanline/vblank notification |
 | 116 | `InternalDriverCallX` | console private | absent | runtime↔UMD escape hatch; nothing to forward to |
 
-The seven standard functions are 5–11. The other sixteen are console-only. Leonida serves four of
+The seven standard functions are 5–11. The other sixteen are console-only. Greenbridge serves four of
 the twenty-three today (6, 10, 11, 13). Any function in the table other than those four is an
 unimplemented import if the game imports it; the PE loader's dry-run report (`docs/runtime_imports.md`
 on the runtime-imports branch) is the place to see it.
@@ -214,7 +214,7 @@ vendor token:
   tell-tale "an console Series" — the tree was mechanically de-branded before the first commit.
 
 Therefore `D3D12ConsCreateDevice` (ordinal 13) and the other four `D3D12Cons*` exports are
-SCARAB's internal spellings, not evidence of the runtime's export names. Leonida already uses
+SCARAB's internal spellings, not evidence of the runtime's export names. Greenbridge already uses
 `D3D12XboxCreateDevice`, which is the public GDK name and the same call shape
 (`adapter, params, riid, out`). That is the likely wire name, but it should be confirmed from the
 game's import table. The same caveat applies to `IID_ID3D12ConsDmaCommandList`: the GUID in §4 is
@@ -287,12 +287,12 @@ The second also compares all 93 values and the 59 documented ordinals against a 
 The third is the standalone test; `pytest tests/test_d3d12_xs_surface.py` works where pytest is
 installed.
 
-Consequences for Leonida:
+Consequences for Greenbridge:
 
 - A QI for any standard interface can be answered with the SDK GUID. No translation table is
   needed, and a captured GUID can be looked up directly in the SDK headers.
 - The 28-IID claim understates the evidence. If the game uses D3D11 on the console — SCARAB's
-  open question 1 — the existing D3D11/DXGI IIDs are the PC ones too. Leonida still lists D3D11
+  open question 1 — the existing D3D11/DXGI IIDs are the PC ones too. Greenbridge still lists D3D11
   as a non-goal, so this is information, not a work item.
 - The GUID values are facts about the runtime; for the 83 standard GUIDs, the *names* come from
   the SDK and are not proprietary.
@@ -336,7 +336,7 @@ Ten IIDs exported by the runtime are absent from the Windows SDK. Values are **R
 SCARAB from the vendor runtime's export table; the ordinal is from `iid_console.inc`, so it is
 **Verified** against SCARAB's file, not against the vendor binary.
 
-| Ordinal | IID | GUID | What it is | Leonida relevance |
+| Ordinal | IID | GUID | What it is | Greenbridge relevance |
 |---:|---|---|---|---|
 | 100 | `IID_ID3D12ConsDmaCommandList` | `30bc77b9-8379-4b25-95de-b8588c42275d` | DMA command-list interface | **High.** If the game creates a DMA list, this is the IID it passes to `CreateCommandList` |
 | 115 | `IID_IGraphicsUnknown` | `aceeea63-e0a9-4a1c-bbec-71b2f485f758` | unknown purpose | Do not invent a vtable; log and refuse |
@@ -400,7 +400,7 @@ SCARAB's wrapper class derives from the genuine `ID3D12Device4` and
 compiler proves **53 device and 76 command-list** signatures against the real `d3d12.h`
 ([`docs/d3d12-xs-wrapper.md:53-63`](https://github.com/p-portela/SCARAB/blob/d304fa2/docs/d3d12-xs-wrapper.md)).
 That proves the PC-side vtable layout of its wrapper; it says nothing about the appended console
-block, which is the part Leonida must not copy.
+block, which is the part Greenbridge must not copy.
 
 Class placement that is evidence-backed:
 
@@ -412,7 +412,7 @@ Class placement that is evidence-backed:
 | graphics list | `RSSetDepthBiasX`, `OMSetSampleMaskX`, `OMSetFrontAndBackStencilRef`, `FillMemoryWithPattern` | UMD messages |
 | unattributed | the other ~90 names | strings only |
 
-**Do not copy the appended order.** Leonida implements the public vtable chain; an unknown X
+**Do not copy the appended order.** Greenbridge implements the public vtable chain; an unknown X
 method should be logged with its slot and arguments and refused, exactly as SCARAB does, until the
 game's trace identifies it.
 
@@ -434,7 +434,7 @@ The lesson is not that the catalogue is useless; it is that a name with an `X` s
 of a console-only method. Check every name against the SDK version the game was compiled against
 before treating it as new. For `OMSetFrontAndBackStencilRef` the signature is identical, so a
 GCL8-compiled game calls it at the public slot; SCARAB's placement after GCL6 would land in the
-wrong slot. Leonida's public-chain command list already has it at GCL8.
+wrong slot. Greenbridge's public-chain command list already has it at GCL8.
 
 ## 6. Command lists and `CreateCommandList`
 
@@ -457,7 +457,7 @@ SCARAB's interception logic
 - prefer `CreateCommandList1` and `Reset` to apply the initial state;
 - return a wrapper that serves the DMA IID only for DMA lists.
 
-For Leonida, the transferable facts are the rule and the IID, not the wrapper:
+For Greenbridge, the transferable facts are the rule and the IID, not the wrapper:
 
 - On `CreateCommandList`, log `(nodeMask, type, riid)` once. If `type` is outside 0–5, or `riid` is
   not a standard GCL IID, treat it as a console list.
@@ -473,14 +473,14 @@ For Leonida, the transferable facts are the rule and the IID, not the wrapper:
   Their IIDs are not runtime exports according to SCARAB, so this package's export tables cannot
   supply them; the values and the layouts are **Open**.
 
-What this does not tell us: the slot of `CreateCommandList` in the console device vtable (Leonida
+What this does not tell us: the slot of `CreateCommandList` in the console device vtable (Greenbridge
 already measures device slot 14/62/76 independently), the real numeric value of the DMA type, or
 whether the game uses DMA lists at all. It is a conditional branch to add to the trace, not a
 proven path.
 
 ## 7. Presentation: `PresentX`, `DXGIX*`, frame events
 
-This is where the expectation that SCARAB closes Leonida's §7 list is **not** met. SCARAB gives
+This is where the expectation that SCARAB closes Greenbridge's §7 list is **not** met. SCARAB gives
 names and constraints, not signatures, slots or a working present path.
 
 What is evidence-backed:
@@ -532,9 +532,9 @@ slot. The plan in [d3d12_vulkan.md §4.5](d3d12_vulkan.md) is now a `PresentX` +
 with DXGI factory/adapter/output enumeration kept and the DXGI swapchain as fallback.
 
 The `DXGIX*` free functions are a separate question. If the game imports them from `d3d12_xs.dll`,
-Leonida's loader will report them as unimplemented; a Vulkan present-array implementation would
+Greenbridge's loader will report them as unimplemented; a Vulkan present-array implementation would
 need a swapchain registry, which does not exist yet. SCARAB's no-op behavior is not acceptable for
-Leonida because it would silently present nothing.
+Greenbridge because it would silently present nothing.
 
 ### 7.1 Public sources for the presentation and device ABI
 
@@ -637,9 +637,9 @@ The catalogue contributes **names**, which are useful as a checklist:
   `D3D12CONS_TEXTURE_DATA_PITCH_ALIGNMENT`, `D3D12CONS_DCC_COMPRESSION_LEVEL_128B_TEXTURE_COMPATIBLE`.
 
 None of these has a numeric value in SCARAB, and none has a layout. The tiling/DCC question is
-therefore **described, not answered**: the names tell Leonida what to look for in the game's
+therefore **described, not answered**: the names tell Greenbridge what to look for in the game's
 resource descriptions, and the copy/state names tell it which compression transitions the game
-may perform, but the actual swizzle and DCC metadata format still has to come from Leonida's own
+may perform, but the actual swizzle and DCC metadata format still has to come from Greenbridge's own
 `tools/amd_swizzle.py` (the mode's equation, read from the public AMD header and evaluated to
 detile with), `tools/tile_probe.py` (the block-endpoint feature and smoothness score measured on
 a blob) and `tools/swizzle_search.py` (the brute-force search over every bit ordering with the
@@ -652,17 +652,17 @@ performance: `D3D12CONS_RESOURCE_STATE_PRESERVE_*` (a barrier that preserves com
 `D3D12CONS_COPY_FLAG_FORCE_ELIMINATE_DCC` / `RESUMMARIZE_HTILE` (a copy that changes compression).
 If the game uses either, a naive Vulkan copy or barrier will read stale or compressed bytes.
 
-## 9. What this answers for Leonida
+## 9. What this answers for Greenbridge
 
-Mapping to [d3d12_vulkan.md §8.2](d3d12_vulkan.md). "Answered" means a fact Leonida can implement
+Mapping to [d3d12_vulkan.md §8.2](d3d12_vulkan.md). "Answered" means a fact Greenbridge can implement
 against; "described" means names or constraints but no layout; "still unknown" means no usable
 evidence.
 
-| Leonida unknown | Status after SCARAB (and §7.1) | What is actually new |
+| Greenbridge unknown | Status after SCARAB (and §7.1) | What is actually new |
 |---|---|---|
 | #1 device entry point and 24-word params | **described** | The separate console device export exists at ordinal 13 and is named `D3D12ConsCreateDevice` internally / `D3D12XboxCreateDevice` publicly; the params struct is named `D3D12CONS_CREATE_DEVICE_PARAMETERS`. Public sources name 17 fields and their x64 offsets, plus two more field names; a 24-word block still has at least four words unaccounted (§7.1). |
 | #2 device/heap/queue/command-list slots | **partly measured** | SCARAB has no console slot map. Its appended-after-GCL6 model conflicts with the SDK's GCL8/GCL9 methods (§5.1). Public §7.1 gives the presentation slots (device 78-81, queue 30/32); the heap and command-list slot map is still unknown. Do not use SCARAB as a slot source. |
-| #3 root signature → `s0..s31` | **still unknown** | Only flag names (`D3D12CONS_ROOT_SIGNATURE_FLAG_FORCE_MEMORY_BASED_ABI`, `_RAYTRACING`); no mapping. Leonida's own register-based/spill facts already go further. |
+| #3 root signature → `s0..s31` | **still unknown** | Only flag names (`D3D12CONS_ROOT_SIGNATURE_FLAG_FORCE_MEMORY_BASED_ABI`, `_RAYTRACING`); no mapping. Greenbridge's own register-based/spill facts already go further. |
 | #4 descriptor bytes and increments | **still unknown** | No measured increment. `D3D12CONS_DESCRIPTOR_HEAP_TYPE_SAMPLER_UNBOUNDED` is a new name, not a size. |
 | #5 VA range / arena capacity | **still unknown** | — |
 | #6 DXGI vs `PresentX` | **partly answered** | `PresentX` is a queue method; public code gives its queue slot (30 in the older runtime layout, 32 in the newer) and the x64 plane/present layouts (§7.1). Public samples give the call sequence and argument counts (no DXGI swapchain; frame events + `PresentX`), see §7. The game itself is not observed. |
@@ -676,7 +676,7 @@ evidence.
 | console IIDs | **10 exported; 4 not exported** | The DMA list IID is proven and the other nine console GUIDs are reported. SCARAB's provenance reports that the four command-list IIDs are not runtime exports, so they have no ordinal; this package has no D3D12 DLL to read. They stay unresolved until a title trace or another artifact supplies them. |
 | standard IIDs | **answered** | 83/83 standard GUIDs match the SDK; the 28 D3D12 ones are exact. |
 | export contract | **answered** | 116 = 23 functions + 93 GUIDs; 23 function ordinals and 59 IID ordinals are documented, 34 are derived. The four command-list IIDs are outside the 93 and have no ordinal. |
-| free-function dispositions | **answered as a list** | 7 standard + 16 console-only; Leonida serves 4 today. |
+| free-function dispositions | **answered as a list** | 7 standard + 16 console-only; Greenbridge serves 4 today. |
 
 The honest summary: SCARAB closes the **export/IID contract** and the **DMA-list rule**, and gives
 a **name-level map** of the extension surface. It does not close presentation, slots, struct
@@ -735,7 +735,7 @@ hold as files, subject to the name caveat.
 ## 11. Licence and provenance
 
 SCARAB is **GPL-3.0-only**: its README says so and every first-party file carries
-`SPDX-License-Identifier: GPL-3.0-only`. Leonida is GPL-3.0-or-later. The two are compatible in the
+`SPDX-License-Identifier: GPL-3.0-only`. Greenbridge is GPL-3.0-or-later. The two are compatible in the
 direction that matters — GPL-3.0-only code can be combined into a GPL-3.0 work — but the combined
 work cannot be relicensed as "or later" for the SCARAB-derived part. This page copies **no SCARAB
 code**. It records interface names, ordinal numbers and 16-byte GUIDs, which are ABI facts, with
@@ -779,8 +779,8 @@ Windows SDK 10.0.26100.0:
 - `um/d3d12sdklayers.h:4243` — `IID_ID3D12Debug`.
 - `um/d3d11*.h`, `shared/dxgi*.h`, `um/d3dcommon.h`, `um/dxgidebug.h` — the other standard GUIDs.
 
-Leonida:
+Greenbridge:
 
 - [d3d12_vulkan.md](d3d12_vulkan.md) §3.5, §4.5, §7, §8.2 — the gaps this page maps onto.
 - `docs/runtime_imports.md` (runtime-imports branch) — which imports the shipped DLLs actually bind.
-- `runtime/shims/d3d12_xs.cpp` — the four functions Leonida serves today.
+- `runtime/shims/d3d12_xs.cpp` — the four functions Greenbridge serves today.

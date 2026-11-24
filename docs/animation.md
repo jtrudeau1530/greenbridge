@@ -86,7 +86,7 @@ Two observations matter for a decoder:
 
 Top page-count values: 1 (1,883), 2 (7,571), 3 (9,241), 4 (2,022), 19–26 (1,592). The largest sampled page
 (5,636,096 bytes) is 94.6% zero bytes, with sparse pointers. That is a page directory/relocation table, not
-keyframe data. The marker is reported as a page marker, not as a known GTA V resource magic. Each `0DRP` stream is
+keyframe data. The marker is reported as a page marker, not as a known earlier title resource magic. Each `0DRP` stream is
 the first system page of a resource; the page map at the `+0x08` pointer gives its page count (see
 [Keyframe decoding](#keyframe-decoding)).
 
@@ -402,9 +402,9 @@ python -I tools/anim_clips.py <package>\anim.rpf --decode <dictionary offset> [-
 The JSON holds counts and one row per dictionary (offset, hash and counts, plus the name read from your copy).
 It holds no values. `--decode` prints one dictionary with its decoded values and writes no file.
 
-Provenance: channel types 0–8 follow the GTA V `crAnimation` channel set, as named by community tools such as
+Provenance: channel types 0–8 follow the earlier title `crAnimation` channel set, as named by community tools such as
 CodeWalker's YCD reader (static, quantized, indirect-quantized and cached-quaternion channels). No code was taken
-from them. The resource framing, the GTA VI-only channel type 10, the type 3 and type 8 rules below and every
+from them. The resource framing, the title-specific channel type 10, the type 3 and type 8 rules below and every
 count in this section were measured on the local copy.
 
 ### Clip dictionaries are RAGE resources
@@ -593,7 +593,7 @@ The data holds, in order:
 | 7 | none | rebuilds one quaternion component (below) | 4,942,792 |
 | 8 | none | marks a quaternion with four stored components (below) | 227,655 |
 | 9 | — | not seen | 0 |
-| 10 | variable, see below | second-order delta coding (GTA VI) | 6,836,654 |
+| 10 | variable, see below | second-order delta coding (the supported title) | 6,836,654 |
 
 **Type 10** (new in this build, and the most common animated channel):
 
@@ -1173,7 +1173,7 @@ state-machine and motion-tree hierarchy (**1,616** containers across the 324 res
 
 ## Likely format family
 
-The bytes support **new RAGE resource pages**, not the GTA V `YCD`/`RSC7` family:
+The bytes support **new RAGE resource pages**, not the earlier title `YCD`/`RSC7` family:
 
 - RPF9 container, `0DRP` page directories with `0x50xxxxxx` virtual pointers and page counts.
 - `pack:/...` path tables with 16-byte-aligned names and 16-byte hash/pointer records.

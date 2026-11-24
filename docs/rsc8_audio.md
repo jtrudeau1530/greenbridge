@@ -153,7 +153,7 @@ The name word is 0 on 96 records (78 tags start with one); what a nameless recor
 
 - **The name is a joaat of a lowercase word.** Four of the stored values are the hashes of `beat` (`0xe89ae78c`,
   17,770 records), `trackid` (`0xa6d93246`, 1,042), `intro` (`0xda8f5f53`, 835) and `outro` (`0x5d40b28d`, 825),
-  as the [GTA6-Asset-Info](https://github.com/TrinitronClient/GTA6-Asset-Info) byte reference reports
+  as the [Asset format reference](https://github.com/TrinitronClient/GTA6-Asset-Info) byte reference reports
   (`structure/03-audio-awc.md`, commit `029e4c3`); the hashes were computed here, not copied. The names behind
   `0xE5C74063` (418,838 records, 402,357 of them on speech streams with a `0x5c` clip) and `0xdbedd43c` (330,756,
   all on such streams and all with `extra = 0`) are not known.

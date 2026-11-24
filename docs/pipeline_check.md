@@ -136,7 +136,7 @@ measure shader compile time and reproduce compiler failures on a machine without
 Readback and dispatch correctness still require a Vulkan device that executes commands.
 See the [Mesa DRM shim guide](https://docs.mesa3d.org/ci/drm-shim.html).
 
-From the Leonida root, build the checker and translate a synthetic fixture. The fixture build needs
+From the Greenbridge root, build the checker and translate a synthetic fixture. The fixture build needs
 `spirv-as`, `spirv-val` and LLVM 21 or later with the AMDGPU target. Set `LLVM_MC` if the assembler
 has a versioned name.
 

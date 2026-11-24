@@ -2,7 +2,7 @@
 
 The GDK's task queue and async-block implementation, taken unmodified from
 [microsoft/libHttpClient](https://github.com/microsoft/libHttpClient) at commit
-`c5007fd9cbdc785518ea6dccc5751b125d451cc1`. **MIT licence** (see `LICENSE`), which is compatible with Leonida's
+`c5007fd9cbdc785518ea6dccc5751b125d451cc1`. **MIT licence** (see `LICENSE`), which is compatible with Greenbridge's
 GPL-3.0-or-later.
 
 Only what the task queue needs is copied: `Include/XAsync.h`, `Include/XAsyncProvider.h`, `Include/XTaskQueue.h`,

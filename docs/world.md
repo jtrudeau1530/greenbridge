@@ -715,7 +715,7 @@ The 41.3% at the earlier pin (917e9b9) was a model-recovery gap, not a naming ga
 resolves (99.85%, see *What is readable* above), but only recovered models can be placed. The archetypes that
 #8/#10 add are `.#ft` fragments, whose headers `LooksLikeFragment` rejected before breadbbbb/rpf9-explorer#8 (it
 now accepts null optional pointers at `+16`/`+32`/`+40` and range-checks the 16-bit fields at `+48..+54`).
-Leonida's pin is now e2939175, which contains #8 and #10, so the pinned `LooksLikeFragment` accepts these headers;
+Greenbridge's pin is now e2939175, which contains #8 and #10, so the pinned `LooksLikeFragment` accepts these headers;
 the 99.96% was measured on 917e9b9 with both applied and has not been recounted at e2939175.
 
 **Not verified or limited:**
@@ -772,7 +772,7 @@ Ranges: `defaultMaxSpeed` 8 to 15 (median 8), `maxAcceleration` 1 and `maxDecele
 ## Instanced props and grass
 
 Map resources can carry two instance lists besides `CEntityDef`. All four struct names are the case-sensitive
-joaat of the GTA V class names, and every member below is named by the resource's own member table.
+joaat of the earlier title class names, and every member below is named by the resource's own member table.
 `tools/instance_lists.py` reads them through that table (by name hash) and writes counts only.
 
 | Hash | Struct | Size | Members (offset) |
@@ -814,7 +814,7 @@ is set in 5,802, and `lodLevel` is ORPHAN_HD in 205,181 and SLOD1 in 3,058.
 
 ## Procedural objects and plants (`CProceduralInfo`)
 
-In GTA V, `procedural.meta` scatters small objects and plants over ground by collision material: a tag table maps
+In earlier title, `procedural.meta` scatters small objects and plants over ground by collision material: a tag table maps
 material procedural tags to entries in an object list and a plant list. This build's equivalent, one
 `CProceduralInfo` XML document in `common.rpf`, has the same three parts but only the table is filled. Counts
 only; no names.
@@ -837,7 +837,7 @@ only; no names.
   a field value in those records exactly. The fragments cover only part of the list (see the snow and mud
   section below). A numeric value in the slot range (0–254) alone does not identify a slot reference.
 
-Not measured here (hypothesis): whether materials index this table by slot, as in GTA V, and where the
+Not measured here (hypothesis): whether materials index this table by slot, as in earlier title, and where the
 object and plant definitions live.
 
 ## Deformable snow and mud (`CSnowTrackData`)
