@@ -10,12 +10,16 @@ Original source authorship and licenses are retained. Greenbridge is an independ
 
 ## Project status
 
-**The VIctory integration is being built and tested; no gameplay has been verified here.**
+**Readable startup screens have been verified locally; gameplay is not yet usable.**
+A Linux/Wine run reached the world workload with audio, but the scene remained dark
+and slow. A subsequent candidate reduced CPU copy time and then hit a GPU memory
+fault. A later guarded candidate ran past that point but exhausted host memory.
+Synthetic test success does not establish correct world rendering or stability.
 The [pinned upstream README](https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md)
 reports working menus and entry into the world on Windows 11 with an AMD RX 6700 XT.
 Upstream still describes it as **not playable**: world rendering is incomplete and slow,
 and entering the world can hang a real GPU and cause a display-driver reset.
-These are upstream observations, not Greenbridge test results.
+The Windows observations above are upstream results.
 
 ## VIctory runtime
 
@@ -24,6 +28,16 @@ These are upstream observations, not Greenbridge test results.
 [`ffe310eb2098e52169f4c44db5ffdabf43a72622`](https://github.com/Marvisak/VIctory/commit/ffe310eb2098e52169f4c44db5ffdabf43a72622).
 It runs the title's x86-64 code with a Rust runtime and host Direct3D 12, translating
 console shaders to DXIL. It is separate from the Vulkan reference engine below.
+Greenbridge builds apply the reviewed source patches below to that pinned base.
+The submodule HEAD remains the upstream commit; a plain submodule checkout alone
+does not include these changes.
+
+| Source patch | Original author | Upstream commit |
+|---|---|---|
+| Mapped-region copy fallback | Noname0202 | [`61474f6`](https://github.com/MartinIndra02/VIctory/commit/61474f6b350ec3b2b8cdf3760eece2b9c9f957cc) |
+| Scalar loads from root buffer views | adamfx | [`417f4e3`](https://github.com/adamdotpy/VIctory/commit/417f4e30d22f8ffc1801d60e1b480bbc29781594) |
+| Serialized descriptor refresh and bounded root SRVs | slaktarn, hophaver, Hiiva; regression by swarm | [Adapted source commits](runtimes/victory-patches/amd-world-guards.patch) |
+| Test allocation and write-journal isolation | Jason Trudeau | [Synthetic fixture fix](runtimes/victory-patches/watch-fixture-retirement.patch) |
 
 For a local Windows build, install the Rust toolchain manager and the Visual Studio C++
 build tools, then run:
@@ -33,17 +47,33 @@ git clone https://github.com/jtrudeau1530/greenbridge.git
 cd greenbridge
 git submodule update --init -- runtimes/victory
 cd runtimes/victory
+$patches = @(
+  '../victory-patches/61474f6-region-copy.patch',
+  '../victory-patches/417f4e3-root-view-loads.patch',
+  '../victory-patches/amd-world-guards.patch',
+  '../victory-patches/watch-fixture-retirement.patch'
+)
+foreach ($patch in $patches) {
+  git apply --check --index $patch
+  if ($LASTEXITCODE -ne 0) { throw "Cannot apply $patch" }
+  git apply --index $patch
+  if ($LASTEXITCODE -ne 0) { throw "Failed to apply $patch" }
+}
 rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target x86_64-pc-windows-msvc
 cargo +1.98.1 test --workspace --locked
 cargo +1.98.1 build --release --locked -p victory
 ```
+
+Apply the queue once to a fresh checkout. For subsequent builds, run Cargo directly.
+Keep local changes when updating; use a separate clean checkout for a new patch queue.
 
 Building and the default tests require no game files. Running requires your own readable
 copy, Windows 10/11 x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6
 (plus mesh shaders for the world). Follow the pinned upstream README for configuration
 and runtime options; keep game files, caches and saves outside the repository.
 The dedicated [VIctory CI workflow](.github/workflows/victory.yml) checks both default
-and all-feature Clippy builds and runs the locked workspace tests on Windows with Rust 1.98.1.
+and all-feature Clippy builds and runs the locked workspace tests on the patched source
+on Windows with Rust 1.98.1.
 It does not publish build artifacts or releases.
 
 **Dependency provenance:** the gitlink retains upstream authorship and keeps upstream
