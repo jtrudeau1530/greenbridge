@@ -17117,6 +17117,62 @@ def mesh_psv(path, name):
     return None
 
 
+# VOP3 / VOPC-e64 / SDWA-VOPC operands that are a lane mask, sized by the wave (RDNA2 ISA: SDST and the carry /
+# condition SSRC of these are 64 bits in wave64, 32 in wave32): base op (or prefix) -> operand indices.
+WAVE_MASK_OPERANDS = {
+    "v_cndmask_b32": (3,),                                       # condition (src2; e32: implicit vcc_lo / vcc)
+    "v_add_co_u32": (1,), "v_sub_co_u32": (1,), "v_subrev_co_u32": (1,),           # carry out (VOP3b sdst)
+    "v_add_co_ci_u32": (1, 4), "v_sub_co_ci_u32": (1, 4), "v_subrev_co_ci_u32": (1, 4),   # carry out, carry in
+    "v_div_scale_f32": (1,), "v_div_scale_f64": (1,),            # VCC-like sdst
+    "v_mad_u64_u32": (1,), "v_mad_i64_i32": (1,),                # carry out
+}
+
+
+# Operand count of the explicit VOP3(b) form whose mask slots WAVE_MASK_OPERANDS lists.
+WAVE_MASK_FULL_ARGS = {
+    "v_cndmask_b32": 4,
+    "v_add_co_u32": 4, "v_sub_co_u32": 4, "v_subrev_co_u32": 4,
+    "v_add_co_ci_u32": 5, "v_sub_co_ci_u32": 5, "v_subrev_co_ci_u32": 5,
+    "v_div_scale_f32": 5, "v_div_scale_f64": 5,
+    "v_mad_u64_u32": 5, "v_mad_i64_i32": 5,
+}
+
+
+def wave_mask_operand_slots(ins):
+    """Indices of the wave-sized lane-mask operands of one parsed instruction (see WAVE_MASK_OPERANDS; a v_cmp_* /
+    v_cmp_class_* with a destination operand: a[0]; v_cmpx_* has none on GFX10)."""
+    op = base_op(ins["op"])
+    if op.startswith("v_cmp_") and len(ins["args"]) >= 3:
+        return (0,)
+    slots = WAVE_MASK_OPERANDS.get(op, ())
+    # Only the explicit VOP3(b) forms name these operands. A short form (e.g. the 3-operand VOP2
+    # v_add_co_ci_u32 vD, src0, src1 with implicit VCC carry in and out) has a plain data source where the
+    # VOP3b form has its sdst, so it gets no slots: widening or refusing an SGPR there would be wrong.
+    if len(ins["args"]) < WAVE_MASK_FULL_ARGS.get(op, 0):
+        return ()
+    return slots
+
+
+def wave64_mask_operands_as_pairs(insns):
+    """The listings are disassembled in wave32 syntax (llvm-mc's GFX10 default; shader_library.py and
+    shader_disasm.py pass no -mattr=+wavefrontsize64), so a wave64 program's VOP3 lane-mask operand prints as `sN`
+    where the hardware reads or writes the pair s[N:N+1]. Widen each such single SGPR to the pair, as a
+    +wavefrontsize64 listing prints it, so that mask_src gives lanes 32-63 their bit from s[N+1] and mask_dst /
+    lane_masks / shader_meta write both words. Keeping a single SGPR makes a data pair give lanes
+    32-63 the low word's bits and a v_cmp_e64 / carry-out leave s[N+1] unwritten, which a later 64-bit SALU read
+    (s_and_saveexec_b64, s_bcnt1_i32_b64, ...) then sees stale. vcc_lo / exec_lo there are left alone: the
+    translator keeps EXEC and VCC as this lane's bit, so they already stand for the whole 64-bit register.
+    Wave32 code is not touched. An odd N (not a valid 64-bit SGPR operand) is refused."""
+    for ins in insns:
+        args = ins["args"]
+        for i in wave_mask_operand_slots(ins):
+            if i < len(args) and args[i].get("k") == "sgpr" and args[i].get("n", 1) == 1:
+                if args[i]["r"] % 2:
+                    raise Unsupported(f"{base_op(ins['op'])} wave64 lane mask in odd SGPR")
+                args[i] = dict(args[i], n=2)
+    return insns
+
+
 def native_paths(path, name):
     """The .s file's sources next to its folder: fssm/<name>.fssm for the game's shaders, and fspx/<name>.code and
     fspx/<name>.json for the FSPX programs tools/fspx_unpack.py writes (docs/fspx.md)."""
@@ -17317,6 +17373,8 @@ def translate(path):
         g.wave64 = False
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+    if g.wave64:
+        wave64_mask_operands_as_pairs(insns)
     if stage == "gs":
         ins_by_reg = {}
         for reg, mask, sv, ctype in input_signature(path, info["name"]):
