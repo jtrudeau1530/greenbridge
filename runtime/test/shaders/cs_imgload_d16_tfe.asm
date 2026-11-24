@@ -1,8 +1,9 @@
-; tfe status VGPR on a d16 image_load (SHADER-1266): cs_imgload_d16 with tfe on both loads. Under d16 one
-; component fills one VGPR, and with tfe the fetch status follows it, so vdata is v[7:8] and v[11:12]. Every texel is
-; resident, so the status is 0. Each status VGPR is seeded with 1000 and added into the result, so a stale status
-; moves every texel by 2000. The unpacking and the result are cs_imgload_d16's, checked by vk_store_test load-d16
-; (including its saturation row). Suggested by @nnonno91, who ran the same companion on gfx1036 and an RTX 5090 in #8968.
+; Resident d16 image_load TFE status preservation (SHADER-1266). With one packed component the
+; status follows the data in v[7:8] and v[11:12]. Successful resident fetches preserve the seeded status;
+; only a texture fault writes it (RDNA2 ISA, MIMG TFE/LWE). Add (1000 - status) for each load so an
+; incorrect status clear changes the output while correct preservation contributes zero.
+; The unpacking and result are cs_imgload_d16's, checked by vk_store_test load-d16, including saturation.
+; This does not test sparse faults. Original d16 companion suggested by @nnonno91 in #8968.
 v_and_b32_e32 v1, 7, v0
 v_lshrrev_b32_e32 v2, 3, v0
 v_cvt_f32_u32_e32 v3, v1
@@ -41,6 +42,8 @@ s_mov_b32 s31, 0x33
 v_mov_b32_e32 v12, 0x3e8
 image_load v[11:12], v[1:2], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm tfe d16
 s_waitcnt vmcnt(0)
+v_sub_nc_u32_e32 v8, 0x3e8, v8
+v_sub_nc_u32_e32 v12, 0x3e8, v12
 v_and_b32_e32 v7, 0xffff, v7
 v_bfe_i32 v11, v11, 0, 16
 v_add_nc_u32_e32 v11, v7, v11
