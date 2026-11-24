@@ -6,9 +6,11 @@ or unimportable file always makes it exit 1 with that file named, in parallel an
 import contextlib
 import io
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +46,49 @@ def cli(*argv):
 
 
 class RunnerTest(unittest.TestCase):
+    def test_progress_is_live_before_module_exit_and_failure_output_is_retained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_pass.py": PASS,
+                        "test_live.py": "import pathlib, time, unittest\n"
+                        "class T(unittest.TestCase):\n"
+                        "    def test_live(self):\n"
+                        "        print('ordinary output stays grouped', flush=True)\n"
+                        "        print('[semantic progress] waiting for release', flush=True)\n"
+                        "        until = time.monotonic() + 20\n"
+                        "        while not pathlib.Path('release').exists() and time.monotonic() < until:\n"
+                        "            time.sleep(0.02)\n"
+                        "        self.assertTrue(pathlib.Path('release').exists(), 'progress was buffered')\n"
+                        "        self.fail('deliberate failure after progress')\n"})
+            cmd = [sys.executable, "-I", os.path.join(ROOT, "scripts", "run_semantic_tests.py"), tmp, "-j", "2"]
+            with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
+                seen, ready = [], queue.Queue()
+
+                def read_progress():
+                    for line in p.stdout:
+                        seen.append(line)
+                        if line.startswith("progress test_live:"):
+                            ready.put(line)
+                            return
+
+                reader = threading.Thread(target=read_progress, daemon=True)
+                reader.start()
+                try:
+                    line = ready.get(timeout=10)
+                    self.assertIn("[semantic progress] waiting for release", line)
+                    self.assertIsNone(p.poll(), "the module must still be waiting for our release")
+                    self.assertNotIn("ordinary output stays grouped", "".join(seen))
+                    reader.join(timeout=2)
+                finally:
+                    with open(os.path.join(tmp, "release"), "w", encoding="utf-8") as f:
+                        f.write("continue")
+                tail, err = p.communicate(timeout=10)
+                out = "".join(seen) + tail
+            self.assertEqual(p.returncode, 1, out + err)
+            self.assertIn("==== FAILED: test_live", out)
+            self.assertEqual(out.count("ordinary output stays grouped"), 1)
+            self.assertIn("deliberate failure after progress", out)
+            self.assertIn("2 files, 3 tests, 1 files failed", out)
+
     def test_custom_patterns_find_only_python_modules_in_packages(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"case_one.py": "", "case_two.txt": "", "case_bad-name.py": "",

@@ -24,6 +24,8 @@ import subprocess
 import sys
 import time
 
+PROGRESS_PREFIX = "[semantic progress]"
+
 
 def test_modules(directory, pattern="test*.py"):
     """Dotted names of the test modules unittest discover finds under `directory` (it enters packages only)."""
@@ -40,10 +42,20 @@ def test_modules(directory, pattern="test*.py"):
 def run_module(directory, module, verbose):
     """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
-    p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                       errors="replace")
-    ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
+    # Keep each module's complete output together, but forward explicit progress records immediately:
+    # a job deadline must not hide which phase of a long-running module was still executing.
+    output = []
+    with subprocess.Popen(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors="replace", bufsize=1) as p:
+        for line in p.stdout:
+            output.append(line)
+            marker = line.find(PROGRESS_PREFIX)
+            if marker >= 0:
+                print(f"progress {module}: {line[marker:].rstrip()}\n", end="", flush=True)
+        code = p.wait()
+    out = "".join(output)
+    ran = re.search(r"^Ran (\d+) tests? in", out, re.M)
+    return code, int(ran.group(1)) if ran else 0, out
 
 
 def main(argv=None):
