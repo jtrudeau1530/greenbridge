@@ -217,7 +217,12 @@ jobs:
         run: python -m compileall -q make_game.py tools tests
       - name: make_game.py help
         run: python -I make_game.py --help
-      # Before anything is installed, as in the check job, so these files stay standard library only. The semantic
+      - name: Install semantic validation tools
+        run: |
+          brew install spirv-tools
+          spirv-as --version
+          spirv-val --version
+      # Before Python packages are installed, as in the check job, so these files stay standard library only. The semantic
       # suite runs alongside the loop, on another of the runner's three cores; together they take about 6 minutes.
       - name: Translator semantic tests and tests (standard library only, no game data)
         shell: bash
@@ -236,9 +241,9 @@ jobs:
           echo "== tests/semantic"
           cat "$RUNNER_TEMP/semantic.log"
           exit "$status"
-      - name: Install llvm-mc and SPIRV-Tools
+      - name: Install llvm-mc and Python test dependencies
         run: |
-          brew install llvm spirv-tools
+          brew install llvm
           pip install -r tests/requirements.txt
           LLVM_MC="$(brew --prefix llvm)/bin/llvm-mc"  # keg-only: not on PATH
           echo "LLVM_MC=$LLVM_MC" >> "$GITHUB_ENV"
