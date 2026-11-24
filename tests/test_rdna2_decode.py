@@ -48,6 +48,19 @@ def words(*ws: int) -> bytes:
 
 
 class Rdna2DecodeUnitTests(unittest.TestCase):
+    def test_permlane_control_bits(self):
+        # LLVM gfx1013: v5, v7, s2, s3. Bits 11/12 are FI and BOUND_CTRL for both instructions.
+        for opcode, name in ((0xD7770005, "v_permlane16_b32"), (0xD7780005, "v_permlanex16_b32")):
+            for fi in (0, 1):
+                for bound in (0, 1):
+                    with self.subTest(name=name, fi=fi, bound=bound):
+                        code = words(opcode | fi << 11 | bound << 12, 0x000C0507)
+                        ins, = rdna2_decode.decode_bytes(code)["insns"]
+                        modifier = f" op_sel:[{fi},{bound}]" if fi or bound else ""
+                        expected = shader_ir.parse_line(f"{name} v5, v7, s2, s3{modifier}")
+                        for field in ("op", "args", "mods"):
+                            self.assertEqual(ins[field], expected[field])
+
     def test_image_atomic_data_width(self):
         for opcode, name, mask, data in (
             (0x17, "umax", 1, "v16"), (0x17, "umax", 3, "v[16:17]"),

@@ -261,8 +261,10 @@ class ParseLineTests(unittest.TestCase):
 
     def test_exp_null_off_target(self):
         ins = shader_ir.parse_line("\texp null off, v0, v1, v2")
+        self.assertEqual(ins["args"][0], {"k": "target", "t": "null"})
         self.assertEqual([a["t"] for a in ins["args"][:2]], ["null", "off"])
         self.assertEqual(len(ins["args"]), 5)
+        self.assertEqual(shader_ir.parse_line("s_mov_b32 null, s0")["args"][0]["k"], "special")
 
     def test_sendmsg_commas_stay_in_one_operand(self):
         ins = shader_ir.parse_line("\ts_sendmsg sendmsg(MSG_GS, GS_OP_NOP)")
