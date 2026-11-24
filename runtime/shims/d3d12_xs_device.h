@@ -75,7 +75,9 @@ bool is_device_proxy(const void* device);
 using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither: nothing is set then.
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
-// Optional backend for the console slot-14 address/size extension. Install before exposing the proxy to callers.
+// Opt in to the console slot-14 description ABI, whose address/size tail follows the PC fields. Install before
+// exposing the proxy to console callers; leave unset for callers supplying the shorter PC description. Merely
+// wiring a Vulkan device's outer identity must not enable reads beyond that PC object.
 // Without one, descriptor-heap creation stays on the host device's PC interface, with no Vulkan dependency.
 using DescriptorHeapProvider = HRESULT (*)(ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
                                            D3D12_GPU_VIRTUAL_ADDRESS address, std::uint64_t size,

@@ -80,6 +80,29 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
         ~ClearOuter() { rt::d3d12::set_device_outer(real, nullptr); }
     } clear_outer{real_device};
 
+    // Identity wiring alone does not select the extended ABI. Nonzero adjacent objects must not become a heap
+    // address merely because they are readable. This is the shape used by the presentation test's PC caller.
+    using Handle = std::uint64_t(WINAPI*)(void*);
+    struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        std::uint64_t unrelated_address = 0x112233440000ull;
+        std::uint64_t unrelated_size = 32;
+    } ordinary;
+    {
+        Ref<ID3D12DescriptorHeap> normal;
+        if (FAILED(proxy->CreateDescriptorHeap(&ordinary.desc, IID_PPV_ARGS(normal.put()))) || !normal.get())
+            return false;
+        auto** table = *reinterpret_cast<void***>(normal.get());
+        const auto cpu = reinterpret_cast<Handle>(table[9])(normal.get());
+        if (!cpu || cpu == ordinary.unrelated_address) {
+            std::fprintf(stderr, "ordinary proxy heap read bytes beyond its PC description\n");
+            return false;
+        }
+    }
+    // The explicit console factory installs this provider; exercise that ABI separately on the same proxy.
+    if (!rt::d3d12_xs::set_device_descriptor_heap_provider(proxy.p, rt::d3d12::create_console_descriptor_heap))
+        return false;
+
     struct ConsoleDescriptorHeapDesc {
         D3D12_DESCRIPTOR_HEAP_DESC desc{};
         std::uint64_t address = 0;
@@ -100,7 +123,6 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
     }
     // This is an Xbox heap proxy: slots 9/10 return the handle in RAX, unlike the PC C++ interface's hidden
     // return buffer. Call the proxy ABI, as the title does.
-    using Handle = std::uint64_t(WINAPI*)(void*);
     auto** table = *reinterpret_cast<void***>(heap.get());
     const auto cpu = reinterpret_cast<Handle>(table[9])(heap.get());
     const auto gpu = reinterpret_cast<Handle>(table[10])(heap.get());
