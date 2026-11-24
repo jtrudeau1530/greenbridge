@@ -52,7 +52,8 @@ jobs:
           $patches = @(
             '../victory-patches/61474f6-region-copy.patch',
             '../victory-patches/417f4e3-root-view-loads.patch',
-            '../victory-patches/amd-world-guards.patch'
+            '../victory-patches/amd-world-guards.patch',
+            '../victory-patches/watch-fixture-retirement.patch'
           )
           foreach ($patch in $patches) {
             git apply --check --index $patch

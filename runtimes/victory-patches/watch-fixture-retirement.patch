@@ -1,0 +1,210 @@
+From: Jason Trudeau
+Subject: Retire write-watch entries when test allocations are freed
+
+Test-only cleanup: preserve other ranges and the monotonic journal counter.
+The same-address regression checks stale entries without racing allocators.
+
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 8a58da2..93ff9a1 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -1397,29 +1397,34 @@ mod tests {
+     #[cfg(windows)]
+     #[test]
+     fn copied_title_descriptors_resync_at_submission() {
+-        use windows_sys::Win32::System::Memory::{
+-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+-            VirtualAlloc, VirtualFree,
+-        };
+         let host = crate::host::host().expect("descriptor resync requires a real host GPU");
++        let allocation = crate::watch::WatchedTestAllocation::new(64 << 10);
++        let memory = allocation.address() as *mut c_void;
++        // Declared after the allocation: descriptor heaps are unregistered even
++        // on panic before their watched backing memory and journal keys retire.
++        struct Objects(Vec<This>);
++        impl Drop for Objects {
++            fn drop(&mut self) {
++                while let Some(object) = self.0.pop() {
++                    slot::<Release>(object, 0x10)(object);
++                }
++            }
++        }
++        let mut objects = Objects(Vec::new());
+         let null = std::ptr::null();
+-        let make = |desc| {
++        let mut make = |desc| {
+             let mut out = null;
+             assert_eq!(
+                 create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                 S_OK
+             );
++            objects.0.push(out);
+             out
+         };
+         let first = make(texture(4, 4, 28, 1));
+         let second = make(texture(4, 4, 28, 1));
+         let constants = make(buffer(256));
+         let (bytes, _) = buffer_bytes(constants).unwrap();
+-        // SAFETY: ordinary committed guest memory, tracked by write-watch.
+-        let memory = unsafe {
+-            VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE)
+-        };
+-        assert!(!memory.is_null());
+         let start = memory as u64;
+         #[repr(C)]
+         struct Extended([u32; 4], [u64; 2]);
+@@ -1429,6 +1434,7 @@ mod tests {
+             crate::descriptor::create_heap(null, std::ptr::from_ref(&ext).cast(), &PAGEABLE_IIDS[0], &mut heap),
+             S_OK
+         );
++        objects.0.push(heap);
+         crate::descriptor::create_srv(null, first, std::ptr::null(), start);
+         crate::descriptor::create_srv(null, second, std::ptr::null(), start + 32);
+         crate::descriptor::create_srv(null, first, std::ptr::null(), start + 96);
+@@ -1468,11 +1474,9 @@ mod tests {
+         assert!(heap_host.test_resource(0).is_some());
+         eprintln!("descriptor resync: serialized title submissions mirrored A -> B -> A; internal submissions unchanged; copied CBV explicitly null until materialized");
+ 
+-        for object in [heap, first, second, constants] {
++        while let Some(object) = objects.0.pop() {
+             assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+         }
+-        // SAFETY: the heap was released and no object retains the guest records.
+-        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+     }
+ 
+     fn heap(size: u64) -> This {
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 7694609..347c511 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -282,26 +282,67 @@ fn writable(at: usize) -> bool {
+     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+ }
+ 
++/// A test's private watched range. The journal intentionally outlives kernel
++/// write-watch resets, so a fixture must retire its entries before freeing an
++/// address that another test can reuse. Other ranges and the asking stay intact.
++#[cfg(test)]
++pub(crate) struct WatchedTestAllocation {
++    address: usize,
++    size: usize,
++}
++
++#[cfg(test)]
++impl WatchedTestAllocation {
++    pub(crate) fn new(size: usize) -> Self {
++        use windows_sys::Win32::System::Memory::{
++            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
++        };
++        assert!(size > 0 && size.is_multiple_of(PAGE));
++        // SAFETY: reserve and commit our own private write-watched range.
++        let allocated = unsafe {
++            VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE)
++        } as usize;
++        assert_ne!(allocated, 0, "watched test allocation");
++        Self { address: allocated, size }
++    }
++
++    pub(crate) fn address(&self) -> usize {
++        self.address
++    }
++
++    fn retire_writes(&self) {
++        let (first, last) = (self.address / PAGE, (self.address + self.size) / PAGE);
++        let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
++        journal.written.retain(|page, _| !(first..last).contains(page));
++    }
++}
++
++#[cfg(test)]
++impl Drop for WatchedTestAllocation {
++    fn drop(&mut self) {
++        self.retire_writes();
++        // SAFETY: this fixture still owns the full allocation. Its heap users
++        // must be dropped first; release only after removing its journal keys.
++        let freed = unsafe {
++            windows_sys::Win32::System::Memory::VirtualFree(
++                self.address as *mut _, 0, windows_sys::Win32::System::Memory::MEM_RELEASE,
++            )
++        };
++        if !std::thread::panicking() {
++            assert_ne!(freed, 0, "release watched test allocation");
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use windows_sys::Win32::System::Memory::{
+-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+-    };
+-    const MEM_WRITE_WATCH: u32 = 0x20_0000;
++    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+ 
+     #[test]
+     fn written_pages_are_reported_to_every_asker() {
+-        // SAFETY: a fresh write-watched allocation, freed at the end.
+-        let p = unsafe {
+-            VirtualAlloc(
+-                std::ptr::null(),
+-                4 * PAGE,
+-                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+-                PAGE_READWRITE,
+-            )
+-        } as usize;
+-        assert_ne!(p, 0);
++        let allocation = WatchedTestAllocation::new(4 * PAGE);
++        let p = allocation.address();
+         let (start, end) = (p, p + 4 * PAGE);
+         let (_, before) = writes(start, end, false).expect("watched");
+         assert!(before.is_empty());
+@@ -322,8 +363,45 @@ mod tests {
+             )
+             .is_none()
+         );
+-        // SAFETY: our allocation.
+-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
++    }
++
++    /// Reusing an address must not inherit the retired fixture's journal keys.
++    /// A separate live allocation still has to report its earlier write.
++    #[test]
++    fn retired_test_ranges_do_not_pollute_reused_addresses() {
++        let live = WatchedTestAllocation::new(PAGE);
++        let retired = WatchedTestAllocation::new(PAGE);
++        let (live_at, old_at) = (live.address(), retired.address());
++        // SAFETY: each byte belongs to a separate live watched allocation.
++        unsafe {
++            (live_at as *mut u8).write(1);
++            (old_at as *mut u8).write(2);
++        }
++        let (live_stamp, live_pages) = writes(live_at, live_at + PAGE, false).unwrap();
++        assert_eq!(live_pages, [(live_at / PAGE, live_stamp)]);
++        let (old_stamp, old_pages) = writes(old_at, old_at + PAGE, false).unwrap();
++        assert_eq!(old_pages, [(old_at / PAGE, old_stamp)]);
++        // Use the same retirement as Drop, but keep the address reserved while
++        // replacing its contents so parallel allocators cannot steal it.
++        retired.retire_writes();
++        use windows_sys::Win32::System::Memory::{
++            MEM_COMMIT, MEM_DECOMMIT, ResetWriteWatch, VirtualAlloc, VirtualFree,
++        };
++        // SAFETY: this fixture owns the entire range and retains its reservation.
++        let freed = unsafe { VirtualFree(old_at as *mut _, PAGE, MEM_DECOMMIT) };
++        assert_ne!(freed, 0);
++        // SAFETY: commit exactly the reserved range; it has no remaining users.
++        let reused = unsafe { VirtualAlloc(old_at as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) };
++        assert_eq!(reused as usize, old_at, "the control must reuse the exact address");
++        // SAFETY: a live watched allocation; establish the new kernel epoch.
++        assert_eq!(unsafe { ResetWriteWatch(reused, PAGE) }, 0);
++        let (now, before) = writes(old_at, old_at + PAGE, false).unwrap();
++        assert!(now > old_stamp, "retirement must not reset the asking");
++        assert!(before.is_empty(), "a fresh allocation inherited a retired journal entry");
++        let (later, still_live) = writes(live_at, live_at + PAGE, false).unwrap();
++        assert!(later > now);
++        assert_eq!(still_live, live_pages, "retirement must preserve unrelated live writes");
++        eprintln!("watch fixture retirement: same-address reuse is clean; unrelated live write and monotonic asking retained");
+     }
+ 
+     /// A kernel read into a guarded view block fails; opened first, it

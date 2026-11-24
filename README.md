@@ -13,7 +13,8 @@ Original source authorship and licenses are retained. Greenbridge is an independ
 **Readable startup screens have been verified locally; gameplay is not yet usable.**
 A Linux/Wine run reached the world workload with audio, but the scene remained dark
 and slow. A subsequent candidate reduced CPU copy time and then hit a GPU memory
-fault. Synthetic test success does not establish correct world rendering or stability.
+fault. A later guarded candidate ran past that point but exhausted host memory.
+Synthetic test success does not establish correct world rendering or stability.
 The [pinned upstream README](https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md)
 reports working menus and entry into the world on Windows 11 with an AMD RX 6700 XT.
 Upstream still describes it as **not playable**: world rendering is incomplete and slow,
@@ -36,6 +37,7 @@ does not include these changes.
 | Mapped-region copy fallback | Noname0202 | [`61474f6`](https://github.com/MartinIndra02/VIctory/commit/61474f6b350ec3b2b8cdf3760eece2b9c9f957cc) |
 | Scalar loads from root buffer views | adamfx | [`417f4e3`](https://github.com/adamdotpy/VIctory/commit/417f4e30d22f8ffc1801d60e1b480bbc29781594) |
 | Serialized descriptor refresh and bounded root SRVs | slaktarn, hophaver, Hiiva; regression by swarm | [Adapted source commits](runtimes/victory-patches/amd-world-guards.patch) |
+| Test allocation and write-journal isolation | Jason Trudeau | [Synthetic fixture fix](runtimes/victory-patches/watch-fixture-retirement.patch) |
 
 For a local Windows build, install the Rust toolchain manager and the Visual Studio C++
 build tools, then run:
@@ -48,7 +50,8 @@ cd runtimes/victory
 $patches = @(
   '../victory-patches/61474f6-region-copy.patch',
   '../victory-patches/417f4e3-root-view-loads.patch',
-  '../victory-patches/amd-world-guards.patch'
+  '../victory-patches/amd-world-guards.patch',
+  '../victory-patches/watch-fixture-retirement.patch'
 )
 foreach ($patch in $patches) {
   git apply --check --index $patch
