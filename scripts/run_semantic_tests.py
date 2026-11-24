@@ -3,11 +3,14 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
     python -I scripts/run_semantic_tests.py tests/semantic          # one file per core
     python -I scripts/run_semantic_tests.py tests/semantic -p 'test_image_*.py'  # a matching subset
     python -I scripts/run_semantic_tests.py tests/semantic -j 4     # four at a time
+    python -I scripts/run_semantic_tests.py tests/semantic --first test_mutations  # start a known slow module first
     python -I scripts/run_semantic_tests.py tests/semantic -v       # also print the output of the files that pass
 
 `-p` / `--pattern` selects test filenames using unittest discover's glob syntax (default `test*.py`). Quote the
 pattern so the shell does not expand it. Only Python module filenames are selected, including inside packages;
 the pattern matches their basenames, not directory paths. No matching files is an error in serial and parallel runs.
+`--first MODULE` prioritizes an already-discovered module in parallel runs; repeat it for more modules, in order.
+An unknown or filtered-out priority is an error. Priorities never add, remove or duplicate selected modules.
 
 It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each as
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
@@ -23,6 +26,8 @@ import re
 import subprocess
 import sys
 import time
+
+PROGRESS_PREFIX = "[semantic progress]"
 
 
 def test_modules(directory, pattern="test*.py"):
@@ -40,10 +45,28 @@ def test_modules(directory, pattern="test*.py"):
 def run_module(directory, module, verbose):
     """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
-    p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                       errors="replace")
-    ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
+    # Keep each module's complete output together, but forward explicit progress records immediately:
+    # a job deadline must not hide which phase of a long-running module was still executing.
+    output = []
+    with subprocess.Popen(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors="replace", bufsize=1) as p:
+        for line in p.stdout:
+            output.append(line)
+            marker = line.find(PROGRESS_PREFIX)
+            if marker >= 0:
+                print(f"progress {module}: {line[marker:].rstrip()}\n", end="", flush=True)
+        code = p.wait()
+    out = "".join(output)
+    ran = re.search(r"^Ran (\d+) tests? in", out, re.M)
+    return code, int(ran.group(1)) if ran else 0, out
+
+
+def ordered_modules(directory, modules, first):
+    """Priorities first, then largest files; preserve the complete discovered membership exactly once."""
+    priority = {module: index for index, module in enumerate(dict.fromkeys(first))}
+    return sorted(modules, key=lambda module: (
+        priority.get(module, len(priority)),
+        -os.path.getsize(os.path.join(directory, *module.split(".")) + ".py")))
 
 
 def main(argv=None):
@@ -51,6 +74,8 @@ def main(argv=None):
     ap.add_argument("directory", help="the suite's folder, tests/semantic")
     ap.add_argument("-p", "--pattern", default="test*.py", help="test filename glob (default: test*.py)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="files at a time (default: cores)")
+    ap.add_argument("--first", action="append", default=[], metavar="MODULE",
+                    help="start this discovered module first in parallel runs (repeatable)")
     ap.add_argument("-v", "--verbose", action="store_true", help="unittest -v, and print passing files' output")
     a = ap.parse_args(argv)
     directory = os.path.abspath(a.directory)
@@ -58,11 +83,15 @@ def main(argv=None):
     if not modules:
         print(f"no {a.pattern} files in {directory}")
         return 1
+    unknown = sorted(set(a.first) - set(modules))
+    if unknown:
+        print("priority modules not selected by discovery: " + ", ".join(unknown))
+        return 1
     if a.jobs <= 1:
         return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
                                 "-p", a.pattern, *(["-v"] if a.verbose else [])])
-    # Largest files first: they tend to run longest, and one started last would set the wall time alone.
-    modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
+    # Size is a useful default, but small mutation drivers can launch many expensive child suites.
+    modules = ordered_modules(directory, modules, a.first)
     start, total, failed = time.monotonic(), 0, []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
         jobs = {pool.submit(run_module, directory, m, a.verbose): m for m in modules}

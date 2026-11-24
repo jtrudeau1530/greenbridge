@@ -6,9 +6,11 @@ or unimportable file always makes it exit 1 with that file named, in parallel an
 import contextlib
 import io
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +46,80 @@ def cli(*argv):
 
 
 class RunnerTest(unittest.TestCase):
+    def test_progress_is_live_before_module_exit_and_failure_output_is_retained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_pass.py": PASS,
+                        "test_live.py": "import pathlib, time, unittest\n"
+                        "class T(unittest.TestCase):\n"
+                        "    def test_live(self):\n"
+                        "        print('ordinary output stays grouped', flush=True)\n"
+                        "        print('[semantic progress] waiting for release', flush=True)\n"
+                        "        until = time.monotonic() + 20\n"
+                        "        while not pathlib.Path('release').exists() and time.monotonic() < until:\n"
+                        "            time.sleep(0.02)\n"
+                        "        self.assertTrue(pathlib.Path('release').exists(), 'progress was buffered')\n"
+                        "        self.fail('deliberate failure after progress')\n"})
+            cmd = [sys.executable, "-I", os.path.join(ROOT, "scripts", "run_semantic_tests.py"), tmp, "-j", "2"]
+            with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
+                seen, ready = [], queue.Queue()
+
+                def read_progress():
+                    for line in p.stdout:
+                        seen.append(line)
+                        if line.startswith("progress test_live:"):
+                            ready.put(line)
+                            return
+
+                reader = threading.Thread(target=read_progress, daemon=True)
+                reader.start()
+                try:
+                    line = ready.get(timeout=10)
+                    self.assertIn("[semantic progress] waiting for release", line)
+                    self.assertIsNone(p.poll(), "the module must still be waiting for our release")
+                    self.assertNotIn("ordinary output stays grouped", "".join(seen))
+                    reader.join(timeout=2)
+                finally:
+                    with open(os.path.join(tmp, "release"), "w", encoding="utf-8") as f:
+                        f.write("continue")
+                tail, err = p.communicate(timeout=10)
+                out = "".join(seen) + tail
+            self.assertEqual(p.returncode, 1, out + err)
+            self.assertIn("==== FAILED: test_live", out)
+            self.assertEqual(out.count("ordinary output stays grouped"), 1)
+            self.assertIn("deliberate failure after progress", out)
+            self.assertIn("2 files, 3 tests, 1 files failed", out)
+
+    def test_priority_changes_order_without_changing_membership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_small.py": "", "test_big.py": "#" * 100,
+                        "pkg/__init__.py": "", "pkg/test_nested.py": "#" * 20})
+            modules = r.test_modules(tmp)
+            default = r.ordered_modules(tmp, modules, [])
+            self.assertEqual(default, ["test_big", "pkg.test_nested", "test_small"])
+            ordered = r.ordered_modules(tmp, modules, ["test_small", "pkg.test_nested", "test_small"])
+            self.assertEqual(ordered, ["test_small", "pkg.test_nested", "test_big"])
+            self.assertCountEqual(ordered, modules)
+            self.assertEqual(len(ordered), len(set(ordered)))
+
+    def test_unknown_or_filtered_priority_fails_before_running_any_test(self):
+        for jobs in (1, 2):
+            for priority in ("missing", "case_excluded"):
+                with self.subTest(jobs=jobs, priority=priority), tempfile.TemporaryDirectory() as tmp:
+                    suite(tmp, {"test_one.py": BROKEN, "case_excluded.py": BROKEN})
+                    result = cli(tmp, "-j", str(jobs), "--first", priority)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("priority modules not selected by discovery: " + priority, result.stdout)
+                    self.assertNotIn("no_such_module_anywhere", result.stdout + result.stderr)
+
+    def test_prioritized_failure_keeps_every_other_module_and_fails_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_fail.py": FAIL, "test_pass.py": PASS,
+                        "pkg/__init__.py": "", "pkg/test_nested.py": PASS})
+            result = cli(tmp, "-j", "2", "--first", "test_fail", "--first", "pkg.test_nested")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("==== FAILED: test_fail", result.stdout)
+            self.assertIn("3 files, 5 tests, 1 files failed", result.stdout)
+
     def test_custom_patterns_find_only_python_modules_in_packages(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"case_one.py": "", "case_two.txt": "", "case_bad-name.py": "",

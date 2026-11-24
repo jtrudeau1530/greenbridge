@@ -80,18 +80,26 @@ MUTATIONS = [
 ]
 
 
+@contextlib.contextmanager
+def phase_timer(phase):
+    """The runner forwards these flushed records even while it retains the module's full output."""
+    started = time.monotonic()
+    print(f"[semantic progress] mutation {phase}: start", flush=True)
+    try:
+        yield
+    finally:
+        print(f"[semantic progress] mutation {phase}: {time.monotonic() - started:.3f}s", flush=True)
+
+
+@phase_timer("child run")
 def run_semantics(tools_dir):
     # The child finds test_ps_semantics through PYTHONPATH, not cwd=HERE: Windows refuses a working directory longer
     # than 258 characters (WinError 267), which a checkout in a deep folder reaches.
     path = os.pathsep.join(filter(None, [HERE, os.environ.get("PYTHONPATH")]))
     env = dict(os.environ, LEONIDA_TOOLS_DIR=tools_dir, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=path)
-    started = time.monotonic()
-    try:
-        p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], env=env,
-                           capture_output=True, text=True, timeout=300)
-        return p.returncode, p.stdout + p.stderr
-    finally:
-        print(f"[mutation timing] child run {time.monotonic() - started:.3f}s", flush=True)
+    p = subprocess.run([sys.executable, "-m", "unittest", "test_ps_semantics", "-v"], env=env,
+                       capture_output=True, text=True, timeout=300)
+    return p.returncode, p.stdout + p.stderr
 
 
 def failed_tests(output):
@@ -122,13 +130,16 @@ def restored_mutation(path, old, new):
     with open(path, "rb") as f:
         original = f.read()
     try:
-        apply_mutation(path, old, new)
+        with phase_timer("apply mutation"):
+            apply_mutation(path, old, new)
         yield
     finally:
-        with open(path, "wb") as f:
-            f.write(original)
+        with phase_timer("restore source"):
+            with open(path, "wb") as f:
+                f.write(original)
 
 
+@phase_timer("fingerprint")
 def tools_fingerprint(directory):
     """Detect any child-created or changed state before reusing the private tree."""
     result = {}
@@ -142,12 +153,9 @@ def tools_fingerprint(directory):
     return result
 
 
+@phase_timer("cleanup")
 def cleanup_copy(tmp):
-    started = time.monotonic()
-    try:
-        tmp.cleanup()
-    finally:
-        print(f"[mutation timing] cleanup {time.monotonic() - started:.3f}s", flush=True)
+    tmp.cleanup()
 
 
 class MutationTests(unittest.TestCase):
@@ -155,12 +163,11 @@ class MutationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cleanup_copy, cls.tmp)
-        started = time.monotonic()
         cls.tools = os.path.join(cls.tmp.name, "tools")
-        shutil.copytree(os.path.join(ROOT, "tools"), cls.tools,
-                        ignore=shutil.ignore_patterns("__pycache__", "rpf9dump"))
+        with phase_timer("copy"):
+            shutil.copytree(os.path.join(ROOT, "tools"), cls.tools,
+                            ignore=shutil.ignore_patterns("__pycache__", "rpf9dump"))
         cls.original_tree = tools_fingerprint(cls.tools)
-        print(f"[mutation timing] copy {time.monotonic() - started:.3f}s", flush=True)
 
     def assert_pristine_tools(self):
         actual = tools_fingerprint(self.tools)
@@ -194,29 +201,6 @@ class MutationTests(unittest.TestCase):
                 finally:
                     self.assert_pristine_tools()
 
-    def test_anchors_match_crlf_translator_copies(self):
-        # Regression: on a CRLF checkout of tools/ the four multiline anchors (v_bfe_i32, v_subrev_co_ci_u32,
-        # v_cmpx_eq_u64, v_mul_legacy_f32) do not occur in the raw bytes and test_each_mutation_is_caught
-        # stops before any mutation runs. apply_mutation must find every anchor in a CRLF copy, mutate it
-        # once, keep the file on CRLF and leave it valid Python.
-        with open(os.path.join(ROOT, "tools", TRANSLATOR), encoding="utf-8", newline="") as f:
-            text = f.read().replace("\r\n", "\n")
-        crlf_text = text.replace("\n", "\r\n")
-        for label, fname, old, new, expect in MUTATIONS:
-            if fname != TRANSLATOR:
-                continue
-            with self.subTest(mutation=label), tempfile.TemporaryDirectory() as tmp:
-                path = os.path.join(tmp, TRANSLATOR)
-                with open(path, "w", encoding="utf-8", newline="") as f:
-                    f.write(crlf_text)
-                apply_mutation(path, old, new)
-                with open(path, encoding="utf-8", newline="") as f:
-                    mutated = f.read()
-                # the copy stays on CRLF: no bare LF survives, and the injected mutation text followed suit
-                self.assertNotIn("\n", mutated.replace("\r\n", ""))
-                self.assertIn(new.replace("\n", "\r\n"), mutated)
-                self.assertNotIn(old.replace("\n", "\r\n"), mutated)
-                compile(mutated, path, "exec")
 
 
 if __name__ == "__main__":

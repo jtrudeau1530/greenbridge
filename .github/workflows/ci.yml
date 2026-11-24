@@ -247,7 +247,9 @@ jobs:
       - name: Translator semantic tests
         env:
           LEONIDA_REQUIRE_SPIRV_TOOLS: '1'
-        run: python -I scripts/run_semantic_tests.py tests/semantic -v
+        # Windows measurements show this small driver spends minutes compiling its 13 CRLF mutations.
+        # Run its independent CRLF and child suites first, preserving every check and the ten-minute limit.
+        run: python -I scripts/run_semantic_tests.py tests/semantic ${{ runner.os == 'Windows' && '--first test_mutations --first test_mutation_crlf' || '' }} -v
 
   # The combined stdlib/semantic stage exhausted the job's budget before LLVM setup and pytest.
   # Give semantics its own Apple Silicon runner; both jobs keep their twenty-minute limit.
