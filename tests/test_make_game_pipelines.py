@@ -56,7 +56,8 @@ class PipelinesJobsTest(unittest.TestCase):
                                      os.path.join(self.out, "pipeline_cache.bin")])
 
     def test_jobs_on_the_command_line_reach_the_checker(self):
-        self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5"))), "5")
+        with mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(self.jobs_of(self.checker_args(lambda: self.main_with("--jobs", "5"))), "5")
 
     def test_windows_reuses_the_checker_from_the_supplied_runtime_build(self):
         supplied = os.path.join(self.root, "unpacked runtime")
@@ -68,7 +69,8 @@ class PipelinesJobsTest(unittest.TestCase):
         argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
                 "--stages", "runtime,pipelines", "--runtime-build", supplied, "--jobs", "3"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "ROOT", self.root), \
-                mock.patch("os.name", "nt"), mock.patch.object(make_game, "below_normal"), \
+                mock.patch("os.name", "nt"), mock.patch("os.cpu_count", return_value=16), \
+                mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
                 mock.patch.object(make_game, "log"), mock.patch.object(make_game, "run") as run:
             self.assertEqual(make_game.main(), 0)
