@@ -62,6 +62,13 @@ jobs:
     if: ${{ !cancelled() && needs.change-scope.outputs.docs-only != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    env:
+      STDLIB_SHARD_INDEX: ${{ matrix.shard }}
+      STDLIB_SHARD_COUNT: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,31 +88,50 @@ jobs:
       - name: Tests (standard library only, no game data)
         shell: bash
         run: |
-          # Run every file, then fail: stopping at the first failure would hide the files after it.
+          # Partition eligible files only; both shards together run the complete sorted list.
+          if [[ ! "${STDLIB_SHARD_COUNT:-}" =~ ^[1-9][0-9]*$ || ! "${STDLIB_SHARD_INDEX:-}" =~ ^(0|[1-9][0-9]*)$ ]] ||
+             (( STDLIB_SHARD_COUNT <= 0 || STDLIB_SHARD_INDEX >= STDLIB_SHARD_COUNT )); then
+            echo "::error::invalid standard-library shard index/count"
+            exit 2
+          fi
+          # Run every selected file, then fail: one failure must not hide the files after it.
           failed=()
+          ordinal=0
+          selected=0
           while IFS= read -r t; do
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               continue
             fi
+            owner=$((ordinal % STDLIB_SHARD_COUNT))
+            ordinal=$((ordinal + 1))
+            if (( owner != STDLIB_SHARD_INDEX )); then
+              continue
+            fi
+            selected=$((selected + 1))
             echo "== $t"
             python -I "$t" || failed+=("$t")
           done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)  # pytest-based files run in the translator-tests job
+          echo "Completed standard-library shard $STDLIB_SHARD_INDEX/$STDLIB_SHARD_COUNT: $selected of $ordinal eligible files"
           if (( ${#failed[@]} )); then
             for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
             exit 1
           fi
       - name: Build rpf9dump
+        if: matrix.shard == 1
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
       - name: Test TTPF export retry
+        if: matrix.shard == 1
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
         run: python -I tests/test_ttpf_export_resume.py
       # The standard-library loop above runs this file before rpf9dump is built, where it skips for lack of the DLL.
       - name: Test rpf9dump exit codes
+        if: matrix.shard == 1
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
         run: python -I tests/test_rpf9dump_exit_codes.py
       - name: Build the calibrated BCPack reader and test the texture pipeline
+        if: matrix.shard == 1
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
         shell: bash
@@ -116,6 +142,7 @@ jobs:
           python -I tests/test_calibrated_texture.py
           python -I tests/test_ttpf_assets.py
       - name: Test rpf9dump diagnostics
+        if: matrix.shard == 1
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
   translator-tests:
     needs: change-scope

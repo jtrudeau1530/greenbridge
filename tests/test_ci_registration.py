@@ -22,8 +22,8 @@ drift) and fails on the three ways a test goes missing without CI turning red --
 * a nested ``tests/*/test_*.cjs`` file that ``fnmatch`` matches across ``/`` but the non-recursive
   ``node --test tests/test_*.cjs`` command never runs.
 
-It also runs the ``check`` loop itself, taken from the workflow, under bash on a synthetic tree: the loop has
-to run every file and then fail, since stopping at the first failure hides the files sorted after it.
+It also runs both ``check`` shards, taken from the workflow, under bash on a synthetic tree: together they
+must run every eligible file exactly once and then fail, since one failure must not hide later files.
 
 Only the tracked test files and the workflow are read; no game files, no build tools, no pytest. The loop check
 needs bash (Git for Windows' on Windows) and skips without it, except on a GitHub runner.
@@ -578,27 +578,19 @@ class RepositoryRegistrationTest(unittest.TestCase):
 
 
 class StdlibLoopTest(unittest.TestCase):
-    """The check job's loop runs every file and then fails, so one failure cannot hide the files after it."""
+    """The check shards cover every file exactly once and do not stop at the first failed file."""
 
-    def test_loop_runs_past_a_failure_and_names_every_failed_file(self):
+    def run_loop(self, files, shard_index, shard_count):
         if not git_bash():
             # On a runner a missing bash would turn this check into a silent skip.
             self.assertFalse(os.environ.get("GITHUB_ACTIONS"), "no bash found on the CI runner")
             self.skipTest("needs bash (Git for Windows on Windows)")
         script = step_script(ROOT, STDLIB_STEP)
         markers = ci_rules(ROOT)[0]
-        failing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(1)\n"
-        passing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(0)\n"
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "tests", "semantic"))
-            files = {
-                "tests/test_a_fails.py": failing,
-                "tests/test_b_passes.py": passing,
-                "tests/test_c_fails.py": failing,
-                "tests/test_d_pytest.py": "import pytest\n" + failing,   # the loop leaves it to pytest
-                "tests/semantic/test_e.py": failing,                    # pruned: unittest discover runs it
-            }
             for rel, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
                 with open(os.path.join(tmp, rel), "w", encoding="utf-8", newline="\n") as f:
                     f.write(text)
             with open(os.path.join(tmp, "step.sh"), "w", encoding="utf-8", newline="\n") as f:
@@ -611,15 +603,86 @@ class StdlibLoopTest(unittest.TestCase):
                 f.write("#!/bin/sh\nexec '%s' \"$@\"\n" % sys.executable.replace("'", "'\\''"))
             os.chmod(shim, 0o755)
             env = dict(os.environ, PYTEST_FILE_MARKERS=markers, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
+            env.pop("STDLIB_SHARD_INDEX", None)
+            env.pop("STDLIB_SHARD_COUNT", None)
+            if shard_index is not None:
+                env["STDLIB_SHARD_INDEX"] = str(shard_index)
+            if shard_count is not None:
+                env["STDLIB_SHARD_COUNT"] = str(shard_count)
             # GitHub runs `shell: bash` as `bash --noprofile --norc -eo pipefail {0}`.
-            result = subprocess.run([git_bash(), "--noprofile", "--norc", "-eo", "pipefail", "step.sh"], cwd=tmp,
-                                    env=env, capture_output=True, text=True, timeout=120)
-        out = result.stdout + result.stderr
-        self.assertNotEqual(result.returncode, 0, out)
-        ran = re.findall(r"^== (\S+)$", out, re.M)
-        self.assertEqual(ran, ["tests/test_a_fails.py", "tests/test_b_passes.py", "tests/test_c_fails.py"], out)
-        errors = re.findall(r"^::error file=(\S+)::", out, re.M)
-        self.assertEqual(errors, ["tests/test_a_fails.py", "tests/test_c_fails.py"], out)
+            return subprocess.run([git_bash(), "--noprofile", "--norc", "-eo", "pipefail", "step.sh"], cwd=tmp,
+                                  env=env, capture_output=True, text=True, timeout=120)
+
+    def test_shards_run_every_file_once_and_name_every_failed_file(self):
+        failing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(1)\n"
+        passing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(0)\n"
+        files = {
+            "tests/test_a_fails.py": failing,
+            "tests/test_b_pytest.py": "import pytest\n" + failing,
+            "tests/test_c_fails.py": failing,
+            "tests/test_d_numpy.py": "HAVE_NUMPY = False\n" + failing,
+            "tests/test_e_passes.py": passing,
+            "tests/test_f_passes.py": passing,
+            "tests/test_g_fails.py": failing,
+            "tests/test_h_fails.py": failing,
+            "tests/test_i_passes.py": passing,
+            "tests/test_j_passes.py": passing,
+            "tests/test_no_main.py": "raise AssertionError('pytest only')\n",
+            "tests/semantic/test_pruned.py": failing,
+        }
+        eligible = ["tests/test_a_fails.py", "tests/test_c_fails.py", "tests/test_e_passes.py",
+                    "tests/test_f_passes.py", "tests/test_g_fails.py", "tests/test_h_fails.py",
+                    "tests/test_i_passes.py", "tests/test_j_passes.py"]
+        runs = []
+        for shard in range(2):
+            with self.subTest(shard=shard):
+                result = self.run_loop(files, shard, 2)
+                out = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 1, out)
+                ran = re.findall(r"^== (\S+)$", out, re.M)
+                self.assertEqual(ran, eligible[shard::2], out)
+                self.assertEqual(re.findall(r"^::error file=(\S+)::", out, re.M),
+                                 [rel for rel in eligible[shard::2] if files[rel] == failing], out)
+                self.assertIn(f"Completed standard-library shard {shard}/2: 4 of 8 eligible files", out)
+                runs.append(ran)
+        self.assertEqual(set(runs[0]) & set(runs[1]), set())
+        self.assertEqual(sorted(runs[0] + runs[1]), eligible)
+
+    def test_all_passing_shards_succeed(self):
+        passing = "if __name__ == '__main__':\n    pass\n"
+        files = {f"tests/test_{i}.py": passing for i in range(3)}
+        for shard in range(2):
+            with self.subTest(shard=shard):
+                result = self.run_loop(files, shard, 2)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(re.findall(r"^== (\S+)$", result.stdout, re.M), sorted(files)[shard::2])
+
+    def test_invalid_shards_fail_before_running_files(self):
+        files = {"tests/test_first.py": "if __name__ == '__main__':\n    pass\n"}
+        for index, count in ((None, 2), (0, None), ("", 2), (0, ""), (-1, 2), (2, 2),
+                             (0, 0), (0, -1), ("one", 2), (0, "two"), ("01", 2), (0, "02")):
+            with self.subTest(index=index, count=count):
+                result = self.run_loop(files, index, count)
+                out = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, out)
+                self.assertIn("::error::invalid standard-library shard index/count", out)
+                self.assertNotRegex(out, r"(?m)^== ")
+
+    def test_both_independent_shards_and_post_build_checks_are_registered(self):
+        workflow = read(ROOT, WORKFLOW)
+        job = re.search(r"^  check:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow, re.M | re.S).group(1)
+        self.assertRegex(job, r"(?m)^    timeout-minutes: 15$")
+        self.assertRegex(job, r"(?m)^      fail-fast: false$")
+        self.assertRegex(job, r"(?m)^        shard: \[0, 1\]$")
+        self.assertRegex(job, r"(?m)^      STDLIB_SHARD_INDEX: \$\{\{ matrix\.shard \}\}$")
+        self.assertRegex(job, r"(?m)^      STDLIB_SHARD_COUNT: 2$")
+        once = ["Build rpf9dump", "Test TTPF export retry", "Test rpf9dump exit codes",
+                "Build the calibrated BCPack reader and test the texture pipeline", "Test rpf9dump diagnostics"]
+        for name in once:
+            with self.subTest(step=name):
+                self.assertEqual(job.count(f"- name: {name}\n        if: matrix.shard == 1\n"), 1)
+        # Both shards retain the original stdlib dependency environment; only post-build checks run once.
+        self.assertRegex(job, r"- uses: actions/setup-dotnet@[^\n]+\n        with:\n")
 
     def test_step_script_reads_the_check_loop(self):
         script = step_script(ROOT, STDLIB_STEP)
