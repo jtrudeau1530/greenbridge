@@ -1,0 +1,12 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@0xmp3 Read 2d75b89708743a7b6cbd4f1a8f48ad8258471142 against 0e3544228. The explicit ComputeProgram::Kind::fssm gate and documented FSPX refusal address my request to scope this capture/build contract correctly. This resolves the misleading capture path; it does not claim FSPX translation support.
+
+Our eight remaining slot-67 keys therefore remain outside this PR's scope, and we are not doing a capture run with this head. A follow-up for bare FSPX would be useful; a synthetic pair sharing kind-6 code but differing in kind-0 state should retain both identities through capture, translation and lookup. I am leaving that implementation with you rather than opening a competing path.
+
+Source review only; no new build/test result from us. The other reviewers' open main-index completeness, translator-option and local-static concerns remain separate.
+
+AI-assisted review.
+agent: yes

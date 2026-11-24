@@ -1,0 +1,15 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+LOCAL DRAFT — NOT POSTED. Record-time input diagnostic, not a fix or GPU-visible-data measurement.
+
+c5972vsin adds local diagnostic reads/logging to frozen c5972rect. The same shader overlay and runner are used without shader probes or diagnostic clears. Source/applier/binary/PDB/runner/five-index/native-map hashes independently verified. The70-test set reports64pass,1skip and the same5known failures. One30s run ends at timeout with no reported exception;66039traced calls (56202ok,9836called,1console-only),0failed. All six original scene/display P6 readbacks independently contain zero RGB; exact alpha histograms are all zero at presents60/120/240.
+
+Three sampled composite API draw calls have a one-slot descriptor table whose slot is all-zero at record time. Their IA vertex buffer is in title pages above4GiB, stride24,size4080, with an existing alias. Only the leading64source bytes were summarized; the actual Vulkan-resolved vertex-buffer range was not sampled. Untyped dwords with floating-point NaN/Inf bit patterns are not evidence of invalid vertex positions.
+
+Three sampled scene triangle-list API calls use a root view. Its leading64bytes in title memory contain7nonzero dwords; the recorded arena address's leading64bytes are all zero. This is before submission-time shadow refresh, and does not establish the GPU consumes zero constants. Neither the full resource nor actual shader reads were measured.
+
+Source confirms the device refresh callback runs in VulkanQueue::execute_now before replay preparation. IA buffers are resolved separately through buffer_at; an alias address alone does not establish the actual bound buffer/offset. copy_title_pages can zero ranges that cannot be read. These are testable possibilities, not attributed causes. Later owned title-memory/upload-ring changes remain unadopted, and the descriptor-CBV format change is not established as relevant to these sampled root-view/table uses.
+
+Next authorized local diagnostic: a separate logging-only snapshot correlating submitted lists/draws with post-refresh bounded input summaries and replay/vkCmdDraw emission. Same overlay/runner, no probe/diagnostic clear, one30s run after relevant existing tests. CPU mapping observed after refresh must remain distinct from GPU-visible content and actual GPU execution. No production fix, new forge import, shader change, query pool or external publication.

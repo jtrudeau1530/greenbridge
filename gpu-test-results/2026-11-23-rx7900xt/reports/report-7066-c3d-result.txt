@@ -1,0 +1,15 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Integration result for 1d8d1d355d9b37ac1fb88103433f88d2d0975a52: **slot 70 progresses through the null-view fallback; next stop is unimplemented slot 127**. Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin SDK 10.0.26100, RelWithDebInfo.
+
+Added this head to the exact combined stack documented in our [#7075 result](https://github.com/ItsNotRexed/Leonida/pull/7075#issuecomment-7108085205). Base: main 8575d36ed + #6919 #4313 #6582 #4348 #6954 #7076 (older #2490 included) #6973 #6964 #7021 #7216 #6953 #7075, plus the local cache-only view mask and previously documented slot-25/26 integration choices. #7218 is absent.
+
+Combination changes: retained the slot-133 handler and all existing routes; the extracted queue route calls proxy_create_command_queue_xbox to retain console flag handling. At the marked hook, destination passes through #7021's in-file translate_cpu_handle before either view write. The heap test's fake SRV-description pointer was replaced with a readable synthetic description for the new snapshot, preserving assertions, as already reported by Zunraz. These are local integration changes, not a clean-head test.
+
+All seven xs_proxy_mock modes pass, including check_slot70_raw_buffer and env_slots_70. Selected suite: 36/40; run_tiny_frame, gameinput, xmem and the loader/TLS checks pass except the prior missing-TMP refusal case. The other unchanged failures are native abort-default's exit-code expectation and the two host WARP device tests (D3D12CreateDevice E_INVALIDARG). No fully-green-suite claim.
+
+One bounded, display-enabled run: init 0, run 3. The raw-buffer shape parser passes, but the resource provider reports that no buffer holds the address, so the NULL view is written. The boot continues through slot 25 to slot 127's beyond-PC-vtable E_NOTIMPL, then a title breakpoint. The old host CreatePlacedResource1 write AV is gone. There is no evidence of a real raw-buffer view or shader access; #7075's committed stand-in is not guest-VA-backed. Actual destination remapping/hook use is not observable from these logs. Wine omitted the breakpoint backtrace and the crash index marks it missing.
+
+Executed by the collaborating runner; I verified frozen source, executable/PDB/DLL hashes, tests and run records. Raw traces stay local. AI-assisted.

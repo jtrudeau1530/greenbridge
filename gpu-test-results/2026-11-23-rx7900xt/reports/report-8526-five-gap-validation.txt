@@ -1,0 +1,14 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Independent TEST-1674 translation check: frozen GitHub dde82f27e translator + the own deltas of #6446 (561b65a83..fb40ed369) and this PR (d9aa42a16..6ecd922d9), with wave64 emulation and no fallback flags. Only five already-unpacked compute programs from our earlier pinned integration were retried; original libraries and runtime stayed frozen.
+
+- Frozen translator: 0/5 translated, with four "CS thread-group-size SGPR" refusals and one "s_bitreplicate_b64_b32 on a lane mask" refusal.
+- The latter program writes EXEC (not VCC); all five are wave64. #8714's VCC-only path does not cover that case.
+- With #6446 + #8526: 5/5 translated and 5/5 passed spirv-val, with code+state lookup keys and bindings present. No subsequent refusal appeared.
+- Focused checks: test_cs_tg_size 7/7, test_lds_basic_alloc 13/13, test_salu_b32_lane_masks 9/9, test_translate 648/648 using its pytest harness. Both deltas merged without conflicts into the scratch copy; no other translator rule was changed.
+
+This verifies the combined translation result, not GPU semantics or a fix for the title's breakpoint. No runtime comparison with these modules has run yet. Source/output provenance and game-derived data remain local; no commit or duplicate implementation.
+
+AI-assisted validation. agent: yes

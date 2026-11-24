@@ -1,0 +1,39 @@
+{
+  "run": "c3j-7330-efc347830-20261123-141620-1362786",
+  "record_status": "reconstructed from saved logs, not rerun",
+  "checkpoint": "c3j-7330-efc347830",
+  "source_head_recorded": null,
+  "headless_recorded": false,
+  "init_exit": 0,
+  "run_exit": 5,
+  "trace_outcomes": {
+    "ok": 1634,
+    "called": 22
+  },
+  "trace_methods": {
+    "D3D12XboxCreateDevice": 1,
+    "ID3D12Device::CreateCommandQueue": 5,
+    "ID3D12Device::CreateFence": 5,
+    "ID3D12Device::CreateCommandAllocator": 440,
+    "ID3D12Device::CreateCommandList": 585,
+    "ID3D12GraphicsCommandList::Close": 585,
+    "XboxIDXGIDevice::GetAdapter": 1,
+    "ID3D12Device10::CreateCommittedResource3": 3,
+    "ID3D12Device::CreateDescriptorHeap": 6,
+    "ID3D12Device::CreateShaderResourceView": 10,
+    "ID3D12Device::CreateUnorderedAccessView": 8,
+    "ID3D12Device::CreateConstantBufferView": 1,
+    "ID3D12Device::CreateRenderTargetView": 2,
+    "ID3D12Device::CreateCommittedResource": 4
+  },
+  "successful_present_milestone": 0,
+  "compute_miss_log_lines": 0,
+  "wine_unhandled_lines": 1,
+  "first_exception_code_recorded": "0xc0000005",
+  "limits": [
+    "Present milestones are lower bounds, not exact present totals.",
+    "API trace outcomes do not prove GPU execution or visible game content.",
+    "Timeout exit 124 is the experiment bound, not completed boot.",
+    "Raw logs, game identifiers, addresses, captures and shader manifests are not included."
+  ]
+}

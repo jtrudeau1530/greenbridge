@@ -1,0 +1,48 @@
+{
+  "id": "logs--tests-main-8575d36",
+  "source_log_name": "tests-main-8575d36.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 5
+  },
+  "cases": [
+    {
+      "test": "loader",
+      "number": 13,
+      "status": "passed",
+      "seconds": 5.2
+    },
+    {
+      "test": "pe_loader",
+      "number": 15,
+      "status": "passed",
+      "seconds": 5.16
+    },
+    {
+      "test": "loader_tls",
+      "number": 17,
+      "status": "passed",
+      "seconds": 5.2
+    },
+    {
+      "test": "xmem",
+      "number": 46,
+      "status": "passed",
+      "seconds": 5.16
+    },
+    {
+      "test": "run_tiny_game",
+      "number": 92,
+      "status": "passed",
+      "seconds": 5.27
+    }
+  ],
+  "summary_lines": [
+    "100% tests passed out of 5"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

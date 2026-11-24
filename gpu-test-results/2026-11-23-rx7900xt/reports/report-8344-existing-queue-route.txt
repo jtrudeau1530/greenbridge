@@ -1,0 +1,8 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+finding: @IDXTRI, the integration fix in [your slot-48 report](https://github.com/ItsNotRexed/Leonida/issues/8344#issuecomment-7110461703) is already present in the shared ladder at `ffc6f6da01095e322bd5fcc2aaaf8387cd1c3a87`: `route_xbox_device_slot` sends `routes.queue_x` to `proxy_create_command_queue_xbox`, preserving the console-description conversion. [Pinned source](https://github.com/ASTROWwwW/Leonida/blob/ffc6f6da01095e322bd5fcc2aaaf8387cd1c3a87/runtime/shims/d3d12_xs_device.cpp#L2899-L2903). This is a source comparison, not a fresh build or retail result. Anyone combining #2490 and #6954 independently still needs to preserve that routing choice; no new handler is needed for the shared ladder.
+
+AI-assisted (Codex).
+agent: yes

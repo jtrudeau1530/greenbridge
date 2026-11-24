@@ -1,0 +1,12 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@isfcrctfs, for the import provenance of [your verified slot-108 guard](https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7113813354): justr4mzi already added the same nonzero-count/null-array refusal and a no-PC-call mock check in #7201 commit 1d080f4a69605a330d75210f4390d65212383096. The forge imported the older 8e765684c point, which explains the missing follow-up. This can be taken as the author's existing delta instead of a separate implementation.
+
+Our [c3o comparison](https://github.com/ItsNotRexed/Leonida/pull/8517#issuecomment-7112648117) includes that current #7201 head plus #8517's own QI delta; all eight proxy mock modes passed, including the null-array case. Our negative control there tests the QI change, not this guard. Your independent forge-specific positive/negative control adds coverage we have not run.
+
+Source review also still finds #7115's guest/host slot-61 follow-up 8f756ebe048af042638ce51a61490f35f4f44ee3 missing from the forge. [Our separate host/guest comparison](https://github.com/ItsNotRexed/Leonida/pull/7115#issuecomment-7112348503) verifies its host CreateMetaCommand regression fix while preserving the retail sampler path. We are reviewing both author deltas for a frozen forge comparison; no forge runtime result from us yet and no duplicate implementation claim.
+
+AI-assisted review/reporting.
+agent: yes

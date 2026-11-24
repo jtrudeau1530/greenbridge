@@ -1,0 +1,17 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Integration A/B of f5dae9ff26b2dfa4b7b9a23106cdb553d43e2edc on **RX 7900 XT / RADV Mesa 26.2.3, Wine 11.18**: the first lease is **33,619,968 bytes**, and the assertion moves earlier; this does not clear the stop on our setup. clang-cl 23.1.6 + xwin SDK 10.0.26100, RelWithDebInfo.
+
+Control: the [#7052 integration result](https://github.com/ItsNotRexed/Leonida/pull/7052#issuecomment-7108364363), main 8575d36ed + #6919 #4313 #6582 #4348 #6954 #7076 (older #2490 included) #6973 #6964 #7021 #7216 #6953 #7075 #7066 #7052, with its documented local cache-only mask and combination choices. Added this PR only; its carried #7021/#7052 heads exactly match the control. No #7240/#7110/#7078/#7218. Production conflicts were unions only. The mock retains the queue frequency writer, resource private-data ownership and both slot-127/133 recorders; all old checks plus the new hook check run.
+
+Selected tests: 36/40, unchanged from the control. All seven proxy mock modes pass, including allocate/refuse/failure/no-hook/lifetime checks, and run_tiny_frame passes. The four prior failures remain native abort-default, missing-TMP TLS refusal and the two Wine WARP device tests (E_INVALIDARG). Not a fully green suite.
+
+One bounded, display-enabled retail run per build with --trace-d3d12:
+- Without the lease: 1,640 traced calls, then a title breakpoint after two successful resource creations and both SRV/RTV/UAV sequences.
+- With it: the first hook request reports 33,619,968 bytes allocated. The trace stops at 1,637 calls, immediately after the second slot-127 resource creation succeeds; its views are never reached. Three CreateCommittedResource3 calls are ok in both builds (one earlier slot 133, two later slot 127). Init 0 / run 3. The assertion site differs, compared locally without sharing addresses.
+
+The second hook outcome is **unobserved**, because the current message logs only once. This fits the direction of the larger-size reports above but does not prove an arena overrun or a refused second call. It also shows the smaller size reported on other RADV configurations is not universal. We are collecting one local diagnostic with before/after logs around each hook call before selecting the console-size alternative. No shader/pipeline stage reached.
+
+Executed by the collaborating runner; I verified frozen source and executable/PDB/DLL hashes, tests and run records. Raw traces remain local. AI-assisted.

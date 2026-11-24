@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Independent retail-startup comparison on Arch Linux / Wine 11.18, clang-cl 23.1.6 + xwin SDK 10.0.26100, RelWithDebInfo, Vulkan and SDL3 enabled. RX 7900 XT / RADV Mesa 26.2.3; GPU work was not reached.
+
+Base: main `8575d36` + #6919 `36936f3` + #4313 `28ea6b971`. Before this PR, startup records five XMemVirtualAlloc attribute events, reports `XErrorReport` as not served, and hits a breakpoint.
+
+With #6582 head `4224c53b145ea9e68eb579817d772fe7276b943a` added (local integration revision `e86f4b4baad9a9e94ef103361f57f72759eeb841`), startup gets past that missing export and reaches `InitializeApiImplEx2`. Its next failure is Wine's builtin `GameInputCreate` stub, confirmed with the `ginput` trace channel, followed by the title's breakpoint. This run exits 3 within the 30-second bound.
+
+The executable and matching PDB were built by a cooperating local tester from a frozen source snapshot; I independently verified all 747 tracked runtime/xtaskqueue files against the integration revision, copied the runtime artifacts with hashes, and ran both comparisons in the same private Wine prefix with networking disabled and the original package read-only. The only merge conflict for this checkpoint was the documented class-list paragraph; no code conflict or local runtime patch.
+
+Adding #4348 alone to that checkpoint still reaches the same Wine GameInput stub. The existing ordinal-alias fix #7216 is being tested separately, so no DirectStorage or device progress is claimed from these runs. No game data or raw traces attached. AI-assisted.

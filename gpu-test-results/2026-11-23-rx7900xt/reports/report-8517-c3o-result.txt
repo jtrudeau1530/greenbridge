@@ -1,0 +1,20 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@Hiiva @justr4mzi
+
+checked: #8517@07b32da9049de906a9aa556b594f0c7cdd13c0d9 with #7201@1d080f4a69605a330d75210f4390d65212383096 | on: Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin | result: all eight proxy mock modes pass; the distinct-interface negative control fails as intended. The combined change gets past our previous execute access violation and reaches command-list recording and presentation-window initialization.
+
+Base: [our frozen c3n diagnostic stack and its linked full ancestry](https://github.com/ItsNotRexed/Leonida/pull/7115#issuecomment-7112348503), plus #7201's range d239fd855..1d080f4a6 and ONLY #8517's 8e765684c..07b32da90 delta. No newer-main rebase. This preserves #7201's newer null-array refusal, which is absent from #8517's carried parent. Conflict resolutions keep the existing handlers/tests and add the new ones; no new production adaptation. Existing slot-61 caller classification and #7021 handle translation remain intact. Slot-108 description cleaning is unchanged from #7201, not unified with other cleaning PRs.
+
+Build passes. Selected suite: 46/51, with the same five control failures (two known Wine environment cases, two Wine WARP device-creation failures, and the previously failing mesh Close check). All eight proxy modes pass, including routing, both slot-108 argument orders, 56-byte stride, 1025-descriptor batch, null-array refusal, distinct QI receivers, error propagation and balanced references. **The device_proxy_test additions are not exercised here:** Wine WARP fails device creation before reaching them.
+
+Negative control: revert ONLY #8517's production changes, retaining byte-identical tests. The proxy test exits 1 at the assertion requiring PC slot 47 to be called on the queried extension, never the base pointer, with its reference released. Restored c3o passes. This isolates the synthetic QI contract.
+
+One bounded retail comparison, same shader library/prefix/offline sandbox: init 0, run 3. The earlier execute access violation after slot 108 is absent. The run records barriers and a render-target clear, later initializes a PresentX window, then terminates on a worker-thread title breakpoint. **No rendered frame or successful Present is established.** The trace contains 2,334 calls: 1,645 ok, 93 void/called, 586 unsupported, 7 failed, 2 ignored and 1 console-only. The seven failures are six CreatePipelineState calls and one command-list Close. Missing slot-67 programs and unsupported allocation format 65 remain; the breakpoint's cause is not identified.
+
+Retail progress belongs to the combined routing + QI change; this does not isolate QI's effect in retail. Existing slot-74 S_OK and XG E_NOTIMPL stand-ins remain limitations. Source/patch/binary hashes verified; raw traces stay local.
+
+AI-assisted testing (Claude), review/reporting (Codex).
+agent: yes

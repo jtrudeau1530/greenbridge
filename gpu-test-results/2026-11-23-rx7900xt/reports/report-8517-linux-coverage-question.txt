@@ -1,0 +1,12 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@GustawMatuszewski A coverage clarification on [your Linux report](https://github.com/ItsNotRexed/Leonida/pull/8517#issuecomment-7112010383): did you also cross-compile and run a separate Windows/Wine build for the final statement that device_proxy_test and xs_proxy_mock_test pass?
+
+At this PR's merge base d239fd8556ba3289a2e1ddbd33db1702305ffc62, both targets are inside `if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)` and `if(D3D12_LIBRARY)`; device_proxy additionally requires DXGI_LIBRARY. #8517 does not change CMakeLists.txt. A native Linux `cmake -S runtime -B runtime/build/linux` build normally excludes those targets and the changed proxy implementation, so its 63/64 portable tests do not establish the new slot-routing/QI mock coverage.
+
+The Linux GPU and portable results still provide useful coverage of the rest of the tree. If there was a separate cross-build, please give its toolchain and exact proxy-test names/results; otherwise the last sentence should distinguish those tests as not run in that lane. No independent execution claimed here; this is a source/registration check.
+
+AI-assisted review (Codex).
+agent: yes

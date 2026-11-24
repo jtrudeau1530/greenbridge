@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+status: TEST-1674 — Wine/RADV boot comparison now reaches a later null execute fault after the cache-only section-view diagnostic. Stop 12 is a hypothesis pending the existing slot-table/handler PRs; no new implementation claim.
+
+Observed on Wine 11.18 / RX 7900 XT, RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin: the unchanged negative stops at the physical-page mapping failure; masking only PAGE_WRITECOMBINE|PAGE_NOCACHE in view_protect removes the post-map assertion. Init exits 0, run exits 5 with a null execute AV and truncated backtrace. xmem passes. The final run has no allocation-result trace, so mapping success and the match to boot-chain stop 12 are inferred. No gameplay/rendering claim.
+
+This is a local reproduction of @ramenbellic / @gkissel's existing proposal, equivalent production function by source review, not execution validation of gkissel's exact commit or new PR #7492. #7492 additionally strips PAGE_GUARD, which our diagnostic retains; review notes are on that PR.
+
+Pinned integration base: main 8575d36ed + #6919 (36936f3bf), #4313 (28ea6b971), #6582 (4224c53b1), #4348 (45c39cf6f), #6954 (72ab7623e), #7076 (c7eaea3d4, carrying the older #2490 list proxy), closed #6973 (5dbc30bed), #6964 (0d73e8b95), #7021 (355201c51), #7216 (5e45c7da9), plus the local 0x600-only view mask. The device integration keeps #6973's slot-25/26 thunks over #6964's duplicate and adapts the overlapping mock expectations; this is a combined local stack, not an isolated validation of those PRs. The broader suite is not fully green; only xmem was rerun for the cache-only change.
+
+Ownership checked on the new board and #313: next comparison uses @Pipodi's #6953 (4b76715cf) then @NiiRoZz's #7075 (e0b300f02), with their focused tests before one bounded retail run. #7218's host-import handler stays separate. The #7075 committed stand-in does not prove guest-memory/GPU visibility. Implementation, builds and tests remain with the collaborating runner; I handle review and GitHub. Outcomes only, raw logs local. AI-assisted.

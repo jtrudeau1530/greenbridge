@@ -1,0 +1,27 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+checked: the #7880 own delta passes its mock checks, but our older integration also needed #2490's separate list-139 Reset fix to clear its first Close failure.
+
+Linux, Wine 11.18, RX 7900 XT/RADV, clang-cl 23.1.6 + xwin. This is the frozen older integration from our [#7746 comparison](https://github.com/ItsNotRexed/Leonida/pull/7746#issuecomment-7113869828), not current main or the forge. Same five shader indexes, runner, prefix and display setting throughout; source, patch, executable/PDB and index hashes verified locally. Existing diagnostic stand-ins remain in that base.
+
+Three snapshots:
+
+| Snapshot | Only added change | Observed first recording |
+| --- | --- | --- |
+| c3q control | None | No PC Reset; Close fails |
+| c3r | #7880's own ce3f2dbde..0aba6c361 delta | Slot 52 reached; no PC Reset; Close still fails |
+| c3s | c3r + only #2490's 5be2fd287..ef9d0759d delta | Console slot 139 reaches PC Reset, which succeeds; subsequent Close succeeds |
+
+We did not take the newer #2490 IID/default-list-shaping commits or 084c8bd09's GameInput change. #7880 production merged with a constants union only. Its mock needed three declared adaptations to the older harness: two Kind::command_list alternatives reduced to Kind::list, and the fifth make_device argument omitted because this harness already defaults to console lists. All #7880 assertions were retained. The typed slot-51 thunk stayed in c3s.
+
+Each added snapshot built and ran the same 51-test subset: 45 pass, one corpus skip without its environment, five unchanged failures (device_proxy/device_proxy_trace, the two known Wine startup/TLS cases, d3d12_mesh). All eight xs_proxy_mock modes pass. The WARP device-creation failure prevents #7880's end-to-end clear/readback cases from being exercised here.
+
+Two separate negative controls retain byte-identical tests: removing only slot-52 handle translation fails the new translated-RTV assertion; removing only the slot-139 mapping fails the Reset-routing/allocator-unwrapping assertion.
+
+Retail: fresh c3q/c3r runs have the same method/outcome counts (2,334 calls, one failed Close), with a queue-event ordering variation. c3s uses that recent c3r run as its hash-verified control: 2,336 calls, zero failed traced outcomes, one new successful Reset, and Close changes from failed to successful. A console-only queue event occurs twice rather than once. The old failure's HRESULT is not logged, so “already closed” remains a mechanism inferred from source; the isolated Reset change demonstrably removes the failure.
+
+All three still hit the same worker-thread title breakpoint and exit 3. The 11 untraced slot-67 failures (eight missing programs), format-65 allocation warning and allocator-slot-9 refusal remain. PresentX is ready, but no PresentX call or rendered frame is established on these runs. Clearing Close is therefore insufficient to clear that assertion. This is an older-base integration result, not a general failure verdict on #7880.
+
+AI-assisted (Codex review; Claude execution). agent: yes

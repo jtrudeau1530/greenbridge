@@ -1,0 +1,597 @@
+[
+  {
+    "source_ref": "refs/claude/ext/astrowww-ladder",
+    "original_commit": "ffc6f6da01095e322bd5fcc2aaaf8387cd1c3a87",
+    "export_ref": "refs/heads/archive/claude/ext/astrowww-ladder",
+    "export_commit": "0c25cabead5c2f258fc58488a732db891ebd81bb",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/fork/vadson159-pr1",
+    "original_commit": "7999819a58c863eab604932354d95540e9783f52",
+    "export_ref": "refs/heads/archive/claude/fork/vadson159-pr1",
+    "export_commit": "e758d95513a959c04bb6e31a2ede94c9afbb5e0f",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/gh-main",
+    "original_commit": "2d53a8055656f1138e57de5367960fcc0714283a",
+    "export_ref": "refs/heads/archive/claude/gh-main",
+    "export_commit": "2e964a29b936cb67e80dc66a688f81b43cb8f63b",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/2490",
+    "original_commit": "084c8bd097d30541f32ff3c7f0968b8baef5fc95",
+    "export_ref": "refs/heads/archive/claude/pr/2490",
+    "export_commit": "02fa635ff2ea2f595bf1e86df96492614f2dff2e",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/2490-cur",
+    "original_commit": "ef9d0759d22e9a88515e7f56854c9db2b6ccc13f",
+    "export_ref": "refs/heads/archive/claude/pr/2490-cur",
+    "export_commit": "51b4f01ab6c2964f98ca4ac03217dd4f437088cd",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/4091",
+    "original_commit": "5cc877dbad760848bc2d94dd3b9f15864861fb46",
+    "export_ref": "refs/heads/archive/claude/pr/4091",
+    "export_commit": "f29f49e3548e03a02bb70e0578aa5bd85d828912",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/4313",
+    "original_commit": "28ea6b971ba229e8caeb7bf4a50f263224b448fb",
+    "export_ref": "refs/heads/archive/claude/pr/4313",
+    "export_commit": "02a4e00ea61781d6420acb3b8e32a9ed19d050f6",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/4348",
+    "original_commit": "45c39cf6f4148aebbc8a88d476bea755887d35bd",
+    "export_ref": "refs/heads/archive/claude/pr/4348",
+    "export_commit": "60620e34ed21b72ec5bb36170d9fd646d7394061",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/4531",
+    "original_commit": "fc1f8dd8fd005ff2218a0e12968ae3af13bc94b3",
+    "export_ref": "refs/heads/archive/claude/pr/4531",
+    "export_commit": "a0c68a3470d3e9d1ae3becc039f62d7b9c5870d2",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6446",
+    "original_commit": "fb40ed369897fe858fecd77977a0200d8a4756c9",
+    "export_ref": "refs/heads/archive/claude/pr/6446",
+    "export_commit": "91d26ac1fc20cdfd956537c3ba726b8b3aced464",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6582",
+    "original_commit": "4224c53b145ea9e68eb579817d772fe7276b943a",
+    "export_ref": "refs/heads/archive/claude/pr/6582",
+    "export_commit": "0938575b6ae4eac9695362cd89f9bbf4527dea2a",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6709",
+    "original_commit": "ecee287eafc44818c90340976bf85c8b5ddde91c",
+    "export_ref": "refs/heads/archive/claude/pr/6709",
+    "export_commit": "4556044ccfdf0ae68a26333b11ec0b529ba94f0c",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6919",
+    "original_commit": "36936f3bf43e33a60e36cff942fa0862e7474645",
+    "export_ref": "refs/heads/archive/claude/pr/6919",
+    "export_commit": "bd8133a88a658e6c9f113be2651845f5388c7358",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6953",
+    "original_commit": "4b76715cf6cb70d569917299040418e1c24ce7ff",
+    "export_ref": "refs/heads/archive/claude/pr/6953",
+    "export_commit": "534662d22895b12c7afe7bff90b837b78a5e91a9",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6954",
+    "original_commit": "72ab7623e2dcef9136938edc7ad6389554a75010",
+    "export_ref": "refs/heads/archive/claude/pr/6954",
+    "export_commit": "2c5e8196d15178ba434e96abab99d7e5fed7169d",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6964",
+    "original_commit": "0d73e8b95d9af460227efbce4b7ec182764abe2d",
+    "export_ref": "refs/heads/archive/claude/pr/6964",
+    "export_commit": "23b01399515d6c76ce51a0b192106d38afacf72b",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6964-cur",
+    "original_commit": "0d73e8b95d9af460227efbce4b7ec182764abe2d",
+    "export_ref": "refs/heads/archive/claude/pr/6964-cur",
+    "export_commit": "23b01399515d6c76ce51a0b192106d38afacf72b",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/6973",
+    "original_commit": "5dbc30bed79b399b527460501c0ee33f28712096",
+    "export_ref": "refs/heads/archive/claude/pr/6973",
+    "export_commit": "0b7d91b65d7bfd0f44457a184074f5d6107c9755",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7021",
+    "original_commit": "355201c51e6aba95c582e2df344782b22e97bb31",
+    "export_ref": "refs/heads/archive/claude/pr/7021",
+    "export_commit": "cbedb2729ff3e51d5ed34428438d73a6e2c3aa11",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7052",
+    "original_commit": "9ec92918aea93d53fa52f975d5f3f155032dec88",
+    "export_ref": "refs/heads/archive/claude/pr/7052",
+    "export_commit": "48cae9cecc271a79a6005472a30cdbaf0fe17579",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7066",
+    "original_commit": "1d8d1d355d9b37ac1fb88103433f88d2d0975a52",
+    "export_ref": "refs/heads/archive/claude/pr/7066",
+    "export_commit": "7b30347776769f62191b71a4847855212ce3eb88",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7074",
+    "original_commit": "c8ea74de8f8a6ae19c3af40761a4aff2c4377431",
+    "export_ref": "refs/heads/archive/claude/pr/7074",
+    "export_commit": "bb4d013ae056459ee9396a50af438e97f311c4ae",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7075",
+    "original_commit": "e0b300f02b6f1bb358f26a904668dcf3e3e14c68",
+    "export_ref": "refs/heads/archive/claude/pr/7075",
+    "export_commit": "80ac46c4e32761b4bd3f931147bccdb761811c35",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7076",
+    "original_commit": "c7eaea3d42708417270de598da46515eb89831e7",
+    "export_ref": "refs/heads/archive/claude/pr/7076",
+    "export_commit": "590aa44328399e3153253d584c587b903d11e53b",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7078",
+    "original_commit": "3ace9869da2d6607a297e7ca6398bf4be342d78d",
+    "export_ref": "refs/heads/archive/claude/pr/7078",
+    "export_commit": "4ef10eba34b2a08c0fcd7c05c4f432f8134c3827",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7078-cur",
+    "original_commit": "3ace9869da2d6607a297e7ca6398bf4be342d78d",
+    "export_ref": "refs/heads/archive/claude/pr/7078-cur",
+    "export_commit": "4ef10eba34b2a08c0fcd7c05c4f432f8134c3827",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7110",
+    "original_commit": "77878e31bc28ec970b9f3b30d2eceb3b1baacf80",
+    "export_ref": "refs/heads/archive/claude/pr/7110",
+    "export_commit": "b8b2122d1fa44fe270e44cb27683495b2f700a20",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7110-cur",
+    "original_commit": "77878e31bc28ec970b9f3b30d2eceb3b1baacf80",
+    "export_ref": "refs/heads/archive/claude/pr/7110-cur",
+    "export_commit": "b8b2122d1fa44fe270e44cb27683495b2f700a20",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7115-v2",
+    "original_commit": "8f756ebe048af042638ce51a61490f35f4f44ee3",
+    "export_ref": "refs/heads/archive/claude/pr/7115-v2",
+    "export_commit": "052c94ad4e7c876f41d5254e698bfb5d1e0af9d8",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7163",
+    "original_commit": "084c8c60e7e839d0caefaaeccf41a6348b062cf1",
+    "export_ref": "refs/heads/archive/claude/pr/7163",
+    "export_commit": "02dad64e213fba4b30e5e0ac0fbacd7d8da1e0ba",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7175",
+    "original_commit": "eccdadaa57713921088670ac1fb3aba37943cd5d",
+    "export_ref": "refs/heads/archive/claude/pr/7175",
+    "export_commit": "5585a133296d92095fc08b49dcf56fcae2b2304a",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7201",
+    "original_commit": "1d080f4a69605a330d75210f4390d65212383096",
+    "export_ref": "refs/heads/archive/claude/pr/7201",
+    "export_commit": "333148b0e2a12fbd00caf68daf001e3655d7c466",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7216",
+    "original_commit": "5e45c7da942d7ac08fc57561e9ed924bcfc76476",
+    "export_ref": "refs/heads/archive/claude/pr/7216",
+    "export_commit": "3bf07cfdebf73296bdd9b217602cceb8a1e7d669",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7235",
+    "original_commit": "f5dae9ff26b2dfa4b7b9a23106cdb553d43e2edc",
+    "export_ref": "refs/heads/archive/claude/pr/7235",
+    "export_commit": "936e248c19a9ae345dcb915a9fd0daf18cae459a",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7240",
+    "original_commit": "d61755d4d1d02f9503f63448e1ebcc4ab361a3d0",
+    "export_ref": "refs/heads/archive/claude/pr/7240",
+    "export_commit": "becfe4c753b5748c5fefe223b3211db446c75df5",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7323",
+    "original_commit": "a30e78ee777def9fe25f9ac8a8d3253f5c2b909a",
+    "export_ref": "refs/heads/archive/claude/pr/7323",
+    "export_commit": "ff891a1b47797ac0851d2b52bffedfe722085f99",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7330",
+    "original_commit": "efc347830b9ccf1461baf9a764ac9e5e911de8f6",
+    "export_ref": "refs/heads/archive/claude/pr/7330",
+    "export_commit": "3359ed2fad7c8b0634ba6fbe3474ba9be1783186",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7492",
+    "original_commit": "954fcb10617a456632b3f9b8697138988e7675cd",
+    "export_ref": "refs/heads/archive/claude/pr/7492",
+    "export_commit": "f106fd90d0df2df5fdc8e4a67103e233aba28eea",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7529",
+    "original_commit": "b93ffa561711e7885c67d5bf9cf0a939f30c42af",
+    "export_ref": "refs/heads/archive/claude/pr/7529",
+    "export_commit": "4d902aaed34424dce160b549a84e13c2da466f2d",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7584",
+    "original_commit": "cef56a296ece813ecbac9d430fe90f64a21f2aab",
+    "export_ref": "refs/heads/archive/claude/pr/7584",
+    "export_commit": "1506b58b3c637424d7617925d075b6380ea48cae",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7746",
+    "original_commit": "bc5fc47b9c7b57f155166963b880154a7c0aa95d",
+    "export_ref": "refs/heads/archive/claude/pr/7746",
+    "export_commit": "e744e6bc3f31fd60322c450328c56865f0d9d6d4",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/7880",
+    "original_commit": "0aba6c3611541f169c25f0e3a1de90db25bdd2d4",
+    "export_ref": "refs/heads/archive/claude/pr/7880",
+    "export_commit": "e3f56258bd2ba54b40f1468587dca29061130c82",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/8448",
+    "original_commit": "47494e72548447eb23c0326cd20e919dfce577ad",
+    "export_ref": "refs/heads/archive/claude/pr/8448",
+    "export_commit": "8f4514550da24ef434c1d5f034c15d4149e68306",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/8517",
+    "original_commit": "07b32da9049de906a9aa556b594f0c7cdd13c0d9",
+    "export_ref": "refs/heads/archive/claude/pr/8517",
+    "export_commit": "53b6cdb80be886c6243c025a667561b5e97bd146",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/8526",
+    "original_commit": "6ecd922d99f57b4c8a4e815930caa1c855f4e252",
+    "export_ref": "refs/heads/archive/claude/pr/8526",
+    "export_commit": "cd7014787d530da3bde876425e9734e224ef4057",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/8714",
+    "original_commit": "3c741ebefa4c59ab6a3debc6c8461faf86bc2af1",
+    "export_ref": "refs/heads/archive/claude/pr/8714",
+    "export_commit": "2cc2ef3aa45b911522da5f29ae0777b5766f9e34",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/8842",
+    "original_commit": "74859f4dab3a5245f0ef35d50d4803b008629cb5",
+    "export_ref": "refs/heads/archive/claude/pr/8842",
+    "export_commit": "42f9d150cda5ba998cd9e662784b80fb536de64e",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/9403",
+    "original_commit": "0e35442283a6f8b0c7e449db170eeef3f4940d9c",
+    "export_ref": "refs/heads/archive/claude/pr/9403",
+    "export_commit": "6640674f2312bdb5444f0b4d34da5b5ceebd9e86",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/9419",
+    "original_commit": "014d99f37c61f521d9190180c07b9fad033421bf",
+    "export_ref": "refs/heads/archive/claude/pr/9419",
+    "export_commit": "c2fd1782eadcf0001e0aa31b229d438e6a1cfdee",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/pr/9586",
+    "original_commit": "4747819517f582995224c6071dcbb2a107b5ff73",
+    "export_ref": "refs/heads/archive/claude/pr/9586",
+    "export_commit": "12106abbb851a86618a336cda7df465ec2596f05",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/claude/upstream-main",
+    "original_commit": "dde82f27e994337094afc476ded0b1426f6e87e2",
+    "export_ref": "refs/heads/archive/claude/upstream-main",
+    "export_commit": "8474733a2a1ecf0151e72af6856cc5cb1e7286fc",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/forge/history/20261123-1551-ad45344c5",
+    "original_commit": "ad45344c54596d60cccdf760f9f8df259c392200",
+    "export_ref": "refs/heads/archive/codex/forge/history/20261123-1551-ad45344c5",
+    "export_commit": "50487557bdd2cdf1fc006fd2f0f722a2789182b8",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/forge/main",
+    "original_commit": "27210111ce9d223c6057d130d254e7a82da30e1f",
+    "export_ref": "refs/heads/archive/codex/forge/main",
+    "export_commit": "5e55b4be89e35a8c6b478a813a0ed0291391b98e",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/forge/reviews/20261123-1551",
+    "original_commit": "4fe7db213ec8f74b0d93fc6828a840978b3618b3",
+    "export_ref": "refs/heads/archive/codex/forge/reviews/20261123-1551",
+    "export_commit": "037f79d91fe38cac198812355d2bca9c844679b5",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/pr/7115",
+    "original_commit": "e22994464b17517624c898ed34b3e03c06ce2261",
+    "export_ref": "refs/heads/archive/codex/pr/7115",
+    "export_commit": "fccd7404f943a86d4c693f3a0ca98bf873dbdb32",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/pr/7115-current",
+    "original_commit": "8f756ebe048af042638ce51a61490f35f4f44ee3",
+    "export_ref": "refs/heads/archive/codex/pr/7115-current",
+    "export_commit": "052c94ad4e7c876f41d5254e698bfb5d1e0af9d8",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/pr/7201",
+    "original_commit": "1d080f4a69605a330d75210f4390d65212383096",
+    "export_ref": "refs/heads/archive/codex/pr/7201",
+    "export_commit": "333148b0e2a12fbd00caf68daf001e3655d7c466",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/pr/7323",
+    "original_commit": "a30e78ee777def9fe25f9ac8a8d3253f5c2b909a",
+    "export_ref": "refs/heads/archive/codex/pr/7323",
+    "export_commit": "ff891a1b47797ac0851d2b52bffedfe722085f99",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/pr/7584-1519",
+    "original_commit": "28f19186db393f4355dafc6d39535af3ea976698",
+    "export_ref": "refs/heads/archive/codex/pr/7584-1519",
+    "export_commit": "5ea46a517f8df3a3d876e416c5b01dc3028d6e7d",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/pr/7584-1543",
+    "original_commit": "4b075160b72652e7b0af0b1a6a3fde9101fa4817",
+    "export_ref": "refs/heads/archive/codex/pr/7584-1543",
+    "export_commit": "376df6b45333f136661e6a8fa7b9a3ae58b1a848",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/pr/7746-1543",
+    "original_commit": "bc5fc47b9c7b57f155166963b880154a7c0aa95d",
+    "export_ref": "refs/heads/archive/codex/pr/7746-1543",
+    "export_commit": "e744e6bc3f31fd60322c450328c56865f0d9d6d4",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/pr/8517",
+    "original_commit": "07b32da9049de906a9aa556b594f0c7cdd13c0d9",
+    "export_ref": "refs/heads/archive/codex/pr/8517",
+    "export_commit": "53b6cdb80be886c6243c025a667561b5e97bd146",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/review/7584-1611",
+    "original_commit": "cef56a296ece813ecbac9d430fe90f64a21f2aab",
+    "export_ref": "refs/heads/archive/codex/review/7584-1611",
+    "export_commit": "1506b58b3c637424d7617925d075b6380ea48cae",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/review/9403-1611",
+    "original_commit": "2d75b89708743a7b6cbd4f1a8f48ad8258471142",
+    "export_ref": "refs/heads/archive/codex/review/9403-1611",
+    "export_commit": "f3f233c9a62df1ebebf875d43288b27abb2c91f8",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/codex/review/9403-1643",
+    "original_commit": "93fce75a664edaf9177e051013f114fb5c007e40",
+    "export_ref": "refs/heads/archive/codex/review/9403-1643",
+    "export_commit": "5a051d59ecceb2f4da6a529c0b7b0fee8e537a70",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-stack",
+    "original_commit": "fc293e2982372f6ad4887ce3603d0a627150b44f",
+    "export_ref": "refs/heads/archive/heads/claude/boot-stack",
+    "export_commit": "f9693bd648f5b9178fe823c4ffc7fc33570bcac9",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2",
+    "original_commit": "ca5344c9ac16dd3f1ca9fa2de8d26ac8f0d14fd6",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2",
+    "export_commit": "ba37a1750eefec2e5dec6a661acc9dc6bf659f5c",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c2a",
+    "original_commit": "ea2a0bf262e5ba99f0d57813103006703fa7db28",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c2a",
+    "export_commit": "1e808c81548279e26f30a42bbd3e2ba7f2c8560c",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c3a",
+    "original_commit": "3553b0b5caa1f026a7dac4bc02090cd8593543d3",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c3a",
+    "export_commit": "697d94741097ff6fa8197f8718a93c3cac1d262d",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c3b-diagnostic",
+    "original_commit": "a6b6ac35c4c42a5d55d4ebabd6cce76afaa71876",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c3b-diagnostic",
+    "export_commit": "2c2e46157351459e9a4323d57c615d0ff775b097",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c3c-diagnostic",
+    "original_commit": "aacf08f51d93dcc976e3515bf8219e82466ef58f",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c3c-diagnostic",
+    "export_commit": "2c9615ca668823959f563cc470c1142abc6238bd",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c3d-diagnostic",
+    "original_commit": "aca2c62ed97469e68b87c0fa5dcac68e26fd5867",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c3d-diagnostic",
+    "export_commit": "5ea8b19e5a0a56cc60010bb1d0ce8ff48b2495ad",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c3e-diagnostic",
+    "original_commit": "03034f8bcdf8eb05993da71028448df1bcc01ef3",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c3e-diagnostic",
+    "export_commit": "9ad66d34f0bfabea93c5963249ba9b38c49540ec",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c3f-diagnostic",
+    "original_commit": "6f2ebe2665888000e33efc34840b54e6ac23d7ed",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c3f-diagnostic",
+    "export_commit": "7551bc1da20c255fb960c66299358bc631f3b1a0",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c3g-leasediag",
+    "original_commit": "13c446509200cc26c5d8e64ae78193abcb970275",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c3g-leasediag",
+    "export_commit": "d310fa17525ba94f396c745d70e368a4126a5bc8",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/boot-v2-c3h-diagnostic",
+    "original_commit": "90830ffbe214ca737db39d01310349caf894f3bb",
+    "export_ref": "refs/heads/archive/heads/claude/boot-v2-c3h-diagnostic",
+    "export_commit": "e2a352d297eb153f1e421a8980ed088c80166fd2",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/tls-ab",
+    "original_commit": "1d15a1a1627442132a3c3017a29344b7c7918022",
+    "export_ref": "refs/heads/archive/heads/claude/tls-ab",
+    "export_commit": "3b0cf07fce68edf1d186412b6d7ffb82c795f567",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/claude/tls-ab-guards",
+    "original_commit": "e7839b7067bd5c789680911c04a7367cbe2e8760",
+    "export_ref": "refs/heads/archive/heads/claude/tls-ab-guards",
+    "export_commit": "1fa82612e1174ba53440ca4d0a585e097ace322c",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/jason/startup-bringup",
+    "original_commit": "8575d36edc479218972497a7bded8651a42856c0",
+    "export_ref": "refs/heads/archive/heads/jason/startup-bringup",
+    "export_commit": "214efe441e703e379cbc2e9d8ff0a516782cfd56",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/heads/main",
+    "original_commit": "de4c37383cad386eaa851047628d7b92c51009c5",
+    "export_ref": "refs/heads/main",
+    "export_commit": "78c2489df6ca644e49656f427a9b760cb167c491",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/remotes/origin/HEAD",
+    "original_commit": "de4c37383cad386eaa851047628d7b92c51009c5",
+    "export_ref": "refs/heads/archive/remotes/origin/HEAD",
+    "export_commit": "78c2489df6ca644e49656f427a9b760cb167c491",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/remotes/origin/main",
+    "original_commit": "de4c37383cad386eaa851047628d7b92c51009c5",
+    "export_ref": "refs/heads/archive/remotes/origin/main",
+    "export_commit": "78c2489df6ca644e49656f427a9b760cb167c491",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/remotes/origin/pr-6919",
+    "original_commit": "36936f3bf43e33a60e36cff942fa0862e7474645",
+    "export_ref": "refs/heads/archive/remotes/origin/pr-6919",
+    "export_commit": "bd8133a88a658e6c9f113be2651845f5388c7358",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/tags/claude/boot-stack-ckpt1",
+    "original_commit": "bcb17cc2b0309c5d1ecc025d6abed50f92c958ee",
+    "export_ref": "refs/heads/archive/tags/claude/boot-stack-ckpt1",
+    "export_commit": "d6048e7015322d8d03efbd6ca50388e8a2e6b816",
+    "available_history_only": true
+  },
+  {
+    "source_ref": "refs/tags/claude/boot-stack-old",
+    "original_commit": "fc293e2982372f6ad4887ce3603d0a627150b44f",
+    "export_ref": "refs/heads/archive/tags/claude/boot-stack-old",
+    "export_commit": "f9693bd648f5b9178fe823c4ffc7fc33570bcac9",
+    "available_history_only": true
+  }
+]

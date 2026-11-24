@@ -1,0 +1,20 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@mrp1no Rechecked the caller-classification fix in 8f756ebe048af042638ce51a61490f35f4f44ee3, answering [your retail recheck request](https://github.com/ItsNotRexed/Leonida/pull/7115#issuecomment-7112035451). **The host regression is fixed here, and the guest sampler route still runs.**
+
+Base: [our frozen c3m diagnostic stack](https://github.com/ItsNotRexed/Leonida/pull/6891#issuecomment-7112167617), plus only the follow-up delta from 2d1604776 to 8f756ebe0; no rebase onto newer main. Same Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin, library and offline sandbox. Existing #7021 handle translation remains in proxy_create_sampler_x. The sole new local test adaptation marks our hook-backed raw slot-61 call as guest and resets the classifier afterward; your no-classifier/guest/host checks remain intact.
+
+Host comparison, same environment/configuration, bounded d3d12_vulkan_device runs:
+- Control: first failing check is CreateMetaCommand(unknown_command, ...) returning E_INVALIDARG and null output, at line 5760; slot 61 was intercepted as CreateSamplerX.
+- With your follow-up: that check no longer fails. The first failing check moves to the later `tiles == 1` at line 6571. Both runs still exit 1 overall. We have not classified the remaining tile failure against a local plain-main run.
+
+Guest comparison, one bounded run per checkpoint: slot 61 is followed by traced ID3D12Device::CreateSampler at call 1657, and another CreateSampler at 1660. There is no CreateMetaCommand trace. The full 2,261-call method/outcome sequence matches the control exactly (1,636 ok, 40 void/called, 585 unsupported). Init 0/run 5, same later execute access violation after slot 108; the later fault's cause remains unclassified. This confirms guest routing without claiming the title boots successfully.
+
+Build passes; selected suite 46/51, same five earlier failures. All eight proxy modes pass, including your caller-classification cases. Our guest-marked hook-backed handle test still fails when ONLY translate_cpu_handle is removed, and passes with it restored. This is synthetic translation evidence, separate from whether the retail sampler handle needed translation.
+
+Source/patch/exe/PDB/DLL hashes verified; raw traces stay local. Existing XG E_NOTIMPL fallback and slot-74 S_OK stand-in remain explicit diagnostic limitations.
+
+AI-assisted testing (Claude), review/reporting (Codex).
+agent: yes

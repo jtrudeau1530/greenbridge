@@ -1,0 +1,181 @@
+{
+  "id": "claude--logs--claude-boot-v2-c1-6582-e86f4b4ba--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 25,
+    "failed": 2
+  },
+  "cases": [
+    {
+      "test": "loader_tls_index0_noreserve",
+      "number": 20,
+      "status": "passed",
+      "seconds": 1.22
+    },
+    {
+      "test": "xmem",
+      "number": 49,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime",
+      "number": 80,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "loader_tls",
+      "number": 17,
+      "status": "passed",
+      "seconds": 1.34
+    },
+    {
+      "test": "xgameruntime_user",
+      "number": 81,
+      "status": "passed",
+      "seconds": 0.07
+    },
+    {
+      "test": "xgameruntime_gamesave",
+      "number": 82,
+      "status": "passed",
+      "seconds": 0.07
+    },
+    {
+      "test": "xgameruntime_store",
+      "number": 83,
+      "status": "passed",
+      "seconds": 0.05
+    },
+    {
+      "test": "xgameruntime_offline_hdr",
+      "number": 85,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "xgameruntime_offline",
+      "number": 84,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "xgameruntime_user_gamertag_long",
+      "number": 87,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "xgameruntime_user_gamertag",
+      "number": 86,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game",
+      "number": 95,
+      "status": "passed",
+      "seconds": 0.08
+    },
+    {
+      "test": "run_tiny_game_console_paths",
+      "number": 96,
+      "status": "passed",
+      "seconds": 0.08
+    },
+    {
+      "test": "run_tiny_game_exit_code",
+      "number": 97,
+      "status": "passed",
+      "seconds": 0.07
+    },
+    {
+      "test": "run_tiny_game_fixed",
+      "number": 99,
+      "status": "passed",
+      "seconds": 0.05
+    },
+    {
+      "test": "run_tiny_game_fixed_exit_code",
+      "number": 100,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "run_tiny_game_tls",
+      "number": 104,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "run_tiny_game_eh",
+      "number": 105,
+      "status": "passed",
+      "seconds": 0.07
+    },
+    {
+      "test": "run_tiny_game_stack",
+      "number": 107,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "run_tiny_game_abort_exit_codes",
+      "number": 98,
+      "status": "failed",
+      "seconds": 0.4
+    },
+    {
+      "test": "run_tiny_tls_clone_cleanup",
+      "number": 109,
+      "status": "passed",
+      "seconds": 0.19
+    },
+    {
+      "test": "run_tiny_tls_ga",
+      "number": 108,
+      "status": "failed",
+      "seconds": 0.25
+    },
+    {
+      "test": "run_tiny_game_dir",
+      "number": 110,
+      "status": "passed",
+      "seconds": 0.14
+    },
+    {
+      "test": "run_tiny_frame",
+      "number": 248,
+      "status": "passed",
+      "seconds": 0.42
+    },
+    {
+      "test": "run_tiny_frame_queue_test_settings",
+      "number": 249,
+      "status": "passed",
+      "seconds": 0.42
+    },
+    {
+      "test": "loader_tls_index0_threads",
+      "number": 19,
+      "status": "passed",
+      "seconds": 6.75
+    },
+    {
+      "test": "loader_tls_index0",
+      "number": 18,
+      "status": "passed",
+      "seconds": 6.89
+    }
+  ],
+  "summary_lines": [
+    "93% tests passed, 2 tests failed out of 27"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

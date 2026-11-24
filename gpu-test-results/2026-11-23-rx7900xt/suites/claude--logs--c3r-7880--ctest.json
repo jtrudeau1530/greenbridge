@@ -1,0 +1,326 @@
+{
+  "id": "claude--logs--c3r-7880--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 45,
+    "failed": 5,
+    "skipped": 1
+  },
+  "cases": [
+    {
+      "test": "pe_loader_bounds",
+      "number": 16,
+      "status": "passed",
+      "seconds": 0.99
+    },
+    {
+      "test": "loader_tls_index0",
+      "number": 18,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "pe_loader",
+      "number": 15,
+      "status": "passed",
+      "seconds": 1.05
+    },
+    {
+      "test": "loader_tls_index0_threads",
+      "number": 19,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "loader_tls_index0_noreserve",
+      "number": 20,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "unimplemented_policy",
+      "number": 23,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "device_proxy",
+      "number": 25,
+      "status": "failed",
+      "seconds": 0.32
+    },
+    {
+      "test": "xs_proxy_mock",
+      "number": 27,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_no_reserve",
+      "number": 28,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_no_protect",
+      "number": 29,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_no_handler",
+      "number": 30,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_env_slots",
+      "number": 31,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_invalid",
+      "number": 32,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "device_proxy_trace",
+      "number": 26,
+      "status": "failed",
+      "seconds": 0.32
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_70",
+      "number": 33,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_74",
+      "number": 34,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "command_list",
+      "number": 36,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "shader_library_corpus",
+      "number": 44,
+      "status": "skipped",
+      "seconds": 0.01
+    },
+    {
+      "test": "shader_library",
+      "number": 42,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xmem",
+      "number": 51,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xg_xs",
+      "number": 52,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "xgameruntime_user",
+      "number": 85,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime",
+      "number": 84,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "xgameruntime_store",
+      "number": 87,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_gamesave",
+      "number": 86,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_offline",
+      "number": 88,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_offline_hdr",
+      "number": 89,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_user_gamertag",
+      "number": 90,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_user_gamertag_long",
+      "number": 91,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "run_tiny_game",
+      "number": 99,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_console_paths",
+      "number": 100,
+      "status": "passed",
+      "seconds": 0.05
+    },
+    {
+      "test": "run_tiny_game_exit_code",
+      "number": 101,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_abort_exit_codes",
+      "number": 102,
+      "status": "failed",
+      "seconds": 0.21
+    },
+    {
+      "test": "run_tiny_game_fixed",
+      "number": 103,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_fixed_exit_code",
+      "number": 104,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_tls",
+      "number": 108,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_eh",
+      "number": 109,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_stack",
+      "number": 111,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_tls_ga",
+      "number": 112,
+      "status": "failed",
+      "seconds": 0.12
+    },
+    {
+      "test": "run_tiny_tls_clone_cleanup",
+      "number": 113,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "run_tiny_game_dir",
+      "number": 114,
+      "status": "passed",
+      "seconds": 0.09
+    },
+    {
+      "test": "d3d12_com",
+      "number": 141,
+      "status": "passed",
+      "seconds": 0.16
+    },
+    {
+      "test": "gameinput",
+      "number": 93,
+      "status": "passed",
+      "seconds": 2.59
+    },
+    {
+      "test": "allocator_proxy",
+      "number": 180,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_compute",
+      "number": 229,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_mesh",
+      "number": 248,
+      "status": "failed",
+      "seconds": 0.11
+    },
+    {
+      "test": "run_tiny_frame",
+      "number": 252,
+      "status": "passed",
+      "seconds": 0.32
+    },
+    {
+      "test": "run_tiny_frame_queue_test_settings",
+      "number": 253,
+      "status": "passed",
+      "seconds": 0.31
+    },
+    {
+      "test": "queue_proxy",
+      "number": 179,
+      "status": "passed",
+      "seconds": 3.95
+    },
+    {
+      "test": "loader_tls",
+      "number": 17,
+      "status": "passed",
+      "seconds": 10.57
+    },
+    {
+      "test": "loader",
+      "number": 13,
+      "status": "passed",
+      "seconds": 10.64
+    }
+  ],
+  "summary_lines": [
+    "90% tests passed, 5 tests failed out of 51"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

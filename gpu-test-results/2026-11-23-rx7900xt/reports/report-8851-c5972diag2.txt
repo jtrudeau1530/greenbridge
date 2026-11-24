@@ -1,0 +1,15 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+LOCAL DRAFT — NOT POSTED. c5972diag2 readback follow-up.
+
+Pinned c5972diag plus local scene/display readback and pipeline/SRV logging, unchanged shader overlay. Readback waits for device idle and runs at PresentX60/120/240, after submissions rather than before the composite; it perturbs image layouts. The scene selection is RT0 of the last API draw with a DSV and is recorded before deferred replay/record_draw decisions.
+
+Six valid3840x2160 P6 samples (scene and display at each of the three points) were independently read: all RGB bytes zero. Run/source/applier/runner/binary/five-index/native-map hashes match. The30s run timed out with0exceptions and0failed traced outcomes:67184calls,56518ok,10666called; successful presents reached256. The unchanged70-test set is worker-reported64pass/1skip/5known failures.
+
+Scene RGBA readback logs report alpha min0,max255,mean127.500 at all three samples; display alpha min/max/mean0. The diagnostic did not retain alpha bytes or a histogram, and P6 carries no alpha. Thus exactly half the pixels at alpha255 is NOT established. The summary is consistent with half coverage, among other distributions.
+
+Logged draw pipelines have triangle topology type3, while later API draws use console rectangle-list topology17 with3vertices. They have one render target, a pixel shader, blending disabled and write mask0xF. Source inspection shows type19 is needed for the generated rectangle geometry stage. This supports the existing owner's rectangle-variant fix as a controlled comparison; it does not establish the cause of zero scene RGB or actual per-draw coverage. SRV creation includes the scene/depth resources but actual bound tables are not logged.
+
+Jason explicitly approved the combined forge645c08112+ab1cfd674 comparison after a temporary automatic-approval denial. The worker picked up that exact frozen no-commit scope, tests/negative control and one30s readback run. The separate claim that interning645c08112 is strictly necessary remains under source review. No later broad forge merge is included.

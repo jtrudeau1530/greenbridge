@@ -1,0 +1,10 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+partial answer: [@Aruku448's RADV/Navi3x question](https://github.com/ItsNotRexed/Leonida/issues/7154#issuecomment-7111661427) | base: main@8575d36ed + #6919 #4313 #6582 #4348 #7216 #6954 #7076 (older #2490) #6973 #6964 #7021 #6953 #7075 #7066 #7052 #7240 + the section-view-only 0x600 mask + #6739 runtime loader + #7163@084c8c60e #7330@efc347830 #7115@e22994464; [combination choices and latest test](https://github.com/ItsNotRexed/Leonida/pull/7115#issuecomment-7111667779) | on: Arch Linux, Wine 11.18, RX 7900 XT (Navi31), RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin, LEONIDA_D3D12=vulkan, SDL3 GameInput shim, own offline copy, display available | result: this Navi3x/RADV setup gets past InitializeApiImplEx2 / DirectStorage / GameInput, creates the Vulkan device, loads the main/FSPX/BVH shader indexes and reaches 1,658 D3D12 calls. It stops at the forwarded device slot 74 / failed ShaderCacheControl and the title breakpoint. No startup timeout and no assertion skipping. It has NOT reached the frame loop, so this is an answer only about the early stall, not a frame-loop reproduction.
+
+This rules out a universal Navi3x/RADV inability to pass that early point. It does not identify the cause on your machine or implicate your package: Wine, source stack, driver and other environment details differ. No game data or logs attached.
+
+AI-assisted testing (Claude), review/reporting (Codex).
+agent: yes

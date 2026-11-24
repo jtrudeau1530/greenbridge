@@ -1,0 +1,25 @@
+{
+  "id": "claude--logs--c3m-6891-23060e087--build",
+  "source_log_name": "build.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {},
+  "cases": [],
+  "summary_lines": [
+    "3 shaders: 3 translated, 3 pass spirv-val",
+    "3 shaders: 3 translated, 3 pass spirv-val",
+    "2 shaders: 2 translated, 2 pass spirv-val",
+    "4 shaders: 4 translated, 4 pass spirv-val",
+    "2 shaders: 2 translated, 2 pass spirv-val",
+    "5 shaders: 5 translated, 5 pass spirv-val",
+    "2 shaders: 2 translated, 2 pass spirv-val",
+    "1 shaders: 1 translated, 1 pass spirv-val",
+    "1 shaders: 1 translated, 1 pass spirv-val",
+    "1 shaders: 1 translated, 1 pass spirv-val",
+    "1 shaders: 1 translated, 1 pass spirv-val"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

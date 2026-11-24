@@ -1,0 +1,1640 @@
+{
+  "id": "claude--logs--ladder-ffc6f6da0--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 222,
+    "failed": 18,
+    "skipped": 30
+  },
+  "cases": [
+    {
+      "test": "d3d12_xdxr_rt",
+      "number": 155,
+      "status": "passed",
+      "seconds": 1.47
+    },
+    {
+      "test": "xdxr_build",
+      "number": 125,
+      "status": "passed",
+      "seconds": 1.53
+    },
+    {
+      "test": "buffer_va_index",
+      "number": 3,
+      "status": "passed",
+      "seconds": 0.34
+    },
+    {
+      "test": "xdxr_build_output",
+      "number": 5,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "pipeline_cache_file",
+      "number": 4,
+      "status": "passed",
+      "seconds": 0.41
+    },
+    {
+      "test": "pipeline_summary",
+      "number": 7,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xdxr_descs",
+      "number": 8,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vulkan_device_filter",
+      "number": 9,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vk_presenter_capture_colour",
+      "number": 10,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "runtime_types",
+      "number": 11,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "large_module_gate",
+      "number": 6,
+      "status": "passed",
+      "seconds": 0.61
+    },
+    {
+      "test": "module_names",
+      "number": 13,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "pe_loader",
+      "number": 14,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "loader",
+      "number": 12,
+      "status": "passed",
+      "seconds": 0.47
+    },
+    {
+      "test": "pe_loader_bounds",
+      "number": 15,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "loader_tls_index0",
+      "number": 17,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "loader_tls",
+      "number": 16,
+      "status": "passed",
+      "seconds": 0.07
+    },
+    {
+      "test": "loader_tls_index0_threads",
+      "number": 18,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "loader_tls_index0_noreserve",
+      "number": 19,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "dll_thread_calls",
+      "number": 20,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "gameinput_host",
+      "number": 21,
+      "status": "failed",
+      "seconds": 0.05
+    },
+    {
+      "test": "startup_trace",
+      "number": 23,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "unimplemented_policy",
+      "number": 22,
+      "status": "passed",
+      "seconds": 0.08
+    },
+    {
+      "test": "device_proxy_trace",
+      "number": 25,
+      "status": "failed",
+      "seconds": 0.35
+    },
+    {
+      "test": "device_proxy",
+      "number": 24,
+      "status": "failed",
+      "seconds": 0.4
+    },
+    {
+      "test": "xs_proxy_mock_no_reserve",
+      "number": 27,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xs_proxy_mock",
+      "number": 26,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xs_proxy_mock_no_handler",
+      "number": 29,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xs_proxy_mock_no_protect",
+      "number": 28,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xs_proxy_mock_env_slots",
+      "number": 30,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_invalid",
+      "number": 31,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_70",
+      "number": 32,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "command_list",
+      "number": 34,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "spirv_stores",
+      "number": 35,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "shader_fixture_path",
+      "number": 36,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "resource_tiling",
+      "number": 37,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "resource_detile",
+      "number": 38,
+      "status": "passed",
+      "seconds": 0.05
+    },
+    {
+      "test": "descriptor_table",
+      "number": 39,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "shader_library",
+      "number": 40,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "spirv_f16_halves",
+      "number": 41,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "shader_library_corpus",
+      "number": 42,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "bink_decode",
+      "number": 43,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "root_sig",
+      "number": 33,
+      "status": "passed",
+      "seconds": 0.35
+    },
+    {
+      "test": "bink_abi",
+      "number": 44,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "bink_play_headless",
+      "number": 45,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "bvh_builder",
+      "number": 47,
+      "status": "skipped",
+      "seconds": 0.04
+    },
+    {
+      "test": "fsr_dispatch",
+      "number": 46,
+      "status": "skipped",
+      "seconds": 0.04
+    },
+    {
+      "test": "xmem",
+      "number": 49,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "bink_audio",
+      "number": 48,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "process_cmdline",
+      "number": 50,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "int3_skip",
+      "number": 52,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "winhttp_offline",
+      "number": 53,
+      "status": "passed",
+      "seconds": 0.05
+    },
+    {
+      "test": "file_system",
+      "number": 51,
+      "status": "failed",
+      "seconds": 0.18
+    },
+    {
+      "test": "api_ref_state",
+      "number": 54,
+      "status": "passed",
+      "seconds": 0.1
+    },
+    {
+      "test": "api_global_refs",
+      "number": 55,
+      "status": "passed",
+      "seconds": 0.08
+    },
+    {
+      "test": "context_pinning",
+      "number": 56,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "context_rundown",
+      "number": 57,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "context_concurrent_detach",
+      "number": 59,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "context_reentrant",
+      "number": 58,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "context_attach_detach_stress",
+      "number": 60,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_unregister",
+      "number": 61,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_terminate",
+      "number": 63,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_undispatched",
+      "number": 62,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_parked",
+      "number": 64,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_self",
+      "number": 65,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_presignaled",
+      "number": 66,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_monitor",
+      "number": 67,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_composite",
+      "number": 69,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_close",
+      "number": 68,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "wait_registration_cross",
+      "number": 71,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_snapshot",
+      "number": 70,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_concurrent",
+      "number": 72,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_held_snapshot",
+      "number": 73,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_admission",
+      "number": 74,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_cancel_unregister",
+      "number": 75,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_reentrant_admission",
+      "number": 76,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_reentrant_vs_external_unregister",
+      "number": 77,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_multi_dispatcher_unregister_replace",
+      "number": 79,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "wait_registration_multi_dispatcher_terminate",
+      "number": 78,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime",
+      "number": 81,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "xgameruntime_user",
+      "number": 82,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_gamesave",
+      "number": 83,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "xgameruntime_store",
+      "number": 84,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_offline",
+      "number": 85,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_offline_hdr",
+      "number": 86,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_user_gamertag",
+      "number": 87,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_user_gamertag_long",
+      "number": 88,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "active_input",
+      "number": 89,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "gameinput",
+      "number": 90,
+      "status": "passed",
+      "seconds": 2.6
+    },
+    {
+      "test": "run_startup_cmdline",
+      "number": 91,
+      "status": "failed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_async",
+      "number": 92,
+      "status": "passed",
+      "seconds": 0.05
+    },
+    {
+      "test": "run_tiny_gdk_load",
+      "number": 93,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_bundled_load",
+      "number": 94,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_atexit",
+      "number": 95,
+      "status": "passed",
+      "seconds": 0.82
+    },
+    {
+      "test": "run_tiny_game",
+      "number": 96,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_console_paths",
+      "number": 97,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "run_tiny_game_exit_code",
+      "number": 98,
+      "status": "passed",
+      "seconds": 0.07
+    },
+    {
+      "test": "run_tiny_game_abort_exit_codes",
+      "number": 99,
+      "status": "failed",
+      "seconds": 0.23
+    },
+    {
+      "test": "run_tiny_game_fixed",
+      "number": 100,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_fixed_exit_code",
+      "number": 101,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "gta6rt_rejects_dry-run_run",
+      "number": 102,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "gta6rt_rejects_dry-run_init",
+      "number": 103,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "gta6rt_rejects_init_run",
+      "number": 104,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_tls",
+      "number": 105,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_eh",
+      "number": 106,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "gta6rt_stack",
+      "number": 107,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "run_tiny_game_stack",
+      "number": 108,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_tls_ga",
+      "number": 109,
+      "status": "failed",
+      "seconds": 0.13
+    },
+    {
+      "test": "run_tiny_tls_clone_cleanup",
+      "number": 110,
+      "status": "passed",
+      "seconds": 0.13
+    },
+    {
+      "test": "run_tiny_game_dir",
+      "number": 111,
+      "status": "passed",
+      "seconds": 0.09
+    },
+    {
+      "test": "root_signature",
+      "number": 112,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "root_signature_oracle",
+      "number": 113,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "spirv_capability",
+      "number": 114,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vk_shader_fma",
+      "number": 115,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "host_adapter",
+      "number": 116,
+      "status": "passed",
+      "seconds": 0.27
+    },
+    {
+      "test": "vk_pipeline_check_cli",
+      "number": 117,
+      "status": "passed",
+      "seconds": 0.73
+    },
+    {
+      "test": "vk_texture_cube_alpha",
+      "number": 118,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vk_pipeline_check_stack",
+      "number": 119,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "dstorage",
+      "number": 80,
+      "status": "failed",
+      "seconds": 10.18
+    },
+    {
+      "test": "vk_command_replay",
+      "number": 121,
+      "status": "passed",
+      "seconds": 0.14
+    },
+    {
+      "test": "vk_predicated_copy",
+      "number": 122,
+      "status": "passed",
+      "seconds": 0.14
+    },
+    {
+      "test": "vk_predicate_capture",
+      "number": 123,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "vk_queue",
+      "number": 124,
+      "status": "passed",
+      "seconds": 0.37
+    },
+    {
+      "test": "depth24_convert",
+      "number": 120,
+      "status": "passed",
+      "seconds": 9.33
+    },
+    {
+      "test": "vk_queue_query_sync",
+      "number": 127,
+      "status": "passed",
+      "seconds": 0.18
+    },
+    {
+      "test": "vk_sync_validation",
+      "number": 128,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "vk_overlapping_occlusion",
+      "number": 129,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "vk_overlapping_occlusion_no_statistics",
+      "number": 130,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "vk_device_pick",
+      "number": 131,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vk_bc_zero_init",
+      "number": 132,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "vk_fence_dispatcher_sync",
+      "number": 133,
+      "status": "passed",
+      "seconds": 0.37
+    },
+    {
+      "test": "bindless_sizing",
+      "number": 134,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vulkan13_features",
+      "number": 135,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vulkan_scratch",
+      "number": 136,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vk_binary_occlusion",
+      "number": 137,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_com",
+      "number": 138,
+      "status": "passed",
+      "seconds": 0.16
+    },
+    {
+      "test": "d3d12_multithread",
+      "number": 139,
+      "status": "passed",
+      "seconds": 0.22
+    },
+    {
+      "test": "d3d12_options1_first_use",
+      "number": 140,
+      "status": "passed",
+      "seconds": 0.24
+    },
+    {
+      "test": "d3d12_queue_wait",
+      "number": 141,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_noop_copy",
+      "number": 142,
+      "status": "failed",
+      "seconds": 0.33
+    },
+    {
+      "test": "d3d12_queue_wait_timeout",
+      "number": 143,
+      "status": "passed",
+      "seconds": 0.13
+    },
+    {
+      "test": "d3d12_queue_list_type",
+      "number": 144,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_queue_handover",
+      "number": 145,
+      "status": "passed",
+      "seconds": 2.45
+    },
+    {
+      "test": "d3d12_queue_handover_two_queues",
+      "number": 146,
+      "status": "skipped",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_queue_handover_shared_queue",
+      "number": 147,
+      "status": "passed",
+      "seconds": 2.48
+    },
+    {
+      "test": "d3d12_queue_share",
+      "number": 148,
+      "status": "passed",
+      "seconds": 0.16
+    },
+    {
+      "test": "d3d12_queue_share_one_queue",
+      "number": 149,
+      "status": "passed",
+      "seconds": 0.15
+    },
+    {
+      "test": "d3d12_queue_wait_one_queue",
+      "number": 150,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_queue_share_rejects_case_typo",
+      "number": 151,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_queue_share_rejects_iterations_zero",
+      "number": 152,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_queue_share_rejects_iterations_word",
+      "number": 153,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_queue_share_rejects_iterations_too_many",
+      "number": 154,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "retire_tickets",
+      "number": 2,
+      "status": "passed",
+      "seconds": 31.9
+    },
+    {
+      "test": "gfx10_tiling",
+      "number": 1,
+      "status": "passed",
+      "seconds": 32.02
+    },
+    {
+      "test": "d3d12_gcl8",
+      "number": 157,
+      "status": "passed",
+      "seconds": 1.13
+    },
+    {
+      "test": "d3d12_vulkan_device",
+      "number": 159,
+      "status": "failed",
+      "seconds": 0.17
+    },
+    {
+      "test": "d3d12_buffer_tiles",
+      "number": 160,
+      "status": "passed",
+      "seconds": 0.49
+    },
+    {
+      "test": "d3d12_texture_tiles",
+      "number": 161,
+      "status": "passed",
+      "seconds": 0.39
+    },
+    {
+      "test": "d3d12_dxr_validation",
+      "number": 162,
+      "status": "passed",
+      "seconds": 0.45
+    },
+    {
+      "test": "d3d12_dxr_validation_khr",
+      "number": 163,
+      "status": "passed",
+      "seconds": 0.9
+    },
+    {
+      "test": "d3d12_sparse_queue_family",
+      "number": 164,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_texture1d",
+      "number": 165,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_placed_dimensions",
+      "number": 166,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_uav_clear",
+      "number": 167,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_short_uav_clear",
+      "number": 168,
+      "status": "skipped",
+      "seconds": 0.05
+    },
+    {
+      "test": "d3d12_d24_support",
+      "number": 169,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_r9g9b9e5_uav",
+      "number": 170,
+      "status": "passed",
+      "seconds": 0.13
+    },
+    {
+      "test": "d3d12_debug_markers",
+      "number": 171,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_existing_heap",
+      "number": 172,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_fence_timing",
+      "number": 173,
+      "status": "passed",
+      "seconds": 1.25
+    },
+    {
+      "test": "d3d12_fence_events",
+      "number": 174,
+      "status": "passed",
+      "seconds": 0.22
+    },
+    {
+      "test": "d3d12_fence_device_lost_counter",
+      "number": 175,
+      "status": "passed",
+      "seconds": 0.36
+    },
+    {
+      "test": "d3d12_xdxr_rt_check",
+      "number": 156,
+      "status": "passed",
+      "seconds": 12.12
+    },
+    {
+      "test": "allocator_proxy",
+      "number": 177,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "dxgi_device",
+      "number": 178,
+      "status": "passed",
+      "seconds": 0.25
+    },
+    {
+      "test": "d3d12_fence_waiter",
+      "number": 179,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_method_variants",
+      "number": 180,
+      "status": "passed",
+      "seconds": 0.38
+    },
+    {
+      "test": "d3d12_shader_cache",
+      "number": 181,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_private_data",
+      "number": 182,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_sampler2",
+      "number": 183,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_descriptor",
+      "number": 184,
+      "status": "passed",
+      "seconds": 0.19
+    },
+    {
+      "test": "d3d12_predicated_copy",
+      "number": 185,
+      "status": "skipped",
+      "seconds": 0.04
+    },
+    {
+      "test": "d3d12_indirect_dispatch_count",
+      "number": 186,
+      "status": "failed",
+      "seconds": 0.05
+    },
+    {
+      "test": "d3d12_close_parity",
+      "number": 187,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_execute_indirect_validation",
+      "number": 188,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_rgb9e5_rtv",
+      "number": 189,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "queue_proxy",
+      "number": 176,
+      "status": "passed",
+      "seconds": 4.02
+    },
+    {
+      "test": "d3d12_clear",
+      "number": 190,
+      "status": "failed",
+      "seconds": 0.55
+    },
+    {
+      "test": "d3d12_typeless_rtv",
+      "number": 191,
+      "status": "skipped",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_texture1d_target",
+      "number": 192,
+      "status": "skipped",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_typeless_families",
+      "number": 194,
+      "status": "skipped",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_view_slices",
+      "number": 193,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_rgb96",
+      "number": 196,
+      "status": "skipped",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_state_sweep",
+      "number": 195,
+      "status": "skipped",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_resource_desc",
+      "number": 198,
+      "status": "skipped",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_depth_resolve",
+      "number": 197,
+      "status": "failed",
+      "seconds": 0.31
+    },
+    {
+      "test": "d3d12_subresource_copy",
+      "number": 200,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_typeless_depth",
+      "number": 199,
+      "status": "failed",
+      "seconds": 0.38
+    },
+    {
+      "test": "d3d12_heap_properties",
+      "number": 202,
+      "status": "failed",
+      "seconds": 0.38
+    },
+    {
+      "test": "d3d12_pipeline_library_host",
+      "number": 203,
+      "status": "passed",
+      "seconds": 0.37
+    },
+    {
+      "test": "d3d12_f16_halves",
+      "number": 204,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_boot_movie",
+      "number": 205,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_first_light",
+      "number": 206,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_translated_draw",
+      "number": 207,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "vk_bindless_ps_tex",
+      "number": 208,
+      "status": "passed",
+      "seconds": 0.19
+    },
+    {
+      "test": "vk_bindless_ps_imgatomic",
+      "number": 209,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_m2_textured",
+      "number": 210,
+      "status": "passed",
+      "seconds": 0.13
+    },
+    {
+      "test": "d3d12_m2_formats",
+      "number": 211,
+      "status": "passed",
+      "seconds": 0.13
+    },
+    {
+      "test": "d3d12_m3_frame",
+      "number": 212,
+      "status": "passed",
+      "seconds": 0.13
+    },
+    {
+      "test": "d3d12_m3_first_pass",
+      "number": 213,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_m4_compute",
+      "number": 214,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_buffer_uav",
+      "number": 215,
+      "status": "passed",
+      "seconds": 0.28
+    },
+    {
+      "test": "d3d12_node_mask",
+      "number": 216,
+      "status": "skipped",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_indirect_zero",
+      "number": 217,
+      "status": "skipped",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_copy_xfmt",
+      "number": 218,
+      "status": "skipped",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_stencil_copy",
+      "number": 219,
+      "status": "skipped",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_query_rules",
+      "number": 220,
+      "status": "passed",
+      "seconds": 0.26
+    },
+    {
+      "test": "d3d12_indirect_rt",
+      "number": 221,
+      "status": "failed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_compute",
+      "number": 222,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_fspx_compute",
+      "number": 223,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_draw",
+      "number": 224,
+      "status": "passed",
+      "seconds": 0.16
+    },
+    {
+      "test": "d3d12_conservative_raster",
+      "number": 225,
+      "status": "skipped",
+      "seconds": 0.04
+    },
+    {
+      "test": "d3d12_conservative_tier2",
+      "number": 226,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "inner_coverage_oracle",
+      "number": 227,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_inner_coverage_guards",
+      "number": 228,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_inner_coverage_native",
+      "number": 229,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_conservative_tier3",
+      "number": 230,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_msaa_draw",
+      "number": 231,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_geometry",
+      "number": 232,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_depth24_draw",
+      "number": 233,
+      "status": "passed",
+      "seconds": 0.18
+    },
+    {
+      "test": "d3d12_set0_compute",
+      "number": 234,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_bindless_churn",
+      "number": 235,
+      "status": "passed",
+      "seconds": 0.36
+    },
+    {
+      "test": "d3d12_bindless_churn_validated",
+      "number": 236,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_pipeline_library",
+      "number": 237,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_bundle",
+      "number": 238,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_bundle_forbidden",
+      "number": 239,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_stores_atomics",
+      "number": 240,
+      "status": "passed",
+      "seconds": 0.18
+    },
+    {
+      "test": "d3d12_mesh",
+      "number": 241,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_conservative_tier3_reference",
+      "number": 242,
+      "status": "skipped",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_subgroup",
+      "number": 243,
+      "status": "passed",
+      "seconds": 0.16
+    },
+    {
+      "test": "d3d12_clear_formats",
+      "number": 244,
+      "status": "failed",
+      "seconds": 0.53
+    },
+    {
+      "test": "d3d12_set_descriptor_heaps",
+      "number": 245,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "run_tiny_frame",
+      "number": 246,
+      "status": "passed",
+      "seconds": 0.32
+    },
+    {
+      "test": "run_tiny_frame_queue_test_settings",
+      "number": 247,
+      "status": "passed",
+      "seconds": 0.33
+    },
+    {
+      "test": "typeless_rtv",
+      "number": 248,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "pipeline_cache_snapshot",
+      "number": 249,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "predicated_copy",
+      "number": 250,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "replay_copy_offset",
+      "number": 251,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "replay_readback_stages",
+      "number": 252,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "replay_texture_barrier",
+      "number": 253,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "clear_color",
+      "number": 254,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "frame_pacer",
+      "number": 255,
+      "status": "passed",
+      "seconds": 0.94
+    },
+    {
+      "test": "replay_clear_gate",
+      "number": 256,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "replay_write_immediate_predication",
+      "number": 257,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "d3d12_state_map",
+      "number": 258,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "replay_uav_clear_offset",
+      "number": 259,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "replay_query_predication",
+      "number": 260,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "replay_query_edges",
+      "number": 261,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "gfx10_descriptors",
+      "number": 262,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "replay_cpu_bench_selftest",
+      "number": 263,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "vk_descriptor_bench_selftest",
+      "number": 264,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "mods",
+      "number": 265,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "code_hooks",
+      "number": 266,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "subgroup_size",
+      "number": 267,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "conservative_raster",
+      "number": 268,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "arena_size",
+      "number": 269,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "crt_timed_wait",
+      "number": 270,
+      "status": "passed",
+      "seconds": 0.41
+    },
+    {
+      "test": "d3d12_residency",
+      "number": 201,
+      "status": "failed",
+      "seconds": 9.32
+    },
+    {
+      "test": "d3d12_trace",
+      "number": 158,
+      "status": "passed",
+      "seconds": 29.55
+    },
+    {
+      "test": "xdxr_build_check",
+      "number": 126,
+      "status": "passed",
+      "seconds": 53.37
+    }
+  ],
+  "summary_lines": [
+    "93% tests passed, 18 tests failed out of 270"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

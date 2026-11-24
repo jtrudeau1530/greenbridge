@@ -1,0 +1,15 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Local report only; no external publication.
+
+A clean c5972rect-based table diagnostic completed one 30-second run. The focused set remains 64 passed, one skipped and five known failures. Independent checks match the executable/PDB, changed source and applier; the runner and five indexes/native map match the frozen clean control. The run timed out without an observed exception, with 65,429 traced calls and zero failed outcomes. Six local RGB readbacks and logged alpha histograms remain entirely zero.
+
+At two replay binding points selected as composite draws, the layer table's 32-byte slots at byte offsets 0, 32 and 64 were all zero. Corresponding title-backing samples at 0 and 64 were zero, while the sample at 32 contained nonzero bytes and differed from the layer copy. The recorded heap has sufficient space for these observed ranges. This establishes a paired CPU-memory mismatch under the diagnostic's recorded mapping; it does not validate those nonzero bytes as an image descriptor, prove their writer, or establish GPU-visible bytes.
+
+No instrumented API call was recorded for these slots. That is narrower than no writes: bulk-copy tracking is capped, some hooks record attempted calls before validation or writes, direct stores are unhooked, and histories are not cleared on heap reuse. Title range notes are not unregistered. The replay hook precedes buffer binding/draw and uses an emission sequence rather than an immutable Draw tag. Global arena/heap notes and callback assignment also limit general concurrency claims. These limitations were returned to the worker before another runtime task.
+
+Independent source review finds an existing title-to-layer descriptor-pull mechanism: scan_title_table invokes TitleVaAliases::pull_descriptors, but the frozen runtime contains no call that installs set_descriptor_source. The scan is separately limited by the root signature's declared descriptor count. If that count is one for the selected table, the current scan would cover only 32 bytes, excluding offsets 32 and 64 even with an installed callback. Exact recorded scan coverage remains to be established.
+
+The already-owned #9586 change concerns the opposite direction, mirroring layer API writes back into title backing. This run does not establish that the title copied zero buffer descriptors from such a source. Source-only synchronization/lifetime preflight and completion of private provenance are assigned next. No new runtime run, production patch, forge import or ownership claim is assigned.

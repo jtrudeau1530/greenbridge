@@ -1,0 +1,193 @@
+{
+  "id": "claude--logs--claude-tls-ab-guards-e7839b706--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 27,
+    "failed": 2
+  },
+  "cases": [
+    {
+      "test": "loader_tls_index0_noreserve",
+      "number": 20,
+      "status": "passed",
+      "seconds": 0.77
+    },
+    {
+      "test": "xmem",
+      "number": 49,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "loader_tls_index0",
+      "number": 18,
+      "status": "passed",
+      "seconds": 0.78
+    },
+    {
+      "test": "registry_init_and_classify",
+      "number": 53,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "loader_tls_index0_threads",
+      "number": 19,
+      "status": "passed",
+      "seconds": 0.78
+    },
+    {
+      "test": "xgameruntime_user",
+      "number": 82,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime",
+      "number": 81,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "winhttp_offline",
+      "number": 54,
+      "status": "passed",
+      "seconds": 0.05
+    },
+    {
+      "test": "xgameruntime_gamesave",
+      "number": 83,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_store",
+      "number": 84,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_offline",
+      "number": 85,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_offline_hdr",
+      "number": 86,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_user_gamertag",
+      "number": 87,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_user_gamertag_long",
+      "number": 88,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "run_tiny_game",
+      "number": 96,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_console_paths",
+      "number": 97,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_exit_code",
+      "number": 98,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_fixed",
+      "number": 100,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_fixed_exit_code",
+      "number": 101,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_tls",
+      "number": 105,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_eh",
+      "number": 106,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_stack",
+      "number": 108,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_tls_ga",
+      "number": 109,
+      "status": "failed",
+      "seconds": 0.1
+    },
+    {
+      "test": "run_tiny_game_abort_exit_codes",
+      "number": 99,
+      "status": "failed",
+      "seconds": 0.18
+    },
+    {
+      "test": "run_tiny_tls_clone_cleanup",
+      "number": 110,
+      "status": "passed",
+      "seconds": 0.12
+    },
+    {
+      "test": "run_tiny_game_dir",
+      "number": 111,
+      "status": "passed",
+      "seconds": 0.08
+    },
+    {
+      "test": "run_tiny_frame",
+      "number": 249,
+      "status": "passed",
+      "seconds": 0.3
+    },
+    {
+      "test": "run_tiny_frame_queue_test_settings",
+      "number": 250,
+      "status": "passed",
+      "seconds": 0.27
+    },
+    {
+      "test": "loader_tls",
+      "number": 17,
+      "status": "passed",
+      "seconds": 5.53
+    }
+  ],
+  "summary_lines": [
+    "93% tests passed, 2 tests failed out of 29"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

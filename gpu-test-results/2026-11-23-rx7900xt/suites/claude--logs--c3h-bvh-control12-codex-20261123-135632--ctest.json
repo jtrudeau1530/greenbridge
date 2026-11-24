@@ -1,0 +1,91 @@
+{
+  "id": "claude--logs--c3h-bvh-control12-codex-20261123-135632--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 2,
+    "failed": 10
+  },
+  "cases": [
+    {
+      "test": "run_startup_cmdline",
+      "number": 92,
+      "status": "passed",
+      "seconds": 1.11
+    },
+    {
+      "test": "d3d12_indirect_dispatch_count",
+      "number": 187,
+      "status": "failed",
+      "seconds": 0.05
+    },
+    {
+      "test": "d3d12_noop_copy",
+      "number": 143,
+      "status": "failed",
+      "seconds": 1.29
+    },
+    {
+      "test": "d3d12_depth_resolve",
+      "number": 198,
+      "status": "passed",
+      "seconds": 0.3
+    },
+    {
+      "test": "d3d12_clear",
+      "number": 191,
+      "status": "failed",
+      "seconds": 0.45
+    },
+    {
+      "test": "d3d12_typeless_depth",
+      "number": 200,
+      "status": "failed",
+      "seconds": 0.39
+    },
+    {
+      "test": "d3d12_heap_properties",
+      "number": 203,
+      "status": "failed",
+      "seconds": 0.4
+    },
+    {
+      "test": "d3d12_indirect_rt",
+      "number": 226,
+      "status": "failed",
+      "seconds": 0.12
+    },
+    {
+      "test": "d3d12_clear_formats",
+      "number": 249,
+      "status": "failed",
+      "seconds": 0.49
+    },
+    {
+      "test": "d3d12_residency",
+      "number": 202,
+      "status": "failed",
+      "seconds": 9.22
+    },
+    {
+      "test": "d3d12_vulkan_device",
+      "number": 160,
+      "status": "failed",
+      "seconds": 14.89
+    },
+    {
+      "test": "file_system",
+      "number": 52,
+      "status": "failed",
+      "seconds": 14.91
+    }
+  ],
+  "summary_lines": [
+    "17% tests passed, 10 tests failed out of 12"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

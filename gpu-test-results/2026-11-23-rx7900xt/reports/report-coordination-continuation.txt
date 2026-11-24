@@ -1,0 +1,11 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+status: TEST-1674 — continuing independent Linux/Wine startup validation of existing PRs, with a cooperating local tester handling frozen builds and test execution. No competing shim implementation.
+
+Measured progression from main `8575d36`: #6919 passes its synthetic suite but startup still hits the earlier host-module cache access violation; adding #4313 clears that fault; adding #6582 clears missing XErrorReport and reaches Wine's builtin GameInputCreate stub. #4348 alone still reaches that earlier GameInput stop. #7216 is the next controlled comparison. All source heads and results are recorded in the corresponding PRs and #7154; raw game traces stay local.
+
+This also follows up the earlier RT-488/library_loader finding: the minimal #6919 + #4313 arm clears our host-module-cache fault without #7175 or a local guard workaround, so we are not opening a duplicate library_loader fix.
+
+AI-assisted.

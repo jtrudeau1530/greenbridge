@@ -1,0 +1,21 @@
+{
+  "run": "c3a-7216-3553b0b5c-20261123-114053-424973",
+  "record_status": "reconstructed from saved logs, not rerun",
+  "checkpoint": "c3a-7216-3553b0b5c",
+  "source_head_recorded": "3553b0b5c",
+  "headless_recorded": null,
+  "init_exit": 0,
+  "run_exit": 124,
+  "trace_outcomes": {},
+  "trace_methods": {},
+  "successful_present_milestone": 0,
+  "compute_miss_log_lines": 0,
+  "wine_unhandled_lines": 1,
+  "first_exception_code_recorded": null,
+  "limits": [
+    "Present milestones are lower bounds, not exact present totals.",
+    "API trace outcomes do not prove GPU execution or visible game content.",
+    "Timeout exit 124 is the experiment bound, not completed boot.",
+    "Raw logs, game identifiers, addresses, captures and shader manifests are not included."
+  ]
+}

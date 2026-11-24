@@ -1,0 +1,20 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+RX 7900 XT / RADV integration result at #7240 d61755d4d: the previous allocation breakpoint is cleared, and startup reaches CreateRootSignature / Xbox CreateComputePipelineState, then stops on a missing local shader-library index. No frame or playable boot.
+
+Compared with [our #7235 diagnostic](https://github.com/ItsNotRexed/Leonida/pull/7235#issuecomment-7108634717):
+- #7235 requested 33,619,968 bytes twice; the second hook call did not return before the title breakpoint.
+- This stack logs a first lease of 33,423,360 bytes. Both resource/view sequences complete, then device slots 16 and 62 are called. The old breakpoint does not occur. Only the first lease is logged, so later individual hook outcomes are unobserved.
+- 1,640 D3D12 trace calls: 1,620 ok and 20 void calls. Init 0 / run 99; the new first exception is C++ 0xe06d7363 after the missing index diagnostic. Backtrace captured locally.
+
+This is a combined-stack comparison, not an isolated size-only A/B: #7240 also brings slot-25 description cleaning/tile sizing and slot-76 leases. It supports progress past the allocation stop on this configuration, not proof of general sizing correctness or guest-VA/GPU backing.
+
+Base: main 8575d36ed + #6919 (36936f3bf), #4313 (28ea6b971), #6582 (4224c53b1), #4348 (45c39cf6f), #6954 (72ab7623e), #7076 (c7eaea3d4, carrying the older #2490), #6973 (5dbc30bed, closed), #6964 (0d73e8b95), #7021 (355201c51), #7216 (5e45c7da9), #6953 (4b76715cf), #7075 (e0b300f02), #7066 (1d8d1d355), #7052 (9ec92918a), plus this PR d61755d4d. Its carried #6973/#7021/#7052 match; new carried points are #7078 889785539 and #7110 c7ca0f2d1 (both older than their current heads). Started from the pre-lease control: no #7235 or attach_xmem_backing.
+
+Local integration retains the previously disclosed slot-26 conflict choice, console queue route and descriptor translation. The section-view cache-bit mask remains a local reproduction credited to ramenbellic/gkissel, not a test of their exact commit. No new production adaptation for this merge. Test-only unions retain prior checks; duplicate slot-27 mocks required one combined typed/word recorder. The initial test compile failed; the corrected build succeeded.
+
+Selected tests: 36/40, unchanged failures. All seven proxy mock modes pass, including this PR's render-target sizing, cleaned descriptions, lease lifetime, 513-PC/510-console-tile regression, and existing slot-127/133 checks. The four failures remain Wine's native abort exit-code / missing-TMP cases and device_proxy/device_proxy_trace failing WARP creation with E_INVALIDARG; hardware-level proxy tests remain unverified. This does not resolve the full-mip-chain or slot-76 commit-charge concerns raised above.
+
+Wine 11.18, Mesa RADV 26.2.3, LLVM 23.1.6 clang-cl/xwin, own local 1.0.2.1 package, Vulkan backend. One display-enabled, network-isolated, 30-second bounded run. Executed by the collaborating runner; source snapshot and exe/PDB/DLL hashes, tests and trace outcome reviewed against matching provenance. Shader-only setup is next; all extracted content and raw diagnostics stay local. AI-assisted.

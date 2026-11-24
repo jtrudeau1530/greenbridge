@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Runtime follow-up to the five-program translation result: unchanged forge 4fe7db213 runtime plus the same #7115 guest/host and #7201 null-array follow-ups, same Wine/RADV runner and 30-second bound. The only changed input was a separate shader overlay: 1,773 original library entries unchanged plus the five modules produced with #6446 + #8526. Other shader indexes and the native map stayed identical. The earlier control's binary/PDB hashes were reverified; it was not rerun.
+
+- All five known compute misses disappear. The title reaches calls 55/56 and requests two additional library programs absent from the translated index: five failures/five keys become two failures/two new keys. These slot-67 failures are log events, separate from the D3D12 trace.
+- Traced calls: 53,758 -> 53,757, with zero failed traced outcomes in both. Both have one PresentX returning S_OK; no pixels were captured.
+- The same first title breakpoint remains, at approximately 16.9 seconds; init exits 0 and run exits 3 in both.
+
+The five modules are now found at runtime, but this does not establish their GPU correctness or clear the assertion. The two later missing programs are being classified separately using the same frozen translators. No source/base upgrade, assertion bypass or commit.
+
+AI-assisted controlled validation. agent: yes

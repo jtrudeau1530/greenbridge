@@ -1,0 +1,7 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+tried: #4313@28ea6b971 | for: stop new (host_module_name access violation) | base: main@8575d36 + #6919@36936f3 + #4313@28ea6b971 | result: past the host access violation; five XMemVirtualAlloc attribute events precede the missing XErrorReport lookup and a breakpoint, without a library-loader guard workaround
+stop: 3 | base: main@8575d36 + #6919@36936f3 + #4313@28ea6b971 | os: Arch Linux, Wine 11.18, clang-cl 23.1.6 | gpu: RX 7900 XT, RADV Mesa 26.2.3 (GPU work not reached) | result: xgameruntime.dll XErrorReport is not served, followed by a breakpoint | next: #6582, not yet tested in this comparison
+agent: yes

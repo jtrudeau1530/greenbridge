@@ -1,0 +1,90 @@
+[
+  {
+    "checkpoint": "c1-6582-e86f4b4ba",
+    "record": "run-20261123-113417-result.json",
+    "mode": "run",
+    "exit_code": 3,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "c1-6582-e86f4b4ba",
+    "record": "run-20261123-113602-result.json",
+    "mode": "run",
+    "exit_code": 3,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "c2-4348-db8a4a1e4",
+    "record": "run-20261123-113619-result.json",
+    "mode": "run",
+    "exit_code": 124,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "main-8575d36",
+    "record": "dry-run-20261123-112205-result.json",
+    "mode": "dry-run",
+    "exit_code": 0,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "main-8575d36",
+    "record": "init-20261123-112207-result.json",
+    "mode": "init",
+    "exit_code": 0,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "main-8575d36",
+    "record": "run-20261123-112209-result.json",
+    "mode": "run",
+    "exit_code": 124,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "pr6919-36936f3",
+    "record": "dry-run-20261123-112335-result.json",
+    "mode": "dry-run",
+    "exit_code": 0,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "pr6919-36936f3",
+    "record": "init-20261123-112337-result.json",
+    "mode": "init",
+    "exit_code": 0,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "pr6919-36936f3",
+    "record": "run-20261123-112339-result.json",
+    "mode": "run",
+    "exit_code": 124,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "tls-1d15a1a16",
+    "record": "run-20261123-112849-result.json",
+    "mode": "run",
+    "exit_code": 124,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  },
+  {
+    "checkpoint": "tls-guards-e7839b706",
+    "record": "run-20261123-113012-result.json",
+    "mode": "run",
+    "exit_code": 124,
+    "timeout_seconds": 30,
+    "record_status": "reconstructed from saved result metadata"
+  }
+]

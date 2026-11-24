@@ -1,0 +1,14 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Independent before-fix Wine/RADV datapoint for the existing #6610 fixture failure. Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin, RelWithDebInfo. Synthetic tests only.
+
+On `ASTROWwwW:ladder@ffc6f6da01095e322bd5fcc2aaaf8387cd1c3a87` (main base `dde82f27e`, includes #6610), with two unrelated enum-compatibility adaptations, `d3d12_depth_resolve` fails with eight refused-case `destination changed` messages after the invalid-batch refusal. The unchanged fixture passes on our older frozen control based on `8575d36ed`, reporting all twelve refusal destinations kept. These are different integration builds, not an isolated #6610 A/B; the fixture file is byte-identical.
+
+Source inspection matches the previously reported mechanism: the clear, refused resolve and readback copy are in the same failed list. Rejecting that batch means the clear and copy never execute. Host-D3D12 comparisons are skipped under Wine, but the layer refusal/readback checks do run.
+
+I have NOT built or run #7905. This confirms the pre-fix failure on another OS/GPU setup, not a pass for the proposed fix. Tracking this existing PR; no duplicate implementation.
+
+AI-assisted testing (Codex).
+agent: yes

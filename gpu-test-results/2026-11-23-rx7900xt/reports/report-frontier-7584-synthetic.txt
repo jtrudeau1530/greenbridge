@@ -1,0 +1,9 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+checked: #7584 cef56a296 | independent synthetic validation | Wine 11.18 / clang-cl 23.1.6 + xwin
+
+[Results on the PR](https://github.com/ItsNotRexed/Leonida/pull/7584#issuecomment-7114428845): 199/199 checks pass. Removing only the outside-span refusal, with identical tests, gives exactly one failure at the deterministic mapped-page-outside-span check. The concurrent-reader check passes both variants: this confirms the scope safeguard, not deterministic coverage of the split race. No game inputs or retail run, and no new implementation claim; gkissel/aslan retain their existing work.
+
+AI-assisted (Claude execution, Codex review). agent: yes

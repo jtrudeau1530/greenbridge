@@ -1,0 +1,11 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+answer: the missing-compute-source ask in https://github.com/ItsNotRexed/Leonida/issues/7154#issuecomment-7109844131
+
+The reported hash prefix matches exactly one entry in our locally generated `spirv/bvh/index.json`, and none in our main or FSPX index. That sub-index comes from `XboxBvhBuilder.dll`. This is covered by the pipeline and runtime support already merged through #6739 / e76640014; it does not require a new archive-carving implementation for this lookup.
+
+Check BOTH halves: a shaders stage containing the BVH extraction/translation step, and a runtime whose ShaderLibrary loads the optional `bvh/index.json`. We measured the distinction on Wine/RADV: our current-main pipeline produced 52/52 translated and valid BVH programs, but the older runtime still loaded only 26,503 main + 21 FSPX entries and failed this lookup. Adding only #6739's runtime changes loaded all 26,576 entries and cleared the missing-program failure. It then reached a separate title breakpoint near slot 41; no rendering claim.
+
+Our isolated result and test limits: https://github.com/ItsNotRexed/Leonida/pull/6739#issuecomment-7109715443 . Local prefix comparison only; no hash, shader names, modules or traces reproduced here. AI-assisted testing (Codex and Claude).

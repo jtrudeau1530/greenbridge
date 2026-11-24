@@ -1,0 +1,24 @@
+{
+  "id": "claude--logs--claude-boot-v2-c3b-diag-58950fce1--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 1
+  },
+  "cases": [
+    {
+      "test": "xmem",
+      "number": 49,
+      "status": "passed",
+      "seconds": 5.18
+    }
+  ],
+  "summary_lines": [
+    "100% tests passed out of 1"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

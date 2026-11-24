@@ -1,0 +1,19 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+LOCAL DRAFT — NOT POSTED. Synthetic shader-probe comparison.
+
+Unchanged c5972rect binary, runner and shader overlay; DEBUG_CLEAR=1 in both30s runs. Probe=all changes every matching graphics pipeline, including earlier scene passes. Neither result is game-rendering progress. Source/runner/binary/index/native-map hashes and all12P6files independently verified. Effective settings include PROBE_POS unset.
+
+A, pixel shader replacement only: all three scene samples are uniform green, all three display-plane samples uniform magenta; alpha255 at every sampled pixel.74932traced calls:58074ok,16857called,1console-only,0failed. TitleVS retained; rectangle variants are active. Some scene geometry supports visible probe output, but the triangle-list scene draw alone could explain that coverage. It does not prove every rectangle draw works or uniquely identify the original scene PS defect.
+
+B, vertex shader replacement: all six scene/display samples are black with alpha0.72889traced calls:57751ok,15134called,3unsupported,1console-only,0failed. IMPORTANT: all3unsupported events are rectangle-variant CreatePipelineState refusals. The probe VS exposes Position in an interface block the rectangle helper does not recognise, so the runtime uses triangle-pipeline fallback. This run changes VS, culling and geometry path; the retained titlePS also receives undefined interpolants. It cannot isolate originalVS from rectangleGS and does not establish PS correctness.
+
+Both runs timed out at30s without exceptions and reached256successful-present milestone. Readbacks are atPresentX60/120/240 after device-idle with the previously declared layout perturbation. Colours establish what survives those sample points; later clears/execution order remain unisolated.
+
+Completed triangle-path control: unchanged c5972diag2 binary, identical runner/overlay, pixel probe + DEBUG_CLEAR, Position option unset. At presents 60/120/240 all three scene samples are uniform green and all three display-plane samples uniform magenta, with zero green plane pixels. Each image is 3840x2160 (8,294,400 pixels); all six alpha minima and maxima are 255, establishing uniform alpha without a histogram. Six original P6 files and source-provenance/binary/PDB/runner/five-index/native-map hashes independently verified. Init0/run124 at the30s bound;74290traced calls (58054ok,16235called,1console-only), zero unsupported/failed. Title VS remains on triangle pipelines; no rectangle variants exist on this build.
+
+Interpretation: the sampled lack of green display output reproduces without the rectangle geometry stage, so that stage alone cannot explain the observation. This does not prove the title VS outputs are invalid or exonerate every other part of the rectangle path. Global probes, earlier-pass changes, draw/submission order and actual GPU execution remain unisolated. Green scene output proves some scene geometry works with a replacement PS; it does not prove every scene draw works or uniquely identify a defective original PS.
+
+Next: source-only composite-input review of root constants/CBV/table and VB/V# address handling, including already-owned fixes in stored forge objects. Prepare a bounded diagnostic specification for input validity versus actual replayed draws. No new build/run or broad forge import assigned. Upstream source/comment access currently fails; ownership9677/frontier8851 are last verified, not freshly confirmed. No external publication.

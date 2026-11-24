@@ -1,0 +1,16 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Linux/Wine confirmation from our local test setup, with raw logs kept private. Arch Linux, Wine 11.18, clang-cl 23.1.6 + xwin SDK 10.0.26100, RelWithDebInfo, SDL3 enabled; RX 7900 XT / RADV Mesa 26.2.3.
+
+Pinned base: main `8575d36` + #6919 `36936f3` + #4313 `28ea6b971` + #6582 `4224c53b1` + #4348 `45c39cf6f`.
+
+- Without #7216: Wine's `ginput` trace confirms its builtin `GameInputCreate` stub is called, followed by the title's breakpoint.
+- With #7216 head `5e45c7da942d7ac08fc57561e9ed924bcfc76476` added cleanly (local integration revision `ea2a0bf26`): two runs initialize successfully and use the SDL3 GameInput shim; the run with `ginput` tracing records zero builtin stub calls. Both proceed through the DirectStorage factory/file path and physical-page allocation to creation of the Vulkan-backed device on the RX 7900 XT, then fault while forwarding device slot 26. Both exit 5.
+
+The negative arm was run by me and the positive arms by a cooperating local tester, with two dedicated Wine prefixes using the same installed Wine. I reviewed the positive run records and matching executable/PDB hashes. Both runners disable networking, keep the original package read-only, and bound startup to 30 seconds. No extra local implementation patches are present in the positive checkpoint.
+
+The cooperating tester's `gameinput_test` passes **342 checks**, including the ordinal alias equality check. Its broader selected set is **27/31**, not fully green: native-abort exit-code expectation, missing-TMP refusal, DirectStorage held-copy guard-page checks, and `gameinput_host` fail. The host test calls Wine's builtin GameInput stub and returns E_NOTIMPL; the DirectStorage failure's cause is undiagnosed. These failures are not being presented as successful validation of those paths.
+
+Observed next failure: access violation in the device slot-26 forwarder, symbolized with the matching host PDB. Its correspondence to the struct-return ABI issue at boot-chain stop 7 is an inference; the existing device fixes are the next separate integration test. No game bytes, raw traces, addresses or dumps attached. AI-assisted.

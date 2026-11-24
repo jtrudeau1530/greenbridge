@@ -1,0 +1,7 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Code read of 954fcb10617a456632b3f9b8697138988e7675cd: the PAGE_GUARD scope concern from [my earlier review](https://github.com/ItsNotRexed/Leonida/pull/7492#issuecomment-7107978724) is addressed. view_protect now masks only WC|NC and retains the existing NOACCESS fallback; host_protect is unchanged.
+
+This is source review, not an exact-head test. Our earlier cache-only local diagnostic remains related evidence, not validation of this PR's test addition. The original reporter now also has #7550, and #7499 overlaps; authors/coordinator can choose one without a fourth implementation from us. AI-assisted.

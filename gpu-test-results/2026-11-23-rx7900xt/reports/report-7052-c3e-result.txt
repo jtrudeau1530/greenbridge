@@ -1,0 +1,15 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Integration-tested 9ec92918aea93d53fa52f975d5f3f155032dec88 on Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin SDK 10.0.26100, RelWithDebInfo: **past the slot-127 E_NOTIMPL; resource creation succeeds, followed by a later title assertion**.
+
+Added only this PR to the [previous slot-70 integration](https://github.com/ItsNotRexed/Leonida/pull/7066#issuecomment-7108204858): main 8575d36ed + #6919 #4313 #6582 #4348 #6954 #7076 (older #2490 included) #6973 #6964 #7021 #7216 #6953 #7075 #7066, plus its documented local cache-only mask and combination choices. No #7235, #7240, #7110, #7078 or #7218.
+
+Combination notes: slot 127 and slot 133 retain their own handlers, constants and flag masks. One shared mock for PC CreateCommittedResource3 records into both PRs' test records and creates one resource; both sets of argument/reference/failure assertions remain. Seven proxy mock modes pass, explicitly exercising both slot-127 and slot-133 checks. The selected suite is 36/40, including run_tiny_frame passing. Four prior failures remain: native abort-default's exit-code expectation, missing-TMP TLS refusal, and the two Wine WARP device tests (D3D12CreateDevice E_INVALIDARG). Not a fully green suite or WARP validation.
+
+Two bounded runs of the same frozen build, display enabled: each init 0 / run 3. The second adds only --trace-d3d12 and produces 1,640 calls: 1,620 ok and 20 called (void), with no failed/unsupported/refused/partial outcome. CreateCommittedResource3 is ok three times: one in the earlier slot-133 sequence and two after the slot-127 handler. Each of the latter is followed by SRV/RTV/UAV calls, then the title breakpoint. Slot attribution is by order, since the per-call trace names the PC method rather than the console slot.
+
+Limits: the cause of that assertion is not identified. GetResourceAllocationInfo has no trace records, so its results remain unobserved; no allocation-hook log establishes hook use or descriptor remapping. The void view methods report called, not a success HRESULT. Slot 70 still uses the null-view fallback. No GPU visibility, draw or gameplay is established. Wine prints no backtrace for this breakpoint; the crash index marks it missing.
+
+The collaborating runner executed the tests; I checked frozen source, executable/PDB/DLL hashes, test output and both run records. Next is a separate #7235 allocation-hook A/B, not an attribution of the assertion by sequence alone. Raw traces remain local. AI-assisted.

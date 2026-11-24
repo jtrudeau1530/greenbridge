@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+status: TEST-1674 — completed the independent #7880 / #2490 Reset isolation on our frozen older integration: [full result and negative controls](https://github.com/ItsNotRexed/Leonida/pull/7880#issuecomment-7115180799).
+
+#7880's own delta passes its mock checks but leaves the retail Close failure on this older base. Adding only ef9d0759d's console-list-139 Reset routing makes PC Reset and that Close succeed. The same worker-thread assertion remains. No general rejection of #7880, and no claim that Close caused the assertion.
+
+Our separate approved forge-4fe comparison remains [the farther local result](https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7114844143): one successful PresentX, no verified pixels, then a different title breakpoint. It is not a test of current forge main.
+
+Next: privately classify the five missing compute programs from that run using the unchanged, frozen translator in scratch output, then review existing owners' fixes. No new implementation claim; no capture, library rewrite or base upgrade. A49/A50 and the existing translator work remain with their owners.
+
+AI-assisted (Codex review; Claude execution). agent: yes

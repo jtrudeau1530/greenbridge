@@ -1,0 +1,1122 @@
+diff --git a/docs/embedded_shaders.md b/docs/embedded_shaders.md
+index ed3a254d7..a1277dfc7 100644
+--- a/docs/embedded_shaders.md
++++ b/docs/embedded_shaders.md
+@@ -291,12 +291,13 @@ The last line also gets `--wave64-emulate` and the fallback flags of the build,
+   `0x80004001`) after 28 creations.
+ 
+ **Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json`, then
+-`<dir>/fspx/index.json` and `<dir>/bvh/index.json` when they are there. The builder's entries are named
+-`bvh/<name>`, the path of their module below `<dir>`, and go into the table of the game's shaders, so
+-`create_compute` finds them through the lookup it already had (`compute_program()` gives an `FSSM` program, looked up
+-by `(cs, fssm_sha256)`). A missing or unreadable `bvh/index.json` leaves the other indexes loaded, and the main
+-index is still required. `bvh_size()` counts the entries, which `shader_library_corpus_test` leaves out of the
+-entries a carved container must reach, like the FSPX ones.
++`<dir>/fspx/index.json`, `<dir>/bvh/index.json`, and `<dir>/exe/index.json` when they are there. The builder's
++entries are named `bvh/<name>` and the executable's `exe/<name>`, the path of their module below `<dir>`, and both
++go into the table of the game's shaders, so graphics and compute pipeline creation find them through the lookup they
++already had (`fssm_program()` / `compute_program()` gives an `FSSM` program, looked up by `(stage, fssm_sha256)`). A
++missing or unreadable subfolder `index.json` leaves the other indexes loaded, and the main index is still required.
++`bvh_size()` and `exe_size()` count those entries, which `shader_library_corpus_test` leaves out of the entries a
++carved container must reach, like the FSPX ones.
+ 
+ **Measured: `LEONIDA_BVH_DEVICE=vulkan bvh_builder_test`** (package 1.0.2.1, `LEONIDA_BVH_RECORD62=1`,
+ `LEONIDA_SHADERS` on a folder holding this step's output and an empty main index, since only this step was run).
+@@ -390,6 +391,17 @@ constructor's pipelines are created, not that a build produces the right tree (s
+ `tests/test_bvh_shaders_stage.py` runs the step on a synthetic DLL (hand-built containers around a made-up `FSSM`
+ blob, no game data): the key the extracted layout gives the translator, the tools and arguments, reuse and each
+ reason to run again, a second run that leaves no duplicate containers, the report of an untranslated program on
+-every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
+-container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
++every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` and `exe/` indexes (found
++by the container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
+ creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.
++
++**Retail executable (`exe_shaders()`).** After `bvh_shaders()`, `make_game.py`'s `shaders` stage runs
++`exe_shaders()` on `<game>/game_scarlett_master.exe` when present (skipping cleanly and dropping any stale
++`<work>/shaders/spirv/exe/index.json` and `exe_build.json` when the package has no executable). It runs the same
++four tools into `<work>/shaders/exe` and `<work>/shaders/spirv/exe` (without `--max-shared-memory`, since the
++executable's containers are 1 VS + 9 PS graphics shaders), tracking inputs in `exe_build.json` and logging
++translated/missing counts on every run. Measured on 1.0.2.1: 10 of 10 programs translate and pass `spirv-val`
++natively and with `--wave64-emulate`, `ShaderLibrary::load` finds all 10 (`1 VS + 9 PS`) by `(stage, fssm_sha256)`,
++and `vk_pipeline_check` passes 10/10 modules and 10/10 pipelines (0 failed, 0 skipped) on an AMD Radeon RX 9070 XT
++(RADV GFX1201, Mesa 26.2.6) and an AMD Ryzen 7 9800X3D integrated GPU (RADV RAPHAEL_MENDOCINO, Mesa 26.2.6).
++`tests/test_exe_shaders_stage.py` covers the step on synthetic VS/PS `PSV0` containers without game data.
+diff --git a/docs/fspx.md b/docs/fspx.md
+index 7550a2cc8..2dd8b8d50 100644
+--- a/docs/fspx.md
++++ b/docs/fspx.md
+@@ -183,9 +183,17 @@ The step is redone as a whole when the DLL, the unpacking or translating tools,
+ flags change (`fspx_build.json`, written last); it never makes the game's shaders translate again. A package without
+ the DLL skips it.
+ 
+-**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when it
+-is there, `<dir>/fspx/index.json`, whose entries are named `fspx/<name>`. A missing or unreadable `fspx/index.json`
+-leaves the main index loaded. Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
++The executable calls slot 67 itself, for the compute pipelines of the pipeline library in `shaders.rpf`
++([shader_library.md](shader_library.md)): a compute record's state blob, blob, program and layout blob have the sizes
++and shapes of kinds 0, 1, 6 and 7. The next step of the same stage, `library_shaders`, unpacks those programs with
++`tools/shader_library.py --stages cs` (which writes each one's `.code` and its record's state as `.state`) and
++translates them into `<work>/shaders/spirv/library/`, with the same keys, the same clash check and its own
++`library_build.json`.
++
++**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when they
++are there, `<dir>/fspx/index.json` and `<dir>/library/index.json` (and `bvh/`, [embedded_shaders.md](embedded_shaders.md)),
++whose entries are named `fspx/<name>` and `library/<name>`. A missing or unreadable one leaves the others loaded.
++Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
+ `compute_program()` decides what a compute PSO's bytecode is looked up by:
+ 
+ | Bytecode | Key | Who passes it |
+diff --git a/docs/shader_library.md b/docs/shader_library.md
+index 6e29edc89..bb90aea86 100644
+--- a/docs/shader_library.md
++++ b/docs/shader_library.md
+@@ -111,7 +111,9 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
+ ```
+ 
+ * It writes `fspx/<name>.code` and `fspx/<name>.json`, the layout `fspx_unpack.py` writes and `rdna2spirv.py`
+-  reads (`native_blob`, `cs_dispatch_state`). It also writes `index.json` with each program's stage, and
++  reads (`native_blob`, `cs_dispatch_state`). A compute program also gets `fspx/<name>.state`, its record's state
++  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; every compute program has exactly one
++  (2,684 programs, 2,693 records). It also writes `index.json` with each program's stage, and
+   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
+   `lib_<stage>_<index>`.
+ * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
+@@ -123,7 +125,18 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
+ 
+ The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
+ archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
+-walk. It also checks the `--carve` copy and the translator's reads of the compute sidecar.
++walk. It also checks the `--carve` copy, the translator's reads of the compute sidecar and the compute `.state`.
++
++**In the build.** `make_game.py`'s `shaders` stage runs this for the compute stage after the FSPX step
++(`library_shaders`): `--stages cs --disasm --carve` into `<work>/shaders/library`, then `rdna2spirv.py` into
++`<work>/shaders/spirv/library` with the stage's `--wave64-emulate` and fallback flags. The runtime's shader library
++reads that index next to `fspx/` and finds its entries by `fspx_code_sha256` and `fspx_state_sha256`
++([fspx.md](fspx.md), "Build and run-time lookup"). That is how the executable creates these pipelines: it reads the
++library through DirectStorage zlib requests and passes each compute record's four parts to Xbox device slot 67,
++`DeserializeComputePipelineStateX`, as kinds 0, 1, 6 and 7, so the code key is the program's bytes as the table gives
++them and the state key is the record's state blob. The step is redone as a whole when `shaders.rpf`, the tools,
++`llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
++different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
+ 
+ ## 5. Translation
+ 
+diff --git a/make_game.py b/make_game.py
+index 41c273f74..9e4497132 100644
+--- a/make_game.py
++++ b/make_game.py
+@@ -21,7 +21,7 @@ it is missing. Never share what it makes.
+ Stages (each skips work that is already done, so a stopped build continues where it left off):
+     check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
+     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
+-              compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll
++              programs inside amd_fidelityfx_upscaler_xbox.dll, XboxBvhBuilder.dll and game_scarlett_master.exe
+     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
+               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
+     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
+@@ -1317,6 +1317,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
+     verify_translation_completeness(dxbc, spirv)
+     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
+     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
++    library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
++    exe_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+     log("shaders: done")
+ 
+ 
+@@ -1394,6 +1396,69 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
+         f.write(settings + "\n")
+ 
+ 
++LIBRARY_ARCHIVE = "shaders.rpf"
++LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")  # with TRANSLATION_SOURCES
++
++
++def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
++    """What the pipeline library's compute translations depend on, as one line: shaders.rpf, the unpacking and
++    translating tools, llvm-mc, the wave64 mode and the fallback flags."""
++    tools = hashlib.sha256()
++    for name in LIBRARY_TOOLS:
++        tools.update(f"{name}\0".encode() + bytes.fromhex(file_sha256(os.path.join(TOOLS, name))))
++    return json.dumps({"archive": file_sha256(archive), "tools": tools.hexdigest(),
++                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
++                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
++
++
++def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate: bool = False,
++                    fallbacks: tuple[str, ...] = ()) -> None:
++    """The compute pipelines of the pipeline library in shaders.rpf (docs/shader_library.md). The executable reads
++    the library through DirectStorage and creates each compute pipeline with Xbox device slot 67
++    (DeserializeComputePipelineStateX), passing the record's four parts as FSPX kinds 0, 1, 6 and 7 (docs/fspx.md).
++    tools/shader_library.py unpacks the compute programs with their kind-0 state into <work>/shaders/library, and
++    rdna2spirv.py translates them into <work>/shaders/spirv/library, where the runtime's shader library finds them by
++    fspx_code_sha256 and fspx_state_sha256 as it finds the FidelityFX DLL's. Graphics pipelines are not translated
++    here. The game's own shaders neither feed nor depend on this step, apart from the carve that names each program's
++    source container (the translator reads its signatures).
++
++    The step runs whole. Reuse requires the translation index, its named modules and a matching library_build.json
++    (library_settings)."""
++    archive = os.path.join(game, LIBRARY_ARCHIVE)
++    unpacked = os.path.join(work, "shaders", "library")
++    spirv = os.path.join(work, "shaders", "spirv", "library")
++    translated = os.path.join(spirv, "index.json")
++    settings_file = os.path.join(spirv, "library_build.json")
++    if not os.path.isfile(archive):
++        log(f"shaders: no {LIBRARY_ARCHIVE} in the game folder, so no pipeline library to translate")
++        return
++    settings = library_settings(archive, mc_signature, emulate, fallbacks)
++    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
++        return
++    log(f"shaders: unpacking and translating the compute pipelines of the pipeline library in {LIBRARY_ARCHIVE}")
++    drop(translated, settings_file)
++    # A program that no longer translates must not keep a module from the run before.
++    for folder, suffixes in ((os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
++        if os.path.isdir(folder):
++            with os.scandir(folder) as entries:
++                for entry in entries:
++                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
++                        os.unlink(entry.path)
++    carve = os.path.join(work, "shaders", "dxbc")
++    py("shader_library.py", archive, "--out", unpacked, "--stages", "cs", "--disasm", "--jobs", str(jobs),
++       *(["--carve", carve] if os.path.isdir(carve) else []))
++    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
++    py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
++    clash = fspx_key_clash(spirv)
++    if clash:
++        drop(translated)   # the runtime must not load an index whose keys pick between different modules
++        fail(f"shaders: pipeline library programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
++             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
++             "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
++    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
++        f.write(settings + "\n")
++
++
+ def fspx_key_clash(spirv: str):
+     """Two entries of <spirv>/index.json with the same fspx_code_sha256 and fspx_state_sha256 whose .spv files
+     differ, as (name, name), or None. The same kind-6 bytes with different kind-0 entries is allowed: the run time
+@@ -1528,6 +1593,88 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
+         f.write(settings + "\n")
+ 
+ 
++EXE_FILE = "game_scarlett_master.exe"
++EXE_TOOLS = BVH_TOOLS   # pe_shader_containers.py, fssm_unpack.py and shader_disasm.py
++
++
++def exe_settings(exe: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
++    """What the executable's embedded shader outputs depend on, as one line: the executable, the extracting,
++    unpacking and translating tools, llvm-mc, the wave64 mode and the fallback flags."""
++    return json.dumps({"exe": file_sha256(exe), "tools": sources_digest(TOOLS, EXE_TOOLS),
++                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
++                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
++
++
++def exe_report(programs: "tuple[list[str], list[str]]") -> None:
++    """One line with the counts, and one that names every program left without a module. It is printed on every
++    run, also when the step itself is reused: a program the translator has no rule for is never dropped quietly."""
++    extracted, missing = programs
++    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {EXE_FILE} programs translated")
++    if missing:
++        log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
++            f"{'it' if len(missing) == 1 else 'them'}, so any pipeline using it will miss its shader. "
++            "When the step runs, rdna2spirv.py prints the instruction each one stops at "
++            "(docs/embedded_shaders.md, section 2)")
++
++
++def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
++                fallbacks: tuple[str, ...] = ()) -> None:
++    """game_scarlett_master.exe's embedded graphics shaders (docs/embedded_shaders.md, section 2):
++    pe_shader_containers.py extracts the executable's DXBC containers into <work>/shaders/exe, fssm_unpack.py and
++    shader_disasm.py unpack and disassemble their FSSM programs there, as for a shader from shaders.rpf, and
++    rdna2spirv.py translates them into <work>/shaders/spirv/exe, where the runtime's shader library finds them by
++    fssm_sha256. The game's RPF shaders neither feed nor depend on this step.
++
++    The 10 programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and a
++    matching exe_build.json (exe_settings)."""
++    exe = os.path.join(game, EXE_FILE)
++    unpacked = os.path.join(work, "shaders", "exe")
++    spirv = os.path.join(work, "shaders", "spirv", "exe")
++    extracted = os.path.join(unpacked, "index.json")
++    unpack_index = os.path.join(unpacked, "fssm_index.json")
++    translated = os.path.join(spirv, "index.json")
++    settings_file = os.path.join(spirv, "exe_build.json")
++    if not os.path.isfile(exe):
++        # A work folder used before with a package that had the executable still holds that run's index, and the
++        # runtime loads <shaders>/exe/index.json whenever it is there. Without the index the old modules are not found.
++        drop(translated, settings_file)
++        log(f"shaders: no {EXE_FILE} in the game folder, so no executable shader programs to translate")
++        return
++    settings = exe_settings(exe, mc_signature, emulate, fallbacks)
++    programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
++    if programs and len(programs[1]) < len(programs[0]):
++        exe_report(programs)
++        return
++    log(f"shaders: extracting and translating the embedded shader programs of {EXE_FILE}")
++    drop(translated, settings_file, extracted, unpack_index)
++    # pe_shader_containers.py never overwrites a container (a second run would write <stem>_NN.dxbc beside the
++    # first), and a program that no longer translates must not keep a module from the run before.
++    for folder, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
++                             (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
++        if os.path.isdir(folder):
++            with os.scandir(folder) as entries:
++                for entry in entries:
++                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
++                        os.unlink(entry.path)
++    py("pe_shader_containers.py", exe, "--extract", unpacked)
++    py("fssm_unpack.py", unpacked, "--carve-index", extracted)
++    # rdna2spirv.py reads each program's stage from index.json and its FSSM blob from fssm/, both in the parent of
++    # the listings' folder, so the disassembly sits inside the extraction folder as it does for shaders.rpf.
++    disasm = os.path.join(unpacked, "disasm")
++    py("shader_disasm.py", os.path.join(unpacked, "fssm"), "--unpack-index", unpack_index, "--out", disasm,
++       "--mcpu", "gfx1013", "--jobs", jobs)
++    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
++    py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", *extra)
++    programs = bvh_programs(unpacked, spirv)
++    if not programs or len(programs[1]) == len(programs[0]):
++        drop(translated)   # an empty or unreadable index would read as a finished step
++        fail(f"shaders: none of the {EXE_FILE} programs translated, so their index is not kept. Run the shaders "
++             "stage again; if it happens again, the tool output above is why.")
++    exe_report(programs)
++    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
++        f.write(settings + "\n")
++
++
+ WAVE64_MODES = ("auto", "on", "off")
+ 
+ # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
+diff --git a/runtime/src/shader_library.h b/runtime/src/shader_library.h
+index 8eb76f3c4..210b54ec6 100644
+--- a/runtime/src/shader_library.h
++++ b/runtime/src/shader_library.h
+@@ -722,13 +722,18 @@ struct ShaderEntry {
+ 
+ class ShaderLibrary {
+ public:
+-    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs, each
+-    // when it is there:
++    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates outside the game's shader
++    // entries, each when it is there:
+     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
+     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
+-    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
+-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
+-    // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
++    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
++    //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
++    //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
++    //     like the FSPX ones (docs/shader_library.md);
++    //   - <dir>/exe/index.json, game_scarlett_master.exe's embedded FSSM programs, entries named "exe/<name>" and
++    //     found by fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
++    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The folders
++    // are optional: a missing or unreadable index there leaves the main one, and the other folders', loaded.
+     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
+         const auto fail = [&](const std::string& why) {
+             if (error) *error = why;
+@@ -740,7 +745,7 @@ public:
+         } catch (...) {
+             return fail("index.json could not be read");
+         }
+-        for (const char* folder : {"fspx", "bvh"}) {
++        for (const char* folder : {"fspx", "bvh", "library", "exe"}) {
+             try {
+                 const auto ignore = [](const std::string&) { return false; };
+                 const std::filesystem::path sub = dir / folder;
+@@ -754,12 +759,16 @@ public:
+ 
+     bool loaded() const { return !dir_.empty(); }
+     std::size_t size() const { return count_; }
+-    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
+-    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
++    // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
++    // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
++    // entries with size() must leave them out.
+     std::size_t fspx_size() const { return fspx_count_; }
+     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
+     // their containers itself.
+     std::size_t bvh_size() const { return bvh_count_; }
++    // Entries loaded from <dir>/exe/index.json. No RPF container reaches these either: game_scarlett_master.exe
++    // embeds their containers itself.
++    std::size_t exe_size() const { return exe_count_; }
+ 
+     // The first entry for this program. Two containers can hold the same FSSM program with different input
+     // signatures; `candidates` returns all of them.
+@@ -863,6 +872,7 @@ private:
+             count_ = 0;
+             fspx_count_ = 0;
+             bvh_count_ = 0;
++            exe_count_ = 0;
+         }
+         for (const auto& [name, meta] : root.object) {
+             const Json* hash = meta.find("fssm_sha256");
+@@ -926,8 +936,9 @@ private:
+             e.max_primitives = u32(meta.find("max_primitives"));
+             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
+             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+-            if (by_fspx && prefix == "fspx/") ++fspx_count_;
++            if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
+             if (prefix == "bvh/") ++bvh_count_;
++            if (prefix == "exe/") ++exe_count_;
+             ++count_;
+         }
+         return true;
+@@ -937,6 +948,7 @@ private:
+     std::size_t count_ = 0;
+     std::size_t fspx_count_ = 0;
+     std::size_t bvh_count_ = 0;
++    std::size_t exe_count_ = 0;
+     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
+     Entries entries_;
+     Entries fspx_entries_;
+diff --git a/runtime/test/shader_library_corpus_test.cpp b/runtime/test/shader_library_corpus_test.cpp
+index 7fdba2374..bb0be8c72 100644
+--- a/runtime/test/shader_library_corpus_test.cpp
++++ b/runtime/test/shader_library_corpus_test.cpp
+@@ -192,16 +192,16 @@ int main() {
+     }
+ 
+     if (containers == 0) fail("no .dxbc containers in", dxbc_dir);
+-    const std::size_t rpf_entries = library.size() - library.fspx_size() - library.bvh_size();
++    const std::size_t rpf_entries = library.size() - library.fspx_size() - library.bvh_size() - library.exe_size();
+     if (reached.size() != rpf_entries)
+         fail(std::to_string(reached.size() > rpf_entries ? reached.size() - rpf_entries : rpf_entries - reached.size()) +
+                  " RPF index entries not matched one to one",
+              spirv_dir);
+     std::printf("%zu containers, %zu RPF index entries, %zu reached, %zu FSPX index entries, %zu BVH builder index "
+-                "entries; %zu containers with more than one program; "
++                "entries, %zu executable index entries; %zu containers with more than one program; "
+                 "%zu not translated; %d failures\n",
+-                containers, rpf_entries, reached.size(), library.fspx_size(), library.bvh_size(), multi, untranslated,
+-                failures);
++                containers, rpf_entries, reached.size(), library.fspx_size(), library.bvh_size(), library.exe_size(),
++                multi, untranslated, failures);
+     if (untranslated)
+         std::fprintf(stderr, "%zu container(s) have no index entry: the translator left them out, so the lookup had "
+                              "nothing to find. Run the shaders stage again with a current translator.\n",
+diff --git a/runtime/test/shader_library_test.cpp b/runtime/test/shader_library_test.cpp
+index e2d19f340..b91948b7e 100644
+--- a/runtime/test/shader_library_test.cpp
++++ b/runtime/test/shader_library_test.cpp
+@@ -532,6 +532,121 @@ int main() {
+         std::filesystem::remove_all(dir);
+     }
+ 
++    // Pipeline-library entries: the compute programs of the library in shaders.rpf, translated by make_game.py into
++    // <dir>/library/index.json (named "library/<name>"), are found by the same two keys as the DLL's FSPX programs,
++    // next to <dir>/fspx/. The executable's slot-67 description carries kind 0 (the record's state blob) and kind 6.
++    {
++        const auto code = fspx_code(0x5000);
++        std::vector<std::uint8_t> state(28, 0), other_state(28, 0);
++        state[12] = 64;  // word 3: NumThreadsX
++        other_state[12] = 32;
++        const auto n = std::uint32_t(code.size());
++        const auto payload = [&](const std::vector<std::uint8_t>& kind0) {
++            std::vector<std::uint8_t> body = kind0;
++            body.insert(body.end(), code.begin(), code.end());
++            return fspx_payload({{0, 48, 28}, {6, 48 + 28, n}}, body);
++        };
++        std::filesystem::create_directories(dir / "fspx");
++        std::filesystem::create_directories(dir / "library");
++        {
++            std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
++            index << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"}}";
++            std::ofstream dll(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
++            dll << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(fspx_code(0x6000))
++                << "\"}}";
++            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
++            lib << "{\"lib_cs_00007\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(code)
++                << "\", \"fspx_state_sha256\": \"" << sha256_hex(state)
++                << "\", \"bindings\": [], \"local_size\": [64, 1, 1]}}";
++            std::ofstream spv(dir / "library" / "lib_cs_00007.spv", std::ios::binary);
++            const std::uint32_t words[5] = {0x07230203, 0x00010500, 7, 1, 0};
++            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
++        }
++        ShaderLibrary library;
++        CHECK(library.load(dir.string(), &error) && library.size() == 3 && library.fspx_size() == 2);
++        const auto found = library.fspx_candidates("cs", sha256_hex(code));
++        CHECK(found.size() == 1 && found[0]->name == "library/lib_cs_00007" && found[0]->local_size[0] == 64 &&
++              found[0]->fssm_sha256.empty());
++        CHECK(library.spirv(*found[0]).size() == 5);  // <dir>/library/lib_cs_00007.spv
++        // As slot 67 passes it: kind 0 and kind 6 in one payload. The record's state finds it; another state doesn't.
++        bool ambiguous = true;
++        CHECK(library.program_candidates("cs", compute_program(payload(state)), &ambiguous) == found && !ambiguous);
++        CHECK(library.program_candidates("cs", compute_program(payload(other_state)), &ambiguous).empty());
++        // The DLL's entries are still there, and the game's own by FSSM hash.
++        CHECK(library.fspx_candidates("cs", sha256_hex(fspx_code(0x6000))).at(0)->name == "fspx/upscaler_00");
++        CHECK(library.find("cs", hash) && library.find("cs", hash)->name == "cs_game");
++        // A broken library index leaves the others loaded; a missing one is not an error either.
++        {
++            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
++            lib << "{broken";
++        }
++        CHECK(library.load(dir.string(), &error) && library.size() == 2 && library.fspx_size() == 1 &&
++              library.fspx_candidates("cs", sha256_hex(code)).empty());
++        std::filesystem::remove(dir / "library" / "index.json");
++        CHECK(library.load(dir.string(), &error) && library.size() == 2 && library.fspx_size() == 1);
++        std::filesystem::remove_all(dir);
++    }
++
++    // Executable embedded shaders (<dir>/exe/index.json): graphics (vs/ps) FSSM programs indexed alongside the game's
++    // own shaders, counted apart via exe_size(), and optional when missing or malformed.
++    {
++        const auto vs_container = container({{fixed, 25}});
++        const auto ps_container = container({{stored, 40}});
++        const std::string vs_hash = sha256_hex(fssm_program(vs_container));
++        const std::string ps_hash = sha256_hex(fssm_program(ps_container));
++        const auto code = fspx_code(0x5000);
++        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
++        const auto write = [&](const std::filesystem::path& file, const std::string& text) {
++            std::ofstream out(file, std::ios::binary | std::ios::trunc);
++            out << text;
++        };
++        const std::string game = "\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}";
++        const std::string vs_entry = "{\"stage\": \"vs\", \"fssm_sha256\": \"" + vs_hash +
++                                     "\", \"input_signature\": [{\"semantic\": \"POSITION\", \"semantic_index\": 0, "
++                                     "\"register\": 0, \"system_value\": 0, \"component_type\": \"float\"}]}";
++        const std::string ps_entry = "{\"stage\": \"ps\", \"fssm_sha256\": \"" + ps_hash + "\"}";
++        std::filesystem::create_directories(dir / "fspx");
++        std::filesystem::create_directories(dir / "bvh");
++        std::filesystem::create_directories(dir / "exe");
++        write(dir / "index.json", "{" + game + "}");
++        write(dir / "fspx" / "index.json",
++              "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" + sha256_hex(code) + "\"}}");
++        write(dir / "bvh" / "index.json",
++              "{\"BuilderProgram\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}}");
++        write(dir / "exe" / "index.json",
++              "{\"container_00\": " + vs_entry + ",\n \"container_01\": " + ps_entry +
++                  ",\n \"NoKey\": {\"error\": \"ValueError: synthetic\"}}");
++        {
++            std::ofstream spv(dir / "exe" / "container_00.spv", std::ios::binary);
++            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
++            std::ofstream spv_ps(dir / "exe" / "container_01.spv", std::ios::binary);
++            spv_ps.write(reinterpret_cast<const char*>(words), sizeof(words));
++        }
++        ShaderLibrary exe;
++        CHECK(exe.load(dir.string(), &error) && exe.size() == 5 && exe.fspx_size() == 1 && exe.bvh_size() == 1 &&
++              exe.exe_size() == 2);
++        const ShaderEntry* vs = exe.find("vs", vs_hash);
++        const ShaderEntry* ps = exe.find("ps", ps_hash);
++        CHECK(vs && vs->name == "exe/container_00" && vs->input_signature.size() == 1 &&
++              vs->input_signature[0].semantic == "POSITION" && exe.spirv(*vs).size() == 5);
++        CHECK(ps && ps->name == "exe/container_01" && exe.spirv(*ps).size() == 5);
++        CHECK(exe.candidates("ps", vs_hash).empty() && exe.candidates("vs", ps_hash).empty() &&
++              exe.fspx_candidates("vs", vs_hash).empty());
++        // Same program in main index and exe/: main comes first (index order).
++        write(dir / "index.json", "{" + game + ",\n \"vs_same\": " + vs_entry + "}");
++        CHECK(exe.load(dir.string(), &error) && exe.size() == 6 && exe.exe_size() == 2);
++        const auto both = exe.candidates("vs", vs_hash);
++        CHECK(both.size() == 2 && both[0]->name == "vs_same" && both[1]->name == "exe/container_00");
++        write(dir / "index.json", "{" + game + "}");
++        // Broken or missing exe/index.json leaves main, fspx, and bvh loaded and resets exe_size() to 0.
++        write(dir / "exe" / "index.json", "{broken");
++        CHECK(exe.load(dir.string(), &error) && exe.size() == 3 && exe.exe_size() == 0 && exe.bvh_size() == 1 &&
++              exe.fspx_size() == 1 && !exe.find("vs", vs_hash));
++        std::filesystem::remove(dir / "exe" / "index.json");
++        CHECK(exe.load(dir.string(), &error) && exe.size() == 3 && exe.exe_size() == 0 && exe.find("cs", hash));
++        std::filesystem::remove_all(dir);
++    }
++
+     // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
+     // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
+     // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.
+diff --git a/tests/test_exe_shaders_stage.py b/tests/test_exe_shaders_stage.py
+new file mode 100644
+index 000000000..e96d0936d
+--- /dev/null
++++ b/tests/test_exe_shaders_stage.py
+@@ -0,0 +1,385 @@
++"""make_game.py's executable shader step (exe_shaders) and the index key the runtime finds its programs by (fssm_sha256).
++
++    python -I tests/test_exe_shaders_stage.py
++
++Zero game data: the "executable" is synthetic bytes around hand-built DXBC containers whose PSV0 chunk names a
++graphics stage (VS/PS) and whose XBCH record is a zlib stream of a made-up FSSM blob; llvm-mc and the translator are
++stood in for the way tests/test_bvh_shaders_stage.py does. The extracting, unpacking and disassembling tools are the
++repository's own, run as make_game.py runs them.
++"""
++import hashlib
++import io
++import json
++import os
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++import zlib
++from unittest import mock
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, ROOT)
++sys.path.insert(0, os.path.join(ROOT, "tools"))
++sys.path.insert(0, os.path.join(ROOT, "tests"))
++import make_game  # noqa: E402
++import rdna2spirv  # noqa: E402
++import shader_meta  # noqa: E402
++from test_pe_shader_containers import container, xdat  # noqa: E402
++
++TOOLS = ["pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py", "rdna2spirv.py"]
++ENDPGM = b"\x00\x00\x81\xbf"
++PSV0_STAGE_CODE = {"ps": 0, "vs": 1}
++
++
++def fssm_blob(seed: int) -> bytes:
++    """A made-up FSSM blob shader_disasm.py accepts: the code section offset at 0xC0, code 0x28 bytes into it, a
++    few filler words that differ per seed and the closing s_endpgm."""
++    head = bytearray(b"FSSM" + b"\x01\x01" + bytes(0xF0 - 6))
++    struct.pack_into("<I", head, 0xC0, 0xC8)
++    return bytes(head) + b"".join(struct.pack("<I", 0x7E000280 + seed + k) for k in range(3)) + ENDPGM
++
++
++def psv0(stage: str) -> bytes:
++    """A minimal PSV0 chunk whose ShaderStage byte at payload offset 4 + 24 names `stage`."""
++    payload = bytearray(struct.pack("<I", 28) + bytes(28))
++    payload[4 + 24] = PSV0_STAGE_CODE[stage]
++    return bytes(payload)
++
++
++def exe_container(stage: str, blob: bytes) -> bytes:
++    """DXBC { SFI0, PSV0 = stage, DXIL = program header + XDAT { 0x12, 0x0D = XBCH + zlib(blob), 0x07 = bitcode } }:
++    the parts of game_scarlett_master.exe's embedded containers the tools read (no ILDN chunk; docs/embedded_shaders.md
++    section 2)."""
++    packed = zlib.compress(blob)
++    xbch = b"XBCH" + struct.pack("<IIIII", 1, len(packed), 0, len(blob), 0) + packed
++    prefix = b"e\x00\x05\x00" + struct.pack("<I", 24) + b"DXIL" + b"\x05\x01\x00\x00" + struct.pack("<II", 0x70, 0x668)
++    dxil = prefix + xdat([(0x12, bytes(16)), (0x0D, xbch), (0x07, b"BC\xc0\xde" + bytes(8))], len(prefix))
++    return container([(b"SFI0", bytes(8)), (b"PSV0", psv0(stage)), (b"DXIL", dxil)])
++
++
++def exe_like(*containers: bytes) -> bytes:
++    """Containers between unrelated bytes, as the executable holds them."""
++    return b"MZ" + b"\0" * 126 + b"".join(c + b"\xcc" * 12 for c in containers)
++
++
++def tool(name: str, *args: str) -> subprocess.CompletedProcess:
++    return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", name), *args],
++                          capture_output=True, text=True)
++
++
++class IndexKey(unittest.TestCase):
++    """Extracted PSV0 containers without ILDN unpack to FSSM and give rdna2spirv the stage (vs/ps) and fssm_sha256."""
++
++    def test_the_extracted_layout_gives_the_translator_the_key_and_graphics_stages(self):
++        programs = [("container_00", "vs", fssm_blob(1)), ("container_01", "ps", fssm_blob(2))]
++        with tempfile.TemporaryDirectory() as t:
++            exe = os.path.join(t, make_game.EXE_FILE)
++            with open(exe, "wb") as f:
++                f.write(exe_like(*(exe_container(stage, blob) for _, stage, blob in programs)))
++            out = os.path.join(t, "exe")
++            r = tool("pe_shader_containers.py", exe, "--extract", out)
++            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
++            r = tool("fssm_unpack.py", out, "--carve-index", os.path.join(out, "index.json"))
++            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
++            os.makedirs(os.path.join(out, "disasm"))
++            rdna2spirv._STAGES = None
++            self.addCleanup(setattr, rdna2spirv, "_STAGES", None)
++            for name, stage, blob in programs:
++                with open(os.path.join(out, "fssm", name + ".fssm"), "rb") as f:
++                    self.assertEqual(f.read(), blob)
++                listing = os.path.join(out, "disasm", name + ".s")
++                meta = shader_meta.collect(listing, name, [[]], [[]])
++                self.assertEqual(meta.get("fssm_sha256"), hashlib.sha256(blob).hexdigest())
++                self.assertNotIn("fspx_code_sha256", meta)
++                self.assertEqual(rdna2spirv.stage_of(name, listing), stage)
++
++
++class ExeStage(unittest.TestCase):
++    """Which tools exe_shaders() runs and what it reports. Each stand-in writes what the real tool writes last."""
++
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.work = os.path.join(self.tmp.name, "work")
++        self.game = os.path.join(self.tmp.name, "game")
++        os.makedirs(self.game)
++        self.exe = os.path.join(self.game, make_game.EXE_FILE)
++        self.programs = {
++            "container_00": ("vs", fssm_blob(1)),
++            "container_01": ("ps", fssm_blob(2)),
++            "container_02": ("ps", fssm_blob(3)),
++        }
++        self.untranslated = set()
++        self.write_exe()
++        self.unpacked = os.path.join(self.work, "shaders", "exe")
++        self.spirv = os.path.join(self.work, "shaders", "spirv", "exe")
++        self.calls, self.logs = [], []
++
++    def write_exe(self):
++        with open(self.exe, "wb") as f:
++            f.write(exe_like(*(exe_container(stage, blob) for stage, blob in self.programs.values())))
++
++    def fake_translate(self, *args):
++        out = args[args.index("--out") + 1]
++        os.makedirs(out, exist_ok=True)
++        index = {}
++        for listing in sorted(os.listdir(args[0])):
++            name = listing[:-2]
++            if not listing.endswith(".s") or name in self.untranslated:
++                continue
++            with open(os.path.join(os.path.dirname(args[0]), "fssm", name + ".fssm"), "rb") as f:
++                stage = self.programs[name][0]
++                index[name] = {"stage": stage, "fssm_sha256": hashlib.sha256(f.read()).hexdigest()}
++            with open(os.path.join(out, name + ".spv"), "wb") as f:
++                f.write(b"module of " + name.encode())
++        with open(os.path.join(out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
++            json.dump(index, f)
++
++    def fake_py(self, tool_name, *args):
++        self.calls.append((tool_name, args))
++        if tool_name == "pe_shader_containers.py":
++            os.makedirs(self.unpacked, exist_ok=True)
++            for name in self.programs:
++                open(os.path.join(self.unpacked, name + ".dxbc"), "wb").close()
++            with open(os.path.join(self.unpacked, "index.json"), "w", encoding="utf-8", newline="\n") as f:
++                json.dump([{"name": n, "file": n + ".dxbc", "stage": st} for n, (st, _) in self.programs.items()], f)
++        elif tool_name == "fssm_unpack.py":
++            os.makedirs(os.path.join(self.unpacked, "fssm"), exist_ok=True)
++            for name, (_, blob) in self.programs.items():
++                with open(os.path.join(self.unpacked, "fssm", name + ".fssm"), "wb") as f:
++                    f.write(blob)
++            with open(os.path.join(self.unpacked, "fssm_index.json"), "w", encoding="utf-8", newline="\n") as f:
++                json.dump([{"name": n} for n in self.programs], f)
++        elif tool_name == "shader_disasm.py":
++            os.makedirs(os.path.join(self.unpacked, "disasm"), exist_ok=True)
++            for name in self.programs:
++                with open(os.path.join(self.unpacked, "disasm", name + ".s"), "w", encoding="utf-8",
++                          newline="\n") as f:
++                    f.write("s_endpgm\n")
++        elif tool_name == "rdna2spirv.py":
++            self.fake_translate(*args)
++
++    def run_step(self, signature="llvm-mc 23", emulate=False, fallbacks=(), py=None):
++        self.calls, self.logs = [], []
++        with mock.patch.object(make_game, "py", py or self.fake_py), \
++                mock.patch.object(make_game, "log", self.logs.append):
++            make_game.exe_shaders(self.game, self.work, signature, 3, emulate=emulate, fallbacks=fallbacks)
++        return [name for name, _ in self.calls]
++
++    def test_runs_once_then_only_reports(self):
++        self.assertEqual(self.run_step(), TOOLS)
++        (_, extract), (_, unpack), (_, disasm), (_, translate) = self.calls
++        self.assertEqual(extract, (self.exe, "--extract", self.unpacked))
++        self.assertEqual(unpack, (self.unpacked, "--carve-index", os.path.join(self.unpacked, "index.json")))
++        self.assertEqual(disasm, (os.path.join(self.unpacked, "fssm"), "--unpack-index",
++                                  os.path.join(self.unpacked, "fssm_index.json"), "--out",
++                                  os.path.join(self.unpacked, "disasm"), "--mcpu", "gfx1013", "--jobs", 3))
++        # Graphics shaders: no --max-shared-memory compute LDS cap.
++        self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
++        self.assertTrue(os.path.isfile(os.path.join(self.spirv, "exe_build.json")))
++        self.assertIn(f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated", self.logs)
++        self.assertEqual(self.run_step(), [])
++        self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated"])
++
++    def test_the_real_tools_fill_the_folder_and_a_second_run_leaves_no_duplicates(self):
++        mc = os.path.join(self.tmp.name, "fake_mc.py")
++        with open(mc, "w", encoding="utf-8", newline="\n") as f:
++            f.write("print('\\ts_endpgm')\n")
++
++        def run_tool(tool_name, *args):
++            self.calls.append((tool_name, args))
++            if tool_name == "rdna2spirv.py":
++                return self.fake_translate(*args)
++            make_game.run([sys.executable, "-I", os.path.join(make_game.TOOLS, tool_name), *args],
++                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++        with mock.patch.dict(os.environ, {"LLVM_MC": f'"{sys.executable}" "{mc}"'}):
++            for signature in ("llvm-mc 23", "llvm-mc 24"):
++                self.assertEqual(self.run_step(signature=signature, py=run_tool), TOOLS)
++                names = sorted(self.programs)
++                self.assertEqual(sorted(f for f in os.listdir(self.unpacked) if f.endswith(".dxbc")),
++                                 [n + ".dxbc" for n in names])
++                self.assertEqual(sorted(os.listdir(os.path.join(self.unpacked, "fssm"))),
++                                 [n + ".fssm" for n in names])
++                self.assertEqual(sorted(os.listdir(os.path.join(self.unpacked, "disasm"))),
++                                 [n + ".s" for n in names])
++                with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
++                    index = json.load(f)
++                self.assertEqual({n: (index[n]["stage"], index[n]["fssm_sha256"]) for n in index},
++                                 {n: (st, hashlib.sha256(blob).hexdigest()) for n, (st, blob) in self.programs.items()})
++                self.assertIn(f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated", self.logs)
++            self.assertEqual(self.run_step(signature="llvm-mc 24", py=run_tool), [])
++
++    def test_no_exe_no_step(self):
++        os.remove(self.exe)
++        self.assertEqual(self.run_step(), [])
++        self.assertFalse(os.path.exists(self.spirv))
++        self.assertFalse(os.path.exists(self.unpacked))
++
++    def test_an_exe_that_is_gone_takes_the_old_index_with_it(self):
++        self.assertEqual(self.run_step(), TOOLS)
++        index, settings = os.path.join(self.spirv, "index.json"), os.path.join(self.spirv, "exe_build.json")
++        self.assertTrue(os.path.isfile(index) and os.path.isfile(settings))
++        os.remove(self.exe)
++        self.assertEqual(self.run_step(), [])
++        self.assertFalse(os.path.exists(index))
++        self.assertFalse(os.path.exists(settings))
++        self.assertEqual(self.logs, [f"shaders: no {make_game.EXE_FILE} in the game folder, so no executable "
++                                     "shader programs to translate"])
++        self.assertEqual(self.run_step(), [])
++        self.write_exe()
++        self.assertEqual(self.run_step(), TOOLS)
++        self.assertTrue(os.path.isfile(index) and os.path.isfile(settings))
++
++    def test_each_input_change_runs_it_again(self):
++        self.run_step()
++        self.assertEqual(self.run_step(signature="llvm-mc 24"), TOOLS)
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True), TOOLS)
++        self.assertIn("--wave64-emulate", self.calls[3][1])
++        flags = ("--no-float-controls",)
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags), TOOLS)
++        self.assertIn("--no-float-controls", self.calls[3][1])
++        self.programs["container_02"] = ("ps", fssm_blob(4))
++        self.write_exe()
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags), TOOLS)
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags), [])
++        with mock.patch.object(make_game, "translation_sources_digest", return_value="another translator"):
++            self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags), TOOLS)
++
++    def test_an_untranslated_program_is_named_on_every_run_and_the_step_still_finishes(self):
++        self.untranslated = {"container_01"}
++        for expected in (TOOLS, [], []):
++            self.assertEqual(self.run_step(), expected)
++            self.assertIn(f"shaders: 2 of 3 {make_game.EXE_FILE} programs translated", self.logs)
++            named = [line for line in self.logs if "NOT translated: container_01." in line]
++            self.assertEqual(len(named), 1, self.logs)
++            self.assertNotIn("container_00", named[0])
++        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
++            self.assertEqual(sorted(json.load(f)), ["container_00", "container_02"])
++        self.assertFalse(os.path.exists(os.path.join(self.spirv, "container_01.spv")))
++
++    def test_nothing_translated_fails_and_keeps_no_index(self):
++        self.untranslated = set(self.programs)
++        with self.assertRaises(SystemExit), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
++            self.run_step()
++        self.assertIn(f"none of the {make_game.EXE_FILE} programs translated", err.getvalue())
++        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
++        self.assertFalse(os.path.exists(os.path.join(self.spirv, "exe_build.json")))
++        self.untranslated = set()
++        self.assertEqual(self.run_step(), TOOLS)
++
++    def test_missing_cached_module_or_index_is_rebuilt(self):
++        self.assertEqual(self.run_step(), TOOLS)
++        module = os.path.join(self.spirv, "container_00.spv")
++        os.remove(module)
++        self.assertEqual(self.run_step(), TOOLS)
++        with open(module, "rb") as f:
++            self.assertEqual(f.read(), b"module of container_00")
++        self.assertEqual(self.run_step(), [])
++        os.remove(os.path.join(self.unpacked, "index.json"))
++        self.assertEqual(self.run_step(), TOOLS)
++        self.assertEqual(self.run_step(), [])
++
++    def test_empty_cached_index_is_rebuilt(self):
++        """A cached index.json with no usable entries ({} or all error entries) must not be reused as finished."""
++        self.assertEqual(self.run_step(), TOOLS)
++        for bad_index in ("{}", '{"container_00": {"error": "ValueError: synthetic"}}'):
++            with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
++                f.write(bad_index)
++            self.assertEqual(self.run_step(), TOOLS)
++            self.assertIn(f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated", self.logs)
++            self.assertEqual(self.run_step(), [])
++            self.assertEqual(self.logs, [f"shaders: 3 of 3 {make_game.EXE_FILE} programs translated"])
++
++
++class ShadersStageWithTheExe(unittest.TestCase):
++    """The whole shaders() stage with both DLLs and the executable: exe_shaders() runs last and runs alone when only
++    the executable changes."""
++
++    def test_exe_runs_after_bvh_and_alone_when_only_the_exe_changes(self):
++        from test_bvh_shaders_stage import builder_container, dll_like as bvh_dll
++        from test_fspx_shaders_stage import container as fspx_container, dll_like as fspx_dll, program
++        with tempfile.TemporaryDirectory() as t:
++            work, game = os.path.join(t, "work"), os.path.join(t, "game")
++            os.makedirs(game)
++            with open(os.path.join(game, make_game.FSPX_DLL), "wb") as f:
++                f.write(fspx_dll(fspx_container(program())))
++            with open(os.path.join(game, make_game.BVH_DLL), "wb") as f:
++                f.write(bvh_dll(builder_container("SortKeys", fssm_blob(1))))
++            exe = os.path.join(game, make_game.EXE_FILE)
++            with open(exe, "wb") as f:
++                f.write(exe_like(exe_container("vs", fssm_blob(2))))
++            ran = []
++            dxbc = os.path.join(work, "shaders", "dxbc")
++            bvh = os.path.join(work, "shaders", "bvh")
++            exe_dir = os.path.join(work, "shaders", "exe")
++
++            def write(text, *parts):
++                os.makedirs(os.path.dirname(os.path.join(*parts)), exist_ok=True)
++                with open(os.path.join(*parts), "w", encoding="utf-8", newline="\n") as f:
++                    f.write(text)
++
++            def fake_py(tool_name, *args):
++                ran.append(tool_name)
++                if tool_name == "shader_carve.py":
++                    write('[{"file": "shader.dxbc"}]', dxbc, "index.json")
++                elif tool_name == "pe_shader_containers.py":
++                    if args[2] == exe_dir:
++                        write('[{"name": "container_00", "file": "container_00.dxbc", "stage": "vs"}]',
++                              exe_dir, "index.json")
++                    else:
++                        write('[{"name": "SortKeys", "file": "SortKeys.dxbc", "stage": "cs"}]', bvh, "index.json")
++                elif tool_name == "fssm_unpack.py":
++                    if args[0] == exe_dir:
++                        write('[{"name": "container_00"}]', exe_dir, "fssm_index.json")
++                    elif args[0] == bvh:
++                        write('[{"name": "SortKeys"}]', bvh, "fssm_index.json")
++                    else:
++                        write('[{"name": "shader"}]', dxbc, "fssm_index.json")
++                elif tool_name == "shader_disasm.py":
++                    if args[0].startswith(exe_dir):
++                        write("s_endpgm\n", exe_dir, "disasm", "container_00.s")
++                    elif args[0].startswith(bvh):
++                        write("s_endpgm\n", bvh, "disasm", "SortKeys.s")
++                    else:
++                        write("s_endpgm\n", dxbc, "disasm", "shader.s")
++                elif tool_name == "rdna2spirv.py":
++                    out = args[args.index("--out") + 1]
++                    if args[0].startswith(exe_dir):
++                        write('{"container_00": {"stage": "vs", "fssm_sha256": "%s"}}' % ("b" * 64), out, "index.json")
++                        write("", out, "container_00.spv")
++                    elif args[0].startswith(bvh):
++                        write('{"SortKeys": {"stage": "cs", "fssm_sha256": "%s"}}' % ("a" * 64), out, "index.json")
++                        write("", out, "SortKeys.spv")
++                    else:
++                        write('{"Upscale": {"stage": "cs"}}', out, "index.json")
++                        write("", out, "Upscale.spv")
++
++            def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
++                ran.append("translate")
++                write("", spirv, "index.json")
++
++            def stage():
++                ran.clear()
++                with mock.patch.object(make_game, "py", fake_py), \
++                        mock.patch.object(make_game, "need", lambda *a: None), \
++                        mock.patch.object(make_game, "translate", fake_translate), \
++                        mock.patch.object(make_game, "llvm_mc_signature", return_value="llvm-mc 23"), \
++                        mock.patch.object(make_game, "log", lambda *a: None):
++                    make_game.shaders(game, work, 2)
++                return list(ran)
++
++            self.assertEqual(stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate",
++                                       "fspx_unpack.py", "rdna2spirv.py", *TOOLS, *TOOLS])
++            self.assertEqual(stage(), [])
++            with open(exe, "wb") as f:
++                f.write(exe_like(exe_container("vs", fssm_blob(3))))
++            self.assertEqual(stage(), TOOLS)
++            for sub in ((), ("fspx",), ("bvh",), ("exe",)):
++                self.assertTrue(os.path.isfile(os.path.join(work, "shaders", "spirv", *sub, "index.json")))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_library_shaders_stage.py b/tests/test_library_shaders_stage.py
+new file mode 100644
+index 000000000..e06645d7f
+--- /dev/null
++++ b/tests/test_library_shaders_stage.py
+@@ -0,0 +1,118 @@
++"""make_game.py's pipeline-library step (library_shaders): the compute pipelines of the library in shaders.rpf, which
++the executable creates with Xbox device slot 67 (docs/shader_library.md, docs/fspx.md).
++
++    python -I tests/test_library_shaders_stage.py
++
++Synthetic files only, no game data: the tools are mocked the way tests/test_fspx_shaders_stage.py does, and each mock
++writes what the real tool writes last.
++"""
++import json
++import os
++import sys
++import tempfile
++import unittest
++from unittest import mock
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, ROOT)
++import make_game  # noqa: E402
++
++
++class LibraryStage(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.work = os.path.join(self.tmp.name, "work")
++        self.game = os.path.join(self.tmp.name, "game")
++        os.makedirs(self.game)
++        self.archive = os.path.join(self.game, make_game.LIBRARY_ARCHIVE)
++        self.write_archive(b"synthetic archive")
++        self.unpacked = os.path.join(self.work, "shaders", "library")
++        self.spirv = os.path.join(self.work, "shaders", "spirv", "library")
++        self.carve = os.path.join(self.work, "shaders", "dxbc")
++        self.calls = []
++        self.translations = {"lib_cs_00007": ("c" * 64, "s" * 64, b"synthetic module")}
++
++    def write_archive(self, data):
++        with open(self.archive, "wb") as f:
++            f.write(data)
++
++    def fake_py(self, tool, *args):
++        self.calls.append((tool, args))
++        if tool == "shader_library.py":
++            os.makedirs(os.path.join(self.unpacked, "disasm"), exist_ok=True)
++            open(os.path.join(self.unpacked, "disasm", "lib_cs_00007.s"), "w").close()
++        elif tool == "rdna2spirv.py":
++            os.makedirs(self.spirv, exist_ok=True)
++            index = {}
++            for name, (code, state, module) in self.translations.items():
++                index[name] = {"stage": "cs", "fspx_code_sha256": code, "fspx_state_sha256": state}
++                with open(os.path.join(self.spirv, name + ".spv"), "wb") as f:
++                    f.write(module)
++            with open(os.path.join(self.spirv, "index.json"), "w") as f:
++                json.dump(index, f)
++
++    def run_step(self, signature="llvm-mc 23", jobs=4, emulate=False, fallbacks=()):
++        self.calls = []
++        with mock.patch.object(make_game, "py", self.fake_py), mock.patch.object(make_game, "log", lambda *a: None):
++            make_game.library_shaders(self.game, self.work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
++        return [tool for tool, _ in self.calls]
++
++    def test_runs_once_then_nothing(self):
++        os.makedirs(self.carve)
++        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
++        (_, unpack), (_, translate) = self.calls
++        self.assertEqual(unpack, (self.archive, "--out", self.unpacked, "--stages", "cs", "--disasm", "--jobs", "4",
++                                  "--carve", self.carve))
++        self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
++        self.assertTrue(os.path.isfile(os.path.join(self.spirv, "library_build.json")))
++        self.assertEqual(self.run_step(), [])
++
++    def test_without_a_carve_the_sources_are_not_named(self):
++        self.run_step()
++        (_, unpack), _ = self.calls
++        self.assertNotIn("--carve", unpack)
++
++    def test_no_archive_skips_the_step(self):
++        os.unlink(self.archive)
++        self.assertEqual(self.run_step(), [])
++        self.assertFalse(os.path.exists(self.spirv))
++
++    def test_inputs_that_change_the_output_translate_again(self):
++        self.run_step()
++        self.assertEqual(self.run_step(), [])
++        self.assertEqual(self.run_step(signature="llvm-mc 24"), ["shader_library.py", "rdna2spirv.py"])
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True), ["shader_library.py", "rdna2spirv.py"])
++        (_, translate) = self.calls[1]
++        self.assertIn("--wave64-emulate", translate)
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=("--bary-fallback",)),
++                         ["shader_library.py", "rdna2spirv.py"])
++        self.write_archive(b"another archive")
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=("--bary-fallback",)),
++                         ["shader_library.py", "rdna2spirv.py"])
++        with mock.patch.object(make_game, "translation_sources_digest", return_value="another translator"):
++            self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=("--bary-fallback",)),
++                             ["shader_library.py", "rdna2spirv.py"])
++
++    def test_empty_index_is_translated_again_and_drops_stale_modules(self):
++        self.run_step()
++        stale = os.path.join(self.spirv, "lib_cs_00007.spv")
++        self.assertTrue(os.path.isfile(stale))
++        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
++            f.write("{}")
++        self.translations = {}
++        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
++        self.assertFalse(os.path.exists(stale))
++        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
++
++    def test_key_clash_fails_and_leaves_no_index(self):
++        self.translations = {"lib_cs_00001": ("c" * 64, "s" * 64, b"module one"),
++                             "lib_cs_00002": ("c" * 64, "s" * 64, b"module two")}
++        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
++            self.run_step()
++        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
++        self.assertFalse(os.path.exists(os.path.join(self.spirv, "library_build.json")))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_shader_library.py b/tests/test_shader_library.py
+index 8bbde96f9..191603d83 100644
+--- a/tests/test_shader_library.py
++++ b/tests/test_shader_library.py
+@@ -5,6 +5,7 @@
+ Zero game data: every library and archive is built here from synthetic bytes.
+ """
+ import contextlib
++import hashlib
+ import io
+ import json
+ import os
+@@ -18,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ sys.path.insert(0, os.path.join(ROOT, "tools"))
+ 
+ import shader_library as sl  # noqa: E402
++import shader_meta  # noqa: E402
+ 
+ ENDPGM = struct.pack("<I", 0xBF810000)
+ CODE_END = struct.pack("<I", 0xBF9F0000)
+@@ -222,6 +224,16 @@ class Main(unittest.TestCase):
+                 summary = json.load(f)
+             self.assertEqual(summary["graphics"][1]["stages"], {"ps": "lib_ps_00000", "ms": "lib_ms_00002"})
+             self.assertEqual(summary["compute"][0]["program"], "lib_cs_00003")
++            # The compute program gets its record's state blob as kind 0, which the run time finds a slot-67
++            # pipeline by (fspx_state_sha256); a graphics program gets none.
++            with open(os.path.join(out, "fspx", "lib_cs_00003.state"), "rb") as f:
++                self.assertEqual(f.read(), kind0())
++            self.assertFalse(os.path.exists(os.path.join(out, "fspx", "lib_vs_00001.state")))
++            disasm_file = os.path.join(out, "disasm", "lib_cs_00003.s")
++            self.assertEqual(shader_meta.fspx_state_sha256_file(disasm_file, "lib_cs_00003"),
++                             hashlib.sha256(kind0()).hexdigest())
++            self.assertEqual(shader_meta.fspx_code_sha256_file(disasm_file, "lib_cs_00003"),
++                             hashlib.sha256(sl.program(sample(), sl.parse(sample()), 3)).hexdigest())
+ 
+     def test_stage_filter_and_saved_input(self):
+         with tempfile.TemporaryDirectory() as tmp:
+@@ -232,7 +244,8 @@ class Main(unittest.TestCase):
+             rc, text = self.run_main(src, "--out", out, "--stages", "cs,vs")
+             self.assertEqual(rc, 0)
+             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
+-                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
++                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_cs_00003.state", "lib_vs_00001.code",
++                              "lib_vs_00001.json"])
+ 
+     def test_carve_names_sources_and_copies_containers(self):
+         with tempfile.TemporaryDirectory() as tmp:
+diff --git a/tools/shader_library.py b/tools/shader_library.py
+index ca03547a3..90d3cec78 100644
+--- a/tools/shader_library.py
++++ b/tools/shader_library.py
+@@ -17,7 +17,10 @@ stage, a table of state blobs and a table of native RDNA2 programs. Layout (docs
+ A missing stage is program 0xFFFFFFFF. Stage slots: 0 pixel, 1 vertex, 2 mesh (6 is used once and not identified).
+ A compute state blob has the 28-byte layout of an FSPX kind-0 entry (tools/fspx_unpack.py), and every program starts
+ with the same 36-byte hash prologue as an FSPX program, so the programs are written in the layout fspx_unpack.py uses
+-and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
++and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json). A compute program also gets its
++record's state blob as fspx/<name>.state, as fspx_unpack.py writes kind 0: the runtime finds a program the executable
++passes to Xbox device slot 67 by the SHA-256 of both (docs/fspx.md, "Build and run-time lookup"). In the 1.0.2.1
++library every compute program has exactly one state blob (2,684 programs, 2,693 records).
+ 
+ Usage:
+     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
+@@ -304,8 +307,9 @@ def main(argv=None) -> int:
+         start, end = code_range(code)
+         meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),
+                 "code": {"start": start, "end": end, "prologue": start == fspx_unpack.PROLOGUE_SIZE}}
+-        if i in cs_state:
+-            meta.update(fspx_unpack.decode_kind0(blob(b, lib, cs_state[i])))
++        state = blob(b, lib, cs_state[i]) if i in cs_state else None
++        if state is not None:
++            meta.update(fspx_unpack.decode_kind0(state))
+         name = names[i]
+         entry = {"file": name + ".dxbc", "stage": st, "program": i}
+         digests = sorted(lib["digest"].get(i, ()))
+@@ -325,6 +329,12 @@ def main(argv=None) -> int:
+                 entry[k] = meta[k]
+         with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+             f.write(code)
++        state_path = os.path.join(a.out, "fspx", name + ".state")
++        if state is not None:
++            with open(state_path, "wb") as f:   # kind 0 as it is: its SHA-256 is the index's fspx_state_sha256
++                f.write(state)
++        elif os.path.exists(state_path):
++            os.unlink(state_path)   # a program that lost its compute record must not keep an old state key
+         with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+             json.dump(meta, f, indent=1)
+         if disasm and end:

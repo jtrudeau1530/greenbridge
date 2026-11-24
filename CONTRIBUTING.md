@@ -12,6 +12,8 @@ Thanks for helping. A few rules keep the project safe to host:
 
 ## Before you start
 
+Old numbered issue links below are historical Leonida references. Their current availability and ownership status are unknown. For Greenbridge, check this repository's issues and pull requests; if no coordination issue exists, describe the intended work in a new issue before opening a pull request. Recovered experiments are indexed in [recovery/README.md](recovery/README.md).
+
 Claim the work in [the coordination issue][claims] first: the open issue titled "Coordinating who works on what" (it
 moves to a new issue when the thread gets long, so the link searches for it). Check its tables and the open pull
 requests, post `claiming: <ID>` there (or a one-line description for something not listed yet), and put the ID in
@@ -22,7 +24,7 @@ that lands first is merged and the other is asked to rebase or close. GPU test r
 [#313](https://github.com/ItsNotRexed/Leonida/issues/313): the critical path, who builds what, and which D3D12
 methods are still open.
 
-[claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[claims]: https://github.com/jtrudeau1530/greenbridge/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
 ## Working on the code
 
@@ -40,7 +42,7 @@ methods are still open.
   test, a Mesa/LLVM reference, or a count over the corpus.
 - `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all). The test
   files with no `__main__` block or an `import pytest` (they need the packages in `tests/requirements.txt`) run with
-  `python -m pytest tests/test_<name>.py` instead, as [AGENTS.md](AGENTS.md) describes; under `python -I` they fail
+  `python -m pytest tests/test_<name>.py` instead, as [docs/testing.md](docs/testing.md) describes; under `python -I` they fail
   to import or run nothing.
 - Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`, then
   `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured

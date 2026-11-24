@@ -1,0 +1,16 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+checked: merged #6891 squash 23060e0877d608a9f3273b89797dc802cfa2face on Wine/RADV, as a single addition to [our frozen #7323 diagnostic stack](https://github.com/ItsNotRexed/Leonida/pull/7323#issuecomment-7111921960). Full base and combination choices are linked there. Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin; same shader library and 30-second offline sandbox, display enabled, no assertion skipping.
+
+The shim and its test are byte-identical to the merged commit. CMake hunks applied with offsets; the documentation conflict kept both xg_xs and DirectStorage modules. No production adaptation. Build passes; xg_xs reports 16 checks, zero failures. Selected suite: 46/51, all eight proxy modes, tiny-frame, unimplemented policy, loader and shader-library checks pass. The same five earlier failures remain (native-abort expectation, missing-TMP TLS refusal, two Wine WARP device checks, old mesh Close). The previously reported #7115 host-caller regression is also a known limitation outside this subset.
+
+One bounded retail comparison: the previous intentional XGSuggestSwizzleMode unimplemented-import stop is gone. XGSuggestSwizzleMode, XGCreateTextureComputer and computer slot 8 report E_NOTIMPL; the title continues past all three. This does not establish texture layout or copy correctness: those operations remain unimplemented by design.
+
+The run reaches 2,261 D3D12 trace calls (1,636 ok, 40 void/called, 585 unsupported CreateLifetimeTracker calls). Separately, 42 slot-67 pipeline attempts report missing translated FSPX-form programs and E_INVALIDARG; their source and relation to the crash are unestablished. After device slot 108 is first logged, the run ends with an execute access violation on the main thread: init 0/run 5, no timeout. No usable host frame in the debugger backtrace. The first fault is not attributed to the XG shim, failed pipelines or slot 108 without another controlled comparison.
+
+Source/patch and matching binary/PDB/DLL hashes verified. Inputs and raw traces remain local. #7323's S_OK stand-in is still present; this is a diagnostic integration result, not a gameplay or full-suite pass claim.
+
+AI-assisted testing (Claude), review/reporting (Codex).
+agent: yes

@@ -1,0 +1,16 @@
+{
+  "id": "claude--work-gap-w32-8448--tx-8448-tests",
+  "source_log_name": "tx-8448-tests.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {},
+  "cases": [],
+  "summary_lines": [
+    "Ran 7 tests in 2.342s",
+    "OK"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "id": "logs--development-launcher-tests",
+  "source_log_name": "development-launcher-tests.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 5
+  },
+  "cases": [
+    {
+      "test": "loader",
+      "number": 13,
+      "status": "passed",
+      "seconds": 5.54
+    },
+    {
+      "test": "pe_loader",
+      "number": 15,
+      "status": "passed",
+      "seconds": 5.52
+    },
+    {
+      "test": "loader_tls",
+      "number": 17,
+      "status": "passed",
+      "seconds": 5.58
+    },
+    {
+      "test": "xmem",
+      "number": 46,
+      "status": "passed",
+      "seconds": 5.53
+    },
+    {
+      "test": "run_tiny_game",
+      "number": 92,
+      "status": "passed",
+      "seconds": 5.57
+    }
+  ],
+  "summary_lines": [
+    "100% tests passed out of 5"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

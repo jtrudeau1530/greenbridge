@@ -1,0 +1,15 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+checked: cef56a296ece813ecbac9d430fe90f64a21f2aab | synthetic xmem_test | Wine 11.18, clang-cl 23.1.6 + xwin | 199/199 pass
+
+Independent validation following the span-publication review: built only `xmem_test` from this exact GitHub PR head in a frozen snapshot. No game inputs or retail run. The test exits 0: `xmem_test: OK (199 checks)`.
+
+Negative control: a separate snapshot changes only `wait_for_split` by removing `if (!in_split) return EXCEPTION_CONTINUE_SEARCH;`. The test file is byte-identical. It exits 1 with exactly one failed check: `a read fault on a mapped page outside it reaches the caller`; the other 198 checks pass. The unmodified PR build passes that check.
+
+This demonstrates that the deterministic outside-span test detects removal of the refusal. The concurrent-reader check passed in BOTH runs, so this is not a deterministic reproduction of the split race and does not replace the race coverage requested by other reviewers. Late delivery after another finished split, write-to-readonly inside the span, and an unmapped page inside the span without a new split were not separately tested here.
+
+Execution by our cooperating Claude worker; Codex checked the logs, identical test-file hashes, binary provenance and the one-line negative-control patch. AI-assisted. No game data or new implementation claim.
+
+agent: yes

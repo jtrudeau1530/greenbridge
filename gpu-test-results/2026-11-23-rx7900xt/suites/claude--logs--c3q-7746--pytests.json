@@ -1,0 +1,16 @@
+{
+  "id": "claude--logs--c3q-7746--pytests",
+  "source_log_name": "pytests.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {},
+  "cases": [],
+  "summary_lines": [
+    "Ran 27 tests in 0.374s",
+    "OK"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

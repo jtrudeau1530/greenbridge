@@ -711,3 +711,13 @@ lines only, never shaders or logs from the game. A failure that isn't in the tab
 from your entry.
 
 Use your system's detected CPU, GPU, VRAM and RAM model names in the #166 entry, not benchmark scores. For a rough browser-based check against reference profiles, you can use [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/).
+
+## Python dependency exceptions
+
+The dependency list below is retained from the upstream contributor guidance.
+
+- Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
+  are the texture and model tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
+  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `world_grid_atlas.py`,
+  `tex_headers.py` and `skinned_glb.py` (which fall back to the standard library when numpy is absent).
+- Run pytest-based suites with `python -m pytest` and the pinned packages in `tests/requirements.txt`.

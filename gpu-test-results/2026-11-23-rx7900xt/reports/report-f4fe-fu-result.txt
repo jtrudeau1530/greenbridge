@@ -1,0 +1,23 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+checked: forge 4fe7db213 + #7115 follow-up 8f756ebe0 + #7201 null-array follow-up 1d080f4a6 | Linux, Wine 11.18, RX 7900 XT / RADV, clang-cl 23.1.6 + xwin
+
+One bounded offline run, display enabled, `--trace-d3d12`. Init exits 0; run exits 3 at a title breakpoint after about 16.9 s, not a timeout.
+
+Observed against our earlier c3q integration control:
+
+- 53,758 traced D3D12 calls: 53,527 `ok`, 231 `called`, zero failed/unsupported/ignored outcomes. The control had 2,334 calls, one failed `Close` and 586 unsupported outcomes.
+- 51,745 `CreatePipelineState` successes; 630 successful `Close` calls; three `DrawInstanced` calls. The earlier first-Close failure is absent.
+- One observed `PresentX call 1` milestone returned S_OK, with one presented so far. No pixels captured and no rendered-gameplay claim.
+- Five slot-67 creations still fail, outside the above D3D12 trace counter. Their five distinct missing programs are present in the unpacked compute library but absent from our translated index; none is among the eight missing keys requested by the control. That does not establish that those earlier eight are fixed.
+- First fault is a title int3 on a different thread and at a different site from the control. Its cause is not established; Wine supplies no backtrace.
+
+Shader boundary: all five indexes (main/FSPX/BVH/library/EXE) and their modules remain the frozen c3q outputs. A separate overlay adds the native lookup map: 25,321 entries, all resolving inside the frozen carve. No shader retranslation. This is a combined runtime-base + lookup-map comparison, not attribution to either follow-up or any single forge change. It is not a test of current forge main.
+
+Validation: build passed; focused set 55 passed / 1 skipped / 5 failed. All eight proxy mock modes and `d3d12_mesh` pass. Separate controls with identical tests fail the intended host-caller classification and guest sampler-handle translation assertions. Remaining tests, with DISPLAY/WAYLAND unset: 190 passed / 29 skipped / 14 failed. Combined registered inventory: 245 passed / 30 skipped / 19 failed out of 294, not fully green. Display-dependent results and Wine/native-oracle differences need that context. Separate corpus check against the overlay passes. The two DirectStorage guard-page checks recur from our earlier checkpoints (now 331 checks total); cause remains undiagnosed.
+
+AI-assisted: Claude built/ran it; Codex verified logs, source deltas, binary/PDB and index provenance. Raw data stays local. No commits or new implementation claim.
+
+agent: yes

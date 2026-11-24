@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+UNSENT — GitHub comment access is restricted. Intended context: #8448 and its existing mixed-mask correction review. Coverage baseline only; not a recommendation to adopt the uncorrected modules.
+
+AI-assisted Linux/Wine validation under TEST-1674. Scratch translator: frozen GitHub dde82f27e toolchain + #6446 fb40ed369 + #8526 6ecd922d9 + upstream #8448 47494e725. The separate Hiiva correction 7999819a5 and its fork-only tests were not executed. No runtime, overlay or frozen input changed.
+
+Observed: #8448's lane-mask tests passed, and its seven semantic tests passed. A negative control with the same test files and the earlier gapfix production files failed the wave32 VCC_HI isolation assertion and the semantic suite (71 errors across six tests; the invalid-destination rejection test still passed). Production and test-file hashes were independently checked against the recorded comparison.
+
+Only the two remaining wave32 programs from our existing local pipeline-library sample were translated. Before #8448: zero translated/valid, refused at compare destinations. With #8448: two translated, two passed spirv-val, both with code and state lookup keys.
+
+Both programs also contain mixed mask/scalar bitwise writes into VCC_HI, the known case addressed by Hiiva's separate correction. Passing the parent tests and SPIR-V validation therefore does not establish correct runtime behavior. These two modules remain outside every runtime overlay. The corrected comparison is held for approval. No game data included.

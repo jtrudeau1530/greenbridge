@@ -1,0 +1,259 @@
+{
+  "id": "claude--logs--claude-boot-v2-c3g-diag-13c446509--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 36,
+    "failed": 4
+  },
+  "cases": [
+    {
+      "test": "loader_tls_index0_threads",
+      "number": 19,
+      "status": "passed",
+      "seconds": 1.09
+    },
+    {
+      "test": "loader_tls_index0",
+      "number": 18,
+      "status": "passed",
+      "seconds": 1.09
+    },
+    {
+      "test": "device_proxy_trace",
+      "number": 26,
+      "status": "failed",
+      "seconds": 0.3
+    },
+    {
+      "test": "device_proxy",
+      "number": 25,
+      "status": "failed",
+      "seconds": 0.31
+    },
+    {
+      "test": "xs_proxy_mock_no_reserve",
+      "number": 28,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock",
+      "number": 27,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_no_protect",
+      "number": 29,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_no_handler",
+      "number": 30,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xs_proxy_mock_env_slots",
+      "number": 31,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_invalid",
+      "number": 32,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "command_list",
+      "number": 35,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_70",
+      "number": 33,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xmem",
+      "number": 50,
+      "status": "passed",
+      "seconds": 0.01
+    },
+    {
+      "test": "xgameruntime_user",
+      "number": 83,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime",
+      "number": 82,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_store",
+      "number": 85,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_gamesave",
+      "number": 84,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "xgameruntime_offline",
+      "number": 86,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_offline_hdr",
+      "number": 87,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_user_gamertag",
+      "number": 88,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "xgameruntime_user_gamertag_long",
+      "number": 89,
+      "status": "passed",
+      "seconds": 0.02
+    },
+    {
+      "test": "run_tiny_game",
+      "number": 97,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_console_paths",
+      "number": 98,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_exit_code",
+      "number": 99,
+      "status": "passed",
+      "seconds": 0.04
+    },
+    {
+      "test": "run_tiny_game_abort_exit_codes",
+      "number": 100,
+      "status": "failed",
+      "seconds": 0.18
+    },
+    {
+      "test": "run_tiny_game_fixed",
+      "number": 101,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_fixed_exit_code",
+      "number": 102,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_tls",
+      "number": 106,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_eh",
+      "number": 107,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_game_stack",
+      "number": 109,
+      "status": "passed",
+      "seconds": 0.03
+    },
+    {
+      "test": "run_tiny_tls_ga",
+      "number": 110,
+      "status": "failed",
+      "seconds": 0.1
+    },
+    {
+      "test": "run_tiny_tls_clone_cleanup",
+      "number": 111,
+      "status": "passed",
+      "seconds": 0.1
+    },
+    {
+      "test": "run_tiny_game_dir",
+      "number": 112,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "gameinput",
+      "number": 91,
+      "status": "passed",
+      "seconds": 2.59
+    },
+    {
+      "test": "allocator_proxy",
+      "number": 178,
+      "status": "passed",
+      "seconds": 0.13
+    },
+    {
+      "test": "run_tiny_frame",
+      "number": 250,
+      "status": "passed",
+      "seconds": 0.31
+    },
+    {
+      "test": "run_tiny_frame_queue_test_settings",
+      "number": 251,
+      "status": "passed",
+      "seconds": 0.28
+    },
+    {
+      "test": "queue_proxy",
+      "number": 177,
+      "status": "passed",
+      "seconds": 3.84
+    },
+    {
+      "test": "loader_tls_index0_noreserve",
+      "number": 20,
+      "status": "passed",
+      "seconds": 10.1
+    },
+    {
+      "test": "loader_tls",
+      "number": 17,
+      "status": "passed",
+      "seconds": 10.17
+    }
+  ],
+  "summary_lines": [
+    "90% tests passed, 4 tests failed out of 40"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

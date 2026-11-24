@@ -1,0 +1,2214 @@
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index e7814b1e0..3a052de3b 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -3259,6 +3259,13 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
+   presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
+   order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed
+   out gives `E_INVALIDARG` (nothing presented). Skipping a token is fine.
++- *Frame capture* (`LEONIDA_CAPTURE=<dir>`, `LEONIDA_CAPTURE_EVERY=<n>`, `LEONIDA_CAPTURE_LIMIT=<n>`): writes
++  every n-th presented frame (default 30, at most 24) to `<dir>/frame_NNNNN.ppm`, a binary P6 of the swapchain image
++  converted to 8-bit RGB, and appends one line per frame to `<dir>/index.txt` with the extent and the mean RGB. Off
++  unless the variable is set, and the folder is created. This is what a check reads when it has to know what the
++  layer actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
++  mean is enough to tell a real frame from a black one. `d3d12_present_test` turns it on and checks the files against
++  the colour it clears to.
+ - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
+   with `ERROR_INVALID_STATE` and refuses presents (a `PresentX` waiting for a swapchain image polls the suspended
+   state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until
+@@ -3578,7 +3585,7 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
+ | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
+ | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
+ | Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
+-| Device slot 61 | The retail title's boot under `gta6rt --run` (stop 20 of the RT-5 measurements in #6910): called as `(desc, dest handle)` once per sampler | `d3d12_xs_device.cpp` routes it to the PC `CreateSampler` (slot 22) with the description's PC `D3D12_SAMPLER_DESC` prefix; the PC slot 61 is `CreateMetaCommand`. The layout of the description beyond the PC fields is **Open**. |
++| Device slot 61 | The retail title's boot under `gta6rt --run` (stop 20 of the RT-5 measurements in #6910): called as `(desc, dest handle)` once per sampler | `d3d12_xs_device.cpp` routes it to the PC `CreateSampler` (slot 22) with the description's PC `D3D12_SAMPLER_DESC` prefix, for a caller in an image the guest loader mapped; the PC slot 61 is `CreateMetaCommand`, which any other caller (a host test driving the device through the proxy) still gets. The layout of the description beyond the PC fields is **Open**. |
+ | Indirect argument type 105 | The retail title's startup creates five one-argument command signatures (device slot 41) with no root signature; one has type 105 and a 12-byte stride. Its two `ExecuteIndirect` sites, read statically, set the compute state first, as the `DISPATCH` sites do, and pass one command from the same argument buffer, on a second command list | `d3d12_xs_device.cpp` creates it as `DISPATCH` (`D3D12_DISPATCH_ARGUMENTS`). What the console does differently for it is **Open**. |
+ | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
+ | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
+diff --git a/runtime/shims/d3d12_com.cpp b/runtime/shims/d3d12_com.cpp
+index 253415b4d..54140da24 100644
+--- a/runtime/shims/d3d12_com.cpp
++++ b/runtime/shims/d3d12_com.cpp
+@@ -4,6 +4,7 @@
+ #include "d3d12_com_object.h"
+ #include "d3d12_fence_waiter.h"
+ #include "d3d12_trace.h"
++#include "../src/diag_targets.h"  // LOCAL DIAGNOSTIC (c5972diag)
+ #include "d3d12_xs_device.h"
+ #include "../src/gfx10_descriptors.h"
+ #include "../src/title_va_alias.h"
+@@ -419,12 +420,16 @@ public:
+ 
+     // Graphics state. Draws record a copy of it (command_list.h, Draw).
+     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
++        leonida::diag::count(leonida::diag::topology);
++        if (leonida::diag::on()) std::fprintf(stderr, "[diag] IASetPrimitiveTopology %u\n", unsigned(topology));
+         if (list_.closed()) return;
+         if (defer([=](GraphicsCommandList& l) { l.topology_ = u(topology); })) return;
+         topology_ = u(topology);
+     }
+ 
+     void STDMETHODCALLTYPE IASetVertexBuffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) override {
++        leonida::diag::count(leonida::diag::vertex_buffers);
++        if (leonida::diag::on()) std::fprintf(stderr, "[diag] IASetVertexBuffers start %u count %u views %s\n", start, count, views ? "set" : "null");
+         if (std::uint64_t(start) + count > vertex_buffers_.size()) return check(false);
+         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+             std::vector<D3D12_VERTEX_BUFFER_VIEW> copy;
+@@ -446,6 +451,8 @@ public:
+ 
+     // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
+     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
++        leonida::diag::count(count ? leonida::diag::viewports : leonida::diag::viewports_zero);
++        if (leonida::diag::on()) std::fprintf(stderr, "[diag] RSSetViewports count %u first %.0fx%.0f\n", count, count && viewports ? viewports[0].Width : 0.0f, count && viewports ? viewports[0].Height : 0.0f);
+         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+         if (!count) {
+             viewport_ = {};
+@@ -458,6 +465,8 @@ public:
+     }
+ 
+     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
++        leonida::diag::count(count ? leonida::diag::scissors : leonida::diag::scissors_zero);
++        if (leonida::diag::on()) std::fprintf(stderr, "[diag] RSSetScissorRects count %u first %ldx%ld\n", count, count && rects ? long(rects[0].right - rects[0].left) : 0L, count && rects ? long(rects[0].bottom - rects[0].top) : 0L);
+         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+         // A zero-count call disables all previously bound rectangles; it is not a no-op.
+         // With no scissor bound, the rasterizer clips every fragment, as on native D3D12.
+@@ -485,6 +494,13 @@ public:
+         }
+         depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(layer_handle(*depth).ptr)
+                                      : leonida::TargetView{};
++        leonida::diag::count(leonida::diag::om_sets);
++        if (leonida::diag::on()) {
++            std::fprintf(stderr, "[diag] OMSetRenderTargets n %u single %d rts", count, int(single_range));
++            for (UINT i = 0; i < count && i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
++                std::fprintf(stderr, " RES#%u(mip %u)", leonida::diag::rid(render_targets_[i].resource), render_targets_[i].mip);
++            std::fprintf(stderr, " dsv RES#%u\n", leonida::diag::rid(depth_.resource));
++        }
+     }
+ 
+     void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
+@@ -503,6 +519,29 @@ public:
+ 
+     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
+         d3d12_trace::record("ID3D12GraphicsCommandList::DrawInstanced");
++        {  // LOCAL DIAGNOSTIC (c5972diag)
++            leonida::diag::count(leonida::diag::draws);
++            const bool no_vp = !(viewport_.width > 0 && viewport_.height > 0);
++            const bool no_sc = !(scissor_.right > scissor_.left && scissor_.bottom > scissor_.top);
++            if (no_vp) leonida::diag::count(leonida::diag::draws_no_viewport);
++            if (depth_.resource && render_target_count_) leonida::diag::g_scene.store(render_targets_[0].resource, std::memory_order_relaxed);
++            if (no_sc) leonida::diag::count(leonida::diag::draws_no_scissor);
++            if (leonida::diag::on()) {
++                std::fprintf(stderr, "[diag] %s n %u inst %u rts %u", "DrawInstanced", vertices, instances, render_target_count_);
++                for (UINT i = 0; i < render_target_count_ && i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
++                    std::fprintf(stderr, " RES#%u", leonida::diag::rid(render_targets_[i].resource));
++                std::fprintf(stderr, " dsv RES#%u vp %.0fx%.0f sc %dx%d topo %u\n", leonida::diag::rid(depth_.resource), viewport_.width,
++                             viewport_.height, int(scissor_.right - scissor_.left), int(scissor_.bottom - scissor_.top), topology_);
++                std::fprintf(stderr, "[diag]   pipeline %s\n", leonida::diag::pipeline(graphics_pipeline_).c_str());
++
++                {  // LOCAL DIAGNOSTIC (c5972vsin): the inputs of the composite and of one scene triangle-list draw
++                    const unsigned present = leonida::diag::g_present.load(std::memory_order_relaxed);
++                    if (topology_ == 17 && !depth_.resource) diag_inputs("composite topo 17");
++                    else if (topology_ == 4 && depth_.resource && leonida::diag::g_scene_inputs_present.exchange(present) != present)
++                        diag_inputs("scene topo 4");
++                }
++            }
++        }
+         if (defer([=](GraphicsCommandList& l) { l.record_draw(false, vertices, instances, first_vertex, 0, first_instance); },
+                   true))
+             return;
+@@ -512,6 +551,29 @@ public:
+     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT indices, UINT instances, UINT first_index, INT base_vertex,
+                                                 UINT first_instance) override {
+         d3d12_trace::record("ID3D12GraphicsCommandList::DrawIndexedInstanced");
++        {  // LOCAL DIAGNOSTIC (c5972diag)
++            leonida::diag::count(leonida::diag::draws);
++            const bool no_vp = !(viewport_.width > 0 && viewport_.height > 0);
++            const bool no_sc = !(scissor_.right > scissor_.left && scissor_.bottom > scissor_.top);
++            if (no_vp) leonida::diag::count(leonida::diag::draws_no_viewport);
++            if (depth_.resource && render_target_count_) leonida::diag::g_scene.store(render_targets_[0].resource, std::memory_order_relaxed);
++            if (no_sc) leonida::diag::count(leonida::diag::draws_no_scissor);
++            if (leonida::diag::on()) {
++                std::fprintf(stderr, "[diag] %s n %u inst %u rts %u", "DrawIndexedInstanced", indices, instances, render_target_count_);
++                for (UINT i = 0; i < render_target_count_ && i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
++                    std::fprintf(stderr, " RES#%u", leonida::diag::rid(render_targets_[i].resource));
++                std::fprintf(stderr, " dsv RES#%u vp %.0fx%.0f sc %dx%d topo %u\n", leonida::diag::rid(depth_.resource), viewport_.width,
++                             viewport_.height, int(scissor_.right - scissor_.left), int(scissor_.bottom - scissor_.top), topology_);
++                std::fprintf(stderr, "[diag]   pipeline %s\n", leonida::diag::pipeline(graphics_pipeline_).c_str());
++
++                {  // LOCAL DIAGNOSTIC (c5972vsin): the inputs of the composite and of one scene triangle-list draw
++                    const unsigned present = leonida::diag::g_present.load(std::memory_order_relaxed);
++                    if (topology_ == 17 && !depth_.resource) diag_inputs("composite topo 17");
++                    else if (topology_ == 4 && depth_.resource && leonida::diag::g_scene_inputs_present.exchange(present) != present)
++                        diag_inputs("scene topo 4");
++                }
++            }
++        }
+         if (defer([=](GraphicsCommandList& l) {
+                 l.record_draw(true, indices, instances, first_index, base_vertex, first_instance);
+             }, true))
+@@ -729,6 +791,11 @@ public:
+         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+         if (!view.ptr || !color) return check(false);
+         const bool magenta = debug_clear_ && !color[0] && !color[1] && !color[2] && !color[3];
++        leonida::diag::count(leonida::diag::clears);
++        if (leonida::diag::on())
++            std::fprintf(stderr, "[diag] ClearRenderTargetView RES#%u zero %d rects %u\n",
++                         leonida::diag::rid(reinterpret_cast<const leonida::TargetView*>(layer_handle(view).ptr)->resource),
++                         int(!color[0] && !color[1] && !color[2] && !color[3]), count);
+         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(layer_handle(view).ptr),
+                                         magenta ? leonida::ClearColor{1, 0, 1, 1}
+                                                 : leonida::ClearColor{color[0], color[1], color[2], color[3]},
+@@ -1236,6 +1303,7 @@ private:
+         // A root view into the title's own memory (a slot-133 buffer, a constant ring) gets the console VA of a GPU
+         // copy of it, so the shader's heap_base + VA reaches it (src/title_va_alias.h). A descriptor table is in one
+         // of the layer's heaps: kept, and its buffer V#s are rewritten the same way before each submission.
++        if (!is_compute(state) && p->user_offset < diag_set_va_.size()) diag_set_va_[p->user_offset] = va;  // LOCAL DIAGNOSTIC (c5972vsin)
+         if (type == rt::rootsig::ParamType::Descriptor)
+             va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
+         else if (va && p->table_descriptors && (tables_.empty() || tables_.back().first != va))
+@@ -1267,6 +1335,7 @@ private:
+     leonida::IndexBufferView index_{};
+     // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
+     std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
++    std::array<std::uint64_t, rt::rootsig::kMaxUserSgprs> diag_set_va_{};  // LOCAL DIAGNOSTIC (c5972vsin)
+     // The span a root view may read: D3D12's largest constant buffer (4096 x 16 bytes).
+     static constexpr std::uint64_t kRootViewBytes = 65536;
+     leonida::Viewport viewport_{};
+@@ -1451,6 +1520,127 @@ private:
+         return draw_views_;
+     }
+ 
++
++    // LOCAL DIAGNOSTIC (c5972vsin): classes and counts only, never raw bytes.
++    static bool diag_copy(void* to, const void* from, std::size_t n) {
++        __try {
++            std::memcpy(to, from, n);
++            return true;
++        } __except (EXCEPTION_EXECUTE_HANDLER) {
++            return false;
++        }
++    }
++    // An address's class, and a summary of its first 64 bytes when the host can read them.
++    static std::string diag_va(std::uint64_t va) {
++        if (!va) return "null";
++        std::uint8_t* arena = leonida::diag::g_arena.load();
++        const std::uint64_t arena_size = leonida::diag::g_arena_size.load();
++        std::uint32_t w[16] = {};
++        bool read = false;
++        std::string cls;
++        if (arena && va < arena_size) {
++            cls = leonida::diag::in_cbv_heap(va) ? "arena(descriptor heap)" : "arena";
++            if (va + sizeof w <= arena_size) read = diag_copy(w, arena + va, sizeof w);
++        } else if (va < (1ull << 32)) {
++            cls = "below-4GiB-outside-arena";
++        } else {
++            std::uint64_t lo = 0, hi = 0;
++            const bool title = leonida::title_va_aliases().title_memory(va, lo, hi);
++            const bool copied = leonida::title_va_aliases().shader_va(va) != va;
++            cls = std::string(">=4GiB ") + (title ? "title-pages" : "not-title-memory") + (copied ? " (has arena copy)" : " (no arena copy)");
++            MEMORY_BASIC_INFORMATION mbi{};
++            if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), &mbi, sizeof mbi) &&
++                mbi.State == MEM_COMMIT && mbi.Protect && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
++                reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize >= va + sizeof w)
++                read = diag_copy(w, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), sizeof w);
++            else
++                cls += " unreadable";
++        }
++        if (read) {
++            char sum[128];
++            leonida::diag::summarize(w, 16, sum, sizeof sum);
++            cls += std::string(" [first64: ") + sum + "]";
++        }
++        return cls;
++    }
++    void diag_inputs(const char* why) {
++        namespace d = leonida::diag;
++        const RootArgumentLayout* layout = graphics_.layout;
++        UserData data{};
++        graphics_user_data(false, data);
++        if (!layout) {
++            std::fprintf(stderr, "[diag]   inputs(%s): no graphics root signature\n", why);
++            return;
++        }
++        std::fprintf(stderr, "[diag]   inputs(%s): root params %zu, graphics end sgpr %u, heap-index sgprs %s/%s, flags 0x%x\n", why,
++                     layout->parameters.size(), layout->graphics_end_sgpr,
++                     layout->graphics_resource_heap_sgpr == rt::rootsig::kNoSgpr ? "none" : "set",
++                     layout->graphics_sampler_heap_sgpr == rt::rootsig::kNoSgpr ? "none" : "set", layout->flags);
++        if (layout->graphics_resource_heap_sgpr < data.size())
++            std::fprintf(stderr, "[diag]     resource heap base: %s\n", diag_va(data[layout->graphics_resource_heap_sgpr]).c_str());
++        std::uint8_t* arena = d::g_arena.load();
++        const std::uint64_t arena_size = d::g_arena_size.load();
++        for (std::size_t i = 0; i < layout->parameters.size(); ++i) {
++            const auto& p = layout->parameters[i];
++            const std::uint32_t at = p.user_offset;
++            if (p.type == rt::rootsig::ParamType::Constants) {
++                char sum[128] = "beyond user data";
++                const std::uint32_t n = p.constant_count;
++                if (at < data.size()) d::summarize(&data[at], std::min<std::uint32_t>(n, std::uint32_t(data.size() - at)), sum, sizeof sum);
++                std::fprintf(stderr, "[diag]     param %zu constants n %u at s%u: %s\n", i, n, at, sum);
++            } else if (p.type == rt::rootsig::ParamType::Descriptor) {
++                if (at + 1 >= data.size()) { std::fprintf(stderr, "[diag]     param %zu root view at s%u: beyond user data\n", i, at); continue; }
++                const std::uint64_t va = std::uint64_t(data[at]) | (std::uint64_t(data[at + 1]) << 32);
++                std::fprintf(stderr, "[diag]     param %zu root view at s%u: as set %s -> recorded %s\n", i, at,
++                             diag_va(diag_set_va_[at]).c_str(), diag_va(va).c_str());
++                if (std::strncmp(why, "scene", 5) == 0)  // LOCAL DIAGNOSTIC (c5972vsin2)
++                    d::set_watch({"scene root view", va, diag_set_va_[at], 64, false, 0});
++            } else {
++                if (at >= data.size()) { std::fprintf(stderr, "[diag]     param %zu table at s%u: beyond user data\n", i, at); continue; }
++                const std::uint64_t table = data[at];
++                if (std::strncmp(why, "composite", 9) == 0 && data[at])  // LOCAL DIAGNOSTIC (c5972vsin2)
++                    d::set_watch({"composite table slot 0", data[at], 0, 32, true, 0});
++                std::fprintf(stderr, "[diag]     param %zu table at s%u: %u view slots, table %s\n", i, at, p.table_descriptors,
++                             table ? (arena && table < arena_size ? (d::in_cbv_heap(table) ? "arena(descriptor heap)" : "arena(NOT a descriptor heap)") : "outside arena") : "null");
++                if (!table || !arena || table >= arena_size) continue;
++                const std::uint32_t slots = std::min<std::uint32_t>(p.table_descriptors ? p.table_descriptors : 8, 16);
++                for (std::uint32_t k = 0; k < slots; ++k) {
++                    const std::uint64_t at_va = table + std::uint64_t(k) * descriptor_size;
++                    if (at_va + 32 > arena_size) break;
++                    leonida::gfx10::ImageWords words{};
++                    if (!diag_copy(words.data(), arena + at_va, sizeof words)) break;
++                    if (!(words[0] | words[1] | words[2] | words[3] | words[4] | words[5] | words[6] | words[7])) {
++                        std::fprintf(stderr, "[diag]       slot %u: null\n", k);
++                    } else if (leonida::gfx10::is_image(words)) {
++                        leonida::gfx10::Image image{};
++                        if (leonida::gfx10::decode(words, image)) {
++                            const std::uintptr_t key = d::image_key(image.address);
++                            std::fprintf(stderr, "[diag]       slot %u: T# %s %ux%u fmt %u type %u mips %u\n", k,
++                                         key ? ("RES#" + std::to_string(d::rid(key))).c_str() : "unknown-image",
++                                         image.width, image.height, image.format, unsigned(image.type), image.mip_count);
++                        } else {
++                            std::fprintf(stderr, "[diag]       slot %u: T# (does not decode)\n", k);
++                        }
++                    } else {
++                        leonida::gfx10::BufferWords bw{words[0], words[1], words[2], words[3]};
++                        leonida::gfx10::Buffer b{};
++                        if (leonida::gfx10::decode(bw, b))
++                            std::fprintf(stderr, "[diag]       slot %u: V# stride %u records %u fmt %u oob %u base %s\n", k, b.stride,
++                                         b.num_records, b.format, unsigned(b.oob_select), diag_va(b.address).c_str());
++                        else
++                            std::fprintf(stderr, "[diag]       slot %u: buffer-type words that do not decode\n", k);
++                    }
++                }
++            }
++        }
++        if (std::strncmp(why, "composite", 9) == 0 && vertex_buffers_[0].va)  // LOCAL DIAGNOSTIC (c5972vsin2)
++            d::set_watch({"composite vertex buffer 0", leonida::title_va_aliases().shader_va(vertex_buffers_[0].va),
++                          vertex_buffers_[0].va, 64, false, 0});
++        for (std::size_t s = 0; s < vertex_buffers_.size(); ++s)
++            if (vertex_buffers_[s].va)
++                std::fprintf(stderr, "[diag]     vertex buffer slot %zu: stride %u size %u va %s\n", s, vertex_buffers_[s].stride,
++                             vertex_buffers_[s].size, diag_va(vertex_buffers_[s].va).c_str());
++    }
+     // A draw needs a graphics pipeline, a graphics root signature and a topology.
+     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
+         // A dispatch's rule (above): no graphics pipeline state bound draws nothing on D3D12 without the debug
+@@ -1466,6 +1656,33 @@ private:
+         leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, index_, topology_, viewport_,
+                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
+                            first, base_vertex, first_instance};
++        {  // LOCAL DIAGNOSTIC (c5972vsin3): tag a selected draw; the tag travels inside the recorded command
++            namespace d = leonida::diag;
++            const unsigned present = d::g_present.load();
++            const bool composite = d::on() && topology_ == 17 && !depth_.resource;
++            const bool scene = d::on() && !composite && topology_ == 4 && depth_.resource &&
++                               d::g_scene_tag_present.load() != present;
++            if ((composite || scene) && d::g_next_tag.load() < d::kMaxTags) {
++                if (scene) d::g_scene_tag_present.store(present);
++                const unsigned tag = d::g_next_tag.fetch_add(1) + 1;
++                if (tag <= d::kMaxTags) {
++                    draw.diag_tag = tag;
++                    d::TagInfo info{scene ? 1u : 2u, 0};
++                    if (composite) info.source_va = vertex_buffers_[0].va;
++                    else if (graphics_.layout && !graphics_.layout->parameters.empty() &&
++                             graphics_.layout->parameters[0].user_offset < diag_set_va_.size())
++                        info.source_va = diag_set_va_[graphics_.layout->parameters[0].user_offset];
++                    d::g_tags[tag] = info;
++                    std::fprintf(stderr, "[diag] tag %u recorded (%s): list LIST#%u command ordinal %zu, present %u, n %u inst %u; "
++                                         "recorded s8 %s; vb0 %s\n",
++                                 tag, scene ? "scene topo 4" : "composite topo 17", d::rid(reinterpret_cast<std::uintptr_t>(this)),
++                                 list_.commands().size(), present, count, instances,
++                                 scene ? diag_va(std::uint64_t(data[8]) | (std::uint64_t(data[9]) << 32)).c_str()
++                                       : (data[8] ? "table set" : "null"),
++                                 vertex_buffers_[0].va ? diag_va(vertex_buffers_[0].va).c_str() : "unbound");
++                }
++            }
++        }
+         check(list_.draw(std::move(draw)));
+     }
+ };
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index e5b83e183..7fe32873b 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -13,6 +13,7 @@
+ #include "d3d12_stubs.h"  // generated
+ #include "d3d12_com_object.h"
+ #include "d3d12_trace.h"
++#include "../src/diag_targets.h"  // LOCAL DIAGNOSTIC (c5972diag)
+ #include "d3d12_xs_device.h"
+ #include "d3d12_xs_native_pso.h"
+ #include "dxgi_com.h"
+@@ -203,8 +204,25 @@ void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t by
+             read = region.State == MEM_COMMIT && (region.Protect & readable) &&
+                    !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+         }
+-        if (!read || !copy_guarded(to + at, from + at, run, (region.Protect & PAGE_WRITECOMBINE) != 0))
+-            std::memset(to + at, 0, run);
++        const bool copied = read && copy_guarded(to + at, from + at, run, (region.Protect & PAGE_WRITECOMBINE) != 0);
++        if (!copied) std::memset(to + at, 0, run);
++        if (leonida::diag::CopyStats* st = leonida::diag::g_copy_stats) {  // LOCAL DIAGNOSTIC (c5972vsin3)
++            ++st->regions;
++            st->signature = (st->signature ^ (reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize * 3 +
++                                              std::uint64_t(region.State) * 7 + std::uint64_t(region.Protect) * 13)) * 1099511628211ull;
++            if (copied) {
++                ++st->copied, st->copied_bytes += run;
++            } else {
++                if (read) ++st->faulted, st->faulted_bytes += run;
++                else ++st->unreadable, st->unreadable_bytes += run;
++                if (st->first_zero == ~0ull) {
++                    st->first_zero = at;
++                    st->first_state = unsigned(region.State), st->first_protect = unsigned(region.Protect);
++                    st->first_why = read ? 'f' : 'u';
++                }
++                if (st->zero.size() < 64) st->zero.push_back({at, at + run});
++            }
++        }
+         at += run;
+     }
+ }
+@@ -842,6 +860,7 @@ struct DeviceState {
+         std::lock_guard lock(shadow_mutex);
+         for (const Shadow& s : shadows) {
+             if (!shadow_sizes_logged.insert(s.size).second) {
++                if (diag_shadow_refresh(s)) continue;  // LOCAL DIAGNOSTIC (c5972vsin3)
+                 copy_title_pages(s.mapped, s.pages, s.size);
+                 continue;
+             }
+@@ -856,6 +875,118 @@ struct DeviceState {
+         }
+     }
+ 
++
++
++    // LOCAL DIAGNOSTIC (c5972vsin3): an instrumented refresh of one large shadow (called with shadow_mutex held,
++    // after its first, timed refresh). False: not instrumented; the caller copies as before.
++    bool diag_shadow_refresh(const Shadow& s) {
++        namespace d = leonida::diag;
++        if (s.size < (1u << 20) || !d::on() || d::g_submit_logs.load() >= 64) return false;
++        d::CopyStats st;
++        d::g_copy_stats = &st;
++        copy_title_pages(s.mapped, s.pages, s.size);
++        d::g_copy_stats = nullptr;
++        const auto last = d::g_last_signature.find(s.mapped);
++        const char* changed = last == d::g_last_signature.end() ? "first" : last->second != st.signature ? "CHANGED" : "same";
++        d::g_last_signature[s.mapped] = st.signature;
++        std::fprintf(stderr, "[diag] submit #%u (present %u) shadow %zu KiB refresh: regions %u; copied %u (%llu KiB); "
++                             "zero-filled unreadable %u (%llu KiB), fault %u (%llu KiB); first zero-filled at +0x%llx why %c "
++                             "state 0x%x protect 0x%x; region layout vs previous refresh: %s\n",
++                     d::g_submissions.load() + 1, d::g_present.load(), s.size >> 10, st.regions, st.copied,
++                     static_cast<unsigned long long>(st.copied_bytes >> 10), st.unreadable,
++                     static_cast<unsigned long long>(st.unreadable_bytes >> 10), st.faulted,
++                     static_cast<unsigned long long>(st.faulted_bytes >> 10),
++                     static_cast<unsigned long long>(st.first_zero == ~0ull ? 0 : st.first_zero), st.first_why,
++                     st.first_state, st.first_protect, changed);
++        std::vector<d::Watch> watch;
++        {
++            std::lock_guard lock(d::g_watch_mutex);
++            watch = d::g_watch;
++        }
++        for (const d::Watch& e : watch) {
++            if (e.table || !arena.mapped || !e.gpu_va || e.gpu_va >= arena.size) continue;
++            const std::uint8_t* at = arena.mapped + e.gpu_va;
++            if (at < s.mapped || at >= s.mapped + s.size) continue;
++            const std::uint64_t off = std::uint64_t(at - s.mapped);
++            const char* where = "copied";
++            for (const auto& z : st.zero)
++                if (off >= z.first && off < z.second) where = "INSIDE a zero-filled range";
++            if (where[0] == 'c' && st.zero.size() >= 64) where = "copied or past the 64 recorded zero ranges";
++            std::fprintf(stderr, "[diag]   watch %s at +0x%llx: %s\n", e.tag.c_str(), static_cast<unsigned long long>(off), where);
++        }
++        return true;
++    }
++    // LOCAL DIAGNOSTIC (c5972vsin2): the watched addresses right after refresh_shadows. Counts only.
++    void diag_after_refresh() {
++        namespace d = leonida::diag;
++        const unsigned sub = d::g_submissions.fetch_add(1) + 1;
++        if (!d::on() || d::g_submit_logs.load() >= 64) return;
++        std::vector<d::Watch> watch;
++        {
++            std::lock_guard lock(d::g_watch_mutex);
++            watch = d::g_watch;
++        }
++        if (watch.empty()) return;
++        d::g_submit_logs.fetch_add(1);
++        const unsigned present = d::g_present.load();
++        for (const d::Watch& e : watch) {
++            std::string cover = "not registered";
++            const bool in_arena = arena.mapped && e.gpu_va && e.gpu_va + e.bytes <= arena.size;
++            {
++                std::lock_guard lock(shadow_mutex);
++                for (const Shadow& s : shadows) {
++                    if (in_arena && arena.mapped + e.gpu_va >= s.mapped && arena.mapped + e.gpu_va + e.bytes <= s.mapped + s.size) {
++                        cover = "refreshed (in a shadow of " + std::to_string(s.size >> 10) + " KiB)";
++                        break;
++                    }
++                    const auto* t = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(e.title_va));
++                    if (!in_arena && e.title_va && t >= s.pages && t + e.bytes <= s.pages + s.size) {
++                        cover = "refreshed (title range is a shadow of " + std::to_string(s.size >> 10) + " KiB outside the arena)";
++                        break;
++                    }
++                }
++                if (cover == "not registered" && in_arena) cover = e.table ? "descriptor heap (no shadow expected)" : "arena, NOT in any refreshed shadow";
++                if (cover == "not registered" && !in_arena && e.gpu_va) cover = "GPU copy address outside the arena, no shadow found";
++            }
++            char gpu[128] = "unreadable", title[128] = "none";
++            std::uint32_t g[16] = {}, t[16] = {};
++            const unsigned dwords = e.bytes / 4;
++            bool have_g = false, have_t = false;
++            if (in_arena) have_g = d::seh_copy(g, arena.mapped + e.gpu_va, e.bytes);
++            if (e.table) {
++                if (!have_g) std::snprintf(gpu, sizeof gpu, "unreadable");
++                else if (!(g[0] | g[1] | g[2] | g[3] | g[4] | g[5] | g[6] | g[7])) std::snprintf(gpu, sizeof gpu, "NULL");
++                else {
++                    leonida::gfx10::ImageWords iw{};
++                    std::memcpy(iw.data(), g, sizeof iw);
++                    leonida::gfx10::Image image{};
++                    if (leonida::gfx10::is_image(iw) && leonida::gfx10::decode(iw, image)) {
++                        const std::uintptr_t key = d::image_key(image.address);
++                        std::snprintf(gpu, sizeof gpu, "T# %s%u %ux%u fmt %u", key ? "RES#" : "unknown-image ", key ? d::rid(key) : 0u,
++                                      image.width, image.height, image.format);
++                    } else {
++                        std::snprintf(gpu, sizeof gpu, "non-image descriptor (V# or other)");
++                    }
++                }
++                std::fprintf(stderr, "[diag] submit #%u (present %u) after refresh: %s: recorded after submit #%u; %s; slot %s\n", sub,
++                             present, e.tag.c_str(), e.recorded_after, cover.c_str(), gpu);
++                continue;
++            }
++            if (have_g) d::summarize(g, dwords, gpu, sizeof gpu);
++            if (e.title_va) {
++                MEMORY_BASIC_INFORMATION mbi{};
++                if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(e.title_va)), &mbi, sizeof mbi) &&
++                    mbi.State == MEM_COMMIT && mbi.Protect && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
++                    have_t = d::seh_copy(t, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(e.title_va)), e.bytes);
++                if (have_t) d::summarize(t, dwords, title, sizeof title);
++                else std::snprintf(title, sizeof title, "unreadable");
++            }
++            const char* equal = have_g && have_t ? (std::memcmp(g, t, e.bytes) == 0 ? "yes" : "NO") : "n/a";
++            std::fprintf(stderr, "[diag] submit #%u (present %u) after refresh: %s: recorded after submit #%u; %s; gpu copy [%s]; "
++                                 "title pages [%s]; equal %s\n",
++                         sub, present, e.tag.c_str(), e.recorded_after, cover.c_str(), gpu, title, equal);
++        }
++    }
+     // Windows of the title's own memory in the GPU address arena (src/title_va_alias.h, docs/d3d12_vulkan.md
+     // section 3.3 "Title-chosen addresses"): a root view or buffer V# that names the title's memory outside any
+     // slot-133 buffer (a per-frame constant ring, #8862 section 3.5) gets a copy of the 64 KiB-aligned pages it
+@@ -2034,6 +2165,7 @@ public:
+             if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                 std::lock_guard lock(device.cbv_heap_mutex);
+                 device.cbv_heaps[arena_offset_] = arena_offset_ + bytes;
++                leonida::diag::note_cbv_heap(arena_offset_, arena_offset_ + bytes);  // LOCAL DIAGNOSTIC (c5972vsin)
+             }
+         } else {
+             storage_.reset(new std::byte[std::size_t(bytes)]());
+@@ -2087,15 +2219,16 @@ public:
+ 
+     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
+              D3D12_HEAP_FLAGS heap_flags)
+-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
++        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) { leonida::diag::alive(id(), true); }
+ 
+     // A placed resource lives inside a heap's arena range: the heap owns the range, so only the console VA is kept
+     // here and nothing goes back to the arena when this object dies.
+     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
+              D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
+-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
++        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) { leonida::diag::alive(id(), true); }
+ 
+     ~Resource() override {
++        leonida::diag::alive(id(), false);  // LOCAL DIAGNOSTIC (c5972diag2)
+         if (aliased_) leonida::title_va_aliases().remove(va_, title_alias_);
+         if (accel_) {
+             device_.context->unregister_acceleration_structure(gpu_va_);
+@@ -2127,6 +2260,7 @@ public:
+     }
+ 
+     leonida::ResourceId id() const { return resource_id(this); }
++    void diag_wait_idle() { device_.context->vk.vkDeviceWaitIdle(device_.info.device); }  // LOCAL DIAGNOSTIC
+     VkImage image() const { return image_; }
+     bool sparse_image() const { return sparse_image_; }
+     VkBuffer buffer() const { return buffer_; }
+@@ -2563,6 +2697,7 @@ public:
+         format_ = format.format;
+         aspects_ = format.aspects;
+         image_address_ = device_.next_image_address.fetch_add(256);
++        leonida::diag::note_image(image_address_, id());  // LOCAL DIAGNOSTIC (c5972vsin)
+         binding_.image = image_;
+         binding_.format = format_;
+         binding_.aspects = aspects_;
+@@ -2681,6 +2816,7 @@ public:
+         a8_as_alpha_ = format.a8_as_alpha;
+         aspects_ = format.aspects;
+         image_address_ = device_.next_image_address.fetch_add(256);
++        leonida::diag::note_image(image_address_, id());  // LOCAL DIAGNOSTIC (c5972vsin)
+         binding_ = binding;
+         if (host_transfer_) {
+             // Moved to GENERAL and zero-filled on the host now, so the CPU can copy into it before any command
+@@ -3809,6 +3945,20 @@ public:
+     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
+     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
+                             const D3D12_SHADER_BYTECODE* as = nullptr) {
++        {  // LOCAL DIAGNOSTIC (c5972diag2): what a draw with this pipeline writes
++            const D3D12_RENDER_TARGET_BLEND_DESC& b0 = desc.BlendState.RenderTarget[0];
++            char text[256];
++            std::snprintf(text, sizeof text,
++                          "rts %u fmt0 %u ps %s topo_type %u blend0 en %d src %u dst %u op %u srcA %u dstA %u opA %u mask 0x%x "
++                          "logic %d a2c %d depth %d write %d cull %u",
++                          desc.NumRenderTargets, unsigned(desc.RTVFormats[0]), desc.PS.BytecodeLength ? "yes" : "no",
++                          unsigned(desc.PrimitiveTopologyType), int(b0.BlendEnable), unsigned(b0.SrcBlend), unsigned(b0.DestBlend),
++                          unsigned(b0.BlendOp), unsigned(b0.SrcBlendAlpha), unsigned(b0.DestBlendAlpha), unsigned(b0.BlendOpAlpha),
++                          unsigned(b0.RenderTargetWriteMask), int(b0.LogicOpEnable), int(desc.BlendState.AlphaToCoverageEnable),
++                          int(desc.DepthStencilState.DepthEnable), int(desc.DepthStencilState.DepthWriteMask),
++                          unsigned(desc.RasterizerState.CullMode));
++            leonida::diag::note_pipeline(id(), text);
++        }
+         auto& vk = device_.context->vk;
+         const VkDevice dev = device_.info.device;
+         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
+@@ -4090,9 +4240,11 @@ public:
+         if (rect_list) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
+             std::string why;
+             const std::vector<std::uint32_t> words = leonida::rect_list_geometry(vs_stage.words, why);
+-            if (words.empty()) {
+-                std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list: %s\n",
+-                             vs_stage.entry->name.c_str(), why.c_str());
++            if (words.empty()) {  // refused (a ClipDistance output, say): logged once, not per pipeline
++                static std::atomic<bool> logged{false};
++                if (!logged.exchange(true, std::memory_order_relaxed))
++                    std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list: %s (logged once)\n",
++                                 vs_stage.entry->name.c_str(), why.c_str());
+                 return E_NOTIMPL;
+             }
+             const VkShaderModule module = device_.shader_modules().acquire(words);
+@@ -5590,7 +5742,10 @@ public:
+                                                                   info.conditional_rendering, info.ray_tracing,
+                                                                   info.xdxr_acceleration_structures &&
+                                                                       info.buffer_device_address);
+-        state_.context->set_before_execute([this] { state_.refresh_shadows(); });
++        state_.context->set_before_execute([this] {
++            state_.refresh_shadows();
++            state_.diag_after_refresh();  // LOCAL DIAGNOSTIC (c5972vsin2)
++        });
+         {
+             char text[16] = {};
+             size_t length = 0;
+@@ -5933,6 +6088,7 @@ public:
+             return false;
+         }
+         arena.mapped = static_cast<std::uint8_t*>(mapped);
++        leonida::diag::note_arena(arena.mapped, info.size);  // LOCAL DIAGNOSTIC (c5972vsin)
+         std::memset(arena.mapped, 0, kZeroPage);  // the zero page unbound vertex and index buffers read
+         auto* indices = reinterpret_cast<std::uint32_t*>(arena.mapped + kZeroPage);
+         for (std::uint32_t i = 0; i < kQuadIndexCount; i += kQuadIndicesPerQuad) {
+@@ -5944,6 +6100,7 @@ public:
+         address.buffer = arena.buffer;
+         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
+         arena.size = info.size;
++        leonida::diag::g_arena_buffer = reinterpret_cast<std::uint64_t>(arena.buffer);  // LOCAL DIAGNOSTIC (c5972vsin3)
+         arena.free[kArenaReserved] = arena.size - kArenaReserved;
+         arena.peak_end = kArenaReserved;
+         char log[4] = {};
+@@ -6724,6 +6881,13 @@ public:
+             rid = resource_id(resource);
+             rd = resource->GetDesc();
+         }
++        {  // LOCAL DIAGNOSTIC (c5972diag)
++            bool fresh = false;
++            const unsigned id = leonida::diag::rid(rid, &fresh);
++            std::fprintf(stderr, "[diag] CreateRenderTargetView -> RES#%u %llux%u fmt %u dim %u layered %u flags 0x%x%s\n", id,
++                         static_cast<unsigned long long>(rd.Width), rd.Height, unsigned(rd.Format), unsigned(rd.Dimension),
++                         unsigned(rd.DepthOrArraySize), unsigned(rd.Flags), fresh ? " (first sight)" : "");
++        }
+         if (rid) {
+             view = {rid, 0, 0, rd.DepthOrArraySize};
+             if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+@@ -6927,6 +7091,12 @@ public:
+     void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
+                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
++        if (leonida::diag::on()) {  // LOCAL DIAGNOSTIC (c5972diag2)
++            const D3D12_RESOURCE_DESC d = resource ? resource->GetDesc() : D3D12_RESOURCE_DESC{};
++            std::fprintf(stderr, "[diag] CreateShaderResourceView -> RES#%u %llux%u fmt %u dim %u\n",
++                         leonida::diag::rid(resource ? resource_id(resource) : 0), static_cast<unsigned long long>(d.Width), d.Height,
++                         unsigned(d.Format), unsigned(d.Dimension));
++        }
+         d3d12_trace::record("ID3D12Device::CreateShaderResourceView");
+         using leonida::gfx10::ImageType;
+         if (!destination.ptr) return;
+@@ -9331,6 +9501,129 @@ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature)
+     return s ? &s->layout() : nullptr;
+ }
+ 
++// LOCAL DIAGNOSTIC (c5972diag2): read a layer render target back after the GPU is idle and write <dir>/<tag>_<n>.ppm
++// plus a stats line. RGBA8 only. Called at sampled PresentX calls; the copy moves the image's layout as a
++// CopyTextureRegion would (a diagnostic perturbation), and the device wait serialises the frame.
++bool diag_read_target(std::uintptr_t key, unsigned present, const char* tag) {
++    if (!key || !leonida::diag::is_alive(key)) {
++        std::fprintf(stderr, "[diag] readback %s at present %u: no live resource\n", tag, present);
++        return false;
++    }
++    auto* resource = reinterpret_cast<ID3D12Resource*>(key);
++    Resource* r = Resource::from<Resource>(resource);
++    if (!r) return false;
++    const D3D12_RESOURCE_DESC d = r->GetDesc();
++    const unsigned id = leonida::diag::rid(key);
++    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
++        (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
++         d.Format != DXGI_FORMAT_B8G8R8A8_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS)) {
++        std::fprintf(stderr, "[diag] readback %s RES#%u at present %u: format %u not read\n", tag, id, present, unsigned(d.Format));
++        return false;
++    }
++    const UINT w = UINT(d.Width), h = d.Height, pitch = w * 4;
++    std::vector<std::uint8_t> px(std::size_t(pitch) * h);
++    r->diag_wait_idle();
++    const HRESULT hr = r->ReadFromSubresource(px.data(), pitch, pitch * h, 0, nullptr);
++    if (FAILED(hr)) {
++        std::fprintf(stderr, "[diag] readback %s RES#%u at present %u: ReadFromSubresource 0x%08lx\n", tag, id, present, long(hr));
++        return false;
++    }
++    const bool bgra = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
++    unsigned long long nz = 0, sum[4] = {0, 0, 0, 0};
++    unsigned long long a0 = 0, a255 = 0, aother = 0;
++    unsigned mn[4] = {255, 255, 255, 255}, mx[4] = {0, 0, 0, 0};
++    std::vector<std::uint8_t> rgb(std::size_t(w) * h * 3);
++    for (std::size_t i = 0, n = std::size_t(w) * h; i < n; ++i) {
++        const std::uint8_t* p = &px[i * 4];
++        const std::uint8_t c[4] = {bgra ? p[2] : p[0], p[1], bgra ? p[0] : p[2], p[3]};
++        if (c[0] || c[1] || c[2]) ++nz;
++        if (c[3] == 0) ++a0; else if (c[3] == 255) ++a255; else ++aother;  // exact alpha histogram
++        for (int k = 0; k < 4; ++k) { sum[k] += c[k]; mn[k] = c[k] < mn[k] ? c[k] : mn[k]; mx[k] = c[k] > mx[k] ? c[k] : mx[k]; }
++        rgb[i * 3] = c[0]; rgb[i * 3 + 1] = c[1]; rgb[i * 3 + 2] = c[2];
++    }
++    const double n = double(w) * h;
++    std::fprintf(stderr, "[diag] readback %s RES#%u %ux%u fmt %u at present %u: nonzero_rgb %llu of %.0f mean rgba %.3f %.3f %.3f %.3f "
++                 "min %u %u %u %u max %u %u %u %u\n", tag, id, w, h, unsigned(d.Format), present, nz, n, sum[0] / n, sum[1] / n,
++                 sum[2] / n, sum[3] / n, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3]);
++    std::fprintf(stderr, "[diag] readback %s RES#%u at present %u: alpha histogram 0=%llu 255=%llu other=%llu\n", tag, id, present, a0, a255, aother);
++    char dir[512] = {};
++    std::size_t length = 0;
++    if (getenv_s(&length, dir, sizeof dir, "LEONIDA_DIAG_DIR") == 0 && length > 1) {
++        std::error_code ec;
++        std::filesystem::create_directories(dir, ec);
++        char name[96];
++        std::snprintf(name, sizeof name, "%s_%04u_RES%u.ppm", tag, present, id);
++        const std::filesystem::path path = std::filesystem::path(dir) / name;
++        if (FILE* f = _wfopen(path.wstring().c_str(), L"wb")) {
++            std::fprintf(f, "P6\n%u %u\n255\n", w, h);
++            std::fwrite(rgb.data(), 1, rgb.size(), f);
++            std::fclose(f);
++        }
++    }
++    return true;
++}
++[[maybe_unused]] const bool diag_read_hook_set = (leonida::diag::g_read_hook = &diag_read_target, true);
++
++// LOCAL DIAGNOSTIC (c5972vsin3): a tagged draw was just emitted into its command buffer (after this submission's
++// refresh_shadows, before the GPU runs it). Bounded 64-byte CPU samples of what it reads; untyped counts only.
++static bool diag_title_sample(std::uint64_t va, std::uint8_t (&out)[64]) {
++    if (!va) return false;
++    MEMORY_BASIC_INFORMATION mbi{};
++    if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), &mbi, sizeof mbi) ||
++        mbi.State != MEM_COMMIT || !mbi.Protect || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
++        reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize < va + 64)
++        return false;
++    return leonida::diag::seh_copy(out, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), 64);
++}
++void diag_emit(unsigned tag, unsigned count, unsigned instances, std::uint64_t vb_buffer, std::uint64_t vb_offset,
++               std::uint64_t vb_size, const std::uint32_t* ud) {
++    namespace d = leonida::diag;
++    if (!tag || tag > d::kMaxTags) return;
++    const d::TagInfo info = d::g_tags[tag];
++    std::uint8_t* arena = d::g_arena.load();
++    const std::uint64_t arena_size = d::g_arena_size.load();
++    std::uint8_t src[64] = {}, cpy[64] = {};
++    char a[96] = "none", b[96] = "unreadable";
++    const bool have_src = diag_title_sample(info.source_va, src);
++    if (have_src) d::zero_counts(src, 64, b, sizeof b);
++    std::uint64_t at = ~0ull;
++    const char* what = "";
++    if (info.kind == 2) {
++        if (!vb_buffer) what = "VB slot 0 UNBOUND at emission";
++        else if (vb_buffer != d::g_arena_buffer.load()) what = "VB slot 0 bound to a NON-arena VkBuffer (not sampled)";
++        else {
++            at = vb_offset;
++            const std::uint64_t alias = leonida::title_va_aliases().shader_va(info.source_va);
++            what = alias == vb_offset ? "VB slot 0 = arena buffer, bound offset == the title alias's copy"
++                                      : "VB slot 0 = arena buffer, bound offset != the title alias's copy";
++        }
++    } else {
++        at = std::uint64_t(ud[8]) | (std::uint64_t(ud[9]) << 32);
++        what = "scene root view (recorded s8..s9) in the arena";
++    }
++    bool have_cpy = false;
++    if (at != ~0ull && arena && at + 64 <= arena_size) have_cpy = d::seh_copy(cpy, arena + at, 64);
++    else if (at != ~0ull) what = "address outside the arena (not sampled)";
++    if (have_cpy) d::zero_counts(cpy, 64, a, sizeof a);
++    const char* equal = have_cpy && have_src ? (std::memcmp(cpy, src, 64) == 0 ? "equal" : "DIFFERENT") : "n/a";
++    std::fprintf(stderr, "[diag] tag %u EMITTED (vkCmdDraw n %u inst %u) at callback #%u, CPU mapping after refresh, before "
++                         "GPU execution: %s; bytes read [%s]; title source [%s]; %s (vb size %llu)\n",
++                 tag, count, instances, d::g_submissions.load(), what, a, b, equal, static_cast<unsigned long long>(vb_size));
++    if (info.kind == 2 && arena && ud[8] && std::uint64_t(ud[8]) + 32 <= arena_size) {
++        leonida::gfx10::ImageWords w{};
++        if (d::seh_copy(w.data(), arena + ud[8], sizeof w)) {
++            bool null = true;
++            for (std::uint32_t x : w) null = null && !x;
++            leonida::gfx10::Image image{};
++            const bool img = !null && leonida::gfx10::is_image(w) && leonida::gfx10::decode(w, image);
++            const std::uintptr_t key = img ? d::image_key(image.address) : 0;
++            std::fprintf(stderr, "[diag] tag %u table slot 0 at emission: %s%s%u\n", tag,
++                         null ? "NULL" : img ? "T# " : "non-image descriptor", key ? "RES#" : "", key ? d::rid(key) : 0u);
++        }
++    }
++}
++[[maybe_unused]] const bool diag_emit_hook_set = (leonida::diag::g_emit_hook = &diag_emit, true);
++
+ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
+     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+     return p && p->compute() ? p->id() : 0;
+diff --git a/runtime/shims/d3d12_xs.cpp b/runtime/shims/d3d12_xs.cpp
+index 796f18a44..088d50362 100644
+--- a/runtime/shims/d3d12_xs.cpp
++++ b/runtime/shims/d3d12_xs.cpp
+@@ -220,6 +220,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
+         std::fprintf(stderr,
+                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
+                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
++        // A console method whose slot is another PC method (61) is served only to the title: a caller in an image
++        // this loader mapped.
++        rt::d3d12_xs::set_console_caller([](std::uint64_t address) {
++            std::uint64_t base = 0;
++            return rt::shims::mapped_image_base(address, base);
++        });
+     }
+ 
+     // A console title gets the console-shaped list the Xbox ABI calls. A guest compiled against the PC
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 2df8d4e95..c1bd22bef 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -25,11 +25,13 @@
+ // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
+ #include "d3d12_xs_device.h"
+ #include "d3d12_trace.h"
++#include "../src/diag_targets.h"  // LOCAL DIAGNOSTIC (c5972diag)
+ #include "d3d12_xs_alloc_size.h"
+ #include "d3d12_xs_desc_clean.h"
+ #include "d3d12_xs_pso_stream.h"
+ #include "d3d12_xs_native_pso.h"
+ #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
++#include "../src/rect_list_geometry.h"  // leonida::topology_rect_list
+ 
+ #ifdef LEONIDA_VULKAN_DEVICE
+ // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
+@@ -40,6 +42,7 @@
+ 
+ #include <windows.h>
+ #include <dxgi1_4.h>
++#include <intrin.h>  // _ReturnAddress: slot 61 serves a console caller differently from a host one
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -285,7 +288,7 @@ const char* slot_name(unsigned slot) {
+         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+         case 56: return "GetResourceAllocationInfo1 (C or PC form)";
+         case 57: return "Xbox native graphics pipeline";
+-        case 61: return "Xbox CreateSamplerX -> PC CreateSampler";
++        case 61: return "Xbox CreateSamplerX -> PC CreateSampler (a host caller gets PC CreateMetaCommand)";
+         case 62: return "Xbox CreateComputePipelineState";
+         case 67: return "Xbox DeserializeComputePipelineStateX";
+         case 70: return "Xbox shader-resource view from raw words";
+@@ -2089,6 +2092,9 @@ struct ListProxy {
+     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
+     std::vector<D3D12_VERTEX_BUFFER_VIEW> vb_scratch;  // slot-48 views with their VAs translated
+     std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> so_scratch;  // slot-49 views, same treatment
++    // Rectangle lists (rect_list_pipeline): the pipeline the title set, the one the real list has, and the topology.
++    std::uint64_t title_pso = 0, bound_pso = 0;
++    std::uint32_t topology = 0;
+ 
+     void pin_cursor_at_limit() {
+         const std::uint64_t at_limit = static_cast<std::uint64_t>(
+@@ -2212,6 +2218,49 @@ unsigned detect_list_slot_count(IUnknown* real) {
+     return 60;
+ }
+ 
++// Rectangle lists (console IA topology 17). The console draws them with pipelines it made as triangles (slot 57's
++// native format has topology types 0..4 only, and slot 55 derives from those). While topology 17 is set, the real
++// list gets the pipeline's rectangle variant instead (rect_list_pipeline, below), so the layer's geometry stage adds
++// each rectangle's fourth corner; otherwise the title's own pipeline. Reset, ClearState and an executed bundle set
++// the state as D3D12 does.
++ID3D12PipelineState* rect_list_pipeline(DeviceProxy* device, ID3D12PipelineState* pso);
++
++std::uint64_t rect_list_wanted(ListProxy* self) {
++    if (self->topology != leonida::topology_rect_list || !self->title_pso) return self->title_pso;
++    return reinterpret_cast<std::uint64_t>(
++        rect_list_pipeline(self->device, reinterpret_cast<ID3D12PipelineState*>(self->title_pso)));
++}
++
++// SetPipelineState (slot 25): the pipeline to forward.
++std::uint64_t rect_list_set_pipeline(ListProxy* self, std::uint64_t pso) {
++    self->title_pso = pso;
++    self->bound_pso = rect_list_wanted(self);
++    return self->bound_pso;
++}
++
++// IASetPrimitiveTopology (slot 20): entering or leaving topology 17 changes the pipeline the real list needs.
++void rect_list_set_topology(ListProxy* self, std::uint64_t topology) {
++    self->topology = static_cast<std::uint32_t>(topology);
++    const std::uint64_t want = rect_list_wanted(self);
++    if (want == self->bound_pso) return;
++    self->bound_pso = want;
++    self->real->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(want));
++}
++
++// Reset and ClearState (initial pipeline, topology undefined), and list creation.
++void rect_list_reset(ListProxy* self, std::uint64_t pso) {
++    self->title_pso = self->bound_pso = pso;
++    self->topology = 0;
++}
++
++// ExecuteBundle: the pipeline and topology a bundle set stay set on the calling list afterwards.
++void rect_list_after_bundle(ListProxy* self, const ListProxy* bundle) {
++    if (bundle->title_pso) self->title_pso = bundle->title_pso, self->bound_pso = bundle->bound_pso;
++    if (bundle->topology) self->topology = bundle->topology;
++}
++
++bool is_list_proxy_impl(const void* list);
++
+ template <unsigned Slot>
+ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+@@ -2242,6 +2291,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t
+             if constexpr (Slot == kConsoleAllocateUpload) {
+                 return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
+             }
++            leonida::diag::note_unforwarded(Slot, a1, a2, a3, a4);  // LOCAL DIAGNOSTIC (c5972diag)
+             return 0;  // unmodelled console slot: recorded above, never a PC call
+         } else {
+             if (pc >= self->pc_slot_count) {
+@@ -2266,7 +2316,16 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t
+                 // exists, the same way).
+                 a1 = unwrap_object(a1);
+                 a2 = unwrap_object(a2);
++                rect_list_reset(self, a2);
++            } else if constexpr (Slot == 11) {
++                rect_list_reset(self, a1);  // ClearState(pso)
++            } else if constexpr (Slot == 20) {
++                rect_list_set_topology(self, a1);  // IASetPrimitiveTopology
++            } else if constexpr (Slot == 25) {
++                a1 = rect_list_set_pipeline(self, a1);  // SetPipelineState
+             } else if constexpr (Slot == kConsoleExecuteBundle) {
++                if (is_list_proxy_impl(reinterpret_cast<const void*>(a1)))
++                    rect_list_after_bundle(self, reinterpret_cast<const ListProxy*>(a1));
+                 a1 = unwrap_object(a1);  // the bundle is a list proxy too
+             } else if constexpr (Slot >= 41 && Slot <= 46) {
+                 // The six root descriptor setters (index, GPU VA): an upload-arena CPU pointer becomes the
+@@ -2419,7 +2478,7 @@ IUnknown* list_real_or_null(const void* object) {
+ 
+ // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
+ // proxy through `out`.
+-HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
++HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out, std::uint64_t initial_pso) {
+     if (!created) return E_FAIL;
+     ListProxy* proxy = new (std::nothrow) ListProxy();  // (): the console body starts zeroed
+     if (!proxy) {
+@@ -2431,6 +2490,7 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
+     proxy->device = device;
+     proxy->refs.store(1, std::memory_order_relaxed);
+     proxy->pc_slot_count = detect_list_slot_count(created);
++    rect_list_reset(proxy, initial_pso);
+     proxy->pin_cursor_at_limit();
+     proxy_add_ref(device);  // the list keeps its Xbox-ABI device alive for GetDevice
+ 
+@@ -2473,7 +2533,7 @@ HRESULT proxy_create_command_list(DeviceProxy* self, std::uint64_t node_mask, st
+         reinterpret_cast<ID3D12PipelineState*>(pso), __uuidof(ID3D12GraphicsCommandList), &created);
+     if (FAILED(hr)) return hr;
+     if (!created) return E_FAIL;
+-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
++    return wrap_list(static_cast<IUnknown*>(created), self, riid, out, pso);
+ }
+ 
+ // Calls the real device's slot `Slot` with these five words in the positions the thunk received them (see "A thunk
+@@ -2609,7 +2669,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word,
+     const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
+                                                    __uuidof(ID3D12GraphicsCommandList), &created);
+     if (FAILED(hr)) return hr;
+-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
++    return wrap_list(static_cast<IUnknown*>(created), self, riid, out, initial_state_word);
+ }
+ 
+ // Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer
+@@ -3033,6 +3093,17 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
+ // past this call; whatever follows it is not known and not read. The title was not seen testing a result, so a null
+ // description is skipped rather than reported. The handle is passed as given: a handle in the title's own heap range
+ // is #7021's translation.
++// The same proxy also serves host callers (the runtime's own tests drive the Vulkan device through it), for whom slot
++// 61 is the PC ID3D12Device5::CreateMetaCommand. So the slot is CreateSamplerX only for a caller in an image the
++// guest loader mapped (set_console_caller); any other caller, or every caller when no check is installed, gets the PC
++// method. Without the check d3d12_vulkan_device_test's CreateMetaCommand call reached this handler (#7115).
++std::atomic<ConsoleCaller> g_console_caller{nullptr};
++
++bool is_console_caller(const void* address) {
++    const ConsoleCaller classify = g_console_caller.load(std::memory_order_acquire);
++    return classify && classify(reinterpret_cast<std::uint64_t>(address));
++}
++
+ void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, std::uint64_t dest) {
+     note_slot(61);
+     if (!desc) {
+@@ -3698,6 +3769,85 @@ HRESULT proxy_create_derived_pso(DeviceProxy* self, ID3D12PipelineState* base, s
+     return create_pso_from_stream(self, &desc, riid, out);
+ }
+ 
++// ---- Rectangle variants (see rect_list_wanted) ----
++// A pipeline's rectangle variant is made the first time a list binds it with topology 17, from the stream kept on it
++// (keep_pso_stream: slots 57, 55 and 86 all keep one), with the topology type set to the console's rectangle type 19
++// (rect_list_variant_stream). The variant lives in the pipeline's private data, so it is released with the pipeline
++// and a later pipeline at the same address does not find it. A pipeline that cannot have one keeps a null there:
++// the attempt is made once per pipeline, and each reason is logged once.
++constexpr GUID kRectVariantGuid{0x6d2a41c8, 0x93be, 0x4f07, {0xa5, 0x1c, 0x2e, 0x84, 0x7b, 0xd0, 0x39, 0x5f}};
++constexpr GUID kRectVariantPointerGuid{0xb83e05d4, 0x1f6a, 0x4c92, {0x8e, 0x37, 0xd1, 0x5a, 0x04, 0xc6, 0x9b, 0x21}};
++std::mutex g_rect_variant_mutex;  // one maker at a time, so two lists never make two variants of one pipeline
++std::atomic<std::uint64_t> g_rect_variants_made{0}, g_rect_variants_refused{0};
++
++// True when the pipeline was looked at before; `variant` is then its variant, or null when it has none.
++bool known_rect_variant(ID3D12PipelineState* pso, ID3D12PipelineState*& variant) {
++    variant = nullptr;
++    UINT size = sizeof(variant);
++    return SUCCEEDED(pso->GetPrivateData(kRectVariantPointerGuid, &size, &variant)) && size == sizeof(variant);
++}
++
++ID3D12PipelineState* no_rect_variant(ID3D12PipelineState* pso, unsigned reason, const char* why, HRESULT hr) {
++    ID3D12PipelineState* none = nullptr;
++    pso->SetPrivateData(kRectVariantPointerGuid, sizeof(none), &none);
++    if (!why) return pso;  // nothing to report: the pipeline draws the list as it is
++    g_rect_variants_refused.fetch_add(1, std::memory_order_relaxed);
++    static std::atomic<bool> logged[5]{};
++    if (!logged[reason].exchange(true, std::memory_order_relaxed))
++        std::fprintf(stderr, "[rt] d3d12_xs: a rectangle list (topology 17) keeps a triangle pipeline, so each "
++                             "rectangle draws as one triangle: %s (0x%08lx); logged once\n",
++                     why, static_cast<unsigned long>(hr));
++    return pso;
++}
++
++// The pipeline a list binds for `pso` while topology 17 is set: its rectangle variant, or `pso` itself.
++ID3D12PipelineState* rect_list_pipeline(DeviceProxy* device, ID3D12PipelineState* pso) {
++    ID3D12PipelineState* variant = nullptr;
++    if (!pso) return nullptr;
++    if (known_rect_variant(pso, variant)) return variant ? variant : pso;
++    std::lock_guard lock(g_rect_variant_mutex);
++    if (known_rect_variant(pso, variant)) return variant ? variant : pso;  // another list made it meanwhile
++
++    const PsoStreamRecord* record = find_pso_record(pso);
++    if (!record) return no_rect_variant(pso, 0, "the pipeline has no kept stream", E_FAIL);
++    std::vector<unsigned char> stream;
++    switch (rect_list_variant_stream(*record, stream)) {
++        case RectVariantStatus::ok: break;
++        case RectVariantStatus::rectangles: return no_rect_variant(pso, 0, nullptr, S_OK);
++        case RectVariantStatus::not_triangles:
++            return no_rect_variant(pso, 1, "not a triangle pipeline with a vertex stage", E_INVALIDARG);
++        case RectVariantStatus::extra_stage:
++            return no_rect_variant(pso, 2, "the pipeline has a geometry, tessellation or mesh stage", E_INVALIDARG);
++        case RectVariantStatus::malformed: return no_rect_variant(pso, 3, "the kept stream does not walk", E_FAIL);
++    }
++    ID3D12Device2* device2 = nullptr;
++    HRESULT hr = device->slot_count <= 47 ? E_NOINTERFACE
++                                           : device->real->QueryInterface(__uuidof(ID3D12Device2),
++                                                                          reinterpret_cast<void**>(&device2));
++    ID3D12PipelineState* made = nullptr;
++    if (SUCCEEDED(hr) && device2) {
++        D3D12_PIPELINE_STATE_STREAM_DESC desc{};
++        desc.SizeInBytes = stream.size();
++        desc.pPipelineStateSubobjectStream = stream.data();
++        hr = device2->CreatePipelineState(&desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&made));
++        device2->Release();
++    }
++    // The layer refuses a vertex stage its rectangle geometry stage cannot follow (one that writes ClipDistance,
++    // CullDistance, Layer or ViewportIndex, src/rect_list_geometry.h), and a device without geometry shaders.
++    if (FAILED(hr) || !made)
++        return no_rect_variant(pso, 4, "the device refused the rectangle variant", FAILED(hr) ? hr : E_FAIL);
++    if (FAILED(pso->SetPrivateDataInterface(kRectVariantGuid, made))) {
++        made->Release();
++        return no_rect_variant(pso, 3, "the variant cannot be kept on its pipeline", E_FAIL);
++    }
++    made->Release();  // the pipeline holds it now
++    pso->SetPrivateData(kRectVariantPointerGuid, sizeof(made), &made);
++    if (g_rect_variants_made.fetch_add(1, std::memory_order_relaxed) == 0)
++        std::fprintf(stderr, "[rt] d3d12_xs: first rectangle variant made: topology 17 binds it in place of its "
++                             "triangle pipeline\n");
++    return made;
++}
++
+ // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,
+ // displaced on Xbox by compute-PSO slot 62).
+ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DESC* desc, const IID* riid, void** out) {
+@@ -3746,6 +3896,10 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
+     const auto count = static_cast<UINT>(a3);
+     const auto* raw_descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4);
+     auto* info1 = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
++    if (count > 0 && !raw_descs) {  // a count with no descriptor array: refuse like the other bad-input paths
++        *ret = {UINT64_MAX, 0};
++        return reinterpret_cast<std::uint64_t>(ret);
++    }
+ 
+     std::vector<D3D12_RESOURCE_DESC1> cleaned;
+     const D3D12_RESOURCE_DESC1* descs_to_pass = nullptr;
+@@ -3870,8 +4024,19 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
+             reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
+     } else if constexpr (Slot == 61) {
+-        proxy_create_sampler_x(self, reinterpret_cast<const D3D12_SAMPLER_DESC*>(a1), a2);
+-        return 0;
++        if (is_console_caller(_ReturnAddress())) {
++            proxy_create_sampler_x(self, reinterpret_cast<const D3D12_SAMPLER_DESC*>(a1), a2);
++            return 0;
++        }
++        // A host caller: the PC slot 61 (ID3D12Device5::CreateMetaCommand), forwarded like any other PC method.
++        note_slot(Slot);
++        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
++        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
++                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
++                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
++                                                 std::uint64_t, std::uint64_t, std::uint64_t);
++        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
++        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+     } else if constexpr (Slot == 41) {
+         return hr_to_u64(proxy_create_command_signature(
+             self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1), a2, reinterpret_cast<const IID*>(a3),
+@@ -4414,6 +4579,10 @@ bool heap_slot_overridden(unsigned slot) {
+     return slot <= 2 || slot == 7 || slot == 8 || slot == 9 || slot == 10;
+ }
+ 
++void set_console_caller(ConsoleCaller classify) {
++    g_console_caller.store(classify, std::memory_order_release);
++}
++
+ std::uint64_t device_slot_hits(unsigned slot) {
+     start_hit_counts();
+     return slot < kMaxSlots ? g_hits[slot].load(std::memory_order_relaxed) : 0;
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 4cb58a53e..eef5b93e1 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -193,6 +193,12 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
+ // CreateCommandAllocator, which the proxy handles for the allocator proxy.
+ bool device_slot_overridden(unsigned slot);
+ 
++// Whether a return address is in an image the guest loader mapped, i.e. the call comes from the title. Device slot 61
++// is CreateSamplerX for such a caller and the PC ID3D12Device5::CreateMetaCommand for any other; with no check
++// installed every caller is a host one. D3D12XboxCreateDevice installs rt::shims::mapped_image_base.
++using ConsoleCaller = bool (*)(std::uint64_t address);
++void set_console_caller(ConsoleCaller classify);
++
+ // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
+ // (no reference added), or null when the pointer is not such a proxy.
+ bool is_queue_proxy(const void* queue);
+diff --git a/runtime/shims/d3d12_xs_pso_stream.cpp b/runtime/shims/d3d12_xs_pso_stream.cpp
+index f9b09a1b7..ddf938ba7 100644
+--- a/runtime/shims/d3d12_xs_pso_stream.cpp
++++ b/runtime/shims/d3d12_xs_pso_stream.cpp
+@@ -1,5 +1,8 @@
+ #include "d3d12_xs_pso_stream.h"
+ 
++#include "../src/rect_list_geometry.h"
++
++#include <algorithm>
+ #include <atomic>
+ #include <cstring>
+ 
+@@ -293,6 +296,38 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
+     return DeriveStatus::ok;
+ }
+ 
++RectVariantStatus rect_list_variant_stream(const PsoStreamRecord& base, std::vector<unsigned char>& out) {
++    out = base.bytes();
++    std::vector<Subobject> subs;
++    if (!walk(out.data(), out.size(), subs)) return RectVariantStatus::malformed;
++    const Subobject* topology = nullptr;
++    bool vertex = false;
++    for (const Subobject& s : subs) {
++        switch (s.type) {
++            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: topology = &s; break;
++            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: vertex = true; break;
++            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
++            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
++            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
++            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
++            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
++                D3D12_SHADER_BYTECODE code{};
++                std::memcpy(&code, out.data() + s.payload, sizeof(code));
++                if (code.pShaderBytecode && code.BytecodeLength) return RectVariantStatus::extra_stage;
++                break;
++            }
++            default: break;
++        }
++    }
++    std::uint32_t type = 0;
++    if (topology) std::memcpy(&type, out.data() + topology->payload, sizeof(type));
++    if (type == leonida::topology_type_rect_list) return RectVariantStatus::rectangles;
++    if (!topology || !vertex || type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return RectVariantStatus::not_triangles;
++    type = leonida::topology_type_rect_list;
++    std::memcpy(out.data() + topology->payload, &type, sizeof(type));
++    return RectVariantStatus::ok;
++}
++
+ bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> record) {
+     if (!object || !record) return false;
+     RecordOwner* owner = new RecordOwner(std::move(record));  // one reference: ours
+diff --git a/runtime/shims/d3d12_xs_pso_stream.h b/runtime/shims/d3d12_xs_pso_stream.h
+index 2512ed3aa..e6619b19c 100644
+--- a/runtime/shims/d3d12_xs_pso_stream.h
++++ b/runtime/shims/d3d12_xs_pso_stream.h
+@@ -71,4 +71,18 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
+ bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> record);
+ const PsoStreamRecord* find_pso_record(ID3D12Object* object);
+ 
++// The console draws its rectangle lists (IA topology 17) with pipelines it made as triangles: its native pipeline
++// format (slot 57) carries topology types 0..4 only, and slot 55 derives from those. The layer draws rectangles
++// through a pipeline of the console's rectangle type 19, which adds each rectangle's fourth corner in a generated
++// geometry stage (src/rect_list_geometry.h). rect_list_variant_stream writes `base` with its PRIMITIVE_TOPOLOGY set
++// to that type; `out`'s pointers still refer to the base record's copies.
++enum class RectVariantStatus {
++    ok,
++    rectangles,     // already the rectangle type: the pipeline itself draws the list
++    not_triangles,  // a point, line or patch pipeline, or no topology subobject: not a rectangle list's pipeline
++    extra_stage,    // a GS, HS, DS or mesh stage: the generated stage only follows a vertex stage
++    malformed,
++};
++RectVariantStatus rect_list_variant_stream(const PsoStreamRecord& base, std::vector<unsigned char>& out);
++
+ }  // namespace rt::d3d12_xs
+diff --git a/runtime/shims/xbox_present.cpp b/runtime/shims/xbox_present.cpp
+index ac5fdae1d..e9c580b07 100644
+--- a/runtime/shims/xbox_present.cpp
++++ b/runtime/shims/xbox_present.cpp
+@@ -1,6 +1,7 @@
+ #include "xbox_present.h"
+ 
+ #include "../src/vulkan_present.h"
++#include "../src/diag_targets.h"  // LOCAL DIAGNOSTIC (c5972diag)
+ 
+ #include <cerrno>
+ #include <chrono>
+@@ -151,6 +152,23 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
+                      static_cast<unsigned long long>(w[4]), static_cast<unsigned long long>(w[5]),
+                      static_cast<unsigned long long>(w[6]), static_cast<unsigned long long>(w[7]));
+     }
++    {  // LOCAL DIAGNOSTIC (c5972diag): the planes this PresentX names, then the frame counter and totals
++        const unsigned n = leonida::diag::g_present.fetch_add(1, std::memory_order_relaxed) + 1;
++        if (n <= leonida::diag::kFrames)
++            for (UINT i = 0; i < plane_count; ++i) {
++                ID3D12Resource* r = planes[i].ResourceCount && planes[i].ppResources ? planes[i].ppResources[0] : nullptr;
++                const D3D12_RESOURCE_DESC d = r ? r->GetDesc() : D3D12_RESOURCE_DESC{};
++                std::fprintf(stderr, "[diag] PresentX %u plane %u -> RES#%u %llux%u fmt %u flags 0x%x resources %u\n", n, i,
++                             leonida::diag::rid(r ? resource_id(r) : 0), static_cast<unsigned long long>(d.Width), d.Height,
++                             unsigned(d.Format), unsigned(d.Flags), planes[i].ResourceCount);
++            }
++        if ((n & (n - 1)) == 0) leonida::diag::totals(n);
++        if (leonida::diag::sample_present(n) && leonida::diag::g_read_hook) {
++            leonida::diag::g_read_hook(leonida::diag::g_scene.load(std::memory_order_relaxed), n, "scene");
++            if (plane_count && planes[0].ResourceCount && planes[0].ppResources && planes[0].ppResources[0])
++                leonida::diag::g_read_hook(resource_id(planes[0].ppResources[0]), n, "plane");
++        }
++    }
+     // All planes carry the token of one frame.
+     const std::uint64_t token = planes[0].Token;
+     for (UINT i = 0; i < plane_count; ++i) {
+diff --git a/runtime/src/command_list.h b/runtime/src/command_list.h
+index cc198aa8e..141989621 100644
+--- a/runtime/src/command_list.h
++++ b/runtime/src/command_list.h
+@@ -440,6 +440,7 @@ struct Draw {
+     std::int32_t base_vertex = 0;
+     std::uint32_t first_instance = 0;
+     bool mesh = false;
++    std::uint32_t diag_tag = 0;  // LOCAL DIAGNOSTIC (c5972vsin3): 0 = not a selected draw
+ };
+ 
+ // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
+diff --git a/runtime/src/diag_targets.h b/runtime/src/diag_targets.h
+new file mode 100644
+index 000000000..52d5d381d
+--- /dev/null
++++ b/runtime/src/diag_targets.h
+@@ -0,0 +1,236 @@
++#pragma once
++// LOCAL DIAGNOSTIC (claude-worker c5972diag, not upstream): logging only, no behaviour change. Abstract ids for the
++// resources render targets, clears, draws and PresentX planes name; draw-time viewport/scissor/topology state; counts
++// of the RS/IA setters reaching the PC list and of console list slots the proxy records but does not forward.
++// Detailed lines for the first kFrames PresentX calls; totals at power-of-two presents. Namespace-scope state only
++// (no function-local statics).
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++
++namespace leonida::diag {
++
++inline constexpr unsigned kFrames = 4;
++inline std::atomic<unsigned> g_present{0};
++inline bool on() { return g_present.load(std::memory_order_relaxed) < kFrames; }
++
++struct IdSlot {
++    std::uintptr_t key;
++    unsigned id;
++};
++inline constexpr unsigned kIdSlots = 1024;
++inline IdSlot g_ids[kIdSlots];
++inline unsigned g_next_id = 0;
++inline std::mutex g_id_mutex;
++
++// A small stable id for a resource key (0 = none); `fresh` is set when the key was seen for the first time.
++inline unsigned rid(std::uintptr_t key, bool* fresh = nullptr) {
++    if (fresh) *fresh = false;
++    if (!key) return 0;
++    std::lock_guard lock(g_id_mutex);
++    for (unsigned i = 0; i < g_next_id && i < kIdSlots; ++i)
++        if (g_ids[i].key == key) return g_ids[i].id;
++    if (g_next_id >= kIdSlots) return 9999;
++    g_ids[g_next_id] = {key, g_next_id + 1};
++    if (fresh) *fresh = true;
++    return ++g_next_id;
++}
++
++enum Counter : unsigned { viewports, viewports_zero, scissors, scissors_zero, topology, vertex_buffers, draws,
++                          draws_no_viewport, draws_no_scissor, clears, om_sets, kCounters };
++inline std::atomic<unsigned long long> g_counts[kCounters];
++inline const char* counter_name(unsigned c) {
++    switch (c) {
++    case viewports: return "RSSetViewports";
++    case viewports_zero: return "RSSetViewports(count 0)";
++    case scissors: return "RSSetScissorRects";
++    case scissors_zero: return "RSSetScissorRects(count 0)";
++    case topology: return "IASetPrimitiveTopology";
++    case vertex_buffers: return "IASetVertexBuffers";
++    case draws: return "Draw*";
++    case draws_no_viewport: return "Draw* with no viewport bound";
++    case draws_no_scissor: return "Draw* with no scissor bound";
++    case clears: return "ClearRenderTargetView";
++    case om_sets: return "OMSetRenderTargets";
++    default: return "?";
++    }
++}
++inline void count(Counter c) { g_counts[c].fetch_add(1, std::memory_order_relaxed); }
++
++inline constexpr unsigned kListSlots = 192;
++inline std::atomic<unsigned long long> g_unforwarded[kListSlots];
++
++// The shape of a 64-bit argument word: 0, a small integer (printed), or a pointer-sized value (not printed).
++inline void shape(char* out, std::size_t size, std::uint64_t v) {
++    if (v == 0) std::snprintf(out, size, "0");
++    else if (v < 0x10000) std::snprintf(out, size, "%llu", static_cast<unsigned long long>(v));
++    else if (v < 0x100000000ull) std::snprintf(out, size, "u32big");
++    else std::snprintf(out, size, "ptr");
++}
++
++inline void note_unforwarded(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
++    if (slot >= kListSlots) return;
++    const unsigned long long n = g_unforwarded[slot].fetch_add(1, std::memory_order_relaxed);
++    if (n < 3 || on()) {
++        char s[4][24];
++        shape(s[0], sizeof s[0], a1); shape(s[1], sizeof s[1], a2); shape(s[2], sizeof s[2], a3); shape(s[3], sizeof s[3], a4);
++        std::fprintf(stderr, "[diag] list slot %u (not forwarded) call %llu args %s %s %s %s\n", slot, n + 1, s[0], s[1],
++                     s[2], s[3]);
++    }
++}
++
++inline void totals(unsigned present) {
++    std::fprintf(stderr, "[diag] totals at present %u:", present);
++    for (unsigned c = 0; c < kCounters; ++c)
++        std::fprintf(stderr, " %s=%llu", counter_name(c), g_counts[c].load(std::memory_order_relaxed));
++    std::fprintf(stderr, "\n[diag] unforwarded list slots at present %u:", present);
++    for (unsigned s = 0; s < kListSlots; ++s)
++        if (const auto n = g_unforwarded[s].load(std::memory_order_relaxed)) std::fprintf(stderr, " %u=%llu", s, n);
++    std::fprintf(stderr, "\n");
++}
++
++}  // namespace leonida::diag
++
++// ---- c5972diag2 additions (LOCAL DIAGNOSTIC): pipeline blend summaries, the scene target, readback hook ----
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++namespace leonida::diag {
++inline std::mutex g_pipe_mutex;
++inline std::unordered_map<std::uintptr_t, std::string> g_pipelines;  // graphics pipeline id -> blend/RT summary
++inline void note_pipeline(std::uintptr_t id, std::string summary) {
++    std::lock_guard lock(g_pipe_mutex);
++    g_pipelines[id] = std::move(summary);
++}
++inline std::string pipeline(std::uintptr_t id) {
++    std::lock_guard lock(g_pipe_mutex);
++    const auto it = g_pipelines.find(id);
++    return it == g_pipelines.end() ? std::string("unknown") : it->second;
++}
++inline std::mutex g_alive_mutex;
++inline std::unordered_set<std::uintptr_t> g_alive;  // layer Resource ids currently alive
++inline void alive(std::uintptr_t id, bool yes) {
++    std::lock_guard lock(g_alive_mutex);
++    if (yes) g_alive.insert(id); else g_alive.erase(id);
++}
++inline bool is_alive(std::uintptr_t id) {
++    std::lock_guard lock(g_alive_mutex);
++    return g_alive.count(id) != 0;
++}
++inline std::atomic<std::uintptr_t> g_scene{0};  // the render target of the last draw with a depth target bound
++inline bool (*g_read_hook)(std::uintptr_t key, unsigned present, const char* tag) = nullptr;
++inline bool sample_present(unsigned n) { return n == 60 || n == 120 || n == 240; }
++}  // namespace leonida::diag
++
++// ---- c5972vsin additions (LOCAL DIAGNOSTIC): draw-input classification ----
++#include <utility>
++#include <vector>
++namespace leonida::diag {
++inline std::atomic<std::uint8_t*> g_arena{nullptr};  // the GPU address arena's host mapping
++inline std::atomic<std::uint64_t> g_arena_size{0};
++inline std::mutex g_vsin_mutex;
++inline std::vector<std::pair<std::uint64_t, std::uint64_t>> g_cbv_heaps;  // shader-visible CBV/SRV/UAV heaps [lo, hi)
++inline std::unordered_map<std::uint64_t, std::uintptr_t> g_images;      // T# image address -> resource key
++inline void note_arena(std::uint8_t* mapped, std::uint64_t size) { g_arena = mapped; g_arena_size = size; }
++inline void note_cbv_heap(std::uint64_t lo, std::uint64_t hi) {
++    std::lock_guard lock(g_vsin_mutex);
++    g_cbv_heaps.push_back({lo, hi});
++}
++inline bool in_cbv_heap(std::uint64_t va) {
++    std::lock_guard lock(g_vsin_mutex);
++    for (const auto& h : g_cbv_heaps) if (va >= h.first && va < h.second) return true;
++    return false;
++}
++inline void note_image(std::uint64_t address, std::uintptr_t key) {
++    std::lock_guard lock(g_vsin_mutex);
++    g_images[address] = key;
++}
++inline std::uintptr_t image_key(std::uint64_t address) {
++    std::lock_guard lock(g_vsin_mutex);
++    const auto it = g_images.find(address);
++    return it == g_images.end() ? 0 : it->second;
++}
++inline std::atomic<unsigned> g_scene_inputs_present{0xFFFFFFFFu};  // the present whose scene draw was logged
++// Counts over dwords read as 32-bit floats: zero, non-zero, NaN/Inf, finite with |x| >= 1e8.
++inline void summarize(const std::uint32_t* w, unsigned n, char* out, std::size_t size) {
++    unsigned zero = 0, nz = 0, naninf = 0, huge = 0;
++    for (unsigned i = 0; i < n; ++i) {
++        if (!w[i]) { ++zero; continue; }
++        ++nz;
++        if (((w[i] >> 23) & 0xFFu) == 0xFFu) { ++naninf; continue; }
++        float f;
++        std::memcpy(&f, &w[i], 4);
++        if (f >= 1e8f || f <= -1e8f) ++huge;
++    }
++    std::snprintf(out, size, "dwords %u zero %u nonzero %u naninf %u huge %u", n, zero, nz, naninf, huge);
++}
++}  // namespace leonida::diag
++
++// ---- c5972vsin2 additions (LOCAL DIAGNOSTIC): watched addresses, summarised after the per-submission refresh ----
++#include <string>
++namespace leonida::diag {
++struct Watch {
++    std::string tag;
++    std::uint64_t gpu_va = 0;    // what the GPU reads: an arena VA (or a value past the arena)
++    std::uint64_t title_va = 0;  // the title's address it copies (0: none)
++    unsigned bytes = 64;
++    bool table = false;          // a descriptor slot, not data
++    unsigned recorded_after = 0; // submissions counted when it was recorded
++};
++inline std::mutex g_watch_mutex;
++inline std::vector<Watch> g_watch;
++inline std::atomic<unsigned> g_submissions{0};
++inline std::atomic<unsigned> g_submit_logs{0};
++inline void set_watch(Watch w) {
++    w.recorded_after = g_submissions.load();
++    std::lock_guard lock(g_watch_mutex);
++    for (auto& e : g_watch)
++        if (e.tag == w.tag) { e = w; return; }
++    g_watch.push_back(w);
++}
++inline bool seh_copy(void* to, const void* from, std::size_t n) {
++    __try {
++        std::memcpy(to, from, n);
++        return true;
++    } __except (1) {
++        return false;
++    }
++}
++}  // namespace leonida::diag
++
++// ---- c5972vsin3 additions (LOCAL DIAGNOSTIC): copy_title_pages counters ----
++namespace leonida::diag {
++struct CopyStats {
++    unsigned regions = 0, copied = 0, unreadable = 0, faulted = 0;
++    std::uint64_t copied_bytes = 0, unreadable_bytes = 0, faulted_bytes = 0;
++    std::uint64_t first_zero = ~0ull;  // offset from the shadow's base
++    unsigned first_state = 0, first_protect = 0;
++    char first_why = '-';              // 'u' unreadable, 'f' fault
++    std::uint64_t signature = 1469598103934665603ull;
++    std::vector<std::pair<std::uint64_t, std::uint64_t>> zero;  // [offset, end) zero-filled
++};
++inline CopyStats* g_copy_stats = nullptr;  // set only inside refresh_shadows, under its mutex
++inline std::unordered_map<const void*, std::uint64_t> g_last_signature;
++}  // namespace leonida::diag
++
++// ---- c5972vsin3 part b (LOCAL DIAGNOSTIC): tagged draws ----
++namespace leonida::diag {
++struct TagInfo {
++    unsigned kind = 0;            // 1 scene, 2 composite
++    std::uint64_t source_va = 0;  // the title range the draw's input copies (scene: root view as set; composite: VB view)
++};
++inline constexpr unsigned kMaxTags = 16;
++inline std::atomic<unsigned> g_next_tag{0};
++inline TagInfo g_tags[kMaxTags + 1];
++inline std::atomic<unsigned> g_scene_tag_present{0xFFFFFFFFu};
++inline std::atomic<std::uint64_t> g_arena_buffer{0};
++inline void (*g_emit_hook)(unsigned tag, unsigned count, unsigned instances, std::uint64_t vb_buffer,
++                           std::uint64_t vb_offset, std::uint64_t vb_size, const std::uint32_t* user_data) = nullptr;
++inline void zero_counts(const std::uint8_t* b, unsigned n, char* out, std::size_t size) {
++    unsigned zero = 0;
++    for (unsigned i = 0; i + 4 <= n; i += 4) zero += (b[i] | b[i + 1] | b[i + 2] | b[i + 3]) == 0;
++    std::snprintf(out, size, "dwords %u zero %u nonzero %u", n / 4, zero, n / 4 - zero);
++}
++}  // namespace leonida::diag
+diff --git a/runtime/src/vulkan_present.h b/runtime/src/vulkan_present.h
+index 8644346c5..97c365b5f 100644
+--- a/runtime/src/vulkan_present.h
++++ b/runtime/src/vulkan_present.h
+@@ -40,12 +40,18 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <system_error>
+ #include <cstring>
++#include <fstream>
+ #include <functional>
++#include <iomanip>
+ #include <map>
+ #include <deque>
+ #include <memory>
+ #include <mutex>
++#include <string>
+ #include <thread>
+ #include <vector>
+ 
+@@ -164,7 +170,32 @@ public:
+                 vk.vkCreateSemaphore(device, &semaphore, nullptr, &frame.acquired) != VK_SUCCESS)
+                 return;
+         }
++        // LEONIDA_CAPTURE=<dir>: besides presenting, copy the swapchain image to host memory and write it out as a
++        // binary PPM, every LEONIDA_CAPTURE_EVERY presented frames (default 30), at most LEONIDA_CAPTURE_LIMIT of
++        // them (default 24). Off unless the variable is set; a capture that cannot be made shows nothing and is
++        // reported here instead of failing the presenter.
++        if (const char* dir = std::getenv("LEONIDA_CAPTURE"); dir && *dir) {
++            capture_dir_ = dir;
++            // Create the folder: a capture run names its own output folder and should not have to make it first.
++            std::error_code created;
++            std::filesystem::create_directories(capture_dir_, created);
++            capture_to_disk_ = true;
++            capture_ = true;  // the swapchain needs TRANSFER_SRC, and every frame copies into a staging buffer
++            if (const char* every = std::getenv("LEONIDA_CAPTURE_EVERY")) capture_every_ = std::max(1, std::atoi(every));
++            if (const char* limit = std::getenv("LEONIDA_CAPTURE_LIMIT")) capture_limit_ = std::max(1, std::atoi(limit));
++            std::fprintf(stderr, "[rt] present: capture on: every %d presented frame(s), at most %d, into %s\n",
++                         capture_every_, capture_limit_, capture_dir_.c_str());
++        }
+         ok_ = recreate(true, false);
++        if (!ok_ && capture_to_disk_) {
++            // The surface refused a TRANSFER_SRC swapchain, or the staging buffer could not be made: present
++            // without the capture rather than not at all.
++            std::fprintf(stderr, "[rt] present: capture is unavailable on this surface; presenting without it\n");
++            capture_to_disk_ = false;
++            capture_ = false;
++            capture_dir_.clear();
++            ok_ = recreate(true, false);
++        }
+     }
+ 
+     ~VulkanPresenter() {
+@@ -179,6 +210,8 @@ public:
+             release(swapchain_);
+         }
+         swapchain_ = VK_NULL_HANDLE;
++        // A capture still pending has its copy complete once the queue is idle: write it before the buffer goes.
++        finish_pending_capture();
+         release_capture();
+         composer_.reset();
+         for (Frame& frame : frames_) {
+@@ -461,6 +494,8 @@ private:
+         Frame& frame = frames_[frame_index_ % frames_.size()];
+         if (const VkResult waited = vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX); waited != VK_SUCCESS)
+             return stop(waited);
++        // Every submit copies into the same mapped buffer, even if its frame is outside the disk capture stride.
++        if (const VkResult r = finish_pending_capture(); r != VK_SUCCESS) return stop(r);
+ 
+         std::uint32_t image = 0;
+         VkResult acquired = acquire(frame.acquired, &image);
+@@ -589,6 +624,9 @@ private:
+                 last_tore_ = true;
+                 ++tear_presents_;
+             }
++            if (capture_to_disk_ && capture_ && capture_ptr_ && capture_written_ < capture_limit_ &&
++                (presented_ - 1) % std::uint64_t(capture_every_) == 0)
++                pending_capture_ = frame.done;
+         }
+         if (capture_ && capture_ptr_) {
+             captured_ = true;
+@@ -997,6 +1035,108 @@ private:
+         captured_ = false;
+     }
+ 
++    // The name VkFormat has in the index; the few formats a capture can be written from, else its number.
++    static const char* capture_format_name(VkFormat format) {
++        switch (format) {
++        case VK_FORMAT_B8G8R8A8_UNORM: return "VK_FORMAT_B8G8R8A8_UNORM";
++        case VK_FORMAT_B8G8R8A8_SRGB: return "VK_FORMAT_B8G8R8A8_SRGB";
++        case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
++        case VK_FORMAT_R8G8B8A8_SRGB: return "VK_FORMAT_R8G8B8A8_SRGB";
++        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "VK_FORMAT_A2B10G10R10_UNORM_PACK32";
++        case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return "VK_FORMAT_A2R10G10B10_UNORM_PACK32";
++        default: return "unknown";
++        }
++    }
++
++    VkResult finish_pending_capture() {
++        if (!pending_capture_) return VK_SUCCESS;
++        const VkResult waited = vkWaitForFences_(context_.device(), 1, &pending_capture_, VK_TRUE, UINT64_MAX);
++        pending_capture_ = VK_NULL_HANDLE;
++        if (waited == VK_SUCCESS) write_capture();
++        return waited;
++    }
++
++    void write_capture() {
++        const VkExtent2D extent = captured_extent_;
++        const VkFormat format = captured_format_;
++        const std::uint64_t number = presented_;
++        const std::size_t texels = std::size_t(extent.width) * extent.height;
++        if (!capture_ptr_ || !texels || texels > capture_size_ / 4) return;
++        std::vector<std::uint8_t> rgb(texels * 3);
++        std::uint64_t sum[3] = {0, 0, 0};
++        const std::uint8_t* src = capture_ptr_;
++        switch (format) {
++        case VK_FORMAT_B8G8R8A8_UNORM:
++        case VK_FORMAT_B8G8R8A8_SRGB:
++            for (std::size_t i = 0; i < texels; ++i) {
++                const std::uint8_t b = src[i * 4 + 0], g = src[i * 4 + 1], r = src[i * 4 + 2];
++                rgb[i * 3 + 0] = r;
++                rgb[i * 3 + 1] = g;
++                rgb[i * 3 + 2] = b;
++                sum[0] += r;
++                sum[1] += g;
++                sum[2] += b;
++            }
++            break;
++        case VK_FORMAT_R8G8B8A8_UNORM:
++        case VK_FORMAT_R8G8B8A8_SRGB:
++            for (std::size_t i = 0; i < texels; ++i) {
++                const std::uint8_t r = src[i * 4 + 0], g = src[i * 4 + 1], b = src[i * 4 + 2];
++                rgb[i * 3 + 0] = r;
++                rgb[i * 3 + 1] = g;
++                rgb[i * 3 + 2] = b;
++                sum[0] += r;
++                sum[1] += g;
++                sum[2] += b;
++            }
++            break;
++        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++        case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
++            const bool bgra = format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;  // B in the low bits
++            for (std::size_t i = 0; i < texels; ++i) {
++                std::uint32_t word = 0;
++                std::memcpy(&word, src + i * 4, sizeof word);
++                const std::uint32_t low = word & 0x3ffu, mid = (word >> 10) & 0x3ffu, high = (word >> 20) & 0x3ffu;
++                const auto to8 = [](std::uint32_t v) { return std::uint8_t((v * 255u + 511u) / 1023u); };
++                const std::uint8_t r = to8(bgra ? high : low), g = to8(mid), b = to8(bgra ? low : high);
++                rgb[i * 3 + 0] = r;
++                rgb[i * 3 + 1] = g;
++                rgb[i * 3 + 2] = b;
++                sum[0] += r;
++                sum[1] += g;
++                sum[2] += b;
++            }
++            break;
++        }
++        default: return;  // not a format the capture can be written from (recreate() refused the others)
++        }
++        char name[64];
++        std::snprintf(name, sizeof name, "frame_%05llu.ppm", static_cast<unsigned long long>(number));
++        std::string path = capture_dir_;
++        if (path.back() != '/' && path.back() != '\\') path += '/';
++        path += name;
++        std::ofstream file(path, std::ios::binary | std::ios::trunc);
++        if (!file) {
++            std::fprintf(stderr, "[rt] present: cannot write %s\n", path.c_str());
++            return;
++        }
++        file << "P6\n" << extent.width << ' ' << extent.height << "\n255\n";
++        file.write(reinterpret_cast<const char*>(rgb.data()), std::streamsize(rgb.size()));
++        file.close();
++        const double scale = 1.0 / double(texels);
++        const double mean[3] = {sum[0] * scale, sum[1] * scale, sum[2] * scale};
++        path.resize(path.size() - std::strlen(name));
++        path += "index.txt";
++        std::ofstream index(path, std::ios::app);
++        if (index)
++            index << "frame " << number << " format " << int(format) << " (" << capture_format_name(format)
++                  << ") extent " << extent.width << 'x' << extent.height << " mean rgb " << std::fixed
++                  << std::setprecision(2) << mean[0] << ' ' << mean[1] << ' ' << mean[2] << '\n';
++        ++capture_written_;
++        std::fprintf(stderr, "[rt] present: capture %s (%ux%u, mean rgb %.2f %.2f %.2f)\n", name, extent.width,
++                     extent.height, mean[0], mean[1], mean[2]);
++    }
++
+     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
+     // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
+     // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
+@@ -1007,6 +1147,7 @@ private:
+             std::lock_guard lock(context_.submit_mutex());
+             vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+         }
++        if (finish_pending_capture() != VK_SUCCESS) return false;
+         stale_ = true;  // until this succeeds
+         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
+         VkSurfaceCapabilitiesKHR caps{};
+@@ -1307,6 +1448,13 @@ private:
+     bool captured_ = false;
+     VkExtent2D captured_extent_{};
+     VkFormat captured_format_ = VK_FORMAT_UNDEFINED;
++    // LEONIDA_CAPTURE: write the copies the staging buffer makes to <capture_dir_> (see finish_pending_capture()).
++    bool capture_to_disk_ = false;
++    std::string capture_dir_;
++    int capture_every_ = 30;  // presented frames between files
++    int capture_limit_ = 24;  // files at most
++    VkFence pending_capture_ = VK_NULL_HANDLE;  // owns the shared staging bytes until written
++    std::uint64_t capture_written_ = 0;
+ 
+     PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR_ = nullptr;
+     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR_ = nullptr;
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index bec8eb803..4605a55c5 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -31,6 +31,7 @@
+ // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
+ 
+ #include "command_list.h"
++#include "diag_targets.h"  // LOCAL DIAGNOSTIC (c5972vsin3)
+ #include "depth24.h"
+ #include "rect_list_geometry.h"
+ #include "uav_clear.h"
+@@ -4206,6 +4207,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+             } else {
+                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
+             }
++            if (draw->diag_tag && leonida::diag::g_emit_hook)  // LOCAL DIAGNOSTIC (c5972vsin3): emitted
++                leonida::diag::g_emit_hook(draw->diag_tag, draw->count, draw->instances,
++                                           d.vertex_buffers.empty() ? 0 : reinterpret_cast<std::uint64_t>(d.vertex_buffers[0]),
++                                           d.vertex_offsets.empty() ? 0 : d.vertex_offsets[0],
++                                           d.vertex_sizes.empty() ? 0 : d.vertex_sizes[0], draw->user_data.data());
+             vk.end_rendering(command_buffer);
+         }
+     }
+diff --git a/runtime/test/d3d12_present_test.cpp b/runtime/test/d3d12_present_test.cpp
+index b1f0a75e6..b94e95852 100644
+--- a/runtime/test/d3d12_present_test.cpp
++++ b/runtime/test/d3d12_present_test.cpp
+@@ -1,4 +1,4 @@
+-// Milestone M0 (docs/d3d12_vulkan.md section 6): a window shows a stable clear colour for 60 frames, through the
++// Milestone M0 (docs/d3d12_vulkan.md section 6): a window shows clear colours for 60 frames, through the
+ // Vulkan-backed device behind the Xbox-ABI proxy, with no Vulkan validation errors. Each frame resets the list,
+ // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
+ // The window is then resized, which recreates the swapchain and scales the blit. The presented images are copied
+@@ -19,9 +19,13 @@
+ 
+ #include <dxgi1_6.h>
+ 
++#include <cmath>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <string>
+ #include <functional>
+ #include <string_view>
+ #include <vector>
+@@ -304,6 +308,22 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
+ 
+ int main() {
+     vktest::Device d;
++    // LEONIDA_CAPTURE writes every presented frame to disk. Turn it on here so the path is exercised with the rest of
++    // the presenter, and check its files against the colour this test clears to.
++    wchar_t capture_dir[MAX_PATH]{};
++    {
++        wchar_t temp[MAX_PATH]{};
++        if (GetTempPathW(MAX_PATH, temp))
++            swprintf_s(capture_dir, L"%sleonida_present_capture_%lu", temp, GetCurrentProcessId());
++        if (capture_dir[0]) {
++            CreateDirectoryW(capture_dir, nullptr);
++            // The presenter reads these with std::getenv, so they have to go into the CRT's environment too, which
++            // SetEnvironmentVariableW alone does not update.
++            _wputenv_s(L"LEONIDA_CAPTURE", capture_dir);
++            _wputenv_s(L"LEONIDA_CAPTURE_EVERY", L"1");
++            _wputenv_s(L"LEONIDA_CAPTURE_LIMIT", L"4");
++        }
++    }
+     const auto device_status = d.initialize(true);
+     if (device_status == vktest::DeviceStatus::unavailable) {
+         std::fprintf(stderr, "SKIP: no usable Vulkan presentation device\n");
+@@ -339,6 +359,7 @@ int main() {
+     UpdateWindow(window);
+     pump();
+ 
++    const FLOAT alternate[4] = {1.f, 0.f, 0.f, 1.f};
+     const FLOAT colour[4] = {0.2f, 0.6f, 0.9f, 1.0f};
+     bool screen_checked = false;
+     {
+@@ -429,7 +450,9 @@ int main() {
+             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+             list->ResourceBarrier(1, &barrier);
+-            list->ClearRenderTargetView(rtv, colour, 0, nullptr);
++            const auto next = presenter->presented() + 1;
++            const bool red = next <= 4 && next % 2 == 1;
++            list->ClearRenderTargetView(rtv, red ? alternate : colour, 0, nullptr);
+             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+             list->ResourceBarrier(1, &barrier);
+@@ -623,6 +646,51 @@ int main() {
+             std::printf("the window is not in front: on-screen colour check skipped\n");
+         }
+ 
++        // The capture files must hold the colour the presented images hold: the frame written is the swapchain image
++        // as the presentation engine got it, so a capture that reads the wrong buffer shows up here.
++        if (capture_dir[0]) {
++            char narrow[MAX_PATH * 3]{};
++            WideCharToMultiByte(CP_ACP, 0, capture_dir, -1, narrow, static_cast<int>(sizeof narrow), nullptr, nullptr);
++            char path[MAX_PATH * 3 + 32]{};
++            int exact_files = 0;
++            for (int i = 1; i <= 4; ++i) {
++                std::snprintf(path, sizeof path, "%s\\frame_%05d.ppm", narrow, i);
++                std::ifstream ppm(path, std::ios::binary);
++                std::string magic, dimensions, max_value;
++                std::getline(ppm, magic);
++                std::getline(ppm, dimensions);
++                std::getline(ppm, max_value);
++                const int expected[] = {i % 2 ? 255 : 51, i % 2 ? 0 : 153, i % 2 ? 0 : 230};
++                bool exact = magic == "P6" && dimensions == std::to_string(width) + " " + std::to_string(height) &&
++                             max_value == "255";
++                for (size_t n = 0; exact && n < size_t(width) * height * 3; ++n) {
++                    const int sample = ppm.get();
++                    exact = sample != EOF && std::abs(sample - expected[n % 3]) <= 1;
++                }
++                if (exact && ppm.get() == EOF) ++exact_files;
++                ppm.close();
++                DeleteFileA(path);
++            }
++            int lines = 0, matching = 0;
++            std::ifstream index(std::string(narrow) + "\\index.txt");
++            for (std::string line; std::getline(index, line);) {
++                const auto at = line.find("mean rgb ");
++                double r = -1, g = -1, b = -1;
++                if (at == std::string::npos || std::sscanf(line.c_str() + at, "mean rgb %lf %lf %lf", &r, &g, &b) != 3)
++                    continue;
++                ++lines;
++                const bool red = lines % 2 == 1;
++                if (line.starts_with("frame " + std::to_string(lines) + " ") &&
++                    std::fabs(r - (red ? 255 : 51)) <= 3.0 && std::fabs(g - (red ? 0 : 153)) <= 3.0 &&
++                    std::fabs(b - (red ? 0 : 230)) <= 3.0) ++matching;
++            }
++            std::printf("capture: %d correct images, %d index rows, %d matching frame colours\n", exact_files, lines, matching);
++            index.close();
++            DeleteFileA((std::string(narrow) + "\\index.txt").c_str());
++            RemoveDirectoryA(narrow);
++            EXPECT(exact_files == 4 && lines == 4 && matching == 4);
++        }
++
+         presenter.reset();  // before the device's queue and resources go
+     }
+     DestroyWindow(window);
+diff --git a/runtime/test/xs_native_pso_test.cpp b/runtime/test/xs_native_pso_test.cpp
+index bfe9f0e75..559971bd6 100644
+--- a/runtime/test/xs_native_pso_test.cpp
++++ b/runtime/test/xs_native_pso_test.cpp
+@@ -15,6 +15,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ namespace {
+@@ -32,10 +33,8 @@ int g_failures = 0;
+ struct MockPipeline {
+     void** vtable;
+     long refs;
+-    GUID data_guid;
+-    std::vector<std::uint8_t> data;
+-    GUID interface_guid;
+-    IUnknown* object;
++    std::vector<std::pair<GUID, std::vector<std::uint8_t>>> data;  // per GUID, as ID3D12Object keeps it
++    std::vector<std::pair<GUID, IUnknown*>> interfaces;             // each held for the life of the test
+ };
+ 
+ unsigned g_odd_releases = 0;
+@@ -59,22 +58,25 @@ ULONG WINAPI pipe_release(MockPipeline* self) {
+     return --self->refs;
+ }
+ HRESULT WINAPI pipe_get_private_data(MockPipeline* self, const GUID* guid, UINT* size, void* data) {
+-    if (!IsEqualGUID(*guid, self->data_guid) || self->data.empty()) return DXGI_ERROR_NOT_FOUND;
+-    if (!data || *size < self->data.size()) return E_INVALIDARG;
+-    *size = static_cast<UINT>(self->data.size());
+-    std::memcpy(data, self->data.data(), self->data.size());
+-    return S_OK;
++    for (const auto& [key, bytes] : self->data) {
++        if (!IsEqualGUID(*guid, key)) continue;
++        if (!data || *size < bytes.size()) return E_INVALIDARG;
++        *size = static_cast<UINT>(bytes.size());
++        std::memcpy(data, bytes.data(), bytes.size());
++        return S_OK;
++    }
++    return DXGI_ERROR_NOT_FOUND;
+ }
+ HRESULT WINAPI pipe_set_private_data(MockPipeline* self, const GUID* guid, UINT size, const void* data) {
+-    self->data_guid = *guid;
+     const auto* bytes = static_cast<const std::uint8_t*>(data);
+-    self->data.assign(bytes, bytes + size);
++    for (auto& [key, value] : self->data)
++        if (IsEqualGUID(*guid, key)) return value.assign(bytes, bytes + size), S_OK;
++    self->data.emplace_back(*guid, std::vector<std::uint8_t>(bytes, bytes + size));
+     return S_OK;
+ }
+ HRESULT WINAPI pipe_set_private_interface(MockPipeline* self, const GUID* guid, IUnknown* object) {
+     if (object) object->AddRef();
+-    self->interface_guid = *guid;
+-    self->object = object;  // kept for the life of the test
++    self->interfaces.emplace_back(*guid, object);
+     return S_OK;
+ }
+ HRESULT WINAPI pipe_set_name(MockPipeline*, const wchar_t*) { return S_OK; }
+@@ -87,7 +89,7 @@ void* g_pipe_vtable[] = {reinterpret_cast<void*>(&pipe_qi),
+                          reinterpret_cast<void*>(&pipe_set_name)};
+ 
+ // The root signature slot 57 passes on: an IUnknown, since slot 86's kept stream holds a reference to it.
+-MockPipeline g_root_signature{g_pipe_vtable, 1, {}, {}, {}, nullptr};
++MockPipeline g_root_signature{g_pipe_vtable, 1};
+ 
+ // ---- Mock device: every pipeline must come through PC slot 47 (ID3D12Device2::CreatePipelineState) ----
+ 
+@@ -135,7 +137,7 @@ HRESULT hand_out(MockDevice* self, const IID* riid, void** out) {
+         std::memcpy(object, &vtable, sizeof(vtable));
+         *out = object;
+     } else {
+-        self->last_pipeline = new MockPipeline{g_pipe_vtable, 1, {}, {}, {}, nullptr};
++        self->last_pipeline = new MockPipeline{g_pipe_vtable, 1};
+         *out = self->last_pipeline;
+     }
+     return S_OK;
+@@ -230,6 +232,52 @@ HRESULT WINAPI dev_stream(MockDevice* self, const D3D12_PIPELINE_STATE_STREAM_DE
+     return hand_out(self, riid, out);
+ }
+ 
++// ---- Mock command list: records IASetPrimitiveTopology (PC slot 20) and SetPipelineState (PC slot 25) in order ----
++
++struct MockList {
++    void** vtable;
++    long refs;
++    std::vector<std::pair<unsigned, std::uint64_t>> calls;  // (PC slot, argument)
++};
++
++HRESULT WINAPI list_qi(MockList* self, const IID* riid, void** out) {
++    if (!out) return E_POINTER;
++    *out = nullptr;
++    if (!(IsEqualIID(*riid, __uuidof(IUnknown)) || IsEqualIID(*riid, __uuidof(ID3D12Object)) ||
++          IsEqualIID(*riid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(*riid, __uuidof(ID3D12CommandList)) ||
++          IsEqualIID(*riid, __uuidof(ID3D12GraphicsCommandList))))
++        return E_NOINTERFACE;
++    ++self->refs;
++    *out = self;
++    return S_OK;
++}
++ULONG WINAPI list_add_ref(MockList* self) { return ++self->refs; }
++ULONG WINAPI list_release(MockList* self) { return --self->refs; }
++std::uint64_t WINAPI list_other(MockList*) { return 0; }
++void WINAPI list_topology(MockList* self, std::uint64_t topology) { self->calls.emplace_back(20, topology); }
++void WINAPI list_pipeline(MockList* self, std::uint64_t pso) { self->calls.emplace_back(25, pso); }
++HRESULT WINAPI list_reset(MockList* self, std::uint64_t, std::uint64_t pso) {
++    self->calls.emplace_back(10, pso);
++    return S_OK;
++}
++
++void* g_list_vtable[64];
++MockList* g_last_list = nullptr;
++
++// PC ID3D12Device::CreateCommandList(node_mask, type, allocator, initial_state, riid, out).
++HRESULT WINAPI dev_create_list(MockDevice*, UINT, D3D12_COMMAND_LIST_TYPE, void*, void*, const IID* riid,
++                               void** out) {
++    for (void*& slot : g_list_vtable) slot = reinterpret_cast<void*>(&list_other);
++    g_list_vtable[0] = reinterpret_cast<void*>(&list_qi);
++    g_list_vtable[1] = reinterpret_cast<void*>(&list_add_ref);
++    g_list_vtable[2] = reinterpret_cast<void*>(&list_release);
++    g_list_vtable[10] = reinterpret_cast<void*>(&list_reset);
++    g_list_vtable[20] = reinterpret_cast<void*>(&list_topology);
++    g_list_vtable[25] = reinterpret_cast<void*>(&list_pipeline);
++    g_last_list = new MockList{g_list_vtable, 0, {}};
++    return list_qi(g_last_list, riid, out);
++}
++
+ void* g_dev_vtable[128];
+ 
+ MockDevice* new_device(bool device2 = true) {
+@@ -238,6 +286,7 @@ MockDevice* new_device(bool device2 = true) {
+     g_dev_vtable[1] = reinterpret_cast<void*>(&dev_add_ref);
+     g_dev_vtable[2] = reinterpret_cast<void*>(&dev_release);
+     g_dev_vtable[10] = reinterpret_cast<void*>(&dev_graphics);
++    g_dev_vtable[12] = reinterpret_cast<void*>(&dev_create_list);
+     g_dev_vtable[47] = reinterpret_cast<void*>(&dev_stream);
+     auto* d = new MockDevice{};
+     d->vtable = g_dev_vtable;
+@@ -458,6 +507,145 @@ void test_derive_from_slot57() {
+     EXPECT(mock->last.names.size() == 2 && mock->last.names[1] == "TEXCOORD" && mock->last.rt_count == 2);
+ }
+ 
++// ---- Rectangle lists (console IA topology 17) over slot-57 and slot-55 triangle pipelines ----
++
++void* console_proxy_over(MockDevice* mock) {
++    void* device = nullptr;
++    if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device,
++                                       true)))
++        return nullptr;
++    return device;
++}
++
++// A list thunk declares 14 argument words; the calls below pass all of them.
++using ListFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
++                                      std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
++                                      std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
++void list_call(void* list, unsigned slot, std::uint64_t a1, std::uint64_t a2 = 0) {
++    reinterpret_cast<ListFn>((*static_cast<void***>(list))[slot])(list, a1, a2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
++}
++void set_pipeline(void* list, const void* pso) { list_call(list, 25, reinterpret_cast<std::uint64_t>(pso)); }
++void set_topology(void* list, std::uint64_t topology) { list_call(list, 20, topology); }
++
++void* new_list(void* device) {
++    using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, const IID*,
++                                      void**);
++    const IID iid = __uuidof(ID3D12GraphicsCommandList);
++    void* list = nullptr;
++    const auto fn = reinterpret_cast<Fn>((*static_cast<void***>(device))[12]);
++    if (FAILED(static_cast<HRESULT>(static_cast<std::uint32_t>(
++            fn(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, &iid, &list)))))
++        return nullptr;
++    return list;
++}
++
++using Calls = std::vector<std::pair<unsigned, std::uint64_t>>;
++std::uint64_t word(const void* p) { return reinterpret_cast<std::uint64_t>(p); }
++
++bool holds(const MockPipeline* pso, const void* variant) {
++    for (const auto& [guid, object] : pso->interfaces)
++        if (object == variant) return true;
++    return false;
++}
++
++void test_rect_list_variant() {
++    fresh();
++    MockDevice* mock = new_device();
++    void* device = console_proxy_over(mock);
++    EXPECT(device != nullptr);
++    if (!device) return;
++    Desc d;
++    d.stage(0, kVs).stage(1, kPs);
++    void* triangles = nullptr;
++    EXPECT(call57(device, &d.desc, &kPipelineIid, &triangles) == S_OK && mock->stream_calls == 1);
++    EXPECT(mock->last.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
++    void* list = new_list(device);
++    EXPECT(list && g_last_list);
++    if (!list || !g_last_list) return;
++    MockList* real = g_last_list;
++
++    // A triangle list: the title's pipeline, and no variant is made.
++    set_pipeline(list, triangles);
++    set_topology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    EXPECT(mock->stream_calls == 1);
++    EXPECT((real->calls == Calls{{25, word(triangles)}, {20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST}}));
++
++    // Topology 17 with that pipeline bound: the variant is made now, from the kept stream with topology type 19,
++    // and bound before the topology reaches the real list.
++    real->calls.clear();
++    set_topology(list, 17);
++    EXPECT(mock->stream_calls == 2 && static_cast<std::uint32_t>(mock->last.topology) == 19);
++    EXPECT(mock->last.vs == kVsBytes && mock->last.ps == kPsBytes && mock->last.rt_count == 2);
++    const MockPipeline* variant = mock->last_pipeline;
++    EXPECT(variant != triangles && holds(static_cast<MockPipeline*>(triangles), variant) && variant->refs == 1);
++    EXPECT((real->calls == Calls{{25, word(variant)}, {20, 17}}));
++
++    // Bound again while topology 17 is set, and on a second list: the same variant, not made again.
++    real->calls.clear();
++    set_pipeline(list, triangles);
++    EXPECT((real->calls == Calls{{25, word(variant)}}));
++    void* second = new_list(device);
++    MockList* second_real = g_last_list;
++    set_topology(second, 17);  // nothing bound yet: nothing to change
++    set_pipeline(second, triangles);
++    EXPECT((second_real->calls == Calls{{20, 17}, {25, word(variant)}}));
++    EXPECT(mock->stream_calls == 2);
++
++    // Leaving topology 17 puts the title's pipeline back.
++    real->calls.clear();
++    set_topology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++    EXPECT((real->calls == Calls{{25, word(triangles)}, {20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP}}));
++
++    // Reset leaves the topology undefined: the pipeline it sets is bound as it is.
++    real->calls.clear();
++    set_topology(list, 17);
++    list_call(list, 10, 0, word(triangles));
++    set_pipeline(list, triangles);
++    EXPECT((real->calls == Calls{{25, word(variant)}, {20, 17}, {10, word(triangles)}, {25, word(triangles)}}));
++
++    // A pipeline slot 55 derives from it (#7759) has its own variant, from the derived stream.
++    std::vector<std::uint8_t> record(xs::kDerivedRecordSize, 0);
++    put32(record, 0, 3);  // tag 3: sample mask
++    put32(record, xs::kDerivedRecordPayload, 0x0f);
++    void* derived = nullptr;
++    using Fn55 = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, const void*, const IID*, void**);
++    const auto fn55 = reinterpret_cast<Fn55>((*static_cast<void***>(device))[55]);
++    EXPECT(static_cast<HRESULT>(static_cast<std::uint32_t>(
++               fn55(device, triangles, 1, record.data(), &kPipelineIid, &derived))) == S_OK);
++    EXPECT(derived && mock->stream_calls == 3 && static_cast<std::uint32_t>(mock->last.topology) == 3);
++    real->calls.clear();
++    set_topology(list, 17);
++    set_pipeline(list, derived);
++    EXPECT(mock->stream_calls == 4 && static_cast<std::uint32_t>(mock->last.topology) == 19 &&
++           mock->last.sample_mask == 0x0f);
++    const MockPipeline* derived_variant = mock->last_pipeline;
++    EXPECT(derived_variant != variant && holds(static_cast<MockPipeline*>(derived), derived_variant));
++    EXPECT((real->calls == Calls{{25, word(variant)}, {20, 17}, {25, word(derived_variant)}}));
++
++    // A device that refuses the variant (the layer refuses a vertex stage that writes ClipDistance, say): the
++    // triangle pipeline stays bound, and the attempt is not repeated.
++    void* refused = nullptr;
++    EXPECT(call57(device, &d.desc, &kPipelineIid, &refused) == S_OK && mock->stream_calls == 5);
++    mock->result = E_NOTIMPL;
++    real->calls.clear();
++    set_pipeline(list, refused);
++    EXPECT(mock->stream_calls == 6 && (real->calls == Calls{{25, word(refused)}}));
++    mock->result = S_OK;
++    set_pipeline(list, refused);
++    set_pipeline(second, refused);
++    EXPECT(mock->stream_calls == 6 && real->calls.back() == std::make_pair(25u, word(refused)) &&
++           second_real->calls.back() == std::make_pair(25u, word(refused)));
++
++    // A line pipeline is not a rectangle list's: no variant is asked for.
++    Desc lines;
++    lines.stage(0, kVs).stage(1, kPs);
++    lines.b[0x26] = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
++    void* line_pso = nullptr;
++    EXPECT(call57(device, &lines.desc, &kPipelineIid, &line_pso) == S_OK && mock->stream_calls == 7);
++    set_pipeline(list, line_pso);
++    EXPECT(mock->stream_calls == 7 && real->calls.back() == std::make_pair(25u, word(line_pso)));
++}
++
+ void test_unresolved() {
+     fresh();
+     MockDevice* mock = new_device();
+@@ -551,6 +739,7 @@ int main() {
+     test_container_read_once();
+     test_mesh();
+     test_derive_from_slot57();
++    test_rect_list_variant();
+     test_unresolved();
+     test_arguments_and_results();
+     test_directory();
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index aa890fcd7..939d2263f 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -743,6 +743,9 @@ int check_levels() {
+ 
+         // 133: past every PC device vtable; the retail title calls it. Refused, not a jump through a missing entry.
+         EXPECT(hr_of(raw(device, 133)) == E_NOTIMPL && mock->calls[127] == 0);
++        // LOCAL CHECK (claude-worker f4fe-fu, not upstream): 134 is past every PC device vtable and not handled by
++        // the proxy. Refused, not a jump through a missing entry.
++        EXPECT(hr_of(raw(device, 134)) == E_NOTIMPL && mock->calls[127] == 0);
+ 
+         // 133 with a handler (CreatePlacedResourceX): the arguments in the title's positions (va, desc, state,
+         // clear, riid, out) reach the handler with the real device, the Xbox flag bits masked to the PC ones the host
+@@ -1717,18 +1720,28 @@ int check_xbox_slots() {
+     EXPECT(hr_of(raw(device, 73, word(&desc), 0, 0, word(&list_iid), word(&list))) == E_INVALIDARG);
+     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), 0)) == E_POINTER);
+ 
+-    // 61 CreateSamplerX(desc, dest): the PC CreateSampler (slot 22) gets the same two words, not the PC slot 61
+-    // (CreateMetaCommand). A null description is skipped without reaching the device.
++    // 61 is CreateSamplerX(desc, dest) for the title and the PC CreateMetaCommand for a host caller. With no
++    // console-caller check installed (a host program like this one), the call is the PC slot 61.
+     D3D12_SAMPLER_DESC sampler{};
+     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+     sampler.MaxLOD = D3D12_FLOAT32_MAX;
+     const std::uint64_t sampler_handle = 0x7ff012340040ull;
+     raw(device, 61, word(&sampler), sampler_handle);
+-    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 1);
++    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 0 && xs::device_slot_hits(61) == 1);
++    // A caller the check calls the title's (here every one): the PC CreateSampler (slot 22) gets the same two words,
++    // not the PC slot 61. A null description is skipped without reaching the device.
++    xs::set_console_caller([](std::uint64_t) { return true; });
++    raw(device, 61, word(&sampler), sampler_handle);
++    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
+     EXPECT(mock->args[22][0] == word(&sampler) && mock->args[22][1] == sampler_handle);
+     raw(device, 61, 0, sampler_handle);
+-    EXPECT(mock->calls[61] == 0 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
++    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 3);
++    // A caller outside the title's images is a host one again.
++    xs::set_console_caller([](std::uint64_t) { return false; });
++    raw(device, 61, word(&sampler), sampler_handle);
++    EXPECT(mock->calls[61] == 2 && mock->calls[22] == 1);
++    xs::set_console_caller(nullptr);
+ 
+     // 41 CreateCommandSignature: a console argument of type 105 reaches the PC slot 41 as DISPATCH, in a copy of the
+     // description (stride, count, the root argument before it and the root signature kept). A PC description is
+@@ -1843,6 +1856,12 @@ int check_xbox_slots() {
+     EXPECT(mock->array[68][3] == ((static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR) << 32) |
+                                   static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)));
+ 
++    // A count with a null descriptor array is refused with {UINT64_MAX, 0} and never reaches PC slot 68.
++    D3D12_RESOURCE_ALLOCATION_INFO null_ret{};
++    EXPECT(call_slot108_c_abi(&null_ret, device, 1, 2, nullptr, nullptr) == &null_ret);
++    EXPECT(null_ret.SizeInBytes == UINT64_MAX && null_ret.Alignment == 0);
++    EXPECT(mock->calls[68] == 3 && xs::device_slot_hits(108) == 4);
++
+     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
+     EXPECT(release(queue) == 0);
+     EXPECT(release(device) == 0 && mock->refs == 0);
+@@ -2427,6 +2446,18 @@ int check_descriptor_heap_hooks() {
+     EXPECT(real->args[21][2] == kMockHeapCpuStart + off7);
+     raw(device, 22, 0x55, kCustomBase + off3);                                          // CreateSampler
+     EXPECT(real->args[22][1] == kMockHeapCpuStart + off3);
++    // LOCAL CHECK (claude-worker f4fe-fu, not upstream): a guest-marked slot-61 CreateSamplerX with a hook-backed
++    // destination reaches the PC CreateSampler with the translated handle (#7021 translation under the #7115 v2
++    // caller classifier).
++    D3D12_SAMPLER_DESC sampler61{};
++    sampler61.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
++    sampler61.AddressU = sampler61.AddressV = sampler61.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    const unsigned sampler_calls = real->calls[22];
++    xs::set_console_caller([](std::uint64_t) { return true; });
++    raw(device, 61, word(&sampler61), kCustomBase + off7);
++    xs::set_console_caller(nullptr);
++    EXPECT(real->calls[61] == 0 && real->calls[22] == sampler_calls + 1);
++    EXPECT(real->args[22][0] == word(&sampler61) && real->args[22][1] == kMockHeapCpuStart + off7);
+     raw(device, 24, 1, kCustomBase + off7, kCustomBase + off3, 0);                      // CopyDescriptorsSimple
+     EXPECT(real->args[24][1] == kMockHeapCpuStart + off7);
+     EXPECT(real->args[24][2] == kMockHeapCpuStart + off3);
+diff --git a/scripts/run_wine_session.sh b/scripts/run_wine_session.sh
+old mode 100755
+new mode 100644
+diff --git a/tools/conformance/native/scripts/failure-log.cmd b/tools/conformance/native/scripts/failure-log.cmd
+old mode 100755
+new mode 100644

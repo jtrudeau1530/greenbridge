@@ -1,0 +1,91 @@
+{
+  "id": "claude--logs--c3j-7330-efc347830--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 11,
+    "failed": 1
+  },
+  "cases": [
+    {
+      "test": "xs_proxy_mock_no_handler",
+      "number": 30,
+      "status": "passed",
+      "seconds": 1.0
+    },
+    {
+      "test": "xs_proxy_mock_no_protect",
+      "number": 29,
+      "status": "passed",
+      "seconds": 1.0
+    },
+    {
+      "test": "xs_proxy_mock_env_slots",
+      "number": 31,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_invalid",
+      "number": 32,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_70",
+      "number": 33,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "d3d12_execute_indirect_validation",
+      "number": 189,
+      "status": "passed",
+      "seconds": 0.06
+    },
+    {
+      "test": "d3d12_com",
+      "number": 139,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "d3d12_mesh",
+      "number": 246,
+      "status": "failed",
+      "seconds": 0.06
+    },
+    {
+      "test": "run_tiny_frame",
+      "number": 250,
+      "status": "passed",
+      "seconds": 0.2
+    },
+    {
+      "test": "run_tiny_frame_queue_test_settings",
+      "number": 251,
+      "status": "passed",
+      "seconds": 0.19
+    },
+    {
+      "test": "xs_proxy_mock_no_reserve",
+      "number": 28,
+      "status": "passed",
+      "seconds": 5.34
+    },
+    {
+      "test": "xs_proxy_mock",
+      "number": 27,
+      "status": "passed",
+      "seconds": 5.47
+    }
+  ],
+  "summary_lines": [
+    "92% tests passed, 1 tests failed out of 12"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

@@ -1,0 +1,11 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+done: independent Linux/Wine validation of #6919 at `36936f3`, claimed here: https://github.com/ItsNotRexed/Leonida/issues/7231#issuecomment-7106945207 . Results: https://github.com/ItsNotRexed/Leonida/pull/6919#issuecomment-7107123811 . Clean main and main + PR pass all five targeted tests; XMem checks increase 116 to 173, unresolved imports decrease 29 to 22, and init succeeds. Bounded startup still stops before XMem.
+
+finding: `runtime/shims/library_loader.cpp:75` host-module cache lookup is the first retail startup failure on this clang-cl 23.1.6 / Wine 11.18 setup, on both main `8575d36` and main + #6919. Matching PDB identifies `host_module_name`'s map lookup. No `xmem_attributes` event precedes it. This blocks validation of later allocation behavior; reproducing the retail path needs local game files, but no particular GPU. No raw game data is shared.
+
+This appears related to closed #7074 and RT-488, whose ownership the coordinator just reaffirmed. @denisturcanu84, does your RT-488 work cover the lazy statics in `library_loader.cpp` as well as the registry? We are testing the existing TLS fix #4313 locally; we have not started a competing production fix. #7009 and #4861 also touch this cache, so any implementation needs coordination with those changes.
+
+AI-assisted.

@@ -1,0 +1,794 @@
+diff --git a/docs/design.md b/docs/design.md
+index d0b67d8b8..a99922692 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -389,7 +389,7 @@ How the generated SPIR-V expects the runtime to work:
+ | Full-corpus pipeline build | `vk_pipeline_check <spirv dir> pipeline_cache.bin --jobs 4` on an RTX 4060 Ti (NVIDIA 595 driver): **all 26,503 shaders become real pipelines, 0 failures** (cs 2,689, ps 12,101, ms 9,282, vs 2,236, gs 195; graphics stages with generated stub partners). Compile time 40,784 s of CPU (2.84 h wall on 4 threads): cs 23,633 s (mean 8.8 s; the ray-tracing ScreenProbes/RTShadowTrace shaders take 2-19 min each), ps 11,481 s, ms 5,395 s, vs 275 s. The resulting `VkPipelineCache` is 3.81 GB; seeding a run with it makes those pipelines instant, which is what a fast first boot needs. The cache is per driver and GPU, and a shader whose SPIR-V changes compiles again (the checker resumes from the file). Neither register storage (one variable per register) nor smaller SPIR-V cut NVIDIA compile time: the big ray-tracing shaders are expensive as such, so the runtime should compile them in the background rather than block on them. |
+ | `v_cndmask_b32` source modifiers | `v_cndmask_b32` only moves bits, so a VOP3 `abs` on `src0`/`src1` clears bit 31 and `neg` flips it (`abs` first) as plain bit moves (`OpBitwiseAnd 0x7FFFFFFF`, then `OpBitwiseXor 0x80000000`, `Gen.src_u_sign_mods`), never `FAbs`/`OpFNegate`: a signalling NaN stays signalling and a denormal isn't flushed. Until 2026-11-23 the sources went through `Gen.modify`, and the mini interpreter quieted them (`-v1` of `0x7F800001` gave `0xFFC00001`, not `0xFF800001`). **Not measured on hardware for this instruction**: the rule follows the same VOP3 input modifiers measured as sign-bit moves on `v_cmp_class_f32` (gfx1036, all four IEEE/denorm modes, row "Floating-point class compare" above), and LLVM's AMDGPU backend moves `fneg`/`fabs` through a select into `v_cndmask_b32_e64`'s source modifiers (`AMDGPUTargetLowering::foldFreeOpFromSelect`), which is only exact if they are sign-bit moves. Checked on the CPU and with `spirv-val` by `tests/semantic/test_cndmask_sign_mods.py` (15 words including signalling/quiet NaNs, denormals, zeros and infinities x `v`, `-v`, `\|v\|`, `-\|v\|` x both operands). |
+ | Wave-uniform branches | VCC and EXEC are wave-wide registers, but one invocation holds only its own lane's bit. `s_cbranch_vccz/vccnz/execz/execnz` therefore reduce the condition across the subgroup (`OpGroupNonUniformAny`), so the whole wave takes the branch together, as on hardware. Before this, each lane decided alone. A lane could skip scalar instructions that the hardware wave executes (its SGPRs went stale for later code), and cross-lane ops or barriers inside the block saw a split wave. `v_cmp`/`v_cmp_class`/64-bit compares now write 0 for inactive lanes (hardware VOPC behaviour), so the reduction sees the true mask. GPU-checked with `runtime/test/shaders/ps_uniform_branch.asm`: lanes whose own VCC bit is 0 run the block's scalar add when their wave has any set bit. `s_cbranch_scc0/1` stay per lane; SCC is uniform as long as the SGPRs feeding it are. |
+-| Compute shaders | FSSM header word **0x138 = `COMPUTE_PGM_RSRC2`**: USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7], TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11], LDS_SIZE [23:15] in 512-byte units. Words **0x13C/0x140/0x144 = thread-group size**. Counted over all 2,689 CS listings of 1.0.2.1 by the SGPRs each reads before writing (operand roles from `shader_meta._split_operands`, over the code `translate()` keeps; in wave64 code a lane mask printed as one SGPR covers the pair; an earlier check gave 2,281 exact): 2,540 read nothing past the user SGPRs and enabled TGIDs (2,193 up to the last of them, 342 fewer, 5 none), and the other 149 overshoot only through loop-carried registers in the straight-line check: every extra read follows a branch, and the register is written later in program order. Followed through the CFG (written on every path before the read), 22 still overshoot; each extra register is written on some other path (only loop-carried ones in 15), so these are values undefined on some path, not a missing input. Read raw, 268 overshoot: the other 119 are listings with embedded data words, decoded as instructions. 0x110, which looked similar, doesn't match. Layout: s0..user−1 = user data (push constants), then the enabled workgroup IDs (`WorkgroupId`), and v0/v1/v2 = thread ID x/y/z (`LocalInvocationId`, separate VGPRs on GFX10). Example: the 1,013 shaders with RSRC2 `0x998` have 12 user SGPRs, group ID x/y in s12/s13, and compute x = s12·32 + v0. Shaders with TG_SIZE_EN are rejected for now. GPU-checked with `runtime/test/shaders/cs_lds.asm` through `runtime/test/vk_compute_test.cpp`: 4 groups × 64 threads, LDS exchange between the two waves of a group behind `s_barrier`, store through a V# into the device-address heap, 0 mismatches. |
++| Compute shaders | FSSM header word **0x138 = `COMPUTE_PGM_RSRC2`**: USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7], TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11], LDS_SIZE [23:15] in 512-byte units. Words **0x13C/0x140/0x144 = thread-group size**. Counted over all 2,689 CS listings of 1.0.2.1 by the SGPRs each reads before writing (operand roles from `shader_meta._split_operands`, over the code `translate()` keeps; in wave64 code a lane mask printed as one SGPR covers the pair; an earlier check gave 2,281 exact): 2,540 read nothing past the user SGPRs and enabled TGIDs (2,193 up to the last of them, 342 fewer, 5 none), and the other 149 overshoot only through loop-carried registers in the straight-line check: every extra read follows a branch, and the register is written later in program order. Followed through the CFG (written on every path before the read), 22 still overshoot; each extra register is written on some other path (only loop-carried ones in 15), so these are values undefined on some path, not a missing input. Read raw, 268 overshoot: the other 119 are listings with embedded data words, decoded as instructions. 0x110, which looked similar, doesn't match. Layout: s0..user−1 = user data (push constants), then the enabled workgroup IDs (`WorkgroupId`), and v0/v1/v2 = thread ID x/y/z (`LocalInvocationId`, separate VGPRs on GFX10). Example: the 1,013 shaders with RSRC2 `0x998` have 12 user SGPRs, group ID x/y in s12/s13, and compute x = s12·32 + v0. With TG_SIZE_EN (none of the 2,689; 91 compute programs of the pipeline library, [shader_library.md](shader_library.md)) the next SGPR is the thread-group word, which the prologue writes: the number of waves in the group in bits [5:0] and this wave's index in it in bits [11:6], the wave index again in bits [24:20] and bit 31 set in the group's first wave (measured on gfx1036 through `tools/hw_oracle`, #6446: wave32 x 128 threads gives `80000004 00100044 00200084 003000c4`; one library program reads [24:20]; not measured on gfx1013) (Mesa `ac_nir_lower_intrinsics_to_args.c`, GFX6-10: `load_num_subgroups` and `load_subgroup_id` read those fields, and a wave64 compute shader's local invocation index is `mbcnt(~0, tg_size & 0xfc0)`; the library programs read it as `s_and_b32 sN, sTG, 0xfc0`, most of them then `v_mbcnt_lo_u32_b32`). Thread i is in wave i / W, as for `s_get_waveid_in_workgroup`. CPU-checked by `tests/semantic/test_cs_tg_size.py`, including the gfx1036 words. GPU-checked with `runtime/test/shaders/cs_lds.asm` through `runtime/test/vk_compute_test.cpp`: 4 groups × 64 threads, LDS exchange between the two waves of a group behind `s_barrier`, store through a V# into the device-address heap, 0 mismatches. |
+ | Signed-byte dot products | `v_dot4_i32_i8 D, S0, S1, S2` (VOP3P) is S2 plus the sum of the four products of the sign-extended bytes of S0 and S1, modulo 2^32; `v_dot4c_i32_i8 D, S0, S1` (VOP2) adds the same sum to D. Emitted as four pairs of `OpBitFieldSExtract`, `OpIMul` and `OpIAdd`. **Confirmed on RDNA2 hardware** (gfx1036, raw kernels through `tools/hw_oracle`): 10 operand sets, both instructions and both source orders of the accumulating one, with sign-mixed bytes and sums that wrap; the measured words are the table in `tests/semantic/test_alu_dot4_i8.py`. `clamp` and `op_sel`/`op_sel_hi` are translated and checked against the same `gfx1036` hardware table: `clamp` saturates `v_dot4_i32_i8` to signed 32-bit `[-2^31, 2^31-1]` (both overflowing sets), and `op_sel`/`op_sel_hi` pick the 16-bit half of S0/S1 for byte pairs 0..1 and 2..3 (e.g. `op_sel` 2 / `op_sel_hi` 5 exchanges the 16-bit halves of S1, matching all 5 measured sets — the form of the 89 words `llvm-mc` does not decode, [fspx.md](fspx.md)); non-default S2 half selection stays refused. `neg_lo`/`neg_hi`, which `llvm-mc` accepts on `v_dot4_i32_i8` only, are not ignored (`neg_lo` flips bit 15 and `neg_hi` bit 31 of S0 or S1, and on S2 `neg_hi` clears bit 31 before `neg_lo` flips it; 5 sets under 8 forms, 45 words): any set bit stays Unsupported, while an all-zero field is the plain instruction. Counts: the 29 FSPX programs use the pair 27,271 times (`v_dot4c_i32_i8` 25,813, `v_dot4_i32_i8` 1,458), all in 13 programs; none of the game's own 26,503 shaders has either encoding (0 of the 12,791 words `llvm-mc` cannot decode there with gfx1013). |
+ | Workgroup barriers | `s_barrier` (cs/ms) is one `OpControlBarrier` (workgroup scope, workgroup memory). On RDNA every `s_barrier` counts against the same workgroup barrier and a wave that has ended no longer counts, while Vulkan requires a barrier to be reached by every invocation in uniform control flow. Under `--wave64-emulate` the round loop keeps a single barrier at the top level, so this holds. **Native wave32 compute shaders run in barrier rounds** when an `s_barrier` sits anywhere but a top-level block of the structured tree (one every invocation runs): under a guard, in a loop, or in the dispatch loop (`needs_barrier_rounds`, `bar_scheduler`). That is the emulated loop without its cross-lane part: `s_barrier` ends a segment, each invocation runs its blocks until its next `s_barrier` or the end, then the whole workgroup meets at one `OpControlBarrier` (the same workgroup/acquire-release/workgroup-memory semantics) at the end of the round. A wave that is done no longer holds the others, and a per-round count of the invocations not done (three `Workgroup` words, by round mod 3) ends the loop. A wave that is done no longer holds the others, and a per-round count of the invocations not done (three `Workgroup` words, by round mod 3, or a borrowed LDS word with a large LDS: "Barrier-round count in LDS (SHADER-579)") ends the loop. Cross-lane operations stay subgroup operations, as in the dispatch loop, since a wave's lanes run the same segment. A barrier in a top-level block keeps the single `OpControlBarrier` in place. In the 1.0.2.1 corpus 43 of the 55 wave32 cs shaders with `s_barrier` have one nested (SHADER-91's count), so those 43 now run in rounds. Why: an Intel GPU does not survive the nested form. `cs_barrier_divergent.asm` (two barrier sites in different branches), `cs_barrier_early_end.asm` (the other waves end without a barrier) and `cs_barrier_loop.asm` (a barrier in a loop whose trip count differs per wave) each lose the device (`vkQueueWaitIdle` → `VK_ERROR_DEVICE_LOST`) on an Intel Arrow Lake Xe-LPG iGPU (Windows 32.0.101.8132), and `cs_barrier_divergent` hangs or writes nothing on a UHD 770 (101.6129, #634). With barrier rounds all three pass there and on an RTX 5070 Ti Laptop (617.42). NVIDIA passed them before too (RTX 4070 Ti on 610.88 and 621.24, RTX 5090 on Linux 595.99, RTX 5070 Ti). **Still not proven on the native wave64 path** (wave64 cs and every ms, run natively only on AMD's 64-wide subgroups): there the barrier stays where `s_barrier` is, inside a selection or loop construct in every ms and most wave64 cs shaders of the corpus. Branches are scalar, so whole waves take the same path, and RDNA's own barrier counts the way the shader expects. |
+ | Barrier-round count in LDS (SHADER-579) | Barrier rounds (see "Workgroup barriers") count the invocations not done in `%x_buf`, three `Workgroup` dwords (#930). On a full 32 KiB LDS that made 32,780 B, 12 bytes over the 32,768 B `maxComputeSharedMemorySize` of the AMD Windows (RX 9070 XT) and Intel (UHD 770) drivers, so the runtime refused those pipelines (2 native wave32 cs in towade's 1.0.2.1 corpus, [finding](https://github.com/ItsNotRexed/Leonida/pull/1882#issuecomment-7084298032)). Rule (`bar_counts_in_lds`): when the shader uses its LDS and the LDS array plus 12 bytes is over 16,384 B (the Vulkan minimum limit, so in practice an array of 16, 32 or 64 KiB), there is no `%x_buf`. The count borrows LDS word 0 at the end of each round (`bar_scheduler_tail`): after the round's barrier every invocation is done or waits at `s_barrier`, so no shader code runs; invocation 0 saves the word in a Function variable and clears it, barrier, every invocation not done adds 1 atomically, barrier, all read the count, barrier, invocation 0 stores the saved word back, barrier. The shader sees its LDS bit for bit as before, and the four extra barriers sit where the whole workgroup already waits, so `s_barrier`'s semantics are unchanged; the cost is four more `OpControlBarrier`s per round in those shaders only. Below the threshold `%x_buf` stays (12 bytes fit every device) with one barrier per round; a shader that never touches its LDS also keeps it (no array to borrow from, 12 B in all). A 32 KiB LDS is now exactly 32,768 B and a 64 KiB one 65,536 B (before: 65,548 B, refused or shrunk to its allocation). Not chosen: putting the count in LDS the shader never touches (unprovable with dynamic addresses), or deciding per device (the translator runs offline). Pinned by `tests/semantic/test_cs_barrier_counts_lds.py` (Workgroup bytes from the emitted SPIR-V and `lds_bytes` for 32 KiB, 64 KiB and small LDS, under a 32 KiB `--max-shared-memory`; ring shifts across 10 barriers that read word 0 and an early-ending wave in the workgroup interpreter, whose LDS starts as 0xDEADBEEF, in both wave orders). Confirmed by those CPU tests only; GPU runs on the 32 KiB devices are pending. |
+@@ -432,7 +432,7 @@ How the generated SPIR-V expects the runtime to work:
+ | `s_bfe_u32` / `s_bfe_i32` past bit 31 | offset = S1[4:0], width = S1[22:16] (7 bits; S1 bits 23 to 31 are ignored). When offset + width > 32 the field stops at bit 31: width = min(width, 32 - offset), and `s_bfe_i32` sign-extends from the top bit that exists. Example: `s_bfe_i32 s4, 0xd2f90159, 0x7f001c` gives `0xfffffffd` (4-bit field `0xd`), not `0xd`. SCC = D ≠ 0. Source: measured on gfx1150 (Radeon 880M) with `tools/salu_diff.py --oracle hw`, 4000 random control words, all bit-exact, on gfx1201 (Radeon RX 9070, RDNA4) with 10,000 `salu_diff --oracle hw` programs, 0 mismatches (seed 500 with `--bfe-any`), and **on RDNA2** (AMD Radeon 680M, `gfx1035`: `tools/salu_diff.py --oracle hw,translator --bfe-any --programs 500 --seed 1`, 500/500 match, plus `tools/int_hw_probe.py --oracle both` wave32 and wave64, SHADER-137; and RDNA2 `gfx1036`, Windows 11, driver 26.10.1, `tools/hw_oracle` HIP launcher: `tools/salu_diff.py --oracle translator,hw --bfe-any --ops s_bfe_u32,s_bfe_i32 --programs 2000` with seeds 1, 2 and 3, 6,000 of 6,000 programs pass on both sides, plus seed 4 over every opcode with `--bfe-any`, 2,000 of 2,000, and `int_hw_probe.py`'s `salu_bfe_past31` cases in wave32 and wave64); the translator (`bfe_width`) already did this. `tools/salu_diff.py --oracle hw,translator --bfe-any --programs 500 --seed 1`, 500/500 match, plus `tools/int_hw_probe.py --oracle both` wave32 and wave64, SHADER-137); the translator (`bfe_width`) already did this. Source: measured on gfx1150 (Radeon 880M) with `tools/salu_diff.py --oracle hw`, 4000 random control words, all bit-exact, and on gfx1201 (Radeon RX 9070, RDNA4) with 10,000 `salu_diff --oracle hw` programs, 0 mismatches (seed 500 with `--bfe-any`); the translator (`bfe_width`) already did this. LLVM's v_bfe fold (`constantFoldBFE`) is analogous but has a 5-bit width. **RDNA2 is not measured**; the ISA pseudocode does not say. |
+ | 64-bit scalar data ops (`s_brev_b64`, `s_bfe_u64`/`s_bfe_i64`, `s_bitset0_b64`/`s_bitset1_b64`, `s_flbit_i32_b64`/`s_flbit_i32_i64`) | The SGPR pair is 64-bit data, as for `s_lshl_b64`; a pair that `lane_masks.py` marks as a lane mask (or EXEC) stays `Unsupported` (#210). `s_brev_b64`: D.lo = reverse(S0.hi), D.hi = reverse(S0.lo). `s_bfe_*64`: offset = S1[5:0], width = S1[22:16]; width 0 gives 0; a field past bit 63 stops there (the 64-bit form of the `s_bfe_u32` rule, LLVM `constantFoldBFE`); SCC = D ≠ 0. `s_bitset*_b64`: bit S0 & 63 of the pair cleared / set. `s_flbit_i32_b64`: zeros above the top 1 from bit 63, −1 for 0; `s_flbit_i32_i64`: the same of ~S0 when S0 < 0, −1 for 0 and −1. None but `s_bfe` writes SCC. Source: RDNA2 ISA SOP1/SOP2. CPU-checked by `tests/semantic/test_salu_brev_b64.py`, `test_salu_bfe_64.py`, `test_salu_bitset_b64.py`, `test_salu_flbit_64.py` (#723, #726, #729, #733). **Hardware-verified** on an AMD Radeon RX 7900 XTX (gfx1100, Windows 11, driver 26.10.1), one raw wave32 kernel per op through `tools/hw_oracle`: `s_brev_b64` of 0x12345678_0000000F has low word 0x1E6A2C48, `s_bfe_u64(0x00000123_45678000, w16 o28)` = 0x1234, `s_bfe_i64(0x00000001_80000000, w2 o31)` has 0xFFFFFFFF in both words, `s_bitset1_b64(0, 40)` has high word 0x100, `s_flbit_i32_b64(0x00010000)` = 47 and `s_flbit_i32_i64(0xFFFFFFFF_FFFF0000)` = 48. These are the words `runtime/test/shaders/cs_w32_salu64.asm` expects. Also **hardware-verified on RDNA2** (`gfx1035`, wave32 and wave64 via `tools/int_hw_probe.py --oracle both`, SHADER-137). |
+ | `v_bfe_u32` / `v_bfe_i32` past bit 31 | offset = S1[4:0] and width = S2[4:0]: the bits above are ignored, so an offset of 36 reads as 4 and a width of 32 as 0 (a width of 0 gives 0). When offset + width > 32 the field stops at bit 31, as for `s_bfe`: width = min(width, 32 - offset), and `v_bfe_i32` sign-extends from bit 31. Example: `v_bfe_i32` of `0xd2f90159` with offset 28 and width 16 gives `0xfffffffd` (4-bit field `0xd`), not `0xd`, and `0x80000000` with offset 31 and width 4 gives `0xffffffff`. The translator (`bfe_width` for VGPR or SGPR offset and width, the same cut folded at translation time for constants) already did this. Source: **measured on RDNA2**, AMD Radeon 610M (`gfx1036`, Windows 11, AMD driver 32.0.11016.14003), wave32 and wave64 identical, 16 words over VGPR, inline-constant and literal operands: `tools/int_hw_probe.py --oracle both --group valu_bfe_past31`, 4/4 cases match the translator. The words are pinned on the CPU by `tests/test_int_hw_probe.py` (`ValuBfeMeasuredOnRdna2`). |
+-| `s_quadmask_b32`/`_b64`, `s_bitreplicate_b64_b32` | On scalar data (RDNA2 ISA SOP1): `s_quadmask_b32` sets D[i] to the OR of S0[4i+3:4i] for the 8 quads, `s_quadmask_b64` does the same for the 16 quads of the 64-bit S0 (D[63:16] = 0), and both set SCC = D != 0. `s_bitreplicate_b64_b32` copies each bit S0[i] to D[2i] and D[2i+1] and leaves SCC. Built from fixed shift/mask steps, with no loop. A lane-mask source (EXEC, VCC or an SGPR that `holds_lane_mask`) or an EXEC/VCC destination raises `Unsupported`: each invocation holds only its own lane's bit, and these ops read the other lanes of a quad or move bits between lanes. Until 2026-11-22 all three were rejected. CPU-checked by `tests/semantic/test_salu_quadmask_bitreplicate.py` (fixed and seeded values, SCC written or kept, immediates, aliasing, lane masks rejected). **Hardware-verified** on an AMD Radeon RX 7900 XTX (gfx1100, Windows 11, driver 26.10.1) through `tools/hw_oracle`, one raw wave32 kernel per op: `s_quadmask_b32(0xF)` = 1 with SCC 1, `(0xF0000000)` = 0x80, `(0x0F0F0F0F)` = 0x55 (the set quads are 0, 2, 4 and 6), `(0)` = 0 with SCC 0; `s_quadmask_b64` of 0xF = 1 and of 0xF0000000_00000000 (quad 15, bits 60..63) = 0x8000 in the low word with D[63:16] = 0; `s_bitreplicate_b64_b32` of 5 = 0x33 and of 0x80000000 = 0xC0000000_00000000, with SCC left as it was. **GPU-checked** by `runtime/test/shaders/cs_w32_new_ops.asm` (`s_quadmask_b32(0x01020408)` = 0x55, `s_quadmask_b64(0x80000000_00000001)` low word 0x8001, `s_bitreplicate_b64_b32(0x80000001)` high word 0xC0000000, with the expected words from the ISA pseudocode), exact on the Radeon iGPU of a Ryzen 9 9950X3D (RDNA2, `gfx1036`, driver 26.10.1) and an RTX 5080 (driver 616.92). **Not GPU-verified.** |
++| `s_quadmask_b32`/`_b64`, `s_bitreplicate_b64_b32` | On scalar data (RDNA2 ISA SOP1): `s_quadmask_b32` sets D[i] to the OR of S0[4i+3:4i] for the 8 quads, `s_quadmask_b64` does the same for the 16 quads of the 64-bit S0 (D[63:16] = 0), and both set SCC = D != 0. `s_bitreplicate_b64_b32` copies each bit S0[i] to D[2i] and D[2i+1] and leaves SCC. Built from fixed shift/mask steps, with no loop. For a scalar source and a full EXEC destination, `s_bitreplicate_b64_b32` takes bit `lane // 2` as the lane's new mask bit. `tests/semantic/test_salu_b32_lane_masks.py` checks all 64 lane results and the unchanged SCC. Lane-mask sources and other EXEC/VCC destinations remain unsupported. Until 2026-11-22 all three were rejected. CPU-checked by `tests/semantic/test_salu_quadmask_bitreplicate.py` (fixed and seeded values, SCC written or kept, immediates, aliasing, lane masks rejected). **Hardware-verified** on an AMD Radeon RX 7900 XTX (gfx1100, Windows 11, driver 26.10.1) through `tools/hw_oracle`, one raw wave32 kernel per op: `s_quadmask_b32(0xF)` = 1 with SCC 1, `(0xF0000000)` = 0x80, `(0x0F0F0F0F)` = 0x55 (the set quads are 0, 2, 4 and 6), `(0)` = 0 with SCC 0; `s_quadmask_b64` of 0xF = 1 and of 0xF0000000_00000000 (quad 15, bits 60..63) = 0x8000 in the low word with D[63:16] = 0; `s_bitreplicate_b64_b32` of 5 = 0x33 and of 0x80000000 = 0xC0000000_00000000, with SCC left as it was. **GPU-checked** by `runtime/test/shaders/cs_w32_new_ops.asm` (`s_quadmask_b32(0x01020408)` = 0x55, `s_quadmask_b64(0x80000000_00000001)` low word 0x8001, `s_bitreplicate_b64_b32(0x80000001)` high word 0xC0000000, with the expected words from the ISA pseudocode), exact on the Radeon iGPU of a Ryzen 9 9950X3D (RDNA2, `gfx1036`, driver 26.10.1) and an RTX 5080 (driver 616.92). **Not GPU-verified.** |
+ | 64-bit scalar bitwise ops (`s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64`, `s_orn2_b64`, `s_nand_b64`, `s_nor_b64`, `s_xnor_b64`, `s_not_b64`) | Dispatched like `s_cselect_b64`: when destination is `exec`/`vcc` or any source is a lane mask (`holds_lane_mask` or `exec`/`vcc`), uses the per-lane mask path (`mask_src`/`mask_dst` including `null` dst) and votes SCC across the wave (`scc_from_mask`). Otherwise operates on both 32-bit dwords of non-mask 64-bit scalar data (SGPR pairs, sign-extended inline/literal immediates, `null` = 0), reads all source dwords before storing (preserving destination aliasing), accepts `null` destination, and sets `SCC = ((D.lo \ \| D.hi) != 0)`. Until 2026-11-22 these ops always took the lane-mask path, duplicating D.lo into D.hi and voting SCC on D.lo alone. `s_nand/nor/xnor_b64` compute `~(S0 op S1)` on both paths (a lane's mask value is 0 or ~0, so the NOT is per lane); until 2026-11-22 they were rejected as unsupported. Source: RDNA2 ISA SOP1/SOP2. CPU-checked by `tests/semantic/test_salu64_bitwise_data.py` (all 9 ops, 4-corner SCC, immediates, aliasing, stale mask overwrite, wave32/wave64 lane-mask regression, and `--wave64-emulate`); **Hardware-verified** on the same part through `tools/hw_oracle` for the plain-data path: `s_and_b64(0xFFFFFFFF_00000000, 0x0F0F0F0F_0F0F0F0F)` = 0x0F0F0000_00000000, `s_xnor_b64(0xFFFF0000_00000000, 0_FFFFFFFF)` = 0x0000FFFF_00000000, `s_nand_b64(0xFFFF0000_0, 0)` = 0xFFFFFFFF_FFFFFFFF, `s_not_b64(0x0000FFFF_0)` = 0xFFFF0000_FFFFFFFF and `s_andn2_b64(0xFFFF0000_0, 0)` = 0xFFFF0000_0, all with SCC 1, while `s_or_b64(0, 0)` = 0 with SCC 0: SCC = ((D.lo ≠ 0) or (D.hi ≠ 0)). The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way; on RDNA3 the same plain-data path is **hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way; on RDNA3 the same plain-data path is **hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo \| The measured plain-data words: The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way; on RDNA3 the same plain-data path is **hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo \| The measured plain-data words: `s_and_b64(0xFFFFFFFF_00000000, 0x0F0F0F0F_0F0F0F0F)` = 0x0F0F0000_00000000, `s_xnor_b64(0xFFFF0000_00000000, 0_FFFFFFFF)` = 0x0000FFFF_00000000, `s_nand_b64(0xFFFF0000_0, 0)` = 0xFFFFFFFF_FFFFFFFF, `s_not_b64(0x0000FFFF_0)` = 0xFFFF0000_FFFFFFFF and `s_andn2_b64(0xFFFF0000_0, 0)` = 0xFFFF0000_0, all with SCC 1, while `s_or_b64(0, 0)` = 0 with SCC 0. The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way. **Not GPU-verified.** **hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo \| The measured plain-data words: **Not GPU-verified.** **hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo \| D.hi) != 0`, the `andn2`/`orn2` pairs separate negation of the second source from negation of the first, `s_not_b64` inverts both dwords and clears SCC on a zero result, and `s_nand_b64`/`s_nor_b64`/`s_xnor_b64` invert the per-dword result (`and`/`or` of all ones gives `0` with SCC 0, `xnor` of equal pairs gives all ones with SCC 1); the lane-mask dispatch (`exec`/`vcc` destinations) was not re-measured. The lane-mask dispatch (`exec`/`vcc` destinations) was not re-measured. D.hi) != 0`, the `andn2`/`orn2` pairs separate negation of the second source from negation of the first, `s_not_b64` inverts both dwords and clears SCC on a zero result, and `s_nand_b64`/`s_nor_b64`/`s_xnor_b64` invert the per-dword result (`and`/`or` of all ones gives `0` with SCC 0, `xnor` of equal pairs gives all ones with SCC 1); the lane-mask dispatch (`exec`/`vcc` destinations) was not re-measured. **Not GPU-verified.** **hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way; on RDNA3 the same plain-data path is **hardware-verified on an AMD RX 7600 (gfx1102)**: on four A/B pairs with high-bit-only and cross-half values, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_andn2_b64` and `s_orn2_b64` write both dwords and set `SCC = (D.lo | The measured plain-data words: `s_and_b64(0xFFFFFFFF_00000000, 0x0F0F0F0F_0F0F0F0F)` = 0x0F0F0000_00000000, `s_xnor_b64(0xFFFF0000_00000000, 0_FFFFFFFF)` = 0x0000FFFF_00000000, `s_nand_b64(0xFFFF0000_0, 0)` = 0xFFFFFFFF_FFFFFFFF, `s_not_b64(0x0000FFFF_0)` = 0xFFFF0000_FFFFFFFF and `s_andn2_b64(0xFFFF0000_0, 0)` = 0xFFFF0000_0, all with SCC 1, while `s_or_b64(0, 0)` = 0 with SCC 0. The lane-mask path (EXEC/VCC sources, or a mask destination) is a translator model and cannot be measured this way. The lane-mask dispatch (`exec`/`vcc` destinations) was not re-measured. D.hi) != 0`, the `andn2`/`orn2` pairs separate negation of the second source from negation of the first, `s_not_b64` inverts both dwords and clears SCC on a zero result, and `s_nand_b64`/`s_nor_b64`/`s_xnor_b64` invert the per-dword result (`and`/`or` of all ones gives `0` with SCC 0, `xnor` of equal pairs gives all ones with SCC 1); the lane-mask dispatch (`exec`/`vcc` destinations) was not re-measured. \|
+ | Constant lane masks (`Gen.mask_src` immediates) | A constant read as a lane mask is one bit per lane: lane L takes bit L. The 64-bit forms (`s_and/or/andn2_saveexec_b64`, `s_andn2_wrexec_b64`, `s_mov_b64`/`s_not_b64` into EXEC or VCC, `s_and/or/xor/andn2/orn2_b64` and `s_cselect_b64` on the lane-mask path) read the 64-bit value, an inline constant sign-extended (`-16` = lanes 4-63) and a literal with a zero high word, as `src64_data` reads 64-bit constants; the b32 forms (`s_*_saveexec_b32`, `s_andn2_wrexec_b32`) read the 32-bit value at bit L mod 32. 0 and -1 still give no lane and every lane, with no per-lane code. `s_bcnt0/1_i32_b64` and `s_ff0/1_i32_b64` of a constant read the constant's 64 bits via `src64_data` (scalar data: inline negative constants sign-extend to 64 bits, so `s_ff0_i32_b64 s0, -1` gives −1 rather than 32, and 32-bit literals zero-extend; CPU-checked in `tests/semantic/test_scalar_bitcmp.py`, **not yet GPU-verified**). `s_bcnt0/1_i32_b64` of a constant counts the constant's 64 bits (scalar data, like `s_ff0/1_i32_b64`). **Before this fix every lane took bit 0 of the constant**: `s_and_saveexec_b32 s7, 0xff00` with all 32 lanes on left none on, `5` left all 32 on, and `s_bcnt1_i32_b64 s0, 0xff00ff` gave 32. llvm-mc rejects a constant as the mask operand of `v_cndmask_b32_e64` / `v_add_co_ci_u32_e64` and decodes one as "Invalid immediate", so those VALU callers never see a constant. **A constant held in an SGPR** (`s_mov_b32 s20, 0x3ffffc00`) is read the same way when it reaches a mask consumer: `mask_src` takes bit L of an SGPR that `holds_lane_mask` doesn't flag (a pair in a wave64 64-bit context: the high SGPR for lanes 32-63). In a wave32 or wave64 program a 32-bit bitwise SALU op (`s_not_b32`, `s_and/or/xor/andn2/orn2/nand/nor/xnor_b32`, `s_cselect_b32`) that writes EXEC/VCC (`exec_lo`/`vcc_lo` in wave32; `exec_lo`/`exec_hi` and mask-holding `vcc_lo`/`vcc_hi` in wave64, including after `s_mov_b64 vcc, 0/-1`) skips scalar constant folding, reads its operands through `Gen._mask_b32_src` / `mask_src` (collecting the opposite half through `wave_mask` if a wave64 op mixes `lo` and `hi` halves), preserves the untouched half of EXEC/VCC in wave64 (`exec_half_write` / `put_mask`), and votes SCC over the wave (wave32) or that 32-lane half (wave64, `scc_any_half`), matching `s_not_b32` and the binary ops on lane-mask SGPRs too; into a plain SGPR with a constant it stays a data read, because `lane_masks.py` classifies that SGPR as data when the other operand is a constant (`s_and_b32 s20, exec_lo, 1` then `s_bcnt1` must count the wave's bits: found by @Pierre-Kookis on #1792, GPU-reproduced), and `s_mov_b32 exec_lo/exec_hi, sN` takes each lane's bit. In a wave32 program a 32-bit bitwise SOP2 (`s_and/or/xor/andn2/orn2/nand/nor/xnor_b32`, `s_cselect_b32`) that writes EXEC/VCC reads both operands through `mask_src` (`Gen.sop2_b32_srcs`); into a plain SGPR it stays a data read, because `lane_masks.py` classifies that SGPR as data when the other operand is a constant (`s_and_b32 s20, exec_lo, 1` then `s_bcnt1` must count the wave's bits: found by @Pierre-Kookis on #1792, GPU-reproduced), and `s_mov_b32 exec_lo/exec_hi, sN` takes each lane's bit. A real mask is unchanged: it holds 0 or ~0 per lane, and bit L of that is the same 0 or 1. Until 2026-11-22 these took the value whole, so `s_and_saveexec_b32 s6, s20` with that constant, or `s_and_b32 exec_lo, exec_lo, 0xff00`, left every lane on (found writing `cs_w32_saveexec_ext`, #1771; CPU-checked by `tests/semantic/test_mask_src_sgpr_const.py`, and `tools/cf_diff.py` / `tools/salu_diff.py` still pass). `s_not_b32` on lane masks, `s_and/or/xor_b32` with two immediates into `vcc_lo`, and wave64 half-mask bitwise ops (destination half preservation, `exec_hi`, and `scc_any_half`) are CPU-checked in `tests/semantic/test_salu_b32_lane_masks.py` (wave32, wave64, and `--wave64-emulate`, validated with `spirv-val`) and GPU-checked on gfx1036, RTX 5080 (`--wave64-emulate`), and RX 9060 XT (RADV). Not covered here: a b32 op on one half of a wave64 mask, masks read as data (#293), and a literal with bit 31 set in a 64-bit position (zero- vs sign-extension not measured). GPU-checked with `runtime/test/shaders/cs_w32_mask_imm.asm` and `cs_w64_mask_imm.asm` on an NVIDIA GeForce RTX 5080 (driver 616.92; wave64 with `LEONIDA_W64_EMULATE=1`) and an AMD Radeon RDNA2 iGPU (driver 26.10.1, native 64-wide subgroup): both failed before on both GPUs. Run across every lane in `tests/semantic/test_value_semantics.py` (`LaneMaskConstants`). |
+ | Scalar select and pack (`s_cmov_b32`, `s_cmovk_i32`, `s_pack_ll/lh/hh_b32_b16`) | `s_cmov_b32` / `s_cmovk_i32`: D = SCC ? S0 : D (`s_cmovk_i32`'s S0 is the 16-bit immediate, sign-extended); SCC is read, not written; the destination must be an SGPR (a lane-mask destination, and `s_cmov_b64`, stay `Unsupported`, #210). `s_pack_*`: the low half of D from S0, the high half from S1, the letters naming the half of each (l = 15:0, h = 31:16), S0 first; GFX10 has no `s_pack_hl`; SCC not written. Source: RDNA2 ISA SOP1/SOP2/SOPK. CPU-checked by `tests/semantic/test_salu_cmov.py` and `test_salu_pack.py`; the translated shaders were run on NVIDIA by reviewers (`s_cmov*`: RTX 5090, RTX 4050 and Radeon 740M in #613; `s_pack_*`: RTX 5090 in #449). **Hardware-verified on RDNA2** (`gfx1035`, wave32 and wave64 via `tools/int_hw_probe.py --oracle both`, SHADER-137, SCC kept). |
+diff --git a/docs/fspx.md b/docs/fspx.md
+index 7550a2cc8..2dd8b8d50 100644
+--- a/docs/fspx.md
++++ b/docs/fspx.md
+@@ -183,9 +183,17 @@ The step is redone as a whole when the DLL, the unpacking or translating tools,
+ flags change (`fspx_build.json`, written last); it never makes the game's shaders translate again. A package without
+ the DLL skips it.
+ 
+-**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when it
+-is there, `<dir>/fspx/index.json`, whose entries are named `fspx/<name>`. A missing or unreadable `fspx/index.json`
+-leaves the main index loaded. Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
++The executable calls slot 67 itself, for the compute pipelines of the pipeline library in `shaders.rpf`
++([shader_library.md](shader_library.md)): a compute record's state blob, blob, program and layout blob have the sizes
++and shapes of kinds 0, 1, 6 and 7. The next step of the same stage, `library_shaders`, unpacks those programs with
++`tools/shader_library.py --stages cs` (which writes each one's `.code` and its record's state as `.state`) and
++translates them into `<work>/shaders/spirv/library/`, with the same keys, the same clash check and its own
++`library_build.json`.
++
++**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when they
++are there, `<dir>/fspx/index.json` and `<dir>/library/index.json` (and `bvh/`, [embedded_shaders.md](embedded_shaders.md)),
++whose entries are named `fspx/<name>` and `library/<name>`. A missing or unreadable one leaves the others loaded.
++Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
+ `compute_program()` decides what a compute PSO's bytecode is looked up by:
+ 
+ | Bytecode | Key | Who passes it |
+diff --git a/docs/shader_library.md b/docs/shader_library.md
+index 6e29edc89..bb90aea86 100644
+--- a/docs/shader_library.md
++++ b/docs/shader_library.md
+@@ -111,7 +111,9 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
+ ```
+ 
+ * It writes `fspx/<name>.code` and `fspx/<name>.json`, the layout `fspx_unpack.py` writes and `rdna2spirv.py`
+-  reads (`native_blob`, `cs_dispatch_state`). It also writes `index.json` with each program's stage, and
++  reads (`native_blob`, `cs_dispatch_state`). A compute program also gets `fspx/<name>.state`, its record's state
++  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; every compute program has exactly one
++  (2,684 programs, 2,693 records). It also writes `index.json` with each program's stage, and
+   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
+   `lib_<stage>_<index>`.
+ * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
+@@ -123,7 +125,18 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
+ 
+ The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
+ archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
+-walk. It also checks the `--carve` copy and the translator's reads of the compute sidecar.
++walk. It also checks the `--carve` copy, the translator's reads of the compute sidecar and the compute `.state`.
++
++**In the build.** `make_game.py`'s `shaders` stage runs this for the compute stage after the FSPX step
++(`library_shaders`): `--stages cs --disasm --carve` into `<work>/shaders/library`, then `rdna2spirv.py` into
++`<work>/shaders/spirv/library` with the stage's `--wave64-emulate` and fallback flags. The runtime's shader library
++reads that index next to `fspx/` and finds its entries by `fspx_code_sha256` and `fspx_state_sha256`
++([fspx.md](fspx.md), "Build and run-time lookup"). That is how the executable creates these pipelines: it reads the
++library through DirectStorage zlib requests and passes each compute record's four parts to Xbox device slot 67,
++`DeserializeComputePipelineStateX`, as kinds 0, 1, 6 and 7, so the code key is the program's bytes as the table gives
++them and the state key is the record's state blob. The step is redone as a whole when `shaders.rpf`, the tools,
++`llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
++different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
+ 
+ ## 5. Translation
+ 
+diff --git a/make_game.py b/make_game.py
+index 41c273f74..5d5fdd1f2 100644
+--- a/make_game.py
++++ b/make_game.py
+@@ -1317,6 +1317,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
+     verify_translation_completeness(dxbc, spirv)
+     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
+     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
++    library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+     log("shaders: done")
+ 
+ 
+@@ -1394,6 +1395,69 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
+         f.write(settings + "\n")
+ 
+ 
++LIBRARY_ARCHIVE = "shaders.rpf"
++LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")  # with TRANSLATION_SOURCES
++
++
++def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
++    """What the pipeline library's compute translations depend on, as one line: shaders.rpf, the unpacking and
++    translating tools, llvm-mc, the wave64 mode and the fallback flags."""
++    tools = hashlib.sha256()
++    for name in LIBRARY_TOOLS:
++        tools.update(f"{name}\0".encode() + bytes.fromhex(file_sha256(os.path.join(TOOLS, name))))
++    return json.dumps({"archive": file_sha256(archive), "tools": tools.hexdigest(),
++                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
++                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
++
++
++def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate: bool = False,
++                    fallbacks: tuple[str, ...] = ()) -> None:
++    """The compute pipelines of the pipeline library in shaders.rpf (docs/shader_library.md). The executable reads
++    the library through DirectStorage and creates each compute pipeline with Xbox device slot 67
++    (DeserializeComputePipelineStateX), passing the record's four parts as FSPX kinds 0, 1, 6 and 7 (docs/fspx.md).
++    tools/shader_library.py unpacks the compute programs with their kind-0 state into <work>/shaders/library, and
++    rdna2spirv.py translates them into <work>/shaders/spirv/library, where the runtime's shader library finds them by
++    fspx_code_sha256 and fspx_state_sha256 as it finds the FidelityFX DLL's. Graphics pipelines are not translated
++    here. The game's own shaders neither feed nor depend on this step, apart from the carve that names each program's
++    source container (the translator reads its signatures).
++
++    The step runs whole. Reuse requires the translation index, its named modules and a matching library_build.json
++    (library_settings)."""
++    archive = os.path.join(game, LIBRARY_ARCHIVE)
++    unpacked = os.path.join(work, "shaders", "library")
++    spirv = os.path.join(work, "shaders", "spirv", "library")
++    translated = os.path.join(spirv, "index.json")
++    settings_file = os.path.join(spirv, "library_build.json")
++    if not os.path.isfile(archive):
++        log(f"shaders: no {LIBRARY_ARCHIVE} in the game folder, so no pipeline library to translate")
++        return
++    settings = library_settings(archive, mc_signature, emulate, fallbacks)
++    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
++        return
++    log(f"shaders: unpacking and translating the compute pipelines of the pipeline library in {LIBRARY_ARCHIVE}")
++    drop(translated, settings_file)
++    # A program that no longer translates must not keep a module from the run before.
++    for folder, suffixes in ((os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
++        if os.path.isdir(folder):
++            with os.scandir(folder) as entries:
++                for entry in entries:
++                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
++                        os.unlink(entry.path)
++    carve = os.path.join(work, "shaders", "dxbc")
++    py("shader_library.py", archive, "--out", unpacked, "--stages", "cs", "--disasm", "--jobs", str(jobs),
++       *(["--carve", carve] if os.path.isdir(carve) else []))
++    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
++    py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
++    clash = fspx_key_clash(spirv)
++    if clash:
++        drop(translated)   # the runtime must not load an index whose keys pick between different modules
++        fail(f"shaders: pipeline library programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
++             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
++             "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
++    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
++        f.write(settings + "\n")
++
++
+ def fspx_key_clash(spirv: str):
+     """Two entries of <spirv>/index.json with the same fspx_code_sha256 and fspx_state_sha256 whose .spv files
+     differ, as (name, name), or None. The same kind-6 bytes with different kind-0 entries is allowed: the run time
+diff --git a/runtime/src/shader_library.h b/runtime/src/shader_library.h
+index 8eb76f3c4..1513432e3 100644
+--- a/runtime/src/shader_library.h
++++ b/runtime/src/shader_library.h
+@@ -722,13 +722,16 @@ struct ShaderEntry {
+ 
+ class ShaderLibrary {
+ public:
+-    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs, each
+-    // when it is there:
++    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates outside the game's shader
++    // entries, each when it is there:
+     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
+     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
+-    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
+-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
+-    // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
++    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
++    //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
++    //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
++    //     like the FSPX ones (docs/shader_library.md).
++    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The folders
++    // are optional: a missing or unreadable index there leaves the main one, and the other folders', loaded.
+     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
+         const auto fail = [&](const std::string& why) {
+             if (error) *error = why;
+@@ -740,7 +743,7 @@ public:
+         } catch (...) {
+             return fail("index.json could not be read");
+         }
+-        for (const char* folder : {"fspx", "bvh"}) {
++        for (const char* folder : {"fspx", "bvh", "library"}) {
+             try {
+                 const auto ignore = [](const std::string&) { return false; };
+                 const std::filesystem::path sub = dir / folder;
+@@ -754,8 +757,9 @@ public:
+ 
+     bool loaded() const { return !dir_.empty(); }
+     std::size_t size() const { return count_; }
+-    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
+-    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
++    // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
++    // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
++    // entries with size() must leave them out.
+     std::size_t fspx_size() const { return fspx_count_; }
+     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
+     // their containers itself.
+@@ -926,7 +930,7 @@ private:
+             e.max_primitives = u32(meta.find("max_primitives"));
+             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
+             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+-            if (by_fspx && prefix == "fspx/") ++fspx_count_;
++            if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
+             if (prefix == "bvh/") ++bvh_count_;
+             ++count_;
+         }
+diff --git a/runtime/test/shader_library_test.cpp b/runtime/test/shader_library_test.cpp
+index e2d19f340..948eb7084 100644
+--- a/runtime/test/shader_library_test.cpp
++++ b/runtime/test/shader_library_test.cpp
+@@ -532,6 +532,61 @@ int main() {
+         std::filesystem::remove_all(dir);
+     }
+ 
++    // Pipeline-library entries: the compute programs of the library in shaders.rpf, translated by make_game.py into
++    // <dir>/library/index.json (named "library/<name>"), are found by the same two keys as the DLL's FSPX programs,
++    // next to <dir>/fspx/. The executable's slot-67 description carries kind 0 (the record's state blob) and kind 6.
++    {
++        const auto code = fspx_code(0x5000);
++        std::vector<std::uint8_t> state(28, 0), other_state(28, 0);
++        state[12] = 64;  // word 3: NumThreadsX
++        other_state[12] = 32;
++        const auto n = std::uint32_t(code.size());
++        const auto payload = [&](const std::vector<std::uint8_t>& kind0) {
++            std::vector<std::uint8_t> body = kind0;
++            body.insert(body.end(), code.begin(), code.end());
++            return fspx_payload({{0, 48, 28}, {6, 48 + 28, n}}, body);
++        };
++        std::filesystem::create_directories(dir / "fspx");
++        std::filesystem::create_directories(dir / "library");
++        {
++            std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
++            index << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"}}";
++            std::ofstream dll(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
++            dll << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(fspx_code(0x6000))
++                << "\"}}";
++            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
++            lib << "{\"lib_cs_00007\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(code)
++                << "\", \"fspx_state_sha256\": \"" << sha256_hex(state)
++                << "\", \"bindings\": [], \"local_size\": [64, 1, 1]}}";
++            std::ofstream spv(dir / "library" / "lib_cs_00007.spv", std::ios::binary);
++            const std::uint32_t words[5] = {0x07230203, 0x00010500, 7, 1, 0};
++            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
++        }
++        ShaderLibrary library;
++        CHECK(library.load(dir.string(), &error) && library.size() == 3 && library.fspx_size() == 2);
++        const auto found = library.fspx_candidates("cs", sha256_hex(code));
++        CHECK(found.size() == 1 && found[0]->name == "library/lib_cs_00007" && found[0]->local_size[0] == 64 &&
++              found[0]->fssm_sha256.empty());
++        CHECK(library.spirv(*found[0]).size() == 5);  // <dir>/library/lib_cs_00007.spv
++        // As slot 67 passes it: kind 0 and kind 6 in one payload. The record's state finds it; another state doesn't.
++        bool ambiguous = true;
++        CHECK(library.program_candidates("cs", compute_program(payload(state)), &ambiguous) == found && !ambiguous);
++        CHECK(library.program_candidates("cs", compute_program(payload(other_state)), &ambiguous).empty());
++        // The DLL's entries are still there, and the game's own by FSSM hash.
++        CHECK(library.fspx_candidates("cs", sha256_hex(fspx_code(0x6000))).at(0)->name == "fspx/upscaler_00");
++        CHECK(library.find("cs", hash) && library.find("cs", hash)->name == "cs_game");
++        // A broken library index leaves the others loaded; a missing one is not an error either.
++        {
++            std::ofstream lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
++            lib << "{broken";
++        }
++        CHECK(library.load(dir.string(), &error) && library.size() == 2 && library.fspx_size() == 1 &&
++              library.fspx_candidates("cs", sha256_hex(code)).empty());
++        std::filesystem::remove(dir / "library" / "index.json");
++        CHECK(library.load(dir.string(), &error) && library.size() == 2 && library.fspx_size() == 1);
++        std::filesystem::remove_all(dir);
++    }
++
+     // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
+     // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
+     // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.
+diff --git a/scripts/run_wine_session.sh b/scripts/run_wine_session.sh
+old mode 100755
+new mode 100644
+diff --git a/tests/semantic/test_cs_tg_size.py b/tests/semantic/test_cs_tg_size.py
+new file mode 100644
+index 000000000..bc4b882cc
+--- /dev/null
++++ b/tests/semantic/test_cs_tg_size.py
+@@ -0,0 +1,125 @@
++"""TG_SIZE_EN: the compute thread-group SGPR (COMPUTE_PGM_RSRC2 bit 10).
++
++Standard library only; no GPU, no LLVM, no game files.
++
++With TG_SIZE_EN set, the SGPR after the user data and the enabled workgroup ids holds the number of waves in the
++workgroup in bits [5:0] and the wave's index in it in bits [11:6] (Mesa, src/amd/common/nir/
++ac_nir_lower_intrinsics_to_args.c, GFX6-10: load_num_subgroups = tg_size[5:0], load_subgroup_id = tg_size[11:6];
++a wave64 compute shader's local invocation index is mbcnt(~0, tg_size & 0xfc0)). The translator writes that value
++in the prologue: thread i is in wave i / W (W = 32 or 64), the rule s_get_waveid_in_workgroup uses. It also has
++the wave index in [24:20] and bit 31 set in the first wave, as measured on gfx1036 (#6446, tools/hw_oracle);
++not measured on gfx1013. 91 compute programs of the pipeline library set the bit (docs/shader_library.md);
++the reads of it all start with `s_and_b32 sN, sTG, 0xfc0`, and most feed that to v_mbcnt_lo_u32_b32, as below.
++
++Each case translates a compute listing (4 user SGPRs, workgroup id x in s4, so the thread-group SGPR is s5), runs
++every invocation with run_workgroup on the CPU and has each one store a value at buffer word LocalInvocationIndex.
++"""
++import os
++import struct
++import sys
++import tempfile
++import unittest
++import warnings
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(os.path.dirname(HERE))
++TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
++
++sys.dont_write_bytecode = True
++sys.path.insert(0, TOOLS_DIR)
++sys.path.insert(0, HERE)
++
++import rdna2spirv  # noqa: E402
++import spirv_mini_interp as si  # noqa: E402
++
++STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
++VSHARP = [0, 0, 0x4000, 0x31016FAC]
++TG_SIZE_EN = 1 << 10
++RSRC2 = 0x88 | 2 << 11          # 4 user SGPRs, workgroup id x in s4, thread ids x, y, z in v0, v1, v2
++
++
++def translate(lines, size, rsrc2, name="cs_tg_size"):
++    with tempfile.TemporaryDirectory() as tmp:
++        for d in ("disasm", "fssm"):
++            os.mkdir(os.path.join(tmp, d))
++        with open(os.path.join(tmp, "disasm", name + ".s"), "w", encoding="utf-8") as f:
++            f.write("; " + name + "\n" + "".join(f"\t{ln}\n" for ln in lines) + "\ts_endpgm\n")
++        with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
++            f.write(STUB_DXBC)
++        blob = bytearray(0x148)
++        struct.pack_into("<4I", blob, 0x138, rsrc2, *size)
++        with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
++            f.write(bytes(blob))
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", ResourceWarning)
++            return rdna2spirv.translate(os.path.join(tmp, "disasm", name + ".s"))
++
++
++def run(body, wave64, size, rsrc2=RSRC2 | TG_SIZE_EN):
++    """Translate `body` (each thread then stores v5 at buffer word = its flat index) and run every invocation."""
++    sx, sy, sz = size
++    lines = (["s_mov_b64 exec, -1"] if wave64 else []) + list(body) + [
++        f"v_mad_u32_u24 v3, v1, {sx}, v0", f"v_mad_u32_u24 v3, v2, {sx * sy}, v3", "v_lshlrev_b32 v3, 2, v3",
++        "buffer_store_dword v5, v3, s[0:3], 0 offen"]
++    spv = translate(lines, size, rsrc2)
++    n = sx * sy * sz
++    w = 64 if wave64 else 32
++
++    def inputs(i):
++        return {"%wg_id": (0, 0, 0), "%local_id": (i % sx, (i // sx) % sy, i // (sx * sy)), "%sg_lane": i % w}
++    mem = si.run_workgroup(spv, n, w, inputs_for=inputs, push_constants=VSHARP + [0] * 28, memory={})
++    return [mem.get(4 * i) for i in range(n)]
++
++
++LOCAL_INDEX_W64 = ["s_and_b32 s6, s5, 0xfc0", "v_mbcnt_lo_u32_b32 v5, -1, s6", "v_mbcnt_hi_u32_b32 v5, -1, v5"]
++LOCAL_INDEX_W32 = ["s_and_b32 s6, s5, 0xfc0", "s_lshr_b32 s6, s6, 1", "v_mbcnt_lo_u32_b32 v5, -1, s6"]
++
++
++class TgSizeTests(unittest.TestCase):
++    def test_local_index_wave64(self):
++        # Mesa's wave64 local invocation index: mbcnt(~0, tg_size & 0xfc0).
++        for size in ((256, 1, 1), (16, 16, 1), (8, 8, 4)):
++            with self.subTest(size=size):
++                n = size[0] * size[1] * size[2]
++                self.assertEqual(run(LOCAL_INDEX_W64, True, size), list(range(n)))
++
++    def test_local_index_wave32(self):
++        # Wave index * 32 from bits [11:6]: (tg_size & 0xfc0) >> 1.
++        for size in ((128, 1, 1), (8, 8, 1), (4, 4, 4)):
++            with self.subTest(size=size):
++                n = size[0] * size[1] * size[2]
++                self.assertEqual(run(LOCAL_INDEX_W32, False, size), list(range(n)))
++
++    def test_wave_count(self):
++        # Bits [5:0]: waves in the group, a partial last wave included.
++        for wave64, size, waves in ((True, (256, 1, 1), 4), (False, (256, 1, 1), 8), (True, (100, 1, 1), 2),
++                                    (False, (6, 6, 1), 2), (True, (1, 1, 1), 1), (False, (32, 32, 1), 32)):
++            with self.subTest(wave64=wave64, size=size):
++                got = run(["s_and_b32 s6, s5, 0x3f", "v_mov_b32 v5, s6"], wave64, size)
++                self.assertEqual(set(got), {waves})
++
++    def test_whole_value(self):
++        got = run(["v_mov_b32 v5, s5"], True, (192, 1, 1))
++        self.assertEqual(got, [(i // 64) << 20 | (i // 64) << 6 | 3 | (0x80000000 if i < 64 else 0)
++                               for i in range(192)])
++
++    def test_matches_the_gfx1036_measurement(self):
++        # tools/hw_oracle on gfx1036 (#6446), wave32 x 128 threads: one word per wave.
++        got = run(["v_mov_b32 v5, s5"], False, (128, 1, 1))
++        self.assertEqual([got[32 * k] for k in range(4)], [0x80000004, 0x00100044, 0x00200084, 0x003000C4])
++        self.assertEqual(got, [got[32 * (i // 32)] for i in range(128)])
++
++    def test_follows_the_workgroup_ids(self):
++        # TGID_X/Y/Z all enabled: the ids are s4, s5, s6, the thread-group SGPR is s7.
++        rsrc2 = 0x388 | 2 << 11 | TG_SIZE_EN
++        got = run(["s_and_b32 s8, s7, 0xfc0", "v_mbcnt_lo_u32_b32 v5, -1, s8", "v_mbcnt_hi_u32_b32 v5, -1, v5"],
++                  True, (128, 1, 1), rsrc2)
++        self.assertEqual(got, list(range(128)))
++
++    def test_not_written_without_the_bit(self):
++        spv = translate(["v_mov_b32 v5, s5", "buffer_store_dword v5, v0, s[0:3], 0 offen"], (64, 1, 1), RSRC2)
++        self.assertNotIn("%tgv", spv)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/semantic/test_lds_basic_alloc.py b/tests/semantic/test_lds_basic_alloc.py
+index caa2f937b..b32131ba9 100644
+--- a/tests/semantic/test_lds_basic_alloc.py
++++ b/tests/semantic/test_lds_basic_alloc.py
+@@ -10,8 +10,8 @@ translator puts the Workgroup array `%lds_arr`:
+     (64 KiB), and a dynamic address wraps at its size (dword (A / 4) mod size);
+   * a constant offset past the declared size (SHADER-309; RDNA2 LDS does not wrap, ISA 3.6.1/3.6.6) makes the array
+     exactly the declared size and every access bounds-checked: out of range reads 0 and writes are dropped;
+-  * a declared size over 64 KiB, a thread group of more than 1024 invocations and TG_SIZE_EN (RSRC2 bit 10) are
+-    refused.
++  * a declared size over 64 KiB and a thread group of more than 1024 invocations are refused; TG_SIZE_EN (RSRC2
++    bit 10) is accepted (test_cs_tg_size.py).
+ test_cs_shared_memory_limit.py runs the bounds-checked reads, writes and atomics; this file pins the array size and
+ which of the two forms is chosen.
+ 
+@@ -115,9 +115,8 @@ class TestAllocationSize(unittest.TestCase):
+ 
+ 
+ class TestRefusals(unittest.TestCase):
+-    def test_tg_size_en_refused(self):
+-        with self.assertRaises(rdna2spirv.Unsupported):
+-            L.translate([READ], rsrc2(8, extra=1 << 10))
++    def test_tg_size_en_accepted(self):
++        self.assertIn("%lds_arr", L.translate([READ], rsrc2(8, extra=1 << 10)))
+ 
+     def test_group_over_1024_refused(self):
+         for size in ((1025, 1, 1), (32, 33, 1), (16, 16, 5)):
+diff --git a/tests/semantic/test_salu_b32_lane_masks.py b/tests/semantic/test_salu_b32_lane_masks.py
+index 9e2f59a7f..8130ab22f 100644
+--- a/tests/semantic/test_salu_b32_lane_masks.py
++++ b/tests/semantic/test_salu_b32_lane_masks.py
+@@ -197,6 +197,28 @@ class Wave32B32LaneMaskTests(unittest.TestCase):
+ 
+ 
+ class Wave64HalfMaskBitwiseTests(unittest.TestCase):
++    def test_bitreplicate_writes_exec_and_keeps_scc(self):
++        asm = [
++            "v_mov_b32 v4, 0",
++            "s_cmp_eq_u32 0, 0",
++            "s_bitreplicate_b64_b32 exec, s4",
++            "v_mov_b32 v4, 1",
++            "s_cselect_b32 s5, 1, 0",
++            "s_mov_b64 exec, -1",
++            "v_mov_b32 v5, s5",
++            "v_lshlrev_b32 v6, 2, v0",
++            "buffer_store_dword v4, v6, s[0:3], 0 offen",
++            "buffer_store_dword v5, v6, s[0:3], 0 offen offset:256",
++            "s_endpgm",
++        ]
++        spv = translate_cs("w64_bitreplicate_exec", asm, 64)
++        for word in (0, 0x80000001, 0x0f0f0f0f, M32):
++            with self.subTest(word=hex(word)):
++                mem = run_cs(spv, 64, s4=word)
++                expected = [word >> (lane // 2) & 1 for lane in range(64)]
++                self.assertEqual([mem[4 * lane] for lane in range(64)], expected)
++                self.assertEqual([mem[256 + 4 * lane] for lane in range(64)], [1] * 64)
++
+     def test_exec_lo_and_exec_hi_preserve_other_half_and_vote_own_half_scc(self):
+         # Test s_not_b32 and all 8 binary ops writing exec_lo or exec_hi.
+         ops = ["s_not_b32"] + list(BIN_REFS.keys())
+diff --git a/tests/test_library_shaders_stage.py b/tests/test_library_shaders_stage.py
+new file mode 100644
+index 000000000..e06645d7f
+--- /dev/null
++++ b/tests/test_library_shaders_stage.py
+@@ -0,0 +1,118 @@
++"""make_game.py's pipeline-library step (library_shaders): the compute pipelines of the library in shaders.rpf, which
++the executable creates with Xbox device slot 67 (docs/shader_library.md, docs/fspx.md).
++
++    python -I tests/test_library_shaders_stage.py
++
++Synthetic files only, no game data: the tools are mocked the way tests/test_fspx_shaders_stage.py does, and each mock
++writes what the real tool writes last.
++"""
++import json
++import os
++import sys
++import tempfile
++import unittest
++from unittest import mock
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, ROOT)
++import make_game  # noqa: E402
++
++
++class LibraryStage(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.work = os.path.join(self.tmp.name, "work")
++        self.game = os.path.join(self.tmp.name, "game")
++        os.makedirs(self.game)
++        self.archive = os.path.join(self.game, make_game.LIBRARY_ARCHIVE)
++        self.write_archive(b"synthetic archive")
++        self.unpacked = os.path.join(self.work, "shaders", "library")
++        self.spirv = os.path.join(self.work, "shaders", "spirv", "library")
++        self.carve = os.path.join(self.work, "shaders", "dxbc")
++        self.calls = []
++        self.translations = {"lib_cs_00007": ("c" * 64, "s" * 64, b"synthetic module")}
++
++    def write_archive(self, data):
++        with open(self.archive, "wb") as f:
++            f.write(data)
++
++    def fake_py(self, tool, *args):
++        self.calls.append((tool, args))
++        if tool == "shader_library.py":
++            os.makedirs(os.path.join(self.unpacked, "disasm"), exist_ok=True)
++            open(os.path.join(self.unpacked, "disasm", "lib_cs_00007.s"), "w").close()
++        elif tool == "rdna2spirv.py":
++            os.makedirs(self.spirv, exist_ok=True)
++            index = {}
++            for name, (code, state, module) in self.translations.items():
++                index[name] = {"stage": "cs", "fspx_code_sha256": code, "fspx_state_sha256": state}
++                with open(os.path.join(self.spirv, name + ".spv"), "wb") as f:
++                    f.write(module)
++            with open(os.path.join(self.spirv, "index.json"), "w") as f:
++                json.dump(index, f)
++
++    def run_step(self, signature="llvm-mc 23", jobs=4, emulate=False, fallbacks=()):
++        self.calls = []
++        with mock.patch.object(make_game, "py", self.fake_py), mock.patch.object(make_game, "log", lambda *a: None):
++            make_game.library_shaders(self.game, self.work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
++        return [tool for tool, _ in self.calls]
++
++    def test_runs_once_then_nothing(self):
++        os.makedirs(self.carve)
++        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
++        (_, unpack), (_, translate) = self.calls
++        self.assertEqual(unpack, (self.archive, "--out", self.unpacked, "--stages", "cs", "--disasm", "--jobs", "4",
++                                  "--carve", self.carve))
++        self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
++        self.assertTrue(os.path.isfile(os.path.join(self.spirv, "library_build.json")))
++        self.assertEqual(self.run_step(), [])
++
++    def test_without_a_carve_the_sources_are_not_named(self):
++        self.run_step()
++        (_, unpack), _ = self.calls
++        self.assertNotIn("--carve", unpack)
++
++    def test_no_archive_skips_the_step(self):
++        os.unlink(self.archive)
++        self.assertEqual(self.run_step(), [])
++        self.assertFalse(os.path.exists(self.spirv))
++
++    def test_inputs_that_change_the_output_translate_again(self):
++        self.run_step()
++        self.assertEqual(self.run_step(), [])
++        self.assertEqual(self.run_step(signature="llvm-mc 24"), ["shader_library.py", "rdna2spirv.py"])
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True), ["shader_library.py", "rdna2spirv.py"])
++        (_, translate) = self.calls[1]
++        self.assertIn("--wave64-emulate", translate)
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=("--bary-fallback",)),
++                         ["shader_library.py", "rdna2spirv.py"])
++        self.write_archive(b"another archive")
++        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=("--bary-fallback",)),
++                         ["shader_library.py", "rdna2spirv.py"])
++        with mock.patch.object(make_game, "translation_sources_digest", return_value="another translator"):
++            self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=("--bary-fallback",)),
++                             ["shader_library.py", "rdna2spirv.py"])
++
++    def test_empty_index_is_translated_again_and_drops_stale_modules(self):
++        self.run_step()
++        stale = os.path.join(self.spirv, "lib_cs_00007.spv")
++        self.assertTrue(os.path.isfile(stale))
++        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
++            f.write("{}")
++        self.translations = {}
++        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
++        self.assertFalse(os.path.exists(stale))
++        self.assertEqual(self.run_step(), ["shader_library.py", "rdna2spirv.py"])
++
++    def test_key_clash_fails_and_leaves_no_index(self):
++        self.translations = {"lib_cs_00001": ("c" * 64, "s" * 64, b"module one"),
++                             "lib_cs_00002": ("c" * 64, "s" * 64, b"module two")}
++        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
++            self.run_step()
++        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
++        self.assertFalse(os.path.exists(os.path.join(self.spirv, "library_build.json")))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_shader_library.py b/tests/test_shader_library.py
+index 8bbde96f9..191603d83 100644
+--- a/tests/test_shader_library.py
++++ b/tests/test_shader_library.py
+@@ -5,6 +5,7 @@
+ Zero game data: every library and archive is built here from synthetic bytes.
+ """
+ import contextlib
++import hashlib
+ import io
+ import json
+ import os
+@@ -18,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ sys.path.insert(0, os.path.join(ROOT, "tools"))
+ 
+ import shader_library as sl  # noqa: E402
++import shader_meta  # noqa: E402
+ 
+ ENDPGM = struct.pack("<I", 0xBF810000)
+ CODE_END = struct.pack("<I", 0xBF9F0000)
+@@ -222,6 +224,16 @@ class Main(unittest.TestCase):
+                 summary = json.load(f)
+             self.assertEqual(summary["graphics"][1]["stages"], {"ps": "lib_ps_00000", "ms": "lib_ms_00002"})
+             self.assertEqual(summary["compute"][0]["program"], "lib_cs_00003")
++            # The compute program gets its record's state blob as kind 0, which the run time finds a slot-67
++            # pipeline by (fspx_state_sha256); a graphics program gets none.
++            with open(os.path.join(out, "fspx", "lib_cs_00003.state"), "rb") as f:
++                self.assertEqual(f.read(), kind0())
++            self.assertFalse(os.path.exists(os.path.join(out, "fspx", "lib_vs_00001.state")))
++            disasm_file = os.path.join(out, "disasm", "lib_cs_00003.s")
++            self.assertEqual(shader_meta.fspx_state_sha256_file(disasm_file, "lib_cs_00003"),
++                             hashlib.sha256(kind0()).hexdigest())
++            self.assertEqual(shader_meta.fspx_code_sha256_file(disasm_file, "lib_cs_00003"),
++                             hashlib.sha256(sl.program(sample(), sl.parse(sample()), 3)).hexdigest())
+ 
+     def test_stage_filter_and_saved_input(self):
+         with tempfile.TemporaryDirectory() as tmp:
+@@ -232,7 +244,8 @@ class Main(unittest.TestCase):
+             rc, text = self.run_main(src, "--out", out, "--stages", "cs,vs")
+             self.assertEqual(rc, 0)
+             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
+-                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
++                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_cs_00003.state", "lib_vs_00001.code",
++                              "lib_vs_00001.json"])
+ 
+     def test_carve_names_sources_and_copies_containers(self):
+         with tempfile.TemporaryDirectory() as tmp:
+diff --git a/tests/test_translate.py b/tests/test_translate.py
+index 6c269bd05..d151c36e2 100644
+--- a/tests/test_translate.py
++++ b/tests/test_translate.py
+@@ -299,11 +299,11 @@ def test_cs_store_packed_atomic_pointers(make_shader):
+         assert defs[index] == "OpConstant %uint 0"
+ 
+ 
+-def test_compute_thread_group_size_sgpr_is_rejected(make_shader):
+-    """TG_SIZE_EN (RSRC2 bit 10) adds an SGPR the translator doesn't model."""
++def test_compute_thread_group_size_sgpr_is_written(make_shader):
++    """TG_SIZE_EN (RSRC2 bit 10) adds the thread-group SGPR after the workgroup ids (s5 here); the prologue writes it
++    (tests/semantic/test_cs_tg_size.py runs it)."""
+     shader = make_shader("s_endpgm\n", name="cs_test", cs_header=(0x8088 | 1 << 10, (64, 1, 1)))
+-    with pytest.raises(rdna2spirv.Unsupported):
+-        shader.translate()
++    assert "%tgv" in shader.translate()
+ 
+ 
+ @pytest.mark.parametrize("group", [(0, 1, 1), (2048, 1, 1)], ids=["empty", "over-1024"])
+diff --git a/tools/conformance/native/scripts/failure-log.cmd b/tools/conformance/native/scripts/failure-log.cmd
+old mode 100755
+new mode 100644
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 4680062ac..dea3bfc07 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -6833,8 +6833,20 @@ class Gen:
+             d, x = a[0], a[1]
+             wide_src = op == "s_quadmask_b64"
+             wide_dst = op != "s_quadmask_b32"
+-            if self.is_mask_op(x) or (d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc"))):
++            if self.is_mask_op(x):
+                 raise Unsupported(op + " on a lane mask")
++            if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
++                if op != "s_bitreplicate_b64_b32" or d["t"] != "exec":
++                    raise Unsupported(op + " on a lane mask")
++                # EXEC's bit for lane L comes from scalar-source bit L // 2.
++                shift, shifted, bit = (self.tmp() for _ in range(3))
++                lane = self.wave_lane()
++                word = self.src_u(x)
++                self.emit(f"{shift} = OpShiftRightLogical %uint {lane} {self.cu(1)}")
++                self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {shift}")
++                self.emit(f"{bit} = OpBitwiseAnd %uint {shifted} {self.cu(1)}")
++                self.set_exec(bit)
++                return
+             if wide_src:
+                 lo, hi = self.src64_data(x, op)
+                 words = [lo, hi]
+@@ -15251,6 +15263,30 @@ def assemble(gen):
+         for c in range(gen.cs["tid"] + 1):
+             fn += [f"%li{c} = OpCompositeExtract %uint %lci {c}",
+                    f"%lip{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(c)}", f"OpStore %lip{c} %li{c}"]
++        if gen.cs["tg_size"]:
++            # TG_SIZE_EN (RSRC2 bit 10): the SGPR after the workgroup ids holds the number of waves in the group in
++            # [5:0] and this wave's index in it in [11:6] (Mesa ac_nir_lower_intrinsics_to_args.c, GFX6-10:
++            # load_num_subgroups is tg_size[5:0], load_subgroup_id tg_size[11:6], and a wave64 compute shader's
++            # local invocation index is mbcnt(~0, tg_size & 0xfc0)), the wave index again in [24:20] (Mesa's GFX10.3
++            # field) and bit 31 set in the group's first wave. Measured on gfx1036 through tools/hw_oracle (#6446:
++            # 100, 128 and 133 threads, wave32 and wave64; e.g. wave32 x 128 gives 80000004 00100044 00200084
++            # 003000c4); the other bits were 0 there. One pipeline-library program reads [24:20]. Not measured on
++            # gfx1013. Thread i is in wave i / W, as for s_get_waveid_in_workgroup.
++            sx, sy, sz = gen.cs["size"]
++            w = 64 if gen.wave64 else 32
++            r = gen.cs["user"] + len(gen.cs["tgid"])
++            fn += ["%tgx = OpCompositeExtract %uint %lci 0", "%tgy = OpCompositeExtract %uint %lci 1",
++                   "%tgz = OpCompositeExtract %uint %lci 2",
++                   f"%tgyx = OpIMul %uint %tgy {gen.cu(sx)}", f"%tgzx = OpIMul %uint %tgz {gen.cu(sx * sy)}",
++                   "%tgi0 = OpIAdd %uint %tgx %tgyx", "%tgi = OpIAdd %uint %tgi0 %tgzx",
++                   f"%tgw = OpShiftRightLogical %uint %tgi {gen.cu(w.bit_length() - 1)}",
++                   f"%tgws = OpShiftLeftLogical %uint %tgw {gen.cu(6)}",
++                   f"%tgwh = OpShiftLeftLogical %uint %tgw {gen.cu(20)}",
++                   f"%tgf0 = OpIEqual %bool %tgw {gen.cu(0)}",
++                   f"%tgf = OpSelect %uint %tgf0 {gen.cu(0x80000000)} {gen.cu(0)}",
++                   f"%tgv0 = OpBitwiseOr %uint %tgws {gen.cu(-(-(sx * sy * sz) // w))}",
++                   "%tgv1 = OpBitwiseOr %uint %tgv0 %tgwh", "%tgv = OpBitwiseOr %uint %tgv1 %tgf",
++                   f"%tgp = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(r)}", "OpStore %tgp %tgv"]
+     if gen.frag_inputs:
+         fn += ["%fc = OpLoad %v4float %frag_coord"]
+         if bary:
+@@ -16578,17 +16614,16 @@ def translate(path):
+         # the SGPRs all 2,689 CS read before writing: 2,540 stay inside it, the other 149 overshoot only through
+         # loop-carried registers of the straight-line check; docs/design.md): USER_SGPR [5:1], TGID_X/Y/Z_EN [9:7],
+         # TG_SIZE_EN [10], TIDIG_COMP_CNT [12:11]. Words 0x13C/0x140/0x144 are the thread-group size. Layout (Mesa
+-        # radv_shader_args.c): s0..user-1 = user data, then the enabled workgroup ids; v0, v1, v2 = thread id x, y, z
+-        # (separate VGPRs on GFX10). An FSPX program (the FidelityFX DLL's shaders) carries the same two fields in its
++        # radv_shader_args.c): s0..user-1 = user data, then the enabled workgroup ids, then with TG_SIZE_EN the
++        # thread-group SGPR; v0, v1, v2 = thread id x, y, z (separate VGPRs on GFX10). An FSPX program (the FidelityFX
++        # DLL's shaders) and a pipeline-library program (docs/shader_library.md) carry the same two fields in their
+         # kind-0 entry (docs/fspx.md).
+         rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
+-        if (rsrc2 >> 10) & 1:
+-            raise Unsupported("CS thread-group-size SGPR")
+         if not (1 <= lx * ly * lz <= 1024):
+             raise Unsupported("CS group size")
+         user = (rsrc2 >> 1) & 31
+         g.cs = {"user": user, "tgid": [c for c in range(3) if (rsrc2 >> (7 + c)) & 1],
+-                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz)}
++                "tid": (rsrc2 >> 11) & 3, "size": (lx, ly, lz), "tg_size": bool((rsrc2 >> 10) & 1)}
+         # LDS_SIZE [23:15] in 512-byte units. All 485 LDS-using corpus CS stay inside it; a constant offset past it,
+         # which RDNA2 treats as out of range, is bounds-checked below (SHADER-309).
+         need = ((rsrc2 >> 15) & 0x1FF) * 128
+diff --git a/tools/shader_library.py b/tools/shader_library.py
+index ca03547a3..90d3cec78 100644
+--- a/tools/shader_library.py
++++ b/tools/shader_library.py
+@@ -17,7 +17,10 @@ stage, a table of state blobs and a table of native RDNA2 programs. Layout (docs
+ A missing stage is program 0xFFFFFFFF. Stage slots: 0 pixel, 1 vertex, 2 mesh (6 is used once and not identified).
+ A compute state blob has the 28-byte layout of an FSPX kind-0 entry (tools/fspx_unpack.py), and every program starts
+ with the same 36-byte hash prologue as an FSPX program, so the programs are written in the layout fspx_unpack.py uses
+-and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
++and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json). A compute program also gets its
++record's state blob as fspx/<name>.state, as fspx_unpack.py writes kind 0: the runtime finds a program the executable
++passes to Xbox device slot 67 by the SHA-256 of both (docs/fspx.md, "Build and run-time lookup"). In the 1.0.2.1
++library every compute program has exactly one state blob (2,684 programs, 2,693 records).
+ 
+ Usage:
+     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
+@@ -304,8 +307,9 @@ def main(argv=None) -> int:
+         start, end = code_range(code)
+         meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),
+                 "code": {"start": start, "end": end, "prologue": start == fspx_unpack.PROLOGUE_SIZE}}
+-        if i in cs_state:
+-            meta.update(fspx_unpack.decode_kind0(blob(b, lib, cs_state[i])))
++        state = blob(b, lib, cs_state[i]) if i in cs_state else None
++        if state is not None:
++            meta.update(fspx_unpack.decode_kind0(state))
+         name = names[i]
+         entry = {"file": name + ".dxbc", "stage": st, "program": i}
+         digests = sorted(lib["digest"].get(i, ()))
+@@ -325,6 +329,12 @@ def main(argv=None) -> int:
+                 entry[k] = meta[k]
+         with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+             f.write(code)
++        state_path = os.path.join(a.out, "fspx", name + ".state")
++        if state is not None:
++            with open(state_path, "wb") as f:   # kind 0 as it is: its SHA-256 is the index's fspx_state_sha256
++                f.write(state)
++        elif os.path.exists(state_path):
++            os.unlink(state_path)   # a program that lost its compute record must not keep an old state key
+         with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+             json.dump(meta, f, indent=1)
+         if disasm and end:

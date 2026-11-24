@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+LOCAL DRAFT — NOT POSTED. Tagged-emission CPU-prefix measurement with instrumentation limits.
+
+c5972vsin3 attaches immutable tags to six selected Draw records and samples at the replay hook after vkCmdDraw is called. All source/applier/binary/PDB/runner/five-index/native-map hashes independently match provenance. One30s run ends init0/run124,67102traced calls (56426ok,10676called),0failed. All six original scene/display P6 readbacks independently contain zero RGB; six alpha histograms are all zero. Worker reports64pass/1skip/5known failures in70tests.
+
+At all six tagged emissions, the sampled64byte CPU prefix equals the subsequently read title-source prefix and contains7nonzero dwords. Composite draws bind the arena VkBuffer with an offset equal to the observed title alias. Their watched table slot contains zero bytes at emission. Logs label emissions with global callback counts4/6/8/10. This weakens the previous zero-input explanation for these sampled prefixes and demonstrates that these tagged commands reached Vulkan command recording. It does not prove complete input correctness, GPU-visible content, completed GPU execution, or that a shader actually reads the zero descriptor slot.
+
+Source review found the requested instrumentation corrections absent: CopyStats still uses a global raw pointer to stack storage although other copy_title_pages callers can run outside the refresh mutex; last-signature state is global; emission reads the latest global callback count rather than a carried invocation ID; VB sampling is a64byte prefix at the binding offset without draw first/count/stride adjustment; root offsets remain hard-coded. Thus exact per-invocation attribution and race-free fallback accounting are unverified. Counter logs report no zero-fill for callbacks2..8; they do not cover callback10. Keep this snapshot frozen and do not rerun it or propagate the global stats pointer.
+
+Next source-only work: inspect the composite native pipeline input-layout path, VS input requirements and actual attribute formats/offsets, plus whether the observed descriptor is required or unused. Existing local metadata may support counts/matches only. Return a minimal diagnostic plan including the missing concurrency, execution-ID and referenced-range corrections. No new run, production fix, shader translation or forge adoption is assigned.

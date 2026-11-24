@@ -1,0 +1,15 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+LOCAL DRAFT — NOT POSTED. TEST-1674 Linux/Wine diagnostic follow-up.
+
+Pinned forge5972 runtime plus the previously validated follow-ups/capture code and local logging only; the shader overlay is unchanged. This run did not enable capture or debug clear. Source, applier, runner, binary and all shader-index/native-map hashes were independently checked.
+
+The 30-second run timed out normally, with no exception and no failed traced outcome: 67,739 D3D12 calls, 56,638 ok and 11,101 called. Presentation reached the 256-success milestone. The worker reports the focused70 tests unchanged:64pass,1skip,5known failures.
+
+Abstract resource correlation shows the first four PresentX calls alternate two display buffers. Later DrawInstanced calls bind those same resource IDs with console topology17, three vertices, one instance, and a full-size viewport/scissor. The other two-draw pattern binds a separate intermediate render target. At present256 the logged counters are256 viewport calls,256 scissor calls,512 topology calls,512 vertex-buffer calls and766 draw calls, with zero draw-time empty viewport/scissor observations.
+
+Limits: the first present is clear-only; command recording and presentation interleave, so the log is not a literal per-frame submission proof. The draw logger runs before defer/record_draw and its early exits. These observations establish API calls and bound state, not successful rasterization or shader output. No pixels were captured in this diagnostic. Earlier separate black/magenta capture results cannot identify this individual draw's output or rule out later clears.
+
+Next source-only comparison: existing #7448 rectangle support and newly imported forge ab1cfd674 rectangle pipeline variants, including deferred replay/early exits, dependencies and tests. Existing owners retain implementation ownership. No new base, patch or shader overlay has been adopted from this review.

@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+LOCAL DRAFT — NOT POSTED. Watched CPU ranges after shadow-refresh callbacks.
+
+c5972vsin2 adds bounded global address watches to c5972vsin. Source/applier/EXE/PDB/runner/five-index/native-map hashes independently match provenance. One30s run: init0/run124,67102traced calls (56426ok,10676called),0failed. All six original scene/display P6 files independently have zero RGB; six exact alpha histograms are all zero. Worker reports the existing70tests remain64pass/1skip/5knownfailures.
+
+Fourteen diagnostic lines show: the scene root-view watch at callbacks3..8 alternates all-zero destination leading64bytes (callbacks3/5/7) with a copy equal to the subsequently sampled source (4/6/8). Composite vertex-buffer/table watches exist only at callbacks5..8, not3/4. The vertex-buffer alias has the same zero/equal alternation and the watched table slot stays null. The source leading64bytes contain7nonzero dwords when read. The checked ranges fall within the large slot133shadow.
+
+Critical limitation from source review: g_watch retains the latest address per tag; recorded_after is a global callback count. There is no submitted command-list/reset-generation/draw identity, no actual buffer_at binding observation, and no vkCmdDraw emission marker. Therefore these callbacks cannot yet be called the submissions carrying the watched draws. Range membership is not a successful-copy check. Source and destination are read sequentially after the whole shadow refresh; later CPU writes or asynchronous GPU activity remain possible. The observations do not establish a zero-fill fallback, GPU-visible zero inputs, degenerate vertices, or actual sampling from the null descriptor.
+
+Next: complete actual submitted-draw correlation within the previously assigned local diagnostic scope. Matching-shadow zero-fill reasons/counts can be logged in the same measurement, without changing copies, mapping or execution. A fallback-only run using global watches would leave the causal gap. Worker requested to present concrete hooks/correlation before building; no new forge adoption or external claim.

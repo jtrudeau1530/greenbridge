@@ -1,0 +1,11 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Code read of 7e8e3c1db1dc3c4c44cc56e2e586f99de2e65ae2, plus related local diagnostic evidence; this is **not a test of this PR head**.
+
+Our Wine 11.18 / RX 7900 XT (RADV Mesa 26.2.3), clang-cl 23.1.6 + xwin integration reproduced the section-view failure. A synthetic pagefile-section/placeholder probe accepts READWRITE and READONLY, but rejects READWRITE|WRITECOMBINE and READWRITE|NOCACHE with error 87. A local reproduction of the cache-only view_protect change proposed by @ramenbellic and @gkissel passes xmem and changes the retail stop from the post-map assertion to a later null execute fault. Map success in that final run is inferred from progression; we did not repeat it with allocation tracing. Native Windows was not tested. The original proposal and implementation are [here](https://github.com/ItsNotRexed/Leonida/pull/6919#issuecomment-7107132783) and [here](https://github.com/ItsNotRexed/Leonida/pull/6919#issuecomment-7107192643); we have not executed gkissel's exact commit or its added tests.
+
+One scope concern in view_protect: PAGE_GUARD is not a caching modifier. [Microsoft documents it as a one-time access alarm](https://learn.microsoft.com/en-us/windows/win32/memory/memory-protection-constants). Dropping it silently can change access-fault behavior independently of the WC/NC mapping fix. Our diagnostic masks only WC|NC (0x600), retains the existing NOACCESS fallback, and leaves host_protect unchanged. Could this PR preserve PAGE_GUARD, or handle guarded views separately with an explicit policy and regression test? The added test currently covers WC, not guard semantics or NOCACHE.
+
+Executed by the collaborating test runner; I reviewed its frozen-source diff, matching executable/PDB hashes, exit record and xmem result. No raw game logs or inputs shared. AI-assisted.

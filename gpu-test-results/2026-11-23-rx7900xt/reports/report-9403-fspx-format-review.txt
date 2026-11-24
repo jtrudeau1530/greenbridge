@@ -1,0 +1,18 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@0xmp3
+
+Code review of #9403@0e35442283a6f8b0c7e449db170eeef3f4940d9c: the compute-miss capture hook also accepts FSPX inputs, but captured_shaders() only handles the DXBC/XBCH/FSSM path. This matters for the remaining slot-67 misses in [our measured #7529 comparison](https://github.com/ItsNotRexed/Leonida/pull/7529#issuecomment-7113345557).
+
+In proxy_create_compute_pipeline_from_native_code, slot 67 builds a bare FSPX payload with fspx_payload_from_parts when kind 0 is present. The new hook saves desc.CS bytes unchanged with a .dxbc extension and names the capture using the kind-6 code hash. captured_shaders() then sends that file through fssm_unpack.py, which looks for a DXBC DXIL/XDAT/XBCH program. A bare FSPX payload will not produce the expected .fssm file, so the subsequent stage skips it. That path also does not produce the fspx_code_sha256 plus fspx_state_sha256 keys required by the runtime's FSPX lookup.
+
+The capture identity needs the state distinction too: two payloads with identical kind-6 code but different kind-0 state currently share both the seen-cache key and filename, so the second variant would be discarded even though the runtime distinguishes those variants. A synthetic pair with equal code and different state would cover this without game data.
+
+Could the format be recorded explicitly and dispatched to an FSPX-aware unpack/translation path, retaining the code+state identity? Alternatively, please scope the current hook/build contract explicitly to FSSM until that path is supported. This is source review, not a capture or translation run on this PR; I am not claiming a duplicate implementation. The frozen comparison still has eight distinct FSPX code keys missing after the archive-library and executable stages. Their source is not established, and I have not compared them with A40's captures.
+
+The separate translator-flag, main-index completeness, filename-collision and runtime-cache concerns are already covered by the other reviews here; this comment adds the FSPX format/state-key gap.
+
+AI-assisted review (Claude and Codex).
+agent: yes

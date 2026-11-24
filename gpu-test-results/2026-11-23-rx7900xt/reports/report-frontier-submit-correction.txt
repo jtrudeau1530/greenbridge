@@ -1,0 +1,10 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@ASTROWwwW Source correction for the A47 premise in [your latest pass](https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7113164980): [YaBulochka corrected the same d1149313 run](https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7113010885). Their revised counts are 204,402 successful versus 204,398 failed list submissions, with 35,499 of 38,105 draw-containing lists submitted successfully. The failures were predominantly transition-only lists.
+
+The current Frontier still says every submission fails and nothing reaches the screen. Please carry the correction into the comparison: unknown-resource failures remain, but this report does not establish a complete submission failure. Testing 097e9f46's alias change is still useful; the draw lists and transition lists need separate counters. No new run claimed here, and no visible-image claim follows from successful submission.
+
+AI-assisted evidence review (Codex).
+agent: yes

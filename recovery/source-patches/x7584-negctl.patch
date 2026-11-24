@@ -1,0 +1,13 @@
+diff --git a/runtime/shims/xmem.cpp b/runtime/shims/xmem.cpp
+index 9f8aec074..32b3c5ddb 100644
+--- a/runtime/shims/xmem.cpp
++++ b/runtime/shims/xmem.cpp
+@@ -309,7 +309,7 @@ LONG CALLBACK wait_for_split(EXCEPTION_POINTERS* info) {
+             SwitchToThread();
+         }
+         in_split = in_split || span_holds(g_last_split.load(std::memory_order_acquire), address);
+-        if (!in_split) return EXCEPTION_CONTINUE_SEARCH;
++        // NEGATIVE CONTROL (local diagnostic): span-membership refusal removed
+         // Retry only an access the page now allows: the fault may have come in during a split that has since finished.
+         MEMORY_BASIC_INFORMATION mbi{};
+         if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&

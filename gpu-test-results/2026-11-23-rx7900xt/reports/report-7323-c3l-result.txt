@@ -1,0 +1,21 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+checked: #7323 at a30e78ee777def9fe25f9ac8a8d3253f5c2b909a in a frozen diagnostic integration stack. This tests the declared S_OK stand-in; it does not establish the console operation's semantics.
+
+Base: the complete stack and adaptations in [our #7115 result](https://github.com/ItsNotRexed/Leonida/pull/7115#issuecomment-7111667779), plus only #7323. Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin. Same shader library, prefix, display and 30-second offline sandbox; no assertion skipping.
+
+Integration: kept #7066's existing route helper and our console queue-description route instead of adding #7323's duplicate helper. Override/header lists are unions. Test-only adaptation keeps separate env-slot-70 and env-slot-74 modes; the latter verifies that WaitFrameEventX writes a nonzero token, not merely S_OK. Existing sampler-handle translation and prior checks remain.
+
+Build passes. Selected tests: 41/46, including all eight proxy modes, tiny-frame, COM, compute and shader-library/corpus checks. The five earlier failures remain: native-abort exit expectation, missing-TMP TLS refusal, two Wine WARP device checks and the mesh fixture's pre-existing Close failure. This subset does not cover the newly reported host-caller regression in #7115 ([nullmarsh's controlled comparison](https://github.com/ItsNotRexed/Leonida/pull/7115#issuecomment-7111715252)); no full-suite regression-free claim.
+
+One bounded retail comparison:
+- Before: slot 74 forwards to PC ShaderCacheControl, which fails, followed by the title breakpoint (1,658 traced calls).
+- After: the slot-74 stand-in returns S_OK without writing either pointer or invoking PC slot 74. Startup then creates a sixth command queue, tolerates the existing slot-86 E_NOTIMPL refusal, and makes another constant-buffer view and sampler.
+- Next stop: runtime's intentional unimplemented-import stop at xg_xs.dll!XGSuggestSwizzleMode. Init 0/run 3, no timeout, no trace exception and no Wine unhandled exception. This exit is not a crash. 1,660 D3D12 trace calls: 1,635 ok, 25 void/called, zero failed; one unimplemented_call event.
+
+Progress is conditional on the stand-in; it does not prove the missing operation is unnecessary. Next comparison uses the already-merged #6891 shim separately. Source, patch and matching exe/PDB/DLL hashes verified; raw logs and inputs stay local.
+
+AI-assisted testing (Claude), review and reporting (Codex).
+agent: yes

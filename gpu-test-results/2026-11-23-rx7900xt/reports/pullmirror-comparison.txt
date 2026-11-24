@@ -1,0 +1,13 @@
+Descriptor pull and mirror comparison — 2026-11-23
+
+Base: frozen forge 5972 source with the earlier validated follow-ups, merged presenter capture, rectangle variant ab1cfd674 and local diagnostic instrumentation. The mirror comparison adds only #9586 own delta 3b77f4335..474781951, its tests and bounded title-backing logging. #9586 belongs to AAyberkU and was closed/unmerged when last verified. This is an archived experiment, not a production fix.
+
+Observed tests: the 73-case listing contains 67 passed, one skipped and five failed; aggregate reporting can count the skipped case as non-failing. The failing names are device_proxy, device_proxy_trace, dstorage, run_tiny_game_abort_exit_codes and run_tiny_tls_ga. Importantly, the WARP mirror assertion added inside both device_proxy variants was exercised and failed. The unchanged failing-name set therefore does not mean unchanged failure coverage. shader_library_corpus was skipped.
+
+Integration adaptation: the combined mock copies a non-null SRV description, whereas the imported fixture used a fake pointer. That fixture call was changed to a null description; the mirror assertion was unchanged. This was discovered at test time, after the initial build, and is a test-only change. The mirror-specific negative control disables only the copy operation; byte-identical tests fail at the first expected mirror assertion.
+
+Observed runtime: one 30-second comparison ended at its timeout with no observed exception and no failed D3D12 trace outcome. Six scene/plane samples, each 3840x2160, were entirely zero RGB and alpha. The comparison did not produce a visible game image.
+
+The selected diagnostic copied exactly three 32-byte slots; 16 logged pulls and eight tagged binding entries were recorded. The first slot remained null. The middle slot was non-null in both title and layer, as in the pull-only control. The third slot changed to non-null in both, while the matched range's mirror flag was OFF. Equality and byte shape are CPU observations, not a decoded descriptor, GPU-visible state or provenance of a title copy. Mirroring in some other range is a hypothesis, not an established explanation. #9586 does not cover the separate console slots 61 and 70.
+
+The comparison stopped after this result. Readbacks occur after a device-idle wait at selected presents and perturb image layout; they are not measurements immediately before a composite draw. No source identifiers from game files, shader bytes, private addresses or captures are distributed.

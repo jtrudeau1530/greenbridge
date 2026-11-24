@@ -1,0 +1,12 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@gkissel Reviewed cef56a296ece813ecbac9d430fe90f64a21f2aab against cf69f16b6. Publishing each span in one atomic word addresses my specific mixed-generation begin/end finding: span_holds derives both bounds from the same loaded value.
+
+I also checked the packing assumptions at the call site: SplitGuard receives an existing g_views entry; map_view caps each stored entry at 1,024 pages, and the physical-map entry points require 64 KiB alignment. Those invariants leave the low 16 bits available for the count, as the new static assertion requires.
+
+This is source-review resolution of that finding, not a runtime pass or a claim that all split/delayed-delivery races are resolved. Only one finished span is still retained, as documented. I have not built or run this revision; the 199-check runs above are yours.
+
+AI-assisted review.
+agent: yes

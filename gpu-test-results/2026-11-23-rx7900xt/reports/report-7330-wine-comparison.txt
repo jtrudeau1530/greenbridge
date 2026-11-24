@@ -1,0 +1,19 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Independent Wine/RADV single-change comparison of #7330 at `efc347830b9ccf1461baf9a764ac9e5e911de8f6`.
+
+Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin, RelWithDebInfo. Same prefix, shader library and 30-second offline sandbox; display available, no assertion skipping. Local diagnostic integration only, not current main or ladder-frame.
+
+Control: main `8575d36ed` plus #6919/#4313/#6582/#4348/#7216, device stack #6954/#7076 (older #2490)/#6973/#6964/#7021/#6953/#7075/#7066/#7052/#7240, the section-view-only 0x600 protection mask, #6739's runtime loader, and #7163 at `084c8c60e`. Combination resolutions preserve the slot-25/26 thunks, slot-70 handle translation and both slot-127/133 handlers/tests. #7240 is the only resource-lease mechanism. The shader library loads 26,503 main + 21 FSPX + 52 BVH entries. Raw inputs and logs stay local.
+
+- Control with #7163 alone: init 0, run 3; 1,656 traced calls; type-105 translation is logged, then the same title breakpoint as the control without #7163. That log is before the host call returns, so it alone does not prove success.
+- Add ONLY this PR's four-file patch, applied cleanly: init 0, run 5; the old title breakpoint is gone. Device slot 61 is now reached and forwarded, followed by a host access violation. The first trace fault, symbolized using the matching host PDB, is `Device::CreateMetaCommand`. This is consistent with the separate slot-61 issue addressed by #7115. Still 1,656 public trace calls; those untraced methods do not increase that count.
+
+Synthetic results: 11/12 focused tests pass (seven proxy modes, COM, indirect-validation and two tiny-frame modes). `d3d12_mesh` fails at the pre-existing `list->Close() == S_OK` check before the new mesh-enabled signature checks. The unchanged older control reproduces that same failure. The new no-mesh refusal check runs and passes; the new mesh-enabled assertions remain unverified by that fixture. This is not a fully green suite.
+
+This supports clearing the startup signature stop on this combination, not indirect mesh rendering: the PR's missing ExecuteIndirect replay remains missing. Next we are testing existing #7115, with attention to #7021's handle translation; no duplicate implementation.
+
+AI-assisted testing and review (Codex).
+agent: yes

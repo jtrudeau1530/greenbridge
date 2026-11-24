@@ -1,0 +1,20 @@
+{
+  "id": "claude--work-gapfix5--tx-tests",
+  "source_log_name": "tx-tests.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {},
+  "cases": [],
+  "summary_lines": [
+    "Ran 7 tests in 1.672s",
+    "OK",
+    "Ran 13 tests in 0.202s",
+    "OK",
+    "Ran 9 tests in 5.283s",
+    "OK"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

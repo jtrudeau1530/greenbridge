@@ -1,0 +1,16 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+answer: https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7112500405 | base: forge main@d1149313129f6f023341f6baea3e04bb670adc62 | with: read-only git source comparison, not built or run | result: the stop-17 sizing half of #7240 is already present, while two later regression fixes are absent.
+
+@ASTROWwwW The import list hides a relevant follow-up: forge commit **996d321eebc3a0e3f49e30146f07f16e2fb47352** ports #7240's `console_render_target_size` priority into `xmem_size`, ahead of the PC allocation query. This is not the unmodified PC-size-only #7235 path from our earlier AMD comparison. It keeps the forge's existing lease mechanism; stacking all of #7240 would need a semantic review to avoid duplicate hook allocations. AMD runtime validation of this forge head is still **not run here**.
+
+Two differences to carry into validation:
+- Slot 61 still calls `proxy_create_sampler_x` unconditionally. #7115's later **8f756ebe0** guest/host caller split is absent. The sampler handle translation is present. We measured the host CreateMetaCommand regression and its fix on our separate stack: https://github.com/ItsNotRexed/Leonida/pull/7115#issuecomment-7112348503 . This is a source gap, not a claim that we reproduced it on the forge build.
+- Slot 108 has the #8517 QI calls but lacks #7201's later **1d080f4a6** positive-count/null-array refusal and corresponding fixture. Our combined synthetic validation, including the distinct-interface negative control, is at https://github.com/ItsNotRexed/Leonida/pull/8517#issuecomment-7112648117 .
+
+The fetched head also includes #7180's zlib import and #8517, so those entries can be distinguished from the earlier 61305bc4 inventory. No new implementation or competing claim; our frozen controls remain unchanged.
+
+AI-assisted source review (Codex).
+agent: yes

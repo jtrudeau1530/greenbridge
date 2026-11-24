@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+status: TEST-1674 — independent Wine 11.18 / RX 7900 XT confirmation of the section-view protection failure already reported by @ramenbellic and @gkissel on #6919. We are not claiming a replacement implementation.
+
+Our combined local boot stack gets past the large placeholder reserve and its carve; the first physical-page map then fails when MapViewOfFile3 receives READWRITE + WRITECOMBINE. A separate synthetic pagefile-section/placeholder probe succeeds with READWRITE and READONLY, but fails with error 87 for READWRITE + WRITECOMBINE and READWRITE + NOCACHE. Windows behavior was not measured here. Raw game traces stay local.
+
+Existing fix and test: https://github.com/gkissel/Leonida/commit/34c7135e9 ; original report/fix: https://github.com/ItsNotRexed/Leonida/pull/6919#issuecomment-7107132783 . @gkissel, are you opening/rebasing that commit onto main now that #6919 has merged? We can independently validate that exact change and contribute synthetic coverage in coordination, rather than opening a duplicate.
+
+The narrow scope matters: normalize the cache modifiers for the cached pagefile-backed section view while preserving access rights and unrelated flags; do not globally remove caching flags from private VirtualAlloc calls. Microsoft's [Memory Protection Constants documentation](https://learn.microsoft.com/en-us/windows/win32/memory/memory-protection-constants) distinguishes private PAGE_* cache modifiers from shared-section SEC_* cache attributes. The separate GPU readback issue discussed on #7218 is not claimed as solved by this test.
+
+AI-assisted.

@@ -1,0 +1,17 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Local report only; no external publication.
+
+The clean c5972rect-based vertex-layout diagnostic completed one 30-second run: 64 of 70 focused tests passed, one skipped and the same five known tests failed. The run ended at the timeout without an observed exception; 66,949 traced calls included zero failed outcomes. Six local scene/plane samples remained entirely zero RGB and alpha.
+
+Independent checks match the recorded executable/PDB, changed source files and applier. Current runner and all five index hashes plus the native map match the frozen clean control. The worker comparison metadata still needs its full hash record and clean-control reference; this has been requested without another run.
+
+The sampled composite has three per-vertex attributes: POSITION f32x3 at byte 0, COLOR unorm8x4 at byte 12, TEXCOORD f32x2 at byte 16. With first vertex zero, three vertices, stride 24 and bound size 4080, the position range ends at byte 60. All declared input registers are matched; sampled position components are finite. This proves the observed small range is in bounds, not that the shader produces valid clip positions. The replay diagnostic marker precedes buffer binding/draw emission.
+
+The worker reports that offline inspection of the exact bound composite stages finds vertex-transform buffer descriptors at table byte offsets 0 and 64, and the pixel-stage image descriptor at byte offset 32. Descriptor-size guards select zero constant loads for an empty buffer descriptor. Exact module provenance artifacts are requested for independent verification. The earlier null table+0 CPU sample came from a different diagnostic run; it does not prove GPU-visible bytes or the numeric transformed position.
+
+Next is one logging-only paired-table diagnostic, preserving the frozen base and overlay. It will map the selected immutable Draw table to a live heap, establish allocated extent and actual increment, and compare bounded layer/title-backed bytes at the three offsets where a valid paired mapping exists. CPU samples cannot establish the complete write history. Existing production owners retain ownership; no new fix or forge import is assigned.
+
+Fresh GitHub and forge source fetches fail, and last-known ownership/frontier reads return HTTP 404. Current handoffs, PR heads and test updates cannot be verified. Last successful source heads and comment recovery cursor are retained; no external post.

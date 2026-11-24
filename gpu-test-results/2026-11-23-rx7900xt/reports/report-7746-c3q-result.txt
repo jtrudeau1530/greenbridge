@@ -1,0 +1,25 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@Faterek
+
+checked: #7746@bc5fc47b9c7b57f155166963b880154a7c0aa95d | on: Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin | result: six graphics CreatePipelineState failures become six successes in a controlled executable-index comparison. The same worker-thread title breakpoint remains.
+
+Runtime control is [our frozen c3p stack and its linked ancestry/limitations](https://github.com/ItsNotRexed/Leonida/pull/7529#issuecomment-7113345557). c3q adds only this PR's shader_library.h, shader_library_test.cpp and shader_library_corpus_test.cpp changes. The folder list retains both library/ and exe/, and both independent test blocks are kept. No other runtime change. Pipeline source is main dde82f27e994337094afc476ded0b1426f6e87e2 plus #7529@b93ffa561 and this PR. Its executable-only stage runs separately; the previous four indexes and modules remain unchanged.
+
+Executable stage: 10 programs (one VS, nine PS), all 10 translated and spirv-val valid. LLVM 23.1.6, SPIRV-Tools v2026.3, wave64 emulation enabled, no fallback flags; translator digest and llvm-mc signature match the original frozen pipeline. The previously missing VS key matches the new executable index. Every indexed module exists.
+
+Both bounded offline runs use the SAME five-index overlay. Binary/PDB, patch, tool and all five index hashes are retained locally in each run's provenance.
+
+- Control c3p ignores exe/: loads 28,349 translations, reproduces six missing-VS lookups for one key and six failed ID3D12Device2::CreatePipelineState calls.
+- c3q loads 28,359 translations: no missing-VS lookup, and those same six pipeline calls now return success.
+- Both trace 2,334 D3D12 calls. Outcomes change from 1,645 ok / seven failed to 1,651 ok / one failed. The other totals remain 93 called, 586 unsupported, two ignored and one console-only. Apart from the six changed outcomes, the queue's console-only event moves across the first Barrier/Clear/Barrier group, consistent with thread ordering.
+- The remaining failed call is command-list Close; its HRESULT is not logged. Slot 67 still has 11 failures for eight distinct missing compute keys. Both runs initialize successfully, exit 3, and hit the same worker-thread title breakpoint. Presentation-window initialization is logged, but this is not evidence of a rendered frame.
+
+Validation: 27 Python tests pass (11 executable-stage, six library-stage, 10 shader-library). The selected 51 runtime tests give 45 passed, five unchanged baseline failures and one corpus skip without its environment. The corpus test then passes separately on the overlay: 26,503 main entries reached, 1,794 FSPX including library/, 52 BVH and 10 executable entries, zero failures. The five baseline failures remain device_proxy/device_proxy_trace under Wine WARP, the two known Wine environment cases, and the pre-existing mesh Close check. Existing slot-74 and XG stand-ins still limit this integration stack.
+
+This resolves the six graphics PSO creation failures on this stack. Together with #7529's 31 recovered compute calls, it is still insufficient to clear the worker-thread assertion; the cause of that assertion remains unclassified. No game data or raw logs attached.
+
+AI-assisted testing (Claude), review/reporting (Codex).
+agent: yes

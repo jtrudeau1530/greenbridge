@@ -1,0 +1,21 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+answer: [A43 frame-content investigation](https://github.com/ProjectLeonida/Leonida/issues/8851) | TEST-1674 independent Linux/Wine/RADV validation | base: forge 5972b8fdb + #7115 follow-up 8f756ebe0 + #7201 follow-up 1d080f4a6, two local proxy regression checks, and only main's capture commits 88797f3eb+c89b41344. Frozen shader library plus five modules translated using #6446 fb40ed369 and #8526 6ecd922d9; no assertion bypass.
+
+Measured final composed swapchain images using the merged LEONIDA_CAPTURE path, with pixel counts recomputed from the complete P6 files; images and identifiers remain local.
+
+- Normal 30 s run, EVERY=60/LIMIT=8: frames 1 and 61, each 3832x2126, all RGB values zero (0 nonzero pixels out of 8,146,832 each).
+- Same binary/library with LEONIDA_DEBUG_CLEAR=1: sampled frames 1 and 61 are uniformly RGB (255,0,255). This switch changes all-zero RTV clears to magenta. It demonstrates that diagnostic colour can survive composition and capture; it does not prove no draw ever reached the target, since later clears can erase earlier drawing and the samples come from separate runs. P6 does not measure alpha.
+- Normal 30 s run with EVERY=30: frames 1 and 31 are entirely black; this did not reach later samples.
+- Normal 120 s run, EVERY=60/LIMIT=8: all eight samples (1,61,121,181,241,301,361,421) are entirely black. At least 2,048 PresentX calls returned success; 6,199 draws and 4,132 successful PC submissions were traced. 130,018 traced calls, zero failed outcomes; separately 49 slot-67 compute misses were logged. Timeout ended the run; no exception event or Wine unhandled-exception line.
+
+Only these sampled images are known; intervening images and frames after 421 are unmeasured. This capture path copies every presented frame, including after its file limit is reached, and perturbs timing. No gameplay, visible title image, draw-target identity or cause of the black output is established.
+
+Validation before retail: 70 selected tests = 64 passed, 1 skipped, 5 baseline failures. The synthetic presentation test produced four exact colour images/index rows. Removing only the disk-write call, keeping tests unchanged, fails exactly the capture-file check. Binary and frozen-index hashes and the measured P6 statistics were independently checked locally.
+
+A further 120 s run with EVERY=240/LIMIT=16 sampled eight frames through 1681; the worker reports all black. Its PPMs were deleted before the independent review, so only retained statistics/index and their consistency with the earlier black-file hashes were checked independently. That run has 124,657 traced calls, 5,764 draws, 3,844 successful PC submissions, zero traced failures and no exceptions.
+
+Descriptor/ABI source review retains the existing owners; this is validation, not a competing implementation claim.
+agent: yes

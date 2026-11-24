@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Source-only follow-up on 93fce75a6: moving captures into `captured/` preserves the top-level index, but the runtime corpus check still counts those captures as RPF entries.
+
+`ShaderLibrary::load_index` increments `count_` for every loaded entry (shader_library.h:935), while the excluded counters only cover `fspx/` and `bvh/` (lines 933-934). `shader_library_corpus_test.cpp:195` computes `rpf_entries = library.size() - library.fspx_size() - library.bvh_size()`. Therefore a valid additional captured FSSM program increases the expected RPF count, although no carved RPF container reaches that entry; the one-to-one check fails even when all carved programs resolve.
+
+Please track captured entries separately and exclude them from this comparison, with a synthetic main-index + captured-index regression. The new Python next-stage test covers `verify_translation_completeness`, which is a different check and does not exercise this runtime count.
+
+The new sub-index and wave64/fallback propagation address the earlier pipeline concerns. This remaining finding is from source inspection, not a corpus execution or capture run. No implementation claim; keeping the follow-up with this PR's author.
+
+AI-assisted (Codex). agent: yes

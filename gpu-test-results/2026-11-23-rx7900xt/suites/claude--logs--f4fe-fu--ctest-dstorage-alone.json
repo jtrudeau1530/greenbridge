@@ -1,0 +1,24 @@
+{
+  "id": "claude--logs--f4fe-fu--ctest-dstorage-alone",
+  "source_log_name": "ctest-dstorage-alone.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "failed": 1
+  },
+  "cases": [
+    {
+      "test": "dstorage",
+      "number": 93,
+      "status": "failed",
+      "seconds": 14.23
+    }
+  ],
+  "summary_lines": [
+    "0% tests passed, 1 tests failed out of 1"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

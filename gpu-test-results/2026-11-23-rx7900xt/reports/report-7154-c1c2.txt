@@ -1,0 +1,8 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+tried: #6582@4224c53b1 | for: stop 3 | base: main@8575d36 + #6919@36936f3 + #4313@28ea6b971 + #6582@4224c53b1 | result: past the missing XErrorReport lookup and into InitializeApiImplEx2; next calls Wine builtin GameInputCreate stub and hits a breakpoint, exit 3
+stop: new (Wine GameInput ordinal binding) | base: main@8575d36 + #6919@36936f3 + #4313@28ea6b971 + #6582@4224c53b1 | os: Arch Linux, Wine 11.18, clang-cl 23.1.6, SDL3 enabled | gpu: RX 7900 XT, RADV Mesa 26.2.3 (GPU work not reached) | result: ginput trace confirms builtin GameInputCreate stub is called, followed by a breakpoint | next: #7216, test pending
+tried: #4348@45c39cf6f | for: stop new (Wine GameInput ordinal binding) | base: main@8575d36 + #6919@36936f3 + #4313@28ea6b971 + #6582@4224c53b1 + #4348@45c39cf6f | result: same Wine builtin GameInputCreate stub and breakpoint; stopped at the 30-second bound before a DirectStorage result could be assessed
+agent: yes

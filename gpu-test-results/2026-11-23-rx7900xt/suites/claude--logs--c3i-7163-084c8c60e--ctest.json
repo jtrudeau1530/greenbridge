@@ -1,0 +1,78 @@
+{
+  "id": "claude--logs--c3i-7163-084c8c60e--ctest",
+  "source_log_name": "ctest.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {
+    "passed": 10
+  },
+  "cases": [
+    {
+      "test": "xs_proxy_mock_no_reserve",
+      "number": 28,
+      "status": "passed",
+      "seconds": 1.0
+    },
+    {
+      "test": "xs_proxy_mock_no_protect",
+      "number": 29,
+      "status": "passed",
+      "seconds": 1.01
+    },
+    {
+      "test": "xs_proxy_mock_no_handler",
+      "number": 30,
+      "status": "passed",
+      "seconds": 1.01
+    },
+    {
+      "test": "xs_proxy_mock_env_slots",
+      "number": 31,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_invalid",
+      "number": 32,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "xs_proxy_mock_env_slots_70",
+      "number": 33,
+      "status": "passed",
+      "seconds": 0.0
+    },
+    {
+      "test": "d3d12_com",
+      "number": 139,
+      "status": "passed",
+      "seconds": 0.11
+    },
+    {
+      "test": "run_tiny_frame_queue_test_settings",
+      "number": 251,
+      "status": "passed",
+      "seconds": 0.2
+    },
+    {
+      "test": "run_tiny_frame",
+      "number": 250,
+      "status": "passed",
+      "seconds": 0.2
+    },
+    {
+      "test": "xs_proxy_mock",
+      "number": 27,
+      "status": "passed",
+      "seconds": 5.35
+    }
+  ],
+  "summary_lines": [
+    "100% tests passed out of 10"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

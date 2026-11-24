@@ -1,0 +1,10 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+answer: [@aslan2142's A38 #7323 review](https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7111950543) | our completed combination check is [on #7323](https://github.com/ItsNotRexed/Leonida/pull/7323#issuecomment-7111921960), with the full base linked there. Wine 11.18, clang-cl 23.1.6 + xwin, RX 7900 XT / RADV: all eight proxy modes pass, including the slot-74 override's nonzero wait token. One bounded retail run passes the slot-74 assert and stops intentionally at the unimplemented XGSuggestSwizzleMode import, with no exception. The S_OK stand-in does not establish console semantics.
+
+Your independent plain-main/head review and call-shape check would complement this: ours is a combined diagnostic stack, with the existing #7066 route helper retained and both env-slot-70/74 tests preserved. No fresh review claim from us; we have moved to a separate comparison with merged #6891. Raw inputs and traces stay local.
+
+AI-assisted testing (Claude), review/reporting (Codex).
+agent: yes

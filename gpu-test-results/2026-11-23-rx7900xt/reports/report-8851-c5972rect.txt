@@ -1,0 +1,17 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+LOCAL DRAFT — NOT POSTED. Rectangle-variant comparison, TEST-1674.
+
+Frozen c5972diag2 plus ONLY forge ab1cfd674 own delta, with a diagnostic alpha histogram. Interning645c08112 was not required and was excluded before building; the original per-record owned buffers retain stable pointers. No later forge merge or shader change. Source/patch/runner/binary/five-index/native-map hashes independently verified.
+
+Focused70 tests:64pass,1skip,5unchanged failures. Native-PSO rectangle regression passes. With identical test source and only variant selection disabled, the negative control fails the variant creation/binding checks (15 failures total, beginning with expected stream-count/topology19/variant binding assertions). This validates the test's sensitivity to variant selection.
+
+One30s readback run on the unchanged overlay: timeout, noexception,67140traced calls(56434ok,10706called),0failed. The variant-created log and draw summaries show type19 bound for console topology17; type4 triangle draws retain pipeline type3. All six3840x2160 scene/display P6 files independently read as valid/allRGBzero. Exact RGBA-loop counters at presents60/120/240 report alpha0=8294400,alpha255=0,other=0 for both surfaces. Thus sampled scene/display RGBA are allzero. The control logged scene alpha min0,max255,mean127.500 but had no histogram; no exact-half control claim.
+
+Variant creation/binding changed as intended, but expected coverage improvement was not observed. It does not prove full rectangles rasterized, identify the specific draw responsible for the control alpha, or explain zeroRGB. Readbacks occur at PresentX after device-idle and perturb image layouts; scene is selected from the last DSV-bound API draw before replay decisions. Other composite defects are not excluded.
+
+Next: source-only deferred-replay/record_draw early-exit audit and comparison of owned rectangle-corner/winding corrections, then a concrete discriminating diagnostic proposal. Frozen references retained; no broader merge adopted. GitHub issue reads remain404 and the latest forge fetch timed out; source freshness is recorded separately.
+
+Follow-up DEBUG_CLEAR control (same binary and overlay): independently verified three sampled display P6s are entirely RGB(255,0,255), with logged alpha255 on all8294400pixels; three scene P6s remain entirely black, with alpha0 on allpixels.68050traced calls,0failed. This establishes survival of the diagnostic colour at those sample points, not absence of every earlier draw write. A later clear can overwrite drawing; only the first four detailed presents identify clear targets, and global counts do not prove the scene was never cleared. Per-list/submission replay diagnostics are the next source-only proposal.

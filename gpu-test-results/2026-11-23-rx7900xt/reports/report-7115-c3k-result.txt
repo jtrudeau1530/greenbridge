@@ -1,0 +1,22 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Wine/RADV integration validation at #7115 `e22994464b17517624c898ed34b3e03c06ce2261`, with one declared #7021 integration adaptation.
+
+Control is the complete diagnostic stack in [our #7330 result](https://github.com/ItsNotRexed/Leonida/pull/7330#issuecomment-7111409466): main `8575d36ed`, the listed boot PRs, runtime BVH-index loader, #7163 and #7330. Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin. Same shader library, prefix and 30-second offline sandbox; display enabled, no assertion skipping.
+
+Integration point: the new helper calls `self->real->CreateSampler` directly, so it bypasses #7021's translated slot-22 route. We changed only its destination to `translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(dest)})`, using the existing in-file helper. Null-description behavior is unchanged. Other conflicts were unions preserving the existing handlers and tests.
+
+A new local check in the existing hook-backed heap fixture calls device slot 61 with a handle inside the registered custom range. It expects PC slot 22 once, the same sampler pointer, the translated real-heap handle and no PC slot 61 call. The original identity/null checks remain. Negative control: remove ONLY the translation from this helper and rebuild the mock test; the added translated-handle expectation fails (exit 1). Restored translation passes (exit 0). This validates the combined translation route; it is not a native-GPU sampler-heap test.
+
+One bounded retail run per checkpoint:
+- Before: 1,656 traced calls, then host access violation in PC `Device::CreateMetaCommand` after device slot 61 was forwarded by number.
+- After #7115 plus the adaptation: slot 61 reaches `ID3D12Device::CreateSampler` (void/called); the host fault is gone. Slot 24 follows, then forwarded slot 74 reaches `ID3D12Device9::ShaderCacheControl`, which fails. The title then takes a breakpoint. Init 0/run 3, no timeout; 1,658 calls (1,634 ok, 23 called, 1 failed).
+
+Whether the retail sampler handle actually needed translation is unobserved: there is no custom-heap hook line. The startup progress and synthetic translation regression are separate evidence.
+
+Selected tests: 40/45. All seven proxy modes, tiny-frame, COM, compute and shader-library/corpus checks pass. Five earlier/control failures remain: native-abort exit expectation, missing-TMP TLS refusal, two Wine WARP device checks, and the mesh fixture's pre-existing Close failure. Not a fully green suite. Source/file and matching exe/PDB/DLL hashes verified; raw logs and inputs remain local. Next candidate is existing #7323, separately and with its stand-in limitation explicit.
+
+AI-assisted testing (Claude), review and reporting (Codex).
+agent: yes

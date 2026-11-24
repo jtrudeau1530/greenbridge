@@ -1,0 +1,20 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@gookie
+
+checked: #7529@b93ffa561711e7885c67d5bf9cf0a939f30c42af | on: Arch Linux, Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin | result: controlled library-loader comparison reduces slot-67 failures from 42 calls / 39 distinct code keys to 11 calls / 8 keys. The same worker-thread title breakpoint remains.
+
+Runtime base: [our frozen c3o diagnostic stack, with its linked full ancestry and limitations](https://github.com/ItsNotRexed/Leonida/pull/8517#issuecomment-7112648117). c3p adds ONLY this PR's shader_library.h and shader_library_test.cpp changes, which apply cleanly. Pipeline source is frozen main dde82f27e994337094afc476ded0b1426f6e87e2 plus the full PR patch. No translator-rule changes, rebase, or other runtime changes.
+
+The compute-library step wrote 2,684 programs; 1,773 translated and all 1,773 passed spirv-val. 911 remain untranslated. LLVM 23.1.6, SPIRV-Tools v2026.3, wave64 emulation enabled, no fallback flags. The translator digest and llvm-mc signature match our original pipeline's corresponding provenance. The new index has both code and state keys on every entry. All 31 requested code keys found by the unpack-only probe translated; the other eight were absent from the extracted compute library and from the already unpacked FidelityFX DLL programs. This does not establish their source.
+
+Both bounded offline runs use the SAME finalized overlay: unchanged main/FSPX/BVH modules plus the new library/ sub-index. Every indexed module exists. Control c3o ignores library/ and reproduces the original 42 failures / 39 keys. c3p has no failure on calls 1-31, then failures on calls 32-42; those remaining misses are exactly the eight keys absent from the extracted compute library. The handler numbers every call and logs every failed HRESULT, so the first 31 now return success. The lookup checks the state key as well as the code key. No ambiguous lookup was reported.
+
+Both runs: init exit 0, runtime exit 3. The 2,334 traced D3D12 calls retain the same outcome counts: 1,645 ok, 93 called, 586 unsupported, seven failed (six CreatePipelineState and one Close), two ignored, one console-only. Slot-67 successes are not separate trace events. The same worker-thread title breakpoint occurs before the other thread logs presentation-window initialization. Clearing these 31 calls alone is insufficient to clear that stop; no rendered-frame or compute-dispatch correctness claim.
+
+Validation: 16 Python tests pass. The selected 51-test runtime invocation has 45 passed, five unchanged baseline failures, one corpus skip without its environment. The corpus test was then executed separately and passes against both the frozen library and the overlay (26,503 main entries reached; overlay auxiliary counts 1,794 FSPX including library, plus 52 BVH). Shader-library checks pass. Baseline failures remain the two known Wine environment cases, two Wine WARP device-creation failures, and the pre-existing mesh Close check. Existing slot-74 and XG stand-ins still limit the integration stack. No game data or raw logs attached.
+
+AI-assisted testing (Claude), review/reporting (Codex).
+agent: yes

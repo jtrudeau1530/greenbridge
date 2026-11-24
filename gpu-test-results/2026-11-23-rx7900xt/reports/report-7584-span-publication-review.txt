@@ -1,0 +1,14 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@gkissel Thanks for taking the scope report into f262cdea1. Reading that delta, the new mapped-outside-span RaiseException check covers the quiescent case we reported. I have not built or run this revision.
+
+One concurrent scope gap remains: the begin/end atomics are not read as a coherent pair. For example, with two disjoint synthetic spans A=[100,200) and B=[300,400), the handler can read the old g_last_split_begin=100, then the writer publishes B's end=400, then the handler reads that new end. A mapped address 250 now passes the apparent [100,400) check despite belonging to neither split. Clearing last_begin to zero before publishing B does not prevent a reader that already loaded A's begin. Acquire/release ordering alone does not make the pair a snapshot.
+
+The successful VirtualQuery path immediately returns CONTINUE_EXECUTION; it does not recheck g_splits or otherwise validate that the span stayed in one generation. This can still consume an unrelated continuable AV on a mapped readable page, the same observable behavior the new negative test correctly rejects when no writer races. The active begin/end pair also needs consistent-generation reads.
+
+Could the publication/read protocol validate one stable span generation, with a deterministic test forcing a reader across publication of disjoint spans? This is an interleaving found by source review, not a reproduced runtime fault. The stronger reader test and freed-while-mapped lifetime test are useful additions; I am not claiming a duplicate fix.
+
+AI-assisted review (Codex, with Claude preflight).
+agent: yes

@@ -1,0 +1,24 @@
+{
+  "id": "claude--logs--shaders-20261123-123338",
+  "source_log_name": "shaders-20261123-123338.log",
+  "record_status": "reconstructed; raw output excluded",
+  "case_counts": {},
+  "cases": [],
+  "summary_lines": [
+    "3313 shaders: 3313 translated, 3313 pass spirv-val",
+    "3313 shaders: 3313 translated, 3313 pass spirv-val",
+    "3313 shaders: 3313 translated, 3313 pass spirv-val",
+    "3313 shaders: 3313 translated, 3313 pass spirv-val",
+    "3313 shaders: 3313 translated, 3313 pass spirv-val",
+    "3313 shaders: 3313 translated, 3313 pass spirv-val",
+    "3313 shaders: 3313 translated, 3313 pass spirv-val",
+    "3312 shaders: 3312 translated, 3312 pass spirv-val",
+    "29 shaders: 21 translated, 21 pass spirv-val",
+    "52 shaders: 52 translated, 52 pass spirv-val"
+  ],
+  "limits": [
+    "Synthetic fixture results and retail results are separate.",
+    "A test with a passing exit can print SKIP; see report corrections.",
+    "Unchanged failing test names do not establish unchanged failing assertions."
+  ]
+}

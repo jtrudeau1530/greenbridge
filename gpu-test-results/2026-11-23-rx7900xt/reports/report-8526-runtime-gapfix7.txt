@@ -1,0 +1,13 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+UNSENT — GitHub comment access is restricted. Intended thread: #8526; keep local until access is available.
+
+AI-assisted Linux/Wine/RADV validation, TEST-1674. Follow-up to https://github.com/ProjectLeonida/Leonida/pull/8526#issuecomment-7115492729.
+
+The unchanged forge 4fe7db213 runtime with the previously declared #7115 guest/host and #7201 null-array follow-ups was compared on two frozen shader overlays. The only change was adding two modules translated with the same GitHub #6446 fb40ed369 + #8526 6ecd922d9 translator used for the earlier five modules. The original 1,773 library entries, other indexes and native map were unchanged. Corpus validation passed: 26,503 RPF entries reached; 1,801 FSPX, 52 BVH and 10 executable entries; zero failures.
+
+Observed in the bounded run: two slot-67 misses became zero; all seven recovered programs were served and no further compute or vertex-shader miss appeared. Traced D3D12 outcomes contained zero failures. One PresentX returned S_OK. The same title breakpoint remained, with the same exception line and run exit 3. No pixels were captured.
+
+Serving all seven programs did not remove the breakpoint; no missing slot-67 lookup remained in the observed window. This does not establish shader semantic correctness, a visible image or long-run stability. Counts only; no game data included.

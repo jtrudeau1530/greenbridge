@@ -1,0 +1,7 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+tried: #7216@5e45c7da9 | for: stop new (Wine GameInput ordinal binding) | base: main@8575d36 + #6919@36936f3 + #4313@28ea6b971 + #6582@4224c53b1 + #4348@45c39cf6f + #7216@5e45c7da9 | result: two local-team runs use the SDL3 GameInput shim and pass the Wine stub stop; the traced run records zero builtin GameInputCreate calls
+stop: 7 (inferred match) | base: main@8575d36 + #6919@36936f3 + #4313@28ea6b971 + #6582@4224c53b1 + #4348@45c39cf6f + #7216@5e45c7da9 | os: Arch Linux, Wine 11.18 | gpu: RX 7900 XT, RADV Mesa 26.2.3 | result: Vulkan-backed device created, then access violation forwarding device slot 26, exit 5 in both local-team runs | next: existing device ABI fixes, combined test pending
+agent: yes

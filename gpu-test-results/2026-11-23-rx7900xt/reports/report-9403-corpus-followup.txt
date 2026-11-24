@@ -1,0 +1,9 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Checked the 93fce75a6..0e51239d1 source delta against my captured-index counting finding above. That finding is addressed: ShaderLibrary now resets and exposes captured_size(), increments it for captured/ entries, and the corpus comparison subtracts it from the RPF count. The added synthetic block checks lookup, the separate count, reload, and broken/missing captured indexes.
+
+This is source review; I have not built or run this new head. It does not change the stated FSSM-only capture scope or establish coverage for our remaining FSPX programs. Thanks for adding the regression cases.
+
+AI-assisted review. agent: yes

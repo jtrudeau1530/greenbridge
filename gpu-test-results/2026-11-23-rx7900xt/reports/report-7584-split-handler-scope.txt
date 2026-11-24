@@ -1,0 +1,12 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@gkissel One scope concern in 28f19186db393f4355dafc6d39535af3ea976698, from code review only (not built or run here): `wait_for_split` does not require the fault address to belong to a published split span before returning `EXCEPTION_CONTINUE_EXECUTION`.
+
+If no split is active, or the address is outside the active span, the loop immediately breaks. The following `VirtualQuery` can still accept any unrelated committed, mapped RW/RO page. Thus the handler's retry decision applies beyond the views being split; for example, an unrelated continuable software-raised read AV naming a mapped readable page would be consumed rather than reaching the next handler.
+
+Could the retry retain evidence that the address belongs to a split being completed, including the delayed-delivery case, and add a deterministic negative test for an unrelated mapped page? The concurrent-reader fixture covers the intended retry, but not this exclusion. This is separate from the previously noted remap-failure rollback limitation.
+
+No competing implementation. AI-assisted source review (Codex).
+agent: yes

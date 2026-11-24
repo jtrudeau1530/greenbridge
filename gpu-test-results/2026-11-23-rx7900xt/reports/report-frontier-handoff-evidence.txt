@@ -1,0 +1,11 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@ASTROWwwW @aslan2142 Existing updates relevant to [the 21:15 handoff](https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7114260734), to keep the next work from duplicating fixes:
+
+- #7584: gkissel replied with f262cdea1 and new tests in [7113942747](https://github.com/ItsNotRexed/Leonida/pull/7584#issuecomment-7113942747), then addressed our concurrent span-publication finding in [cef56a296](https://github.com/ItsNotRexed/Leonida/pull/7584#issuecomment-7114123210). I [source-reviewed that specific correction](https://github.com/ItsNotRexed/Leonida/pull/7584#issuecomment-7114164253). The author reports 199 checks passing; we have not independently run this head yet. Only one finished span is retained, so this is not a general delayed-fault correctness claim. Please account for those commits in the backup's scope.
+- A48: dcastell1 posted [taking with a 60-minute ETA](https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7113990763). dadnotdaddy then [separated #9244's short-index path from dcastell1's earlier shard-exit failure](https://github.com/ItsNotRexed/Leonida/issues/8851#issuecomment-7114222844). There are existing owners for those two paths; they should be reconciled before a third implementation starts.
+
+No new implementation claim from us. AI-assisted coordination; links to others' results are not our test results.
+agent: yes

@@ -1,0 +1,18 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Integration-tested e0b300f02b6f1bb358f26a904668dcf3e3e14c68 with #6953 at 4b76715cf6cb70d569917299040418e1c24ce7ff on Wine 11.18, RX 7900 XT / RADV Mesa 26.2.3, clang-cl 23.1.6 + xwin SDK 10.0.26100, RelWithDebInfo: **past slot 133 and the first descriptor heaps; next fault is slot 70 forwarding**.
+
+Base is the complete pinned local stack and cache-only diagnostic described [here](https://github.com/ItsNotRexed/Leonida/issues/7496#issuecomment-7107979500): main 8575d36ed + #6919 #4313 #6582 #4348 #6954 #7076 (carrying the older #2490) #6973 #6964 #7021 #7216, with the documented slot-25/26 integration choices and local WC|NC view mask credited to ramenbellic/gkissel. Added #6953 then this PR. #7075 conflicts were the overridden-slot union and header-comment union; production has no extra patch beyond those merges.
+
+One test-only adaptation was required: clang-cl rejects the constexpr cast of the Xbox-only flag to D3D12_RESOURCE_FLAGS. Following the approach already reported by Stalkerino/Marukooh, the fixture keeps the raw uint32_t value and copies it into desc.Flags. No test assertion or production behavior was removed.
+
+- All six xs_proxy_mock modes pass, including check_placed_resource_x; run_tiny_frame and gameinput pass.
+- Selected suite: 35/39. The same four previously observed failures remain: native abort-default exit-code expectation, missing-TMP TLS refusal, and device_proxy/device_proxy_trace failing host WARP D3D12CreateDevice with E_INVALIDARG. This is not a fully green suite or validation of the real WARP paths. DirectStorage's separate known held-copy failure was not in this selected set.
+- One bounded, display-enabled retail run: init exits 0, run exits 5. Slot 133 is logged, followed by CreateDescriptorHeap, five heap proxies, heap slots 9/10 and SRV/UAV/CBV creation. This later progress establishes that the call was passed, beyond the handler's pre-call "created" wording.
+- Next: device slot 70 is forwarded; the first host fault symbolizes to Device::CreatePlacedResource1 at its output-pointer write. #7066 is the next owned handler being tested.
+
+Limits: this stand-in is not backed by the title's VA, and no GPU visibility, draw or gameplay is established. The heap-start assertion did not fire, but no allocation-hook log was present, so we do not claim #7021's hook path was exercised. The slot-133 texture/layout paths are covered by the mocks, not this retail call.
+
+The collaborating runner executed the build/tests; I reviewed frozen proxy/mock source against the commit, matching executable/PDB/DLL provenance, test output, exits and fault summary. Raw game traces stay local. AI-assisted.

@@ -1,4 +1,4 @@
-"""AGENTS.md names every tool that needs numpy or Pillow, and CONTRIBUTING.md says how pytest-based tests run.
+"""docs/testing.md names every tool that needs numpy or Pillow, and CONTRIBUTING.md says how pytest-based tests run.
 
     python -I tests/test_docs_python_deps.py
 
@@ -39,9 +39,9 @@ def imports_third_party(source):
     return False
 
 
-def listed_tools(agents_text):
-    """Basenames of the `*.py` tools in the AGENTS.md convention bullet that names the numpy/Pillow exceptions."""
-    bullet = re.search(r"^- Python tools run with `python -I`.*?(?=^- |^\Z)", agents_text, re.S | re.M)
+def listed_tools(testing_text):
+    """Basenames of the `*.py` tools in the docs/testing.md convention bullet that names the numpy/Pillow exceptions."""
+    bullet = re.search(r"^- Python tools run with `python -I`.*?(?=^- |^\Z)", testing_text, re.S | re.M)
     return set(re.findall(r"`([\w]+\.py)`", bullet.group(0))) if bullet else set()
 
 
@@ -58,15 +58,15 @@ class DocsPythonDeps(unittest.TestCase):
         self.assertTrue(imports_third_party("def f():\n    from PIL import Image\n"))
         self.assertFalse(imports_third_party("import json\nfrom os import path\n"))
 
-    def test_agents_lists_the_tools_that_need_numpy_or_pillow(self):
+    def test_testing_doc_lists_the_tools_that_need_numpy_or_pillow(self):
         files = tracked_files()
         needing = {os.path.basename(p) for p in files
                    if p.endswith(".py") and (p.startswith(("tools/", "scripts/")) or p == "make_game.py")
                    and imports_third_party(read(p))}
-        listed = listed_tools(read("AGENTS.md"))
+        listed = listed_tools(read("docs/testing.md"))
         self.assertTrue(needing and listed)
-        self.assertEqual(sorted(needing - listed), [], "tools that import numpy/Pillow but are not in AGENTS.md")
-        self.assertEqual(sorted(listed - needing), [], "tools named in AGENTS.md that no longer import numpy/Pillow")
+        self.assertEqual(sorted(needing - listed), [], "tools that import numpy/Pillow but are not in docs/testing.md")
+        self.assertEqual(sorted(listed - needing), [], "tools named in docs/testing.md that no longer import numpy/Pillow")
 
     def test_contributing_says_pytest_files_do_not_run_under_python_i(self):
         pytest_only = [p for p in tracked_files()

@@ -1,0 +1,8 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+stop: new | base: main@8575d36 | os: Arch Linux, Wine 11.18, clang-cl 23.1.6 | gpu: RX 7900 XT, RADV Mesa 26.2.3 (GPU work not reached) | result: host access violation in library_loader.cpp host_module_name map lookup before any xmem_attributes event | next: unknown
+tried: #6919@36936f3 | for: stop new | base: main@8575d36 + #6919 | result: same host access-violation stop before XMem; dry-run unresolved imports decrease 29 to 22 and init exits 0
+checked: #6919@36936f3 | with: xmem, loader, pe_loader, loader_tls, run_tiny_game | base: main@8575d36 + #6919 | on: Arch Linux, Wine 11.18, clang-cl 23.1.6, xwin SDK 10.0.26100 | result: pass 5/5 targeted tests, including 173 xmem checks; clean main also passes all five with 116 xmem checks
+agent: yes

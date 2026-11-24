@@ -1,0 +1,14 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Follow-up to [our RX 7900 XT / RADV A/B](https://github.com/ItsNotRexed/Leonida/pull/7235#issuecomment-7108499945), on the same complete integration base and f5dae9ff2. Added only local before/after diagnostics around each alloc_fn call, flushed with LastError preserved; no allocation-size, flags, flow or exception changes.
+
+Observed in one bounded display-enabled run:
+- First request: 33,619,968 bytes, attributes 0x808000; returns allocated, then its SRV/RTV/UAV calls occur.
+- Second request: the same size and attributes, immediately followed by the title breakpoint, with no return diagnostic. The second resource creation itself had returned ok.
+- Same 1,637 D3D12 calls and same local fault-site identity as the uninstrumented build. Init 0 / run 3. Tests remain 36/40 with the same four known failures; all seven proxy modes, both slot-127/133 checks and the lease lifetime check pass. Mock allocated/refused cases both emit return diagnostics.
+
+This narrows the failure to the second hook call before return; it does not directly measure the arena capacity. The two requested sizes total 67,239,936 bytes, so the existing larger-PC-size explanation is consistent with this run, still an inference here.
+
+Next comparison is #7240 d61755d4d from the pre-lease control, with its full dependencies declared and without this PR's lease active. It will be a combined-stack comparison, not an isolated size-only test. Diagnostics and raw traces remain local; no game addresses or bytes shared. Executed by the collaborating runner and reviewed against matching source/binary provenance. AI-assisted.

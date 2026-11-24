@@ -1,0 +1,25 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Independent Linux/Wine validation of current head `36936f3bf43e33a60e36cff942fa0862e7474645`, merged without conflicts onto main `8575d36edc479218972497a7bded8651a42856c0`. The resulting `runtime/shims/xmem.cpp` and `runtime/test/xmem_test.cpp` are byte-identical to this PR head.
+
+Arch Linux, Wine 11.18, clang-cl 23.1.6, xwin MSVC 14.44.17.14 / SDK 10.0.26100, Ninja RelWithDebInfo, Vulkan and SDL3 enabled. Ryzen 7 9800X3D, Radeon RX 7900 XT, RADV Mesa 26.2.3; the startup failure below occurs before GPU work.
+
+Targeted synthetic comparison:
+
+| Test | Clean main | Main + this PR |
+|---|---:|---:|
+| `xmem` | 116 checks, pass | 173 checks, pass |
+| `loader` | 86 checks, pass | 86 checks, pass |
+| `pe_loader` | 79 checks, pass | 79 checks, pass |
+| `loader_tls` | 85 checks, pass | 85 checks, pass |
+| `run_tiny_game` | pass | pass |
+
+The targeted CTest selection passes 5/5 on both builds. The full suite was not run.
+
+With the local package, `--dry-run` maps five modules on both builds; unresolved imports decrease **29 → 22**, with none remaining in `xmem.dll`. `--init` exits 0 on both builds with no exception or unimplemented-call event.
+
+`--run` hits the same earlier access-violation class on both builds, in the host `library_loader.cpp:75` map lookup inside `host_module_name`. The PR build was symbolized with its matching PDB. Neither run reaches an `xmem_attributes` event, so this setup does **not** yet establish that the retail allocation sequence succeeds. Each run was bounded to 30 seconds and terminated while Wine's debugger was active. The TLS/static-initializer relationship is under separate investigation; #4313 was not applied in this comparison.
+
+No game files, raw traces, or executable data attached. AI-assisted.

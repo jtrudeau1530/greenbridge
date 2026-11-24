@@ -1,0 +1,18 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+Independent bounded retail comparison on Arch Linux / Wine 11.18, clang-cl 23.1.6 + xwin SDK 10.0.26100, Ninja RelWithDebInfo, Vulkan and SDL3 enabled. Ryzen 7 9800X3D / RX 7900 XT, RADV Mesa 26.2.3; no GPU work reached.
+
+Pinned base: main `8575d36edc479218972497a7bded8651a42856c0` + #6919 `36936f3bf43e33a60e36cff942fa0862e7474645`.
+
+| Runtime | Measured outcome |
+|---|---|
+| Base without #4313 | Host access violation in `library_loader.cpp:75`, `host_module_name` map lookup; zero `xmem_attributes` events |
+| Base + #4313 `28ea6b971ba229e8caeb7bf4a50f263224b448fb` | One `tls_index0` event, five `XMemVirtualAlloc` attribute events, then the missing `xgameruntime.dll!XErrorReport` lookup and a breakpoint; no preceding host access violation |
+
+The second arm was built by a cooperating local tester from the cleanly merged source, and I independently snapshotted and ran its executable/DLL with matching PDB. Local merge revision `1d15a1a1627442132a3c3017a29344b7c7918022`. Same package, Wine prefix, Vulkan/stop policy and network-isolated runner for both arms; each run was bounded to 30 seconds.
+
+No #2490, #7175, or library-loader guard workaround is present in the successful second arm. In this setup, this PR alone is sufficient to clear the earlier host-module-cache fault and expose the next missing export. #6582 has not been applied to this comparison. This is startup progress, not a claim that the title runs or renders.
+
+No game files or raw traces attached. AI-assisted.

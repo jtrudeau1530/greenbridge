@@ -1,0 +1,9 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+status: TEST-1674 (continuing the Wine/RADV validation posted in #7804). The shaders-only pipeline on main@dde82f27e completed offline: 26,503/26,503 main programs translated and spirv-val-valid; FSPX 21/29 translated, all 21 valid (8 explicitly untranslated); BVH 52/52 translated and valid. Every indexed module exists. No assets stage or output artifacts published.
+
+Our unchanged diagnostic c3h runtime loaded the main and FSPX entries but stopped at the first BVH compute lookup: its older ShaderLibrary does not read the separate bvh index. That program is present and valid in the local library. This is the known missing runtime support already merged through #6739, not a new shim claim or a frontier advance.
+
+Next: one isolated comparison using only #6739's four runtime-file changes from e76640014, including its shader-library and compute regressions, on the same frozen control and library. Build is running. No new implementation, commit or PR; #7516 remains with its owner. After this comparison we will refresh the integration against current main, the selected #7492 view-protection fix, and the current dependency tests. Results and skips will be reported separately. AI-assisted testing (Codex and Claude).

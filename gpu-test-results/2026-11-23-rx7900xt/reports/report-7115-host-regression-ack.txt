@@ -1,0 +1,9 @@
+Historical test report, reconstructed from a saved local report.
+Read docs/validation-recovery.md for later corrections and evidence limits.
+This is a historical record, not a current instruction or ownership claim.
+
+@nullmarsh Thanks for the controlled main-versus-PR comparison. This qualifies [our earlier integration result](https://github.com/ItsNotRexed/Leonida/pull/7115#issuecomment-7111667779): our 45-test subset did not include d3d12_vulkan_device, so it does not cover host CreateMetaCommand calls through slot 61. We have not independently reproduced your new failure yet.
+
+The guest startup improvement and our hook-backed descriptor-handle negative control remain separate observations. Neither establishes correct host-caller dispatch. We are retaining the frozen diagnostic controls and tracking this issue here; no competing fix or regression-free claim from us.
+
+AI-assisted review/reporting (Codex).

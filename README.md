@@ -1,27 +1,10 @@
-<h1 align="center">
-  <br>
-  <a>
-  <img src="assets/logo.svg" alt="Leonida" width="200">
-</a>
+# Greenbridge
 
-  <br>
-  <b>Leonida</b>
-  <br>
-</h1>
+An experimental Xbox Series compatibility runtime and shader translation project, continuing the available [Leonida](https://github.com/ProjectLeonida/Leonida) source.
 
-<h4 align="center">Grand Theft Auto VI (Xbox Series) running natively on Windows, built on your PC from your own copy.
-</h4>
+[Status](#project-status) · [Build](#how-to-build) · [Recovered test results](gpu-test-results/2026-11-23-rx7900xt/README.md) · [Source recovery](recovery/README.md) · [Credits](#credits) · [License](#license)
 
-<p align="center">
-  <a href="docs/i18n/README.md">Other languages</a> |
-  <a href="#project-status">Status</a> |
-  <a href="#how-to-build">How to build</a> |
-  <a href="#how-it-works">How it works</a> |
-  <a href="#want-to-help">Want to help?</a> |
-  <a href="#credits">Credits</a> |
-  <a href="#license">License</a> |
-  <a href="https://discord.gg/xsqS3DqqVF">Discord</a>
-</p>
+Original source authorship and licenses are retained. Greenbridge is an independent continuation; the original maintainers are not represented as its operators.
 
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
 and run natively, and the console's system software is reimplemented. The console's precompiled RDNA2 GPU programs
@@ -34,15 +17,13 @@ happens **on your PC, from your own copy of the game**.
 > Everything the build creates (the generated shaders, extracted assets, the runtime folder and your saves) comes
 > from your game and stays on your PC. Never share those files.
 
-Discord: https://discord.gg/xsqS3DqqVF
-
-Custom Git Mirror: https://git.notrexed.dev/notrexed/Leonida
-<br>
+Historical upstream links and source identities are recorded in [the recovery index](recovery/README.md). Their current availability is not guaranteed.
 
 ## Project status
 
-**Early. The game does not boot yet.** Everything that can be done without the game's executable is in place, so
-work on booting can start as soon as one is available to a developer.
+**Experimental; no playable state or non-black game image has been verified here.** Saved Linux/Wine experiments reached repeated submissions and presents, including bounded two-minute runs without an observed exception. Sampled normal images remained black. See the [recovered validation record](docs/validation-recovery.md), including failed experiments and corrections.
+
+The table below is the inherited upstream feature summary, not a fresh test of this default branch. `main` retains the last saved GitHub source; forge-based and diagnostic snapshots are archived separately.
 
 | What | Status |
 |---|---|
@@ -86,7 +67,7 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 **The easy way:**
 
 1. Install the prerequisites below.
-2. Download this project **with its submodule**: `git clone --recursive https://github.com/ItsNotRexed/Leonida`. A
+2. Download this project **with its submodule**: `git clone --recursive https://github.com/jtrudeau1530/greenbridge.git`. A
    "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**.
@@ -271,6 +252,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted asset
 pull requests.
 
 ## Credits
+
+Greenbridge preserves the work of Leonida's original authors and contributors. Available commit authorship is retained; [the recovery index](recovery/README.md) records original and exported source identities. The additional validation archive documents local experiments and does not claim ownership of upstream fixes.
 
 - [rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) by breadbbbb: the RPF9 model, texture-pool and AWC
   decoders used by `tools/rpf9dump` (git submodule).

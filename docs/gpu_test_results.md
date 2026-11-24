@@ -96,3 +96,7 @@ until it reports nothing to do before installing it. Loader warnings from instal
 affect the run. This is the first RDNA3 entry: wave64 and mesh shader tests ran natively (all `ms_*` pass).
 
 AI-assisted (Claude): helped set up the tools and write this entry; the build and test run were done on this GPU.
+
+## AMD Radeon RX 7900 XT — recovered Linux/Wine validation
+
+The [2026-11-23 validation archive](../gpu-test-results/2026-11-23-rx7900xt/README.md) preserves reconstructed per-test results, bounded runtime comparisons and sanitized historical reports. See [corrections and evidence limits](validation-recovery.md). These are saved results, not a new full-suite run on the default branch.
