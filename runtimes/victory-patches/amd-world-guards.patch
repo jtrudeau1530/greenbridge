@@ -1,0 +1,640 @@
+Adapted upstream GPU guards; applied after 61474f6 and 417f4e3.
+Upstream: https://github.com/Slaktarn700/VIctory/commit/6f732b6c1cbc66ffef44897c6db12a7af9aac867
+Original author: slaktarn
+Upstream: https://github.com/Slaktarn700/VIctory/commit/993dff8ef8a613259bb40afed0086f613e53c03e
+Original author: slaktarn
+Upstream: https://github.com/Marvisak/VIctory/commit/c48b240addc031cb3126c8dbf3fc39de63507b37
+Original author: hophaver
+Upstream: https://github.com/Hiiva/VIctory/commit/44868bd2c71a411b35aeaaa8f8d9153d3d3b31a1
+Original author: Hiiva
+Upstream: https://github.com/MichaelSmithAI/VIctory/commit/9be8bb3637571196ce293dea363fe20cf666c315
+Original author: swarm
+Adaptation: retain the base watcher; refresh copied heap slots under the
+submission mutex; exercise the actual submission path and required GPU readbacks.
+
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index 20b33fb..400f73e 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -59,6 +59,11 @@ pub(crate) struct Heap {
+     host: std::sync::OnceLock<Option<host::HostHeap>>,
+     #[cfg(windows)]
+     pending: std::sync::Mutex<Vec<u32>>,
++    /// The write-watch asking (see [`crate::watch::writes`]) up to which
++    /// the host heap has caught up with what the title wrote into its
++    /// memory itself (see [`resync_title_writes`]).
++    #[cfg(windows)]
++    synced: std::sync::atomic::AtomicU64,
+ }
+ 
+ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
+@@ -148,6 +153,51 @@ fn mirror(handle: u64) {
+     }
+ }
+ 
++/// Brings the host heaps up to date with descriptors the title wrote into
++/// heap memory itself (copies of whole slots, which no create or copy call
++/// reports), before a submission runs: slots read directly by index (not
++/// through a table) are made only from what was mirrored, so a slot the
++/// title turned from a texture into a constant buffer kept the texture,
++/// whose upper half the shader read as a buffer at address 0: a GPU page
++/// fault and a lost device in the world. Only the 64 KiB blocks written
++/// since the last call are looked at; heaps in memory the kernel does not
++/// watch (ours, not the title's) are left as they are.
++#[cfg(windows)]
++pub(crate) fn resync_title_writes() {
++    #[cfg(test)]
++    crate::host::host().expect("a host for descriptor resync").assert_submission_locked();
++    use std::sync::atomic::Ordering::Relaxed;
++    // Held throughout: registered heaps stay alive while it is.
++    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
++    for &(start, end, at) in heaps.iter() {
++        // SAFETY: registered heaps are live (removed when dropped).
++        let heap = unsafe { &*(at as *const Heap) };
++        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
++            continue; // no host heap yet; a later title submission can sweep it
++        };
++        let page = crate::watch::PAGE as u64;
++        let (first, last) = (start / page * page, end.div_ceil(page) * page);
++        let Some((now, written)) = crate::watch::writes(first as usize, last as usize, true) else {
++            continue;
++        };
++        let before = heap.synced.swap(now, Relaxed);
++        let step = u64::from(step);
++        for (p, asked) in written {
++            if asked <= before {
++                continue;
++            }
++            let from = (p as u64 * page).max(start);
++            let to = ((p as u64 + 1) * page).min(end);
++            for i in (from - start) / step..(to - start).div_ceil(step) {
++                let i = i as u32;
++                if i < heap.desc.count {
++                    host.mirror(i, start + u64::from(i) * step, false);
++                }
++            }
++        }
++    }
++}
++
+ /// Gives back dynamic slots of the host heap behind the title heap at
+ /// `heap`, if that heap still exists.
+ #[cfg(windows)]
+@@ -624,6 +674,8 @@ pub(crate) extern "system" fn create_heap(
+         host: std::sync::OnceLock::new(),
+         #[cfg(windows)]
+         pending: Default::default(),
++        #[cfg(windows)]
++        synced: std::sync::atomic::AtomicU64::new(0),
+     });
+     #[cfg(windows)]
+     if visible {
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 582f234..6ce0d06 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -322,6 +322,59 @@ impl HostHeap {
+         };
+     }
+ 
++    /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
++    /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
++    /// size, whose reads past it return zeros instead of reaching whatever
++    /// the host placed after the buffer.
++    pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
++        if len < 4 {
++            // Rounding up would expose bytes past the root's remaining range.
++            self.null_raw_at(index);
++            return;
++        }
++        let Some(host) = host() else { return };
++        let elements = (len / 4).min(u64::from(u32::MAX)) as u32;
++        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
++            Format: DXGI_FORMAT_R32_TYPELESS,
++            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
++            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
++                Buffer: D3D12_BUFFER_SRV {
++                    FirstElement: offset / 4,
++                    NumElements: elements,
++                    StructureByteStride: 0,
++                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
++                },
++            },
++        };
++        // SAFETY: a slot of our heap and a live buffer covering the range.
++        unsafe {
++            host.device
++                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
++        };
++        self.keep(index, Some(buffer.clone()));
++    }
++
++    /// Makes slot `index` a raw buffer view that reads zeros.
++    pub(crate) fn null_raw_at(&self, index: u32) {
++        null_buffer_view(self.cpu(index));
++        self.keep(index, None);
++    }
++
++    /// Whether this is a sampler heap.
++    pub(crate) fn is_sampler(&self) -> bool {
++        self.sampler
++    }
++
++    /// The shader-visible handle of slot `index`.
++    pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
++        // SAFETY: a live shader-visible heap.
++        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
++        D3D12_GPU_DESCRIPTOR_HANDLE {
++            ptr: start + u64::from(index) * u64::from(self.step),
++        }
++    }
++
+     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+         D3D12_CPU_DESCRIPTOR_HANDLE {
+             ptr: self.cpu + index as usize * self.step as usize,
+@@ -378,6 +431,16 @@ impl HostHeap {
+         Some(view)
+     }
+ 
++    #[cfg(test)]
++    pub(crate) fn test_resource(&self, index: usize) -> Option<ID3D12Resource> {
++        self.kept.lock().unwrap()[index].clone()
++    }
++
++    #[cfg(test)]
++    pub(crate) fn test_dynamic_capacity(&self) -> u32 {
++        self.dynamic
++    }
++
+     /// The view host slot `index` was made from, in a few words, with the
+     /// title and host addresses of a buffer view (diagnostics). "null" for
+     /// a slot never made or left null.
+@@ -973,4 +1036,110 @@ mod tests {
+         assert_eq!(heap.dynamic(50), Some(4));
+         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+     }
++
++    /// Root SRV tables expose only complete dwords in their window; a
++    /// missing root or a window too short for a dword must read zeros.
++    #[test]
++    fn root_srv_tables_bound_reads_and_null_slots_read_zero() {
++        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
++        use windows::Win32::Graphics::Direct3D::ID3DBlob;
++        use windows::core::s;
++
++        let host = host().expect("bounded root SRV readback requires a real host GPU");
++        const SOURCE: &str = r#"
++#define RS "DescriptorTable(SRV(t0, numDescriptors = 4)), UAV(u0)"
++ByteAddressBuffer bounded : register(t0);
++ByteAddressBuffer missing : register(t1);
++ByteAddressBuffer short_view : register(t2);
++ByteAddressBuffer empty_view : register(t3);
++RWByteAddressBuffer seen : register(u0);
++[RootSignature(RS)]
++[numthreads(8, 1, 1)]
++void main(uint3 id : SV_DispatchThreadID) {
++    uint at = id.x * 4;
++    seen.Store(at, bounded.Load(at));
++    seen.Store(32 + at, missing.Load(at));
++    seen.Store(64 + at, short_view.Load(at));
++    seen.Store(96 + at, empty_view.Load(at));
++}
++"#;
++        let mut code: Option<ID3DBlob> = None;
++        // SAFETY: source and names live through the call; output is ours.
++        unsafe {
++            D3DCompile(
++                SOURCE.as_ptr().cast(),
++                SOURCE.len(),
++                s!("bounded-root-srv"),
++                None,
++                None,
++                s!("main"),
++                s!("cs_5_1"),
++                0,
++                0,
++                &mut code,
++                None,
++            )
++        }
++        .unwrap();
++        let code = code.unwrap();
++        // SAFETY: the blob owns these bytes and embeds the root signature.
++        let (root, pso) = unsafe {
++            let bytes = std::slice::from_raw_parts(
++                code.GetBufferPointer().cast::<u8>(),
++                code.GetBufferSize(),
++            );
++            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
++            let pso: ID3D12PipelineState = host
++                .device
++                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                    pRootSignature: std::mem::transmute_copy(&root),
++                    CS: D3D12_SHADER_BYTECODE {
++                        pShaderBytecode: bytes.as_ptr().cast(),
++                        BytecodeLength: bytes.len(),
++                    },
++                    ..Default::default()
++                })
++                .unwrap();
++            (root, pso)
++        };
++        let (source, input) = host.shared_buffer(64).unwrap();
++        let (seen, output) = host.shared_buffer(128).unwrap();
++        let values: Vec<u32> = (0..16).map(|i| 0x7130_0000 | i).collect();
++        // SAFETY: both mappings cover these writes, before GPU use.
++        unsafe {
++            std::ptr::copy_nonoverlapping(values.as_ptr(), input.cast::<u32>(), values.len());
++            std::ptr::write_bytes(output, 0xa5, 128);
++        }
++        let heap = HostHeap::new(false, 4).unwrap();
++        let first = heap.dynamic(4).unwrap();
++        // Nonzero words immediately after the window prove that out-of-
++        // bounds reads use the view's limit, not the backing buffer's end.
++        heap.raw_at(first, &source, 16, 16);
++        heap.null_raw_at(first + 1);
++        heap.raw_at(first + 2, &source, 16, 3);
++        heap.raw_at(first + 3, &source, 16, 0);
++        let list = host.new_list().unwrap();
++        // SAFETY: an open list; all bindings outlive the waited submission.
++        unsafe {
++            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
++            list.list.SetComputeRootSignature(&root);
++            list.list.SetPipelineState(&pso);
++            list.list
++                .SetComputeRootDescriptorTable(0, heap.gpu_handle(first));
++            list.list
++                .SetComputeRootUnorderedAccessView(1, seen.GetGPUVirtualAddress());
++            list.list.Dispatch(1, 1, 1);
++        }
++        list.close();
++        host.execute(&[&list]);
++        // SAFETY: the GPU finished writing all 32 mapped dwords.
++        let got = unsafe { std::slice::from_raw_parts(output.cast::<u32>(), 32) };
++        assert_eq!(&got[..4], &values[4..8], "the bounded window");
++        assert_eq!(&got[4..8], &[0; 4], "past the bounded window");
++        assert_eq!(&got[8..16], &[0; 8], "the missing root");
++        assert_eq!(&got[16..24], &[0; 8], "less than one complete dword");
++        assert_eq!(&got[24..32], &[0; 8], "the empty window");
++        heap.release(first, 4);
++        eprintln!("bounded root SRVs: exact window; OOB, missing, sub-dword and empty views all read zero");
++    }
+ }
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index d2537cc..a1405f2 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -79,6 +79,9 @@ pub(crate) struct State {
+     dynamic: Vec<(usize, u32, u32)>,
+     /// A fresh table of the stage being bound could not be made.
+     table_failed: bool,
++    /// Root SRVs bound as one-view tables in this list: (host heap, title
++    /// address) → dynamic slot.
++    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+ }
+ 
+ impl Drop for State {
+@@ -493,12 +496,23 @@ impl State {
+             }
+             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+                 for &(slot, param) in views {
+-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
++                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
++                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                     else {
+                         once!(slot, "a shader reads a root view the title did not set");
++                        // An unset table is undefined: a null view instead.
++                        if tabled && !self.root_srv_table(list, None, param, compute) {
++                            return false;
++                        }
+                         continue;
+                     };
+-                    let Some(gpu) = root_view(list, *address, srv) else {
++                    if tabled {
++                        if !self.root_srv_table(list, Some(address), param, compute) {
++                            return false;
++                        }
++                        continue;
++                    }
++                    let Some(gpu) = root_view(list, address, srv) else {
+                         continue;
+                     };
+                     // SAFETY: an open list; the address is in live memory.
+@@ -516,6 +530,75 @@ impl State {
+         true
+     }
+ 
++    /// Binds a root SRV as a one-view table (see
++    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
++    /// title buffer's host copy from `address` to the copy's end, or a null
++    /// view (no address, or no host copy). One slot per address per list.
++    /// False if no dynamic slot could be had (the draw is dropped).
++    fn root_srv_table(
++        &mut self,
++        list: &HostList,
++        address: Option<u64>,
++        param: u32,
++        compute: bool,
++    ) -> bool {
++        let Some((heap, host)) = self
++            .heaps
++            .iter()
++            .filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This))
++            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
++        else {
++            once!("a root SRV without a bound view heap: the draw is dropped");
++            return false;
++        };
++        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
++        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
++        let index = match self.root_srv_slots.get(&key) {
++            Some(&index) => index,
++            None => {
++                let Some(index) = host.dynamic(1) else {
++                    return false;
++                };
++                self.dynamic.push((key.0, index, 1));
++                self.root_srv_slots.insert(key, index);
++                match &shadow {
++                    Some((a, s)) => {
++                        // SAFETY: a live buffer.
++                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
++                        let offset = s.gpu(*a) - base;
++                        if offset.is_multiple_of(16) {
++                            host.raw_at(index, &s.buffer, offset, s.left(*a));
++                        } else {
++                            // Raw views start on 16 bytes; one from the
++                            // aligned start would shift every read.
++                            once!(
++                                address = format_args!("{a:#x}"),
++                                "a root SRV not on 16 bytes reads zeros"
++                            );
++                            host.null_raw_at(index);
++                        }
++                    }
++                    None => host.null_raw_at(index),
++                }
++                index
++            }
++        };
++        if let Some((a, s)) = &shadow {
++            s.refresh(list, *a, s.left(*a).min(1 << 20));
++        }
++        let handle = host.gpu_handle(index);
++        // SAFETY: an open list; the slot is in the bound view heap.
++        unsafe {
++            if compute {
++                list.list.SetComputeRootDescriptorTable(param, handle);
++            } else {
++                list.list.SetGraphicsRootDescriptorTable(param, handle);
++            }
++        }
++        true
++    }
++
+     /// Runs a dispatch on the host.
+     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+         #[cfg(feature = "diagnostics")]
+@@ -1215,3 +1298,37 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+     // SAFETY: an open list.
+     unsafe { list.list.OMSetStencilRef(reference) };
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn root_srv_tables_fail_closed_without_heap_or_dynamic_slots() {
++        let host = crate::host::host().expect("root SRV binding test requires a real host GPU");
++        let list = host.new_list().unwrap();
++        let mut state = State::default();
++        assert!(!state.root_srv_table(&list, None, 0, true), "no view heap must refuse binding");
++        assert!(state.root_srv_slots.is_empty() && state.dynamic.is_empty());
++
++        #[repr(C)]
++        struct Extended([u32; 4], [u64; 2]);
++        let description = Extended([0, 4, 1, 1], [0, 0]);
++        let mut heap = std::ptr::null();
++        assert_eq!(crate::descriptor::create_heap(
++            std::ptr::null(), std::ptr::from_ref(&description).cast(),
++            &crate::resource::PAGEABLE_IIDS[0], &mut heap,
++        ), 0);
++        let heap_host = crate::descriptor::heap(heap).host().expect("host view heap");
++        let capacity = heap_host.test_dynamic_capacity();
++        let first = heap_host.dynamic(capacity).expect("reserve the dynamic pool");
++        state.heaps[0] = heap as usize;
++        assert!(!state.root_srv_table(&list, None, 0, true), "exhausted heap must refuse binding");
++        assert!(state.root_srv_slots.is_empty() && state.dynamic.is_empty(), "failed binding must not cache a stale slot");
++        heap_host.release(first, capacity);
++        drop(state);
++        list.close();
++        assert_eq!(crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap), 0);
++        eprintln!("root SRV binding: absent heap and exhausted dynamic pool both fail closed without cached slots");
++    }
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index c4cd76f..37348e8 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -494,6 +494,29 @@ impl Host {
+         // One submission at a time from preparation to copy-back: snapshots
+         // and the ranges shaders write are per host copy, not per submission.
+         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
++        self.submit(&mut submitted, runs);
++    }
++
++    /// Runs a title's submission: as [`execute`](Self::execute), but first,
++    /// under the same lock, refreshes heap slots the title wrote.
++    /// Inside the lock, another queue's submission
++    /// can't refresh a heap while this one's GPU work still reads it.
++    pub(crate) fn execute_title(&self, runs: &[&HostList]) {
++        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
++        crate::descriptor::resync_title_writes();
++        self.submit(&mut submitted, runs);
++    }
++
++    /// Test-only ordering check; focused submission tests run serially.
++    #[cfg(test)]
++    pub(crate) fn assert_submission_locked(&self) {
++        assert!(matches!(
++            self.submitted.try_lock(),
++            Err(std::sync::TryLockError::WouldBlock)
++        ), "descriptor refresh must hold the submission mutex");
++    }
++
++    fn submit(&self, submitted: &mut u64, runs: &[&HostList]) {
+         let started = std::time::Instant::now();
+         #[cfg(feature = "diagnostics")]
+         crate::copystat::add(crate::copystat::C::Submissions, 1);
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index 00aa9aa..13b913f 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -243,6 +243,16 @@ pub(crate) struct Input {
+ const RECTANGLES: i32 = 19;
+ const QUADS: i32 = 32;
+ 
++/// Whether root SRVs are bound as one-view tables of the buffer's host
++/// copy (reads past its end return zeros) rather than root descriptors
++/// (unbounded: a mesh shader's vertex fetch, which has no record limit,
++/// read past the copy into memory the host had freed). Set
++/// `VICTORY_ROOT_SRV_DIRECT=1` to go back.
++pub(crate) fn bounded_root_srvs() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
++}
++
+ /// One stage of a host pipeline and where its bindings go.
+ pub(crate) struct Stage {
+     pub(crate) shader: Arc<Shader>,
+@@ -330,6 +340,9 @@ impl HostPipeline {
+ 
+         // The root signature the translated shaders' bindings define.
+         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
++        // Ranges the table parameters point at, alive until the root
++        // signature is made.
++        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
+         let mut samplers = Vec::new();
+         let mut bound = Vec::new();
+         for &(shader, visibility) in &stages {
+@@ -368,6 +381,32 @@ impl HostPipeline {
+                 ),
+             ] {
+                 for &slot in slots {
++                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
++                        // A one-view table: the view's size bounds the reads,
++                        // which a root descriptor leaves unbounded.
++                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
++                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
++                            NumDescriptors: 1,
++                            BaseShaderRegister: u32::from(slot),
++                            RegisterSpace: ROOT_CBV_SPACE,
++                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
++                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
++                            OffsetInDescriptorsFromTableStart: 0,
++                        }));
++                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
++                        out.push((slot, params.len() as u32));
++                        params.push(D3D12_ROOT_PARAMETER1 {
++                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
++                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
++                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
++                                    NumDescriptorRanges: 1,
++                                    pDescriptorRanges: range,
++                                },
++                            },
++                            ShaderVisibility: visibility,
++                        });
++                        continue;
++                    }
+                     out.push((slot, params.len() as u32));
+                     params.push(D3D12_ROOT_PARAMETER1 {
+                         ParameterType: kind,
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 5992fad..2aecd75 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -123,7 +123,7 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
+             .iter()
+             .filter_map(|&l| crate::list::host_list(l))
+             .collect();
+-        host.execute(&host_lists);
++        host.execute_title(&host_lists);
+         return;
+     }
+     static ONCE: AtomicBool = AtomicBool::new(false);
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 46c5c71..8a58da2 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -1394,6 +1394,87 @@ mod tests {
+         }
+     }
+ 
++    #[cfg(windows)]
++    #[test]
++    fn copied_title_descriptors_resync_at_submission() {
++        use windows_sys::Win32::System::Memory::{
++            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
++            VirtualAlloc, VirtualFree,
++        };
++        let host = crate::host::host().expect("descriptor resync requires a real host GPU");
++        let null = std::ptr::null();
++        let make = |desc| {
++            let mut out = null;
++            assert_eq!(
++                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
++                S_OK
++            );
++            out
++        };
++        let first = make(texture(4, 4, 28, 1));
++        let second = make(texture(4, 4, 28, 1));
++        let constants = make(buffer(256));
++        let (bytes, _) = buffer_bytes(constants).unwrap();
++        // SAFETY: ordinary committed guest memory, tracked by write-watch.
++        let memory = unsafe {
++            VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE)
++        };
++        assert!(!memory.is_null());
++        let start = memory as u64;
++        #[repr(C)]
++        struct Extended([u32; 4], [u64; 2]);
++        let ext = Extended([0, 8, 1, 1], [start, 8 * 32]);
++        let mut heap = null;
++        assert_eq!(
++            crate::descriptor::create_heap(null, std::ptr::from_ref(&ext).cast(), &PAGEABLE_IIDS[0], &mut heap),
++            S_OK
++        );
++        crate::descriptor::create_srv(null, first, std::ptr::null(), start);
++        crate::descriptor::create_srv(null, second, std::ptr::null(), start + 32);
++        crate::descriptor::create_srv(null, first, std::ptr::null(), start + 96);
++        assert_eq!(start / crate::watch::PAGE as u64, (start + 96) / crate::watch::PAGE as u64);
++        let cbv = [bytes as u32, ((bytes as u64) >> 32) as u32, 256, 0];
++        crate::descriptor::create_cbv(null, &cbv, start + 64);
++        let heap_host = crate::descriptor::heap(heap).host().unwrap();
++        let is_resource = |index, guest| {
++            heap_host.test_resource(index).as_ref() == host_resource(guest)
++        };
++        assert!(is_resource(0, first));
++        assert!(is_resource(1, second));
++        host.execute_title(&[]);
++
++        // SAFETY: copy two initialized records wholly within the live title heap.
++        unsafe { std::ptr::copy_nonoverlapping(memory.cast::<u8>().add(32), memory.cast(), 32) };
++        assert!(is_resource(0, first));
++        host.execute(&[]);
++        assert!(is_resource(0, first), "internal submissions must not refresh title heaps");
++        host.execute_title(&[]);
++        assert!(is_resource(0, second), "title submission mirrors copied B");
++
++        // SAFETY: restore A from another full slot on the same watched page.
++        unsafe { std::ptr::copy_nonoverlapping(memory.cast::<u8>().add(96), memory.cast(), 32) };
++        host.execute(&[]);
++        assert!(is_resource(0, second), "internal submission must leave copied B installed");
++        host.execute_title(&[]);
++        assert!(is_resource(0, first), "a second write on the same page restores A");
++
++        // SAFETY: same heap, disjoint full slots.
++        unsafe { std::ptr::copy_nonoverlapping(memory.cast::<u8>().add(64), memory.cast(), 32) };
++        host.execute_title(&[]);
++        assert!(matches!(crate::descriptor::view(start), Some(crate::descriptor::View::Constant(..))));
++        assert!(heap_host.test_resource(0).is_none(), "sweep defers buffer descriptors");
++        // A draw's explicit materialization path can make this same valid CBV.
++        heap_host.mirror(0, start, true);
++        assert!(heap_host.test_resource(0).is_some());
++        eprintln!("descriptor resync: serialized title submissions mirrored A -> B -> A; internal submissions unchanged; copied CBV explicitly null until materialized");
++
++        for object in [heap, first, second, constants] {
++            assert_eq!(slot::<Release>(object, 0x10)(object), 0);
++        }
++        // SAFETY: the heap was released and no object retains the guest records.
++        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
++    }
++
+     fn heap(size: u64) -> This {
+         let desc = HeapDesc {
+             size,

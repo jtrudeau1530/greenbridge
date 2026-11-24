@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - "runtimes/victory"
+      - "runtimes/victory-patches/**"
       - ".gitmodules"
       - ".github/workflows/victory.yml"
   pull_request:
     paths:
       - "runtimes/victory"
+      - "runtimes/victory-patches/**"
       - ".gitmodules"
       - ".github/workflows/victory.yml"
   workflow_dispatch:
@@ -39,6 +41,25 @@ jobs:
       - name: Check out the pinned runtime
         working-directory: .
         run: git submodule update --init --depth 1 -- runtimes/victory
+      - name: Apply the reviewed source patches
+        run: |
+          $base = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($base -ne 'ffe310eb2098e52169f4c44db5ffdabf43a72622') { throw 'Unexpected runtime base' }
+          $changes = git status --porcelain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($changes) { throw 'Runtime checkout must be clean before patching' }
+          $patches = @(
+            '../victory-patches/61474f6-region-copy.patch',
+            '../victory-patches/417f4e3-root-view-loads.patch',
+            '../victory-patches/amd-world-guards.patch'
+          )
+          foreach ($patch in $patches) {
+            git apply --check --index $patch
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git apply --index $patch
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Install Rust
         run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target x86_64-pc-windows-msvc
       - name: Clippy
