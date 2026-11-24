@@ -77,14 +77,14 @@ int main() {
     }
 
     {
-        // Nobody notifies: the wait times out after about its timeout, with the mutex held again.
+        // A false predicate retries permitted spurious/early wakes until the timeout, with the mutex held again.
         const auto start = Clock::now();
         std::unique_lock<std::mutex> lock(mutex);
-        const std::cv_status status = cv.wait_for(lock, std::chrono::milliseconds(200));
+        const bool satisfied = cv.wait_for(lock, std::chrono::milliseconds(200), [] { return false; });
         const long long waited = ms_since(start);
         std::printf("  an unnotified wait_for(200 ms) returned after %lld ms\n", waited);
-        check(status == std::cv_status::timeout, "an unnotified wait_for times out");
-        check(waited >= 150 && waited < 2000, "an unnotified wait_for lasts about its timeout");
+        check(!satisfied, "an unnotified wait_for times out with its predicate false");
+        check(waited >= 200 && waited < 2000, "an unnotified wait_for lasts at least its timeout");
         check(lock.owns_lock(), "the mutex is held again after the timeout");
         bool other_got_it = true;
         std::thread probe([&] { other_got_it = mutex.try_lock(); if (other_got_it) mutex.unlock(); });
