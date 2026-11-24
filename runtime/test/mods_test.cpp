@@ -35,6 +35,14 @@ int main() {
     static_assert(joaat("mandy") == 0x03A885E6u, "Mandy's PERSCHARS name hash");
     static_assert(joaat("CS_Mandy") == joaat("cs_mandy"), "joaat lower-cases");
 
+    // UTF-8 mod names hash bytes with ASCII folding; the Python manifest checker pins the same vectors.
+    static_assert(joaat("\x63\x61\x66\xc3\xa9") == 0x9096ADF2u, "UTF-8 mod name hash");
+    static_assert(joaat("\x43\x61\x66\xc3\xa9") == 0x9096ADF2u, "UTF-8 mod name hash");
+    static_assert(joaat("\x53\x65\xc3\xb1\x6f\x72") == 0x3F0AD84Fu, "UTF-8 mod name hash");
+    static_assert(joaat("\x43\x72\xc3\xa8\x6d\x65\x20\x42\x72\xc3\xbb\x6c\xc3\xa9\x65") == 0xB8C3C844u, "UTF-8 mod name hash");
+    static_assert(joaat("\xc3\x89\x4c\xc3\x89\x47\x49\x45") == 0x47FF949Cu, "UTF-8 mod name hash");
+    static_assert(joaat("\x52\x61\x64\x69\x6f\x5f\x4c\x6f\x73\x53\x61\x6e\x74\x6f\x73\x5f\x43\x61\x66\xc3\xa9") == 0x3A17AFD0u, "UTF-8 mod name hash");
+
     uint32_t id = 0;
     check(parse_model_id("0xD7C0CDFF", id) && id == 0xD7C0CDFFu, "a 0x hash is taken as it is");
     check(parse_model_id("cs_monalisa", id) && id == 0x9CB9BCC6u, "a name is hashed");
