@@ -22,6 +22,7 @@ BODY = """v_mov_b32 v0, 0
 v_mov_b32 v1, 0x3fe80000
 v_mov_b32 v6, 0
 v_mov_b32 v7, 0x3fe00000
+s_mov_b32 exec_lo, s12
 v_add_f64 v[4:5], v[0:1], v[6:7]"""
 
 
@@ -44,7 +45,8 @@ class F64OutputModifiersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for modifiers, scale, clamp in cases:
                 with self.subTest(modifiers=modifiers):
-                    spv = translate_listing(Path(directory), f"{BODY} {modifiers}".rstrip())
+                    # Keep this predicated write separate from the epilogue's VALU run.
+                    spv = translate_listing(Path(directory), f"{BODY} {modifiers}\ns_nop 0")
                     self.check_add(spv, scale, clamp)
 
     def check_add(self, spv, scale, clamp):
