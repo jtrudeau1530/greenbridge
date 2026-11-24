@@ -378,7 +378,7 @@ def format_text(summary: dict, limit: int) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Summarize gta6rt's startup and D3D12 first-boot traces."
+        description="Summarize the runtime's startup and D3D12 first-boot traces."
     )
     ap.add_argument("startup", nargs="?", help="the JSONL written by gta6rt --trace")
     ap.add_argument("--d3d12", help="the stderr log written with --trace-d3d12")

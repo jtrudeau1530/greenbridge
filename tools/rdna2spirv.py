@@ -1610,10 +1610,10 @@ class Gen:
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
         if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
-            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
+            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, self.lane_bit_mask(val))
             return
         if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
-            self.set_exec(val)
+            self.set_exec(self.lane_bit_mask(val) if a["t"] == "exec_lo" else val)
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
             # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR
@@ -5871,6 +5871,16 @@ class Gen:
         else:
             self.emit(f"{r} = OpLoad %uint %sg_lane")
 
+    def lane_bit_mask(self, word):
+        """Bit lane&31 of a computed 32-bit word as this lane's all-ones/zero mask. Already-expanded lane
+        masks remain unchanged: every bit of 0 or 0xFFFFFFFF is that lane's bit, so bitwise mask writes are safe."""
+        sh, shr, bit, r = (self.tmp() for _ in range(4))
+        self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+        self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+        return r
+
     def exec_half_write(self, half, val, const=None):
         """Write one 32-bit half of EXEC. In the per-lane model a lane is active iff its bit is set. A constant
         sets each lane from its own bit; a register value (mask representation: all-ones / zero per lane) sets
@@ -7385,20 +7395,13 @@ class Gen:
                 raise Unsupported("gs sendmsg " + t)
             return
         if op == "s_sendmsg" and a and "MSG_GS_ALLOC_REQ" in a[0].get("t", "") and self.stage == "ms":
-            # SHADER-766: only invocation 0 stores the workgroup counts to avoid SharedMemoryDataRace-RaceOnStore.
-            # The counts are uniform (from SGPR m0), and all invocations synchronize at the post-alloc barrier.
+            # The scalar allocation request may run only in a later wave, so workgroup invocation 0
+            # need not reach it. Publish from the actual senders atomically: equal count writes from
+            # multiple lanes/waves are safe, with no non-atomic shared-memory write race.
             m = self.tmp()
             self.emit(f"{m} = OpLoad %uint %m0")
-            li = self.local_index()
-            is_lead = self.tmp()
-            self.emit(f"{is_lead} = OpIEqual %bool {li} {self.cu(0)}")
-            do_lbl, end_lbl = self.tmp() + "_alloc_do", self.tmp() + "_alloc_end"
-            self.emit(f"OpSelectionMerge {end_lbl} None")
-            self.emit(f"OpBranchConditional {is_lead} {do_lbl} {end_lbl}")
-            self.emit(f"{do_lbl} = OpLabel")
-            self.emit(f"OpStore %ms_counts {m}")
-            self.emit(f"OpBranch {end_lbl}")
-            self.emit(f"{end_lbl} = OpLabel")
+            previous = self.tmp()
+            self.emit(f"{previous} = OpAtomicExchange %uint %ms_counts {self.cu(2)} {self.cu(0)} {m}")
             self.ms_alloc = True
             return
         if op == "s_sendmsg" and a and "MSG_ORDERED_PS_DONE" in a[0].get("t", ""):

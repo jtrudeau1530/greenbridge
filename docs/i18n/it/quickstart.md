@@ -1,4 +1,4 @@
-# Leonida — Guida rapida (`it`)
+# Greenbridge — Guida rapida (`it`)
 
 > [!NOTE]
 > La documentazione in inglese ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
@@ -6,9 +6,9 @@
 > stabili di configurazione e compilazione (sincronizzata con il commit `49475796`). Per lo stato quotidiano del
 > progetto consulta il [`README.md`](../../../README.md).
 
-## Che cos'è Leonida
+## Che cos'è Greenbridge
 
-Leonida è un progetto di ricompilazione statica di Grand Theft Auto VI (Xbox Series) per eseguirlo nativamente su
+Greenbridge è un progetto di ricompilazione statica di un titolo compatibile (Xbox Series) per eseguirlo nativamente su
 Windows, **costruito sul tuo PC a partire dalla tua copia**. Il codice del gioco viene caricato ed eseguito
 nativamente (la CPU di Xbox Series è x86-64 come quella di un PC), il software di sistema della console è
 reimplementato in shim e i programmi GPU RDNA2 della console vengono tradotti in SPIR-V per Vulkan. Modelli,
@@ -65,7 +65,7 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
 2. Scarica il progetto **con il suo sottomodulo**:
 
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
 
    Il «Download ZIP» di GitHub non include `third_party/rpf9-explorer`. La build lo scarica da sola se `git` è
@@ -144,8 +144,7 @@ avvio non devono essere compilati. La traduzione degli shader è il passaggio pi
    `python -I tests/test_manifest_verifier.py` dalla radice del repository. La suite del traduttore si esegue
    con `python -m unittest discover -s tests/semantic -v`.
 3. Nella pull request indica l'ID dell'attività, cosa hai provato e, se hai eseguito test GPU, quale GPU e
-   quale driver. Le regole sono in [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). Se hai usato un assistente
-   IA, dichiaralo nella pull request, come richiesto da [`AGENTS.md`](../../../AGENTS.md).
+   quale driver. Le regole sono in [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 **Mai** allegare a issue o pull request file del gioco, asset estratti o shader generati: condividi solo
 risultati (conteggi, esito dei test, classi di errore).

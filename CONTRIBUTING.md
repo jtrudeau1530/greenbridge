@@ -12,7 +12,7 @@ Thanks for helping. A few rules keep the project safe to host:
 
 ## Before you start
 
-Old numbered issue links below are historical Leonida references. Their current availability and ownership status are unknown. For Greenbridge, check this repository's issues and pull requests; if no coordination issue exists, describe the intended work in a new issue before opening a pull request. Recovered experiments are indexed in [recovery/README.md](recovery/README.md).
+Old numbered issue links below are historical upstream references. Their current availability and ownership status are unknown. For Greenbridge, check this repository's issues and pull requests; if no coordination issue exists, describe the intended work in a new issue before opening a pull request. Recovered experiments are indexed in [recovery/README.md](recovery/README.md).
 
 Claim the work in [the coordination issue][claims] first: the open issue titled "Coordinating who works on what" (it
 moves to a new issue when the thread gets long, so the link searches for it). Check its tables and the open pull

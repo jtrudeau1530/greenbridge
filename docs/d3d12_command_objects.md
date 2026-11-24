@@ -897,7 +897,7 @@ existing device proxy already follows that rule (`runtime/shims/d3d12_xs_device.
 
 ### 8.1 Licence
 
-Leonida is GPL-3.0-or-later. SCARAB is GPL-3.0-only and `americas-recomp` is GPL-2.0-only; both
+Greenbridge is GPL-3.0-or-later. SCARAB is GPL-3.0-only and `americas-recomp` is GPL-2.0-only; both
 are cited for ABI facts only. No code, headers, generated stubs, comments or tables were copied
 from either project. The PE and disassembly facts in section 3 were produced locally from the
 shipped `XboxBvhBuilder.dll`; the public slot table was parsed from the installed Windows SDK

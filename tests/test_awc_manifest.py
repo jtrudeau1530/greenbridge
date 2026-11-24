@@ -355,25 +355,33 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
-    def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
+    def test_failed_replace_after_manifest_becomes_read_only_removes_temp(self):
         out = os.path.join(self.tmp.name, "manifest.json")
         previous = '{"previous": true}\n'
         with open(out, "w", encoding="utf-8") as f:
             f.write(previous)
-        os.chmod(out, 0o444)
         self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
         made_writable = []
         real_chmod = os.chmod
+        real_dump = awc_manifest.json.dump
+
+        def dump_then_make_destination_read_only(*args, **kwargs):
+            real_dump(*args, **kwargs)
+            # Let the initial write-permission check pass, then exercise failure at
+            # replacement, after the temporary file has actually been created.
+            real_chmod(out, 0o444)
 
         def chmod(path, mode, *args, **kwargs):
             if isinstance(path, str) and os.path.basename(path).startswith(".awc_manifest-") and mode == 0o600:
                 made_writable.append(path)
             return real_chmod(path, mode, *args, **kwargs)
 
-        with mock.patch.object(awc_manifest, "replace_retry", side_effect=OSError("replace denied")), \
+        with mock.patch.object(awc_manifest.json, "dump", side_effect=dump_then_make_destination_read_only), \
+                mock.patch.object(awc_manifest, "replace_retry", side_effect=OSError("replace denied")) as replace, \
                 mock.patch.object(awc_manifest.os, "chmod", chmod):
             with self.assertRaises(OSError):
                 awc_manifest.write_manifest([], 0, 0, "json", out)
+        replace.assert_called_once()
         self.assertEqual(len(made_writable), 1)
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), previous)

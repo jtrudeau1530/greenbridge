@@ -18,7 +18,7 @@ scan or report is written.
 
 ## Names
 
-Struct and member hashes are the case-sensitive joaat of the GTA V names where those are recovered:
+Struct and member hashes are the case-sensitive joaat of the earlier title names where those are recovered:
 
 | Hash | Name |
 |---|---|

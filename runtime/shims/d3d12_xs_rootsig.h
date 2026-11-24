@@ -36,7 +36,7 @@ void copy_root_signature_desc_clear_xbox_flags(const D3D12_ROOT_SIGNATURE_DESC& 
 // D3D12CreateRootSignatureDeserializer path: the host deserializer accepts a correctly hashed blob whose RTS0
 // flags carry the Xbox high byte and hands the byte back, and CreateRootSignature then refuses it (E_FAIL on WARP
 // and an RTX 5070). So copy the blob, clear bits 24-31 of the RTS0 flags, recompute the DXBC hash the host
-// deserializer checks (a stale one is E_INVALIDARG; an all-zero hash is accepted as-is and kept zeroed), and return
+// deserializer checks (a stale one is E_INVALIDARG; an all-zero hash is kept zeroed for the host to handle), and return
 // true with the copy in `out`. Returns false (and leaves `out` empty) when no rewrite is needed or the container is
 // not valid to re-sign: no RTS0 chunk, no Xbox high byte, a malformed/truncated header, total_size != size, or a
 // non-zero incoming DXBC hash that does not match the input bytes.

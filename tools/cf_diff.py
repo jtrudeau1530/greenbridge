@@ -315,7 +315,9 @@ class Emitter:
         elif kind == "sif":
             _, (cc, sr, k), on_one, then, other = n
             els, end = self.label(), self.label()
-            self.ins(f"s_cmp_{cc}_u32 s{sr}, {k}")
+            # Scalar not-equal is spelled lg in the ISA; ne is the vector comparison spelling.
+            scalar_cc = "lg" if cc == "ne" else cc
+            self.ins(f"s_cmp_{scalar_cc}_u32 s{sr}, {k}")
             self.br("s_cbranch_scc0" if on_one else "s_cbranch_scc1", els if other else end)
             self.nodes(then)
             if other:

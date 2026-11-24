@@ -809,7 +809,7 @@ Source: <https://docs.xbox.com/reference/graphics/d3d12/interfaces/id3d12pipelin
 repository's usage, [d3d12_command_objects.md](d3d12_command_objects.md)) and its frame-event handshake have no
 public page under any URL form tried, including `d3d12/functions/d3d12createdevice_public.md`'s neighbours.
 
-## 6. What this means for Leonida
+## 6. What this means for Greenbridge
 
 Mapping the documented surface onto what the layer does today. Each row names the code that would change; "gap"
 means the code is absent, not that the API is undocumented.

@@ -36,7 +36,10 @@ def translate(lines, *, emulate=False):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        return support.translate_lines("cs_img_atomic_guard", lines + ["s_endpgm"], fssm=FSSM)
+        # Start with a lane-dependent EXEC mask. With no EXEC writes the translator correctly folds active
+        # to true, so an all-active fixture cannot exercise the inactive-lane guard these tests require.
+        return support.translate_lines("cs_img_atomic_guard",
+                                       ["v_cmpx_lt_u32_e32 v0, 16"] + lines + ["s_endpgm"], fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 
@@ -107,6 +110,18 @@ def vgpr_ptrs(spv, reg_idx):
 
 
 class ImageAtomicsGuardTests(unittest.TestCase):
+    def test_guard_check_rejects_an_unconditional_atomic(self):
+        spv = translate(["v_mov_b32_e32 v0, 5", "v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 2",
+                         "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm"])
+        guarded = find_guarded_texel_block(spv)
+        self.assertEqual(len(guarded), 1)
+        label = guarded[0][0]
+        broken, count = re.subn(r"(OpBranchConditional )%\w+( " + re.escape(label) + r" )",
+                                r"\g<1>%true\g<2>", spv)
+        self.assertEqual(count, 1)
+        with self.assertRaisesRegex(AssertionError, "OpImageTexelPointer in unguarded block"):
+            find_guarded_texel_block(broken)
+
     def test_all_image_atomics_2d_and_3d_guarded_and_valid(self):
         simple_ops = [
             ("image_atomic_add", "OpAtomicIAdd"),

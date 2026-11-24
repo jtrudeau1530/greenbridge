@@ -1,6 +1,6 @@
 # Development tools
 
-From the Leonida checkout root, use Python 3 to list the development tools:
+From the Greenbridge checkout root, use Python 3 to list the development tools:
 
 ```powershell
 python -I scripts/dev.py --help

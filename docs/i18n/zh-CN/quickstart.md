@@ -1,13 +1,13 @@
-# Leonida — 快速上手（`zh-CN`）
+# Greenbridge — 快速上手（`zh-CN`）
 
 > [!NOTE]
 > 英文文档（[`README.md`](../../../README.md)、[`CONTRIBUTING.md`](../../../CONTRIBUTING.md) 和
 > [`docs/README.md`](../../README.md)）是**权威版本**。本文只汇总稳定的安装与构建说明（与 commit `aa2988cc` 同步）。
 > 项目每日进展请查看 [`README.md`](../../../README.md)。
 
-## Leonida 是什么
+## Greenbridge 是什么
 
-Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 Windows 的项目：在**你自己的电脑上、
+Greenbridge 是一个把 Xbox Series 版 受支持游戏 **静态重编译**到 Windows 的项目：在**你自己的电脑上、
 用你自己的游戏拷贝**构建。主机的 RDNA2 着色器翻译为 SPIR-V（Vulkan），资源直接从你的包读取，
 主机的系统软件用 shim 重新实现。
 
@@ -61,7 +61,7 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
 2. **带子模块**克隆仓库：
 
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
 
    用 GitHub 的 “Download ZIP” 下载会缺少 `third_party/rpf9-explorer`：装了 `git` 时构建会自动获取，否则会告诉你该怎么做。

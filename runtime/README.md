@@ -422,7 +422,7 @@ No game data, keys, or extracted assets belong in this directory or in the repos
 ### First-boot D3D12 trace
 
 On a Vulkan-enabled build, select the Vulkan backend to trace device, command-list and queue calls handled
-by Leonida. Put `--trace-d3d12` before the separator for game arguments.
+by Greenbridge. Put `--trace-d3d12` before the separator for game arguments.
 
 ```powershell
 $env:LEONIDA_D3D12 = 'vulkan'

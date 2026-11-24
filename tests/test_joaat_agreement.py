@@ -1,4 +1,4 @@
-"""One joaat rule across tools: every lowercased copy hashes a name as tools/hashdict.py does.
+"""Asset-name joaat copies agree with the pinned dictionary; mod manifests agree with the runtime.
 
     python -I tests/test_joaat_agreement.py
 
@@ -35,6 +35,13 @@ NAMES = [
 # test of nothing.
 EXPECTED = ("anim_index", "audio_config", "awc_names", "hashdict", "mission_tables", "world_names")
 
+# Mod JSON is UTF-8 and its names must match runtime/src/mods.h, which folds only ASCII bytes. Asset dictionaries
+# instead use lowercased Latin-1. Keep the contracts distinct; the same UTF-8 vectors are pinned in mods_test.cpp.
+RUNTIME_UTF8 = {
+    "café": 0x9096ADF2, "Café": 0x9096ADF2, "Señor": 0x3F0AD84F,
+    "Crème Brûlée": 0xB8C3C844, "ÉLÉGIE": 0x47FF949C, "Radio_LosSantos_Café": 0x3A17AFD0,
+}
+
 
 def string_hash_copies():
     """{module name: function} for every ``def joaat(``/``def joaat32(`` that takes a string.
@@ -59,13 +66,15 @@ def string_hash_copies():
 class JoaatAgreementTest(unittest.TestCase):
     def test_every_copy_matches_the_pinned_dictionary(self):
         copies = string_hash_copies()
-        for module in EXPECTED:
+        for module in (*EXPECTED, "leonida_mods"):
             self.assertIn(module, copies)
         for module, function in sorted(copies.items()):
             for name in NAMES:
                 with self.subTest(copy=module, name=name):
-                    self.assertEqual(function(name), hashdict.joaat(name),
-                                     f"{module} hashes {name!r} differently from hashdict.joaat")
+                    expected = (RUNTIME_UTF8.get(name, hashdict.joaat(name)) if module == "leonida_mods"
+                                else hashdict.joaat(name))
+                    self.assertEqual(function(name), expected,
+                                     f"{module} hashes {name!r} differently from its name-encoding contract")
 
     def test_a_stream_id_is_the_name_hash_of_the_same_name(self):
         # The consequence of the bug: audio_config's id and the id awc_names recovers from a bank were

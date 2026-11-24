@@ -1,4 +1,4 @@
-# Leonida — Guia rápido (`pt-BR`)
+# Greenbridge — Guia rápido (`pt-BR`)
 
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
@@ -6,9 +6,9 @@
 > configuração e compilação (sincronizado com o commit `f847748c`). Para o status diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
-## O que é o Leonida
+## O que é o Greenbridge
 
-O Leonida é um projeto de recompilação estática do Grand Theft Auto VI (Xbox Series) para rodar nativamente no
+O Greenbridge é um projeto de recompilação estática de um título compatível (Xbox Series) para rodar nativamente no
 Windows, construído **no seu próprio PC a partir da sua própria cópia**. Os shaders RDNA2 do console são
 traduzidos para SPIR-V (Vulkan), os assets são lidos diretamente do seu pacote e o software de sistema do
 console é reimplementado em shims.
@@ -64,9 +64,9 @@ o estágio parecer concluído com zero shaders, e um link simbólico em `disasm`
 1. Instale os pré-requisitos acima.
 2. Clone o repositório **com o submódulo**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
-3. Abra a pasta `Leonida` e dê duplo clique em **`Build.bat`**.
+3. Abra a pasta `greenbridge` e dê duplo clique em **`Build.bat`**.
 
 O script procura automaticamente sua cópia (Downloads, Desktop, Documentos, Games, pasta de usuário e raiz dos
 discos até dois níveis), valida os pré-requisitos e o espaço livre e grava o resultado em `Documents\Leonida`.
@@ -164,8 +164,7 @@ da instalação. No Windows, `--runtime-build` também permite reutilizar um bui
 2. Rode os testes relevantes com entradas sintéticas. Por exemplo, para testar o verificador de manifestos,
    execute `python -I tests/test_manifest_verifier.py` na raiz do repositório.
 3. No PR, inclua o ID da tarefa, descreva o que testou e informe a GPU e o driver se rodou testes de GPU.
-   Confira as regras em [`CONTRIBUTING.md`](../../../CONTRIBUTING.md). Se usou assistência de IA, indique
-   isso no PR, conforme [`AGENTS.md`](../../../AGENTS.md).
+   Confira as regras em [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 O [guia de testes em GPU](../../testing.md) mostra como executar os testes sem arquivos do jogo.
 Publique os resultados de GPU na [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).

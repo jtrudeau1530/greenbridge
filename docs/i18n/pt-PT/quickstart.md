@@ -1,4 +1,4 @@
-# Leonida — Guia rápido (`pt-PT`)
+# Greenbridge — Guia rápido (`pt-PT`)
 
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
@@ -6,9 +6,9 @@
 > configuração e compilação (sincronizado com o commit `867d922f`). Para o estado diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
-## O que é o Leonida
+## O que é o Greenbridge
 
-O Leonida é um projeto de recompilação estática do Grand Theft Auto VI (Xbox Series) para correr nativamente no
+O Greenbridge é um projeto de recompilação estática de um título compatível (Xbox Series) para correr nativamente no
 Windows, construído **no seu PC a partir da sua própria cópia**. Os programas RDNA2 da consola são traduzidos para
 SPIR-V (Vulkan), os recursos são lidos diretamente do seu pacote e o software de sistema da consola é
 reimplementado em *shims*. Tudo isto acontece **no seu PC, com a sua própria cópia do jogo**.
@@ -41,7 +41,7 @@ Ainda não é possível jogar o jogo em nenhuma plataforma; consulte a secção 
 - [ffmpeg](https://ffmpeg.org/download.html) no `PATH` *(opcional: descodifica streams XMA2; obrigatório com
   `--wav`)*.
 
-**Este PC chega?** O [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/) é um verificador leve no
+**Este PC chega?** O [Community hardware checker](https://assttro.github.io/can-i-run-leonida/) é um verificador leve no
 navegador que compara o teu PC com perfis de referência. É uma estimativa aproximada, não um benchmark.
 
 **Pouco espaço em disco:** os ~400 GB são para a compilação completa. Para *executar* o port,
@@ -59,10 +59,10 @@ faltam. Uma pasta `disasm` que seja uma ligação simbólica é recusada quando 
 1. Instale os pré-requisitos acima.
 2. Clone o repositório **com o submódulo**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/jtrudeau1530/greenbridge
    ```
    Um *Download ZIP* do GitHub não inclui `third_party/rpf9-explorer`.
-3. Abra a pasta `Leonida` e faça duplo clique em **`Build.bat`**.
+3. Abra a pasta `greenbridge` e faça duplo clique em **`Build.bat`**.
 
 O script procura a sua cópia do jogo em Downloads, Ambiente de Trabalho, Documentos (incluindo OneDrive), Games,
 pasta pessoal e raiz de cada unidade, até dois níveis. Reconhece a versão por alguns tamanhos de ficheiro, sem
@@ -174,8 +174,7 @@ está em [`docs/d3d12_vulkan.md`](../../d3d12_vulkan.md), os formatos de áudio 
 2. Execute os testes relevantes com entradas sintéticas. Por exemplo, na raiz do repositório:
    `python -I tests/test_manifest_verifier.py`.
 3. No PR, indique o ID da tarefa, o que testou e a GPU/controlador se executou testes GPU. Siga as regras em
-   [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e indique o uso de IA conforme
-   [`AGENTS.md`](../../../AGENTS.md).
+   [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 O [guia de testes GPU](../../testing.md) explica como executar os testes sem ficheiros do jogo. Publique os
 resultados na [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).

@@ -549,7 +549,8 @@ void test_deserializer() {
         check(!rewrote && out.empty(), "blob helper refuses a DXBC container whose header total_size != size");
     }
 
-    // All-zero DXBC checksum: accepted by host d3d12.dll, so the helper clears the Xbox high byte and keeps it zeroed.
+    // An unsigned blob stays unsigned after clearing the Xbox flags. Host
+    // acceptance of zero checksums varies; compare with the same clean blob.
     {
         std::vector<uint8_t> zero_hash = tampered;
         std::memset(zero_hash.data() + 4, 0, 16);
@@ -561,8 +562,17 @@ void test_deserializer() {
 
         ID3D12RootSignatureDeserializer* shim_zero = nullptr;
         const HRESULT hr_zero = deserialize(zero_hash.data(), zero_hash.size(), IID_PPV_ARGS(&shim_zero));
-        check(SUCCEEDED(hr_zero) && shim_zero && shim_zero->GetRootSignatureDesc()->Flags == 0,
-              "shim deserializer accepts an all-zero-checksum Xbox blob with the high byte cleared");
+        std::vector<uint8_t> clean_zero(bytes, bytes + size);
+        std::memset(clean_zero.data() + 4, 0, 16);
+        ID3D12RootSignatureDeserializer* host_zero = nullptr;
+        const HRESULT hr_host_zero = D3D12CreateRootSignatureDeserializer(
+            clean_zero.data(), clean_zero.size(), IID_PPV_ARGS(&host_zero));
+        check(hr_zero == hr_host_zero &&
+                  (SUCCEEDED(hr_host_zero)
+                       ? host_zero && shim_zero && shim_zero->GetRootSignatureDesc()->Flags == 0
+                       : !host_zero && !shim_zero),
+              "shim zero-checksum handling matches the host after clearing the Xbox high byte");
+        if (host_zero) host_zero->Release();
         if (shim_zero) shim_zero->Release();
     }
 }

@@ -36,7 +36,7 @@ Each cell is the median of 12 process medians, each from 25 timed dispatches aft
 
 Unlike the [M3 Max run](descriptor_lookup_apple.md), this run kept the benchmark's default `--max-dispatch-ms 120`, so that a slow dispatch cannot reach the Windows 2 s GPU timeout (TDR). Before each scenario, a 64-group, four-iteration probe estimates the full dispatch time. If the estimate exceeds 120 ms, the benchmark lowers the iteration count to aim at 60 ms and uses nine timed dispatches after two warmups. The figure stays per million lookups. Only host-visible cells were shortened. The 10,000-entry divergent miss ran with 17–20 iterations in 11 rounds. At 100,000 entries, divergent misses ran with 13–15 iterations in all 12 rounds, and T#+S# pairs with 25–31 in 11 rounds. The table marks these cells. Shortened dispatches had medians of 0.49–9.84 ms, far below the 120 ms limit.
 
-From a Leonida checkout on Windows, with Visual Studio 2022 (C++ desktop workload, C++ CMake tools) and the Vulkan SDK installed:
+From a Greenbridge checkout on Windows, with Visual Studio 2022 (C++ desktop workload, C++ CMake tools) and the Vulkan SDK installed:
 
 ```powershell
 git fetch https://github.com/ItsNotRexed/Leonida.git dcd8ecf10b138566d567020562b7afd853a89024

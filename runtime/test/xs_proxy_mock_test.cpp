@@ -1239,6 +1239,63 @@ int check_console_command_list() {
     return 0;
 }
 
+int check_descriptor_heap_provider() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 11, true);
+    EXPECT(device != nullptr);
+    const IID iid = __uuidof(ID3D12DescriptorHeap);
+    struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        std::uint64_t address = 0x12340000;
+        std::uint64_t size = 128;
+    } extended;
+    static unsigned calls = 0;
+    static std::uint64_t seen_address = 0, seen_size = 0;
+    static bool refuse = false;
+    const auto provider = +[](ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                             D3D12_GPU_VIRTUAL_ADDRESS address, std::uint64_t size, REFIID riid, void** out) {
+        ++calls;
+        seen_address = address;
+        seen_size = size;
+        if (refuse) return E_NOTIMPL;
+        return real->CreateDescriptorHeap(desc, riid, out);
+    };
+    EXPECT(!xs::set_device_descriptor_heap_provider(nullptr, provider));
+    EXPECT(!xs::set_device_descriptor_heap_provider(mock, provider));
+    void* heap = nullptr;
+    // No backend installed: a host-only proxy still forwards to the PC method.
+    EXPECT(hr_of(raw(device, 14, word(&extended.desc), word(&iid), word(&heap))) == S_OK);
+    EXPECT(xs::is_heap_proxy(heap) && calls == 0);
+    EXPECT(release(heap) == 0);
+    EXPECT(xs::set_device_descriptor_heap_provider(device, provider));
+    EXPECT(hr_of(raw(device, 14, word(&extended.desc), word(&iid), word(&heap))) == S_OK);
+    EXPECT(xs::is_heap_proxy(heap) && calls == 1);
+    EXPECT(seen_address == extended.address && seen_size == extended.size);
+    EXPECT(release(heap) == 0);
+    // A capability check does not create a heap or call the backend.
+    EXPECT(hr_of(raw(device, 14, word(&extended.desc), word(&iid), 0)) == S_FALSE);
+    EXPECT(calls == 1);
+    refuse = true;
+    heap = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 14, word(&extended.desc), word(&iid), word(&heap))) == E_NOTIMPL);
+    EXPECT(heap == nullptr && calls == 2);
+    refuse = false;
+    Mock* other_mock = nullptr;
+    void* other = make_device(other_mock, 11, true);
+    EXPECT(other != nullptr);
+    EXPECT(hr_of(raw(other, 14, word(&extended.desc), word(&iid), word(&heap))) == S_OK);
+    EXPECT(calls == 2);  // provider installation is per device
+    EXPECT(release(heap) == 0);
+    EXPECT(release(other) == 0 && other_mock->refs == 0);
+    EXPECT(xs::set_device_descriptor_heap_provider(device, nullptr));
+    EXPECT(hr_of(raw(device, 14, word(&extended.desc), word(&iid), word(&heap))) == S_OK);
+    EXPECT(calls == 2);
+    EXPECT(release(heap) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1249,7 +1306,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
+        check_descriptor_heap_provider())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

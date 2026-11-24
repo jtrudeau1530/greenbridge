@@ -39,13 +39,14 @@ class BuildDestinationTest(unittest.TestCase):
             os.symlink(target, path, target_is_directory=True)
             self.addCleanup(os.unlink, path)
 
-    def run_build(self, game, out, work, rejected):
+    def run_build(self, game, out, work, rejected, game_files=()):
         argv = ["make_game.py", "--game", game, "--out", out, "--work", work,
                 "--stages", "runtime", "--no-tui"]
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
             stack.enter_context(patch("make_game.below_normal"))
-            stack.enter_context(patch("make_game.check", return_value={}))
+            stack.enter_context(patch("make_game.check", return_value={
+                "expected_exe": "fixture.exe", "files": dict.fromkeys(game_files, {})}))
             stack.enter_context(patch("make_game.log"))
             preflight = stack.enter_context(patch("make_game.preflight"))
             build_runtime = stack.enter_context(patch("make_game.runtime"))
@@ -94,13 +95,16 @@ class BuildDestinationTest(unittest.TestCase):
         drive = os.path.splitdrive(self.root)[0] + "\\"
         content_dir = os.path.join(drive, "Content")
         independent_dir = os.path.join(drive, "Leonida_Build")
-        with patch("os.listdir", return_value=["Content"]):
+        with patch("os.listdir", side_effect=AssertionError("use the manifest, not unrelated drive entries")):
             # Allowed: destination is an independent folder on the drive root
-            self.run_build(drive, independent_dir, os.path.join(independent_dir, "work"), rejected=False)
+            self.run_build(drive, independent_dir, os.path.join(independent_dir, "work"), rejected=False,
+                           game_files=("Content/file.bin",))
             # Rejected: destination is inside the game dump's own top-level entry
-            self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"), rejected=True)
+            self.run_build(drive, os.path.join(content_dir, "out"), os.path.join(self.root, "work"), rejected=True,
+                           game_files=("Content/file.bin",))
             # Rejected: destination is the drive root itself
-            self.run_build(drive, drive, os.path.join(self.root, "work"), rejected=True)
+            self.run_build(drive, drive, os.path.join(self.root, "work"), rejected=True,
+                           game_files=("Content/file.bin",))
 
     def test_drive_root_checks_entries_on_each_volume(self):
         if os.name != "nt":
@@ -120,14 +124,15 @@ class BuildDestinationTest(unittest.TestCase):
             (["MountedContent", "Content"], os.path.join(root, "Content")),
             (["Content", "MountedContent"], mounted_content),
         ):
-            with patch("os.listdir", return_value=entries), patch("os.path.realpath", side_effect=realpath):
+            with patch("os.listdir", side_effect=AssertionError("use the manifest")), \
+                    patch("os.path.realpath", side_effect=realpath):
                 for option in ("out", "work"):
                     with self.subTest(protected=protected, option=option):
                         destinations = {name: os.path.join(self.root, name) for name in ("out", "work")}
                         destinations[option] = os.path.join(protected, "build")
-                        self.run_build(root, **destinations, rejected=True)
+                        self.run_build(root, **destinations, rejected=True, game_files=entries)
                 self.run_build(root, os.path.join(other_root, "Build"),
-                               os.path.join(other_root, "Scratch"), rejected=False)
+                               os.path.join(other_root, "Scratch"), rejected=False, game_files=entries)
 
 
 if __name__ == "__main__":

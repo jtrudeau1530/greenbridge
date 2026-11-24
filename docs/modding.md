@@ -165,7 +165,7 @@ camera context (on foot, in a vehicle, ...) with a getter that takes the context
 mod answers `first_person_value` for the listed `contexts` (every context when the list is left out) and
 the game's own answer otherwise. When several enabled mods have a `camera` section, the last folder wins.
 
-**Evidence that the engine has a first-person view.** The camera metadata classes GTA V uses
+**Evidence that the engine has a first-person view.** The camera metadata classes earlier title uses
 (`camFirstPersonShooterCameraMetadata`, `camFollowPedCameraMetadata`, ...) do not appear by `joaat` in the
 carved `common`, `data` or `script` streams, but the game's own tuning data refers to a first-person view
 in several systems: a ladder/mount tunable `FirstPersonDirectionDot`, a `UseFirstPersonCameraMatrix` flag on
@@ -175,12 +175,12 @@ and a `firstpersonshooter_hud` UI texture. So the mod switches on a mode the eng
 a camera. Whether the game exposes it to the player is not known.
 
 **ASSUMPTION:** three things to confirm in the executable: that the view mode is chosen through one getter of the form
-`mode = get(context)`, that context 0 is on foot, and that first person is enum value 4 (GTA V's
+`mode = get(context)`, that context 0 is on foot, and that first person is enum value 4 (earlier title's
 `camViewModeSettings` order: third person near, medium, far, cinematic, first person). All three are
 settings in `mod.json`, so a different answer changes the manifest, not the runtime.
 
 **Day one:** find the getter, then run `gta6rt --dry-run <exe> --view-mode-getter RVA` and check the log
-line's count of redirected calls. Leads: the code that reads the view-mode input (GTA V's
+line's count of redirected calls. Leads: the code that reads the view-mode input (earlier title's
 `INPUT_NEXT_CAMERA`, an action hash), the switch over the five view-mode values that selects a camera
 metadata per mode, and the callers of the `UseFirstPersonCameraMatrix` check in the cloth code (they ask
 whether the active view is first person). The hook (`hook_image_results` in `runtime/src/code_hooks.h`) runs

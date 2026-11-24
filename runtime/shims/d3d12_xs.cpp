@@ -179,6 +179,9 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
             return result(method, vhr);
         }
         rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
+        // This entry point exposes the console descriptor ABI. Generic identity wiring also serves callers
+        // with the shorter PC description, so only this explicit console factory enables the address/size tail.
+        rt::d3d12_xs::set_device_descriptor_heap_provider(*out, rt::d3d12::create_console_descriptor_heap);
         if (!tracing)
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
                          static_cast<void*>(vulkan));

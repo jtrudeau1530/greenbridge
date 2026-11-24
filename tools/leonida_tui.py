@@ -1,4 +1,4 @@
-"""Stdlib LEONIDA build console: setup form + switchable per-stage log panes.
+"""Stdlib Greenbridge build console: setup form + switchable per-stage log panes.
 
 No third-party TUI libraries. When stdin/stdout are not TTYs, callers skip this module.
 """
@@ -16,14 +16,8 @@ from dataclasses import dataclass
 
 STAGE_ORDER = ("shaders", "assets", "runtime", "pipelines")
 
-# Figlet-style wordmark (single block, ASCII only).
-LEONIDA_BANNER = [
-    r"  _     _____ ___  _   _ ___ ____    _    ",
-    r" | |   | ____/ _ \| \ | |_ _|  _ \  / \   ",
-    r" | |   |  _|| | | |  \| || || | | |/ _ \  ",
-    r" | |___| |__| |_| | |\  || || |_| / ___ \ ",
-    r" |_____|_____\___/|_| \_|___|____/_/   \_" + "\\",
-]
+# Build-console wordmark (ASCII only).
+LEONIDA_BANNER = ["", "", "  G R E E N B R I D G E", "", ""]
 
 # ANSI (used only when enable_ansi() succeeded).
 _RESET = "\033[0m"
@@ -641,7 +635,7 @@ def kill_live_processes() -> None:
 
 
 def run_setup(default_jobs: int | None = None, default_overlap: bool = True) -> SetupConfig:
-    """Interactive LEONIDA build setup. Esc keeps the defaults (clamped).
+    """Interactive Greenbridge build setup. Esc keeps the defaults (clamped).
 
     Up/Down select a row; Left/Right change its value; Enter starts; Esc keeps defaults.
     Selection paints only the label+value, not the full terminal width.
@@ -823,7 +817,7 @@ class _BoardStream:
 
 
 class LeonidaBoard:
-    """LEONIDA-branded live view with key-switchable stage panes."""
+    """Greenbridge live view with key-switchable stage panes."""
 
     # Fixed chrome (1-based): rows 1–13 header (rule, banner, summary, tabs, pane-top rule);
     # PANE_TOP is the first log row; last 3 rows are thin / help / rule.
@@ -892,7 +886,7 @@ class LeonidaBoard:
             _active_board = None
         for c in self.consoles.values():
             c.close()
-        print(f"LEONIDA: stage logs in {self.log_dir}", flush=True)
+        print(f"Greenbridge: stage logs in {self.log_dir}", flush=True)
         return False
 
     def _raw(self, text: str) -> None:
@@ -1106,7 +1100,7 @@ def capture_popen_kwargs() -> dict:
     """Popen kwargs that fold a child's output into the board instead of the console.
 
     On Windows, cmake/ninja/MSBuild often WriteConsole past a piped stdout when they still
-    have a console handle — that is the brief flash on top of the LEONIDA frame. CREATE_NO_WINDOW
+    have a console handle — that is the brief flash on top of the Greenbridge frame. CREATE_NO_WINDOW
     removes the console handle so those tools fall back to the pipe.
     """
     kw: dict = {

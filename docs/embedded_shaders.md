@@ -117,7 +117,7 @@ the PSO for it is created twice (under one name, `XDXR GetBVHCompactedSize`, per
 
 The `ILDN` PDB path gives one module per container, all under
 `X:\americas\src\dev\rage\3rdparty\Microsoft\XboxBvhBuilder\Build\Release\Output\XboxBvhBuilder\` (Microsoft's
-component integrated into RAGE, not Rockstar shader code). Grouped by phase:
+component integrated into RAGE, not the publisher shader code). Grouped by phase:
 
 | phase | modules |
 |---|---|
