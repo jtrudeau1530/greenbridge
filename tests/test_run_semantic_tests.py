@@ -89,6 +89,37 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("deliberate failure after progress", out)
             self.assertIn("2 files, 3 tests, 1 files failed", out)
 
+    def test_priority_changes_order_without_changing_membership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_small.py": "", "test_big.py": "#" * 100,
+                        "pkg/__init__.py": "", "pkg/test_nested.py": "#" * 20})
+            modules = r.test_modules(tmp)
+            default = r.ordered_modules(tmp, modules, [])
+            self.assertEqual(default, ["test_big", "pkg.test_nested", "test_small"])
+            ordered = r.ordered_modules(tmp, modules, ["test_small", "pkg.test_nested", "test_small"])
+            self.assertEqual(ordered, ["test_small", "pkg.test_nested", "test_big"])
+            self.assertCountEqual(ordered, modules)
+            self.assertEqual(len(ordered), len(set(ordered)))
+
+    def test_unknown_or_filtered_priority_fails_before_running_any_test(self):
+        for jobs in (1, 2):
+            for priority in ("missing", "case_excluded"):
+                with self.subTest(jobs=jobs, priority=priority), tempfile.TemporaryDirectory() as tmp:
+                    suite(tmp, {"test_one.py": BROKEN, "case_excluded.py": BROKEN})
+                    result = cli(tmp, "-j", str(jobs), "--first", priority)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("priority modules not selected by discovery: " + priority, result.stdout)
+                    self.assertNotIn("no_such_module_anywhere", result.stdout + result.stderr)
+
+    def test_prioritized_failure_keeps_every_other_module_and_fails_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_fail.py": FAIL, "test_pass.py": PASS,
+                        "pkg/__init__.py": "", "pkg/test_nested.py": PASS})
+            result = cli(tmp, "-j", "2", "--first", "test_fail", "--first", "pkg.test_nested")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("==== FAILED: test_fail", result.stdout)
+            self.assertIn("3 files, 5 tests, 1 files failed", result.stdout)
+
     def test_custom_patterns_find_only_python_modules_in_packages(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"case_one.py": "", "case_two.txt": "", "case_bad-name.py": "",
