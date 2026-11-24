@@ -1427,6 +1427,9 @@ void test_compat_modules() {
 }  // namespace
 
 int main() {
+    // Keep completed assertions visible if the process stalls and CTest terminates it.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::puts("loader_test: checking synthetic image access");
     g_dir = work_dir();
     std::error_code ec;
     std::filesystem::remove_all(g_dir, ec);
