@@ -346,7 +346,7 @@ class JobsHandlingTest(unittest.TestCase):
                     self.assertEqual(calc, expected)
 
     def test_custom_jobs_forwarded_to_shaders(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch("os.cpu_count", return_value=16):
             game = os.path.join(tmp, "game")
             out = os.path.join(tmp, "out")
             work = os.path.join(tmp, "work")
@@ -373,7 +373,7 @@ class JobsHandlingTest(unittest.TestCase):
                                                                          emulate=True, keep_emulated=True, fallbacks=())
 
     def test_custom_jobs_forwarded_to_assets(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch("os.cpu_count", return_value=16):
             game = os.path.join(tmp, "game")
             out = os.path.join(tmp, "out")
             work = os.path.join(tmp, "work")
