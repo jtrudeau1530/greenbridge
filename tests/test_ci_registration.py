@@ -293,16 +293,21 @@ def spirv_gated_semantic_files(root, files):
 
 
 def spirv_tools_problem(workflow, gated):
-    """Why the semantic job cannot run `gated` tests, or None: it needs an apt install of spirv-tools and the
-    LEONIDA_REQUIRE_SPIRV_TOOLS=1 switch that makes a missing tool fail."""
+    """Why a semantic matrix leg lacks its tools or the switch that makes missing tools fail."""
     if not gated:
         return None
     job = semantic_job_text(workflow)
     problems = []
     if not re.search(r"apt-get\s+install[^\n]*\bspirv-tools\b", job):
         problems.append("it does not `apt-get install` spirv-tools")
-    if not re.search(r"LEONIDA_REQUIRE_SPIRV_TOOLS:[^\n]*['\"]1['\"]", job):
-        problems.append("it never sets LEONIDA_REQUIRE_SPIRV_TOOLS to 1")
+    windows = [step for step in re.split(r"^      - ", job, flags=re.M)
+               if re.search(r"if:\s*runner\.os\s*==\s*['\"]Windows['\"]", step)]
+    if not any(all(token in step for token in (
+            "https://sdk.lunarg.com/sdk/download/", "Get-FileHash -Algorithm SHA256", "Start-Process",
+            "'spirv-as'", "'spirv-val'", "$env:GITHUB_PATH")) for step in windows):
+        problems.append("it does not install and expose verified SPIRV-Tools on Windows")
+    if not re.search(r"^\s*LEONIDA_REQUIRE_SPIRV_TOOLS:\s*['\"]1['\"]\s*$", job, re.M):
+        problems.append("it never sets LEONIDA_REQUIRE_SPIRV_TOOLS to 1 on both matrix legs")
     return "; ".join(problems) or None
 
 
@@ -426,8 +431,8 @@ class RepositoryRegistrationTest(unittest.TestCase):
             self.assertIn(expected, gated)
         problem = spirv_tools_problem(read(ROOT, WORKFLOW), gated)
         self.assertIsNone(problem, "the `semantic-tests` job in ci.yml runs tests that skip without SPIRV-Tools, but " +
-                          str(problem) + ".\nInstall spirv-tools on the Linux leg and set LEONIDA_REQUIRE_SPIRV_TOOLS "
-                          "to '1' there (see tests/semantic/test_spirv_tools_required.py).")
+                          str(problem) + ".\nInstall SPIRV-Tools on both legs and set LEONIDA_REQUIRE_SPIRV_TOOLS "
+                          "to '1' (see tests/semantic/test_spirv_tools_required.py).")
 
     def test_a_job_runs_the_spirv_using_stdlib_files_with_spirv_tools(self):
         # The check job's Windows runner has no SPIRV-Tools, so these files skip their spirv-val checks there.
@@ -450,8 +455,14 @@ class RepositoryRegistrationTest(unittest.TestCase):
         self.assertIn("apt-get", no_install)
         # the translator-tests job above installs spirv-tools too; only the semantic job's own text may count
         self.assertIn("does not `apt-get install` spirv-tools", spirv_tools_problem(no_install, gated) or "")
-        no_switch = workflow.replace("LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && '1' || '0' }}",
-                                     "LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && 'yes' || 'no' }}")
+        no_windows = workflow.replace("https://sdk.lunarg.com/sdk/download/", "https://example.invalid/")
+        self.assertIn("verified SPIRV-Tools on Windows", spirv_tools_problem(no_windows, gated) or "")
+        no_verify = workflow.replace("Get-FileHash -Algorithm SHA256", "Get-Item")
+        self.assertIn("verified SPIRV-Tools on Windows", spirv_tools_problem(no_verify, gated) or "")
+        no_path = workflow.replace("$env:GITHUB_PATH", "$env:UNUSED_PATH")
+        self.assertIn("verified SPIRV-Tools on Windows", spirv_tools_problem(no_path, gated) or "")
+        no_switch = workflow.replace("LEONIDA_REQUIRE_SPIRV_TOOLS: '1'",
+                                     "LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && '1' || '0' }}")
         self.assertNotEqual(no_switch, workflow)
         self.assertIn("never sets LEONIDA_REQUIRE_SPIRV_TOOLS", spirv_tools_problem(no_switch, gated) or "")
 

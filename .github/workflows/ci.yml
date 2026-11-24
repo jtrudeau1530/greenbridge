@@ -204,9 +204,8 @@ jobs:
           python-version: "3.12"
       # Some semantic tests assemble and validate the translator's output with spirv-as / spirv-val and skip without
       # them (test_fma_khr, test_bary_fallback, test_image_coherent...). The runner images have neither, so a skip
-      # here reads as a pass. The Linux leg installs SPIRV-Tools and LEONIDA_REQUIRE_SPIRV_TOOLS=1 makes
+      # here reads as a pass. Both legs install SPIRV-Tools and LEONIDA_REQUIRE_SPIRV_TOOLS=1 makes
       # tests/semantic/test_spirv_tools_required.py fail when they are missing, so those tests cannot go quiet again.
-      # The Windows leg has no SPIRV-Tools and still skips them.
       - name: Install SPIRV-Tools
         if: runner.os == 'Linux'
         shell: bash
@@ -215,9 +214,39 @@ jobs:
           sudo apt-get install -y --no-install-recommends spirv-tools
           spirv-as --version
           spirv-val --version
+      - name: Install SPIRV-Tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Khronos distributes official Windows SPIRV-Tools binaries through the Vulkan SDK.
+          # Match the SDK version already used for the runtime's Vulkan headers.
+          $version = '1.4.363.0'
+          $installer = Join-Path $env:RUNNER_TEMP "vulkansdk-windows-X64-$version.exe"
+          $destination = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version"
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe" -OutFile $installer
+          $expectedHash = '94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash -ne $expectedHash) {
+            throw "Unexpected SHA-256 for Vulkan SDK $version"
+          }
+          # copy_only avoids system registration; only this job's PATH receives the tools.
+          $arguments = @('--root', "`"$destination`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install', 'copy_only=1')
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Vulkan SDK installation failed with exit code $($process.ExitCode)"
+          }
+          $bin = Join-Path $destination 'Bin'
+          foreach ($tool in @('spirv-as', 'spirv-val')) {
+            $exe = Join-Path $bin "$tool.exe"
+            if (!(Test-Path -LiteralPath $exe -PathType Leaf)) {
+              throw "Missing SPIRV-Tools executable: $exe"
+            }
+            & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw "$tool --version failed" }
+          }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin -Encoding utf8
       - name: Translator semantic tests
         env:
-          LEONIDA_REQUIRE_SPIRV_TOOLS: ${{ runner.os == 'Linux' && '1' || '0' }}
+          LEONIDA_REQUIRE_SPIRV_TOOLS: '1'
         run: python -I scripts/run_semantic_tests.py tests/semantic -v
 
   # The Python suites on an Apple Silicon Mac: the standard-library loop of the check job, the translator semantic
