@@ -79,7 +79,7 @@ jobs:
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: "8.0.x"
-          cache: true
+          cache: ${{ matrix.shard == 1 }}
           cache-dependency-path: "**/packages.lock.json"
       - name: Python tools compile
         run: python -m compileall -q make_game.py tools tests

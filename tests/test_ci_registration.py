@@ -683,6 +683,8 @@ class StdlibLoopTest(unittest.TestCase):
                 self.assertEqual(job.count(f"- name: {name}\n        if: matrix.shard == 1\n"), 1)
         # Both shards retain the original stdlib dependency environment; only post-build checks run once.
         self.assertRegex(job, r"- uses: actions/setup-dotnet@[^\n]+\n        with:\n")
+        # The other shard never restores packages, so it has no NuGet directory to save at job cleanup.
+        self.assertRegex(job, r"(?m)^          cache: \$\{\{ matrix\.shard == 1 \}\}$")
 
     def test_step_script_reads_the_check_loop(self):
         script = step_script(ROOT, STDLIB_STEP)
